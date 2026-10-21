@@ -359,7 +359,7 @@ class DictationRuntime(QObject):
                 pill=self.pill,
                 tray=self.tray,
                 paste=self.paste_func,
-                active_window=lambda: snapshot_target(self.x11, self.x11.target_window()),
+                active_window=self._snapshot_paste_target,
                 schedule=self.schedule,
                 cancel_timer=self.cancel_timer,
                 hotkey_done=self._input_done,
@@ -3134,12 +3134,17 @@ class DictationRuntime(QObject):
         self._wake_generation = self.supervisor.generation
         return True
 
+    def _snapshot_paste_target(self) -> PasteTarget:
+        """Снимок цели с текущим XID пилюли, в том числе после смены её флагов."""
+        wid = self.pill.window_id
+        return snapshot_target(
+            self.x11, self.x11.target_window(exclude=() if wid is None else (wid,))
+        )
+
     def _wake_for_hotkey(self) -> None:
         """Загрузить модель; автостарт разрешён только пока физически удержан PTT."""
         try:
-            window: tuple[PasteTarget] | None = (
-                snapshot_target(self.x11, self.x11.target_window()),
-            )
+            window: tuple[PasteTarget] | None = (self._snapshot_paste_target(),)
         except Exception:
             # Окно не узнать — его определит старт записи, как без выгрузки.
             window = None

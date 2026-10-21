@@ -791,22 +791,22 @@ class X11Display:
             log.debug("не удалось найти клиента фокуса: %s", type(exc).__name__)
         return None
 
-    def target_window(self) -> int | None:
+    def target_window(self, exclude: Collection[int] = ()) -> int | None:
         """Окно-цель для вставки в момент старта записи.
 
-        Сначала активное окно EWMH; если оконный менеджер держит его пустым
+        Сначала активное окно EWMH; если оно исключено или менеджер держит его пустым
         (журнал заказчика 23.09: `reason=no-target` на KDE при живом фокусе в
         поле ввода) — клиент фокуса ввода. Источник пишем в журнал: без этого
         ветки «цели нет» неотличимы на чужой машине.
         """
         active = self.active_window()
-        if active:
+        if active and active not in exclude:
             return active
         focus = self.focus_client()
-        if focus:
-            log.info("окно-цель взято из фокуса ввода: активное окно EWMH пусто")
+        if focus and focus not in exclude:
+            log.info("окно-цель взято из фокуса ввода: активное окно EWMH пусто или исключено")
             return focus
-        log.info("окно-цель не найдено: активное окно EWMH пусто, фокус ввода неизвестен")
+        log.info("окно-цель не найдено: активное окно и фокус ввода неизвестны или исключены")
         return None
 
     def client_list_stacking(self) -> list[int]:

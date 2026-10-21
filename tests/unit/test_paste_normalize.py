@@ -2176,3 +2176,216 @@ def test_invalid_window_type_is_rejected_before_clipboard_access(
         paste.PasteFlow().run("фраза", target, PasteMode.AUTO)  # type: ignore[arg-type]
     clipboard.assert_not_called()
     assert not paste._running
+
+
+# T-284 (Fly 1.8.4, журнал 20.10, У49): к публикации добавляется тип из
+# ClipboardManagerTypesBlacklist; если snapshot_mime его отбрасывает (``Star Embed
+# Source`` — тяжёлый префикс ``star embed``), снимок «своей» прошлой фразы не совпадал с
+# запомненной публикацией → ложный refused-secret и очистка буфера.
+
+FLY_BLACKLIST_TYPES = ("Star Embed Source", "x-openoffice-link")
+
+
+class _QtLikeMime:
+    def __init__(self, data: dict[str, bytes]) -> None:
+        self._data = data
+
+    def formats(self) -> list[str]:
+        return list(self._data)
+
+    def data(self, fmt: str) -> bytes:
+        return self._data[fmt]
+
+
+class QtLikeClipboard(FakeClipboard):
+    """Снимок через настоящий ``snapshot_mime``, как ``_Clipboard.snapshot``."""
+
+    def snapshot(self, primary: bool) -> dict[str, bytes]:
+        return paste.snapshot_mime(_QtLikeMime(self.data[primary]))
+
+
+@pytest.mark.parametrize("hint_data", [b"", None], ids=["empty", "missing"])
+@pytest.mark.parametrize("hint_name", [paste.KDE_HINT, paste.KDE_HINT.upper()])
+@pytest.mark.parametrize("selection", ["clipboard", "primary", "both"])
+@pytest.mark.parametrize("early_restore", [False, True], ids=["normal", "pending"])
+def test_declared_unreadable_secret_hint_is_never_republished(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    hint_data: bytes | None,
+    hint_name: str,
+    selection: str,
+    early_restore: bool,
+) -> None:
+    """ИБ-65: владелец исчез при чтении hint — потенциальный секрет не переиздаётся."""
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "XTerm")
+    marker = b"PRIVATE-UNREADABLE-HINT-65"
+    protected = {
+        "clipboard": {False},
+        "primary": {True},
+        "both": {False, True},
+    }[selection]
+    for primary in protected:
+        cb.data[primary] = {"text/plain": marker, hint_name: b""}
+    before = {primary: data.copy() for primary, data in cb.data.items()}
+
+    def snapshot(primary: bool) -> dict[str, bytes]:
+        data = cb.data[primary].copy()
+
+        def read(fmt: str) -> bytes | None:
+            return hint_data if fmt == hint_name else data[fmt]
+
+        return paste.snapshot_mime(SimpleNamespace(formats=lambda: list(data), data=read))
+
+    monkeypatch.setattr(cb, "snapshot", snapshot)
+    restored: list[bool] = []
+
+    def restore_after_delivery(ms: int) -> None:
+        if ms == 100:
+            assert paste.has_pending()
+            restored.append(paste.restore_pending())
+
+    if early_restore:
+        monkeypatch.setattr(paste, "_wait_ms", restore_after_delivery)
+    outcome = paste.paste_text("Новая фраза", 42, PasteMode.AUTO)
+    assert outcome.kind is PasteOutcomeKind.REFUSED_SECRET
+    assert outcome.restore is (
+        PasteRestore.CLEARED_SECRET if False in protected else PasteRestore.RESTORED
+    )
+    assert outcome.method is PasteMethod.SHIFT_INSERT
+    x.send_combo.assert_called_once_with(["Shift_L"], "Insert")
+    assert cb.data == {
+        primary: {} if primary in protected else before[primary] for primary in (False, True)
+    }
+    assert all(marker not in data.values() for _, data in cb.writes)
+    assert restored == ([True] if early_restore else [])
+    assert not paste.has_pending()
+    assert not paste.restore_pending()
+
+
+@pytest.mark.parametrize("primary", [False, True], ids=["clipboard", "primary"])
+@pytest.mark.parametrize("early_restore", [False, True], ids=["normal", "pending"])
+def test_snapshot_without_declared_hint_restores_previous_text(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    primary: bool,
+    early_restore: bool,
+) -> None:
+    """ИБ-65, контроль: без объявленной пометки прежний снимок возвращается."""
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "XTerm")
+    marker = b"NORMAL-TEXT-WITHOUT-HINT-65"
+    cb.data[primary] = {"text/plain": marker, "text/html": b"<b>normal</b>"}
+    before = {mode: data.copy() for mode, data in cb.data.items()}
+    monkeypatch.setattr(
+        cb, "snapshot", lambda mode: paste.snapshot_mime(_QtLikeMime(cb.data[mode]))
+    )
+    restored: list[bool] = []
+
+    def restore_after_delivery(ms: int) -> None:
+        if ms == 100:
+            restored.append(paste.restore_pending())
+
+    if early_restore:
+        monkeypatch.setattr(paste, "_wait_ms", restore_after_delivery)
+    outcome = paste.paste_text("Новая фраза", 42, PasteMode.AUTO)
+    assert outcome.kind is PasteOutcomeKind.PASTED
+    assert outcome.restore is PasteRestore.RESTORED
+    assert outcome.method is PasteMethod.SHIFT_INSERT
+    assert cb.data == before
+    assert (primary, before[primary]) in cb.writes
+    assert restored == ([True] if early_restore else [])
+
+
+@pytest.mark.parametrize("hint_data", [b"", None], ids=["empty", "missing"])
+@pytest.mark.parametrize("unreadable_first", [False, True])
+def test_unreadable_hint_alias_cannot_be_overwritten_by_public_value(
+    hint_data: bytes | None, unreadable_first: bool
+) -> None:
+    """ИБ-65: второй вариант регистра не снимает защиту непрочитанной пометки."""
+    aliases = [(paste.KDE_HINT, hint_data), (paste.KDE_HINT.upper(), b"public")]
+    if not unreadable_first:
+        aliases.reverse()
+    data = dict(aliases)
+    snapshot = paste.snapshot_mime(
+        SimpleNamespace(formats=lambda: list(data), data=lambda fmt: data[fmt])
+    )
+    assert snapshot == {paste.KDE_HINT: b"secret"}
+
+
+@pytest.fixture
+def fly_clipboard(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> tuple[QtLikeClipboard, Mock]:
+    _, x, _ = harness
+    cb = QtLikeClipboard()
+    monkeypatch.setattr(paste, "_Clipboard", lambda: cb)
+
+    def send_combo(*_args: object) -> bool:
+        tracker = cb.trackers[False]
+        assert tracker is not None
+        tracker.mark()
+        return True
+
+    x.send_combo.side_effect = send_combo
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "Fly")
+    return cb, x
+
+
+def _leave_phrase_in_clipboard(cb: QtLikeClipboard, x: Mock, text: str) -> dict[str, bytes]:
+    """Фраза ушла в буфер (фокус не в окне-цели): буфер — наша публикация."""
+    focus = x.d.get_input_focus.return_value.focus
+    focus.id = 99
+    first = paste.paste_text(text, 42, PasteMode.AUTO)
+    assert first.kind is PasteOutcomeKind.WINDOW_CHANGED
+    assert first.restore is PasteRestore.KEPT_OURS
+    focus.id = 42
+    return cb.data[False].copy()
+
+
+@pytest.mark.parametrize("blacklist", FLY_BLACKLIST_TYPES)
+def test_fly_own_previous_phrase_with_blacklist_type_is_restored(
+    fly_clipboard: tuple[QtLikeClipboard, Mock],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    blacklist: str,
+) -> None:
+    """T-284: прошлая фраза в буфере — своя, хотя snapshot_mime отбросил тип Fly:
+    вставка PASTED, буфер возвращён полностью — вместе с типом из чёрного списка."""
+    cb, x = fly_clipboard
+    monkeypatch.setattr(paste, "_fly_blacklist_type", lambda **_kw: blacklist)
+    published = _leave_phrase_in_clipboard(cb, x, "ПРИВАТНАЯ-ФРАЗА-1")
+    assert published == {
+        "text/plain": "ПРИВАТНАЯ-ФРАЗА-1".encode(),
+        paste.KDE_HINT: b"secret",
+        blacklist: b"",
+    }
+    with caplog.at_level(logging.DEBUG):
+        second = paste.paste_text("ПРИВАТНАЯ-ФРАЗА-2", 42, PasteMode.AUTO)
+    assert second.kind is PasteOutcomeKind.PASTED, (second.kind, second.restore)
+    assert second.restore is PasteRestore.RESTORED
+    # Без типа из чёрного списка fly-wm запишет фразу в ~/.fly/clipboard (У49).
+    assert cb.data[False] == published
+    assert cb.writes[-1] == (False, published)
+    assert "ПРИВАТНАЯ-ФРАЗА" not in caplog.text
+
+
+@pytest.mark.parametrize("foreign", ["other-owner", "other-text"])
+def test_fly_foreign_secret_with_blacklist_type_is_still_cleared(
+    fly_clipboard: tuple[QtLikeClipboard, Mock],
+    monkeypatch: pytest.MonkeyPatch,
+    foreign: str,
+) -> None:
+    """T-284, негатив (У49): чужой буфер с пометкой секрета по-прежнему очищается,
+    даже если совпадает с нашей публикацией после фильтра snapshot_mime."""
+    cb, x = fly_clipboard
+    monkeypatch.setattr(paste, "_fly_blacklist_type", lambda **_kw: "Star Embed Source")
+    published = _leave_phrase_in_clipboard(cb, x, "Наша фраза")
+    if foreign == "other-text":
+        cb.data[False] = {**published, "text/plain": b"FOREIGN-SECRET"}
+    cb.owned[False] = False
+    outcome = paste.paste_text("Вторая фраза", 42, PasteMode.AUTO)
+    assert outcome.kind is PasteOutcomeKind.REFUSED_SECRET
+    assert outcome.restore is PasteRestore.CLEARED_SECRET
+    assert cb.data[False] == {}
+    assert all(data.get("text/plain") != b"FOREIGN-SECRET" for _, data in cb.writes)

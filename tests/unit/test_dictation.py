@@ -1819,30 +1819,59 @@ def test_press_while_cancel_ack_pending_resets_hotkey(rig: Rig, phase: str) -> N
     assert rig.recording
 
 
-def test_short_ptt_tap_switches_to_toggle_without_cancelling(rig: Rig) -> None:
+def test_short_ptt_tap_cancels_recording_quietly(rig: Rig) -> None:
+    """T-285 (Q4, решение владельца 20.10; US-2.4): касание < 0,3 с в «Удерживать» —
+    ничего не вставлено и нет ошибки. Запись отменяется (``record.cancel``), без пилюли
+    ошибки и «Отменено»; индикатор записи гаснет только по подтверждению воркера;
+    статистика — ``cancelled`` (как у ``overlap-tap``). tap→toggle снят."""
     rig.combo_key(pressed=True)
     rig.now += 0.1
     rig.combo_key(pressed=False)
-    assert rig.fsm.mode == HotkeyMode.TOGGLE
-    rig.assert_hotkey_state(HotkeyState.RECORDING)
-    assert rig.core.phase == DictationPhase.RECORDING and rig.recording
-    assert rig.commands() == ["record.start"]
-    assert rig.cancels == 0
-    rig.backend.ungrab_escape.assert_not_called()
+    assert rig.fsm.mode == HotkeyMode.PTT
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert rig.commands() == ["record.start", "record.cancel"], "тап включил toggle"
+    rig.backend.ungrab_escape.assert_called_once_with()
+    # Протокол v4: индикатор записи — до подтверждения воркера.
+    assert rig.recording
+    rig.event("cancelled")
+    assert not rig.recording
+    assert rig.pasted == []
+    shown = {state for state, _, _ in rig.pill.calls}
+    assert PillState.ERROR not in shown and PillState.CANCELLED not in shown
+    assert [e["result"] for e in rig.stats.events if e["type"] == "dictation"] == ["cancelled"]
+    assert rig.core.phase in (DictationPhase.IDLE, DictationPhase.FINISHING)
+    for timer in [t for t in rig.timers if not t.cancelled and not t.fired]:
+        timer.fire()
+    assert rig.pill.hidden, "после тапа пилюля осталась на экране"
+    assert rig.restart_worker.call_count == 0
 
+    # Следующее удержание — обычная фраза PTT.
     rig.now += 1
     rig.combo_key(pressed=True)
-    second_press = rig.now
+    rig.now += 1
+    rig.combo_key(pressed=False)
     rig.assert_hotkey_state(HotkeyState.PROCESSING)
-    # Второе нажатие в режиме «нажать-отпустить» тоже дописывает хвост.
-    assert rig.commands() == ["record.start"]
     rig.fire_tail()
-    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    assert rig.commands()[-3:] == ["record.start", "record.stop", "recognize"]
     rig.result()
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
-    assert rig.stats.events[-1]["t_total_ms"] == pytest.approx((rig.now - second_press) * 1000)
     rig.assert_hotkey_state(HotkeyState.IDLE)
-    assert rig.cancels == 0
+
+
+def test_short_tap_in_configured_toggle_still_toggles() -> None:
+    """T-285, контроль: в «Нажать-нажать» короткое нажатие начинает запись до второго."""
+    rig = Rig(HotkeyMode.TOGGLE)
+    rig.combo_key(pressed=True)
+    rig.now += 0.1
+    rig.combo_key(pressed=False)
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.commands() == ["record.start"]
+    rig.now += 1
+    rig.combo_key(pressed=True)
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    rig.fire_tail()
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
 
 
 @pytest.mark.parametrize("mode", list(HotkeyMode))

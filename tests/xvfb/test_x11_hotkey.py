@@ -249,7 +249,7 @@ def test_escape_is_temporary(backend: X11HotkeyBackend, xdisplay: X11Display) ->
     manager = HotkeyManager(backend)
     escape = xdisplay.parse_combo("Escape")
     try:
-        assert manager.grab(COMBO, HotkeyMode.PTT).ok
+        assert manager.grab(COMBO, HotkeyMode.TOGGLE).ok
         for _ in range(2):
             assert xdisplay.grab_key(escape.keycode, escape.mods).ok
             xdisplay.ungrab_key(escape.keycode, escape.mods)

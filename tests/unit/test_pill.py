@@ -1926,3 +1926,17 @@ def test_pill_ast_accepts_protocol_reason_but_rejects_overwrite_and_shadowing(
     assert _pill_text_violations(f"{import_source}\n{expression} = text\n{display}")
     base = expression.split(".")[0]
     assert _pill_text_violations(f"{import_source}\ndef display({base}):\n    {display}")
+
+
+def test_window_id_follows_native_window_after_flag_change(harness: Harness) -> None:
+    """T-280: ``Pill.window_id`` — текущий XID окна пилюли для исключения из окна-цели.
+
+    fly-wm делает видимую пилюлю активным окном (журнал 20.10); runtime исключает её
+    XID при снимке цели. Смена флагов (полноэкранный режим) заменяет native window —
+    наружу отдаётся новый XID, не запомненный при создании.
+    """
+    assert harness.pill.window_id == 42
+    fake_fullscreen(harness)
+    harness.view.winId.return_value = 84
+    harness.pill.show_state(PillState.LISTENING)
+    assert harness.pill.window_id == 84

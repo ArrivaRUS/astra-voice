@@ -172,19 +172,19 @@ def test_overlap_press_during_processing_starts_next_recording() -> None:
     assert states[-1] == (HotkeyState.IDLE, "done")
 
 
-@pytest.mark.parametrize("previous", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
-def test_overlap_short_tap_does_not_leave_recording_open(previous: HotkeyMode) -> None:
+def test_overlap_short_tap_does_not_leave_recording_open() -> None:
     """US-2.7, открытый риск PTT: короткое нажатие во время распознавания не включает toggle.
 
     Касание < 0,3 с поверх распознавания (дребезг после отпускания, случайное нажатие)
     возвращает автомат в PROCESSING предыдущей фразы с причиной OVERLAP_TAP_REASON —
-    оркестратор отменяет только эту запись. Из IDLE касание по-прежнему toggle.
+    оркестратор отменяет только эту запись. Из IDLE касание — IDLE «tap-ignored» (T-285);
+    вариант «A включена касанием в toggle» снят вместе с tap→toggle (решение 20.10),
+    перекрытие в настроенном «Нажать-нажать» — test_overlap_press_in_configured_toggle_*.
     """
+    previous = HotkeyMode.PTT
     fsm, states = observed_fsm()
     fsm.press(0.0)
-    fsm.release(1.0 if previous is HotkeyMode.PTT else 0.1)
-    if previous is HotkeyMode.TOGGLE:
-        fsm.press(2.0)
+    fsm.release(1.0)
     fsm.press(3.0)
     fsm.release(3.1)
     assert states[-1] == (HotkeyState.PROCESSING, OVERLAP_TAP_REASON)
@@ -213,11 +213,15 @@ def test_overlap_press_in_configured_toggle_ignores_release() -> None:
 
 @pytest.mark.parametrize("previous", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
 def test_refuse_overlap_press_returns_silently_to_processing(previous: HotkeyMode) -> None:
-    """Отказ третьему нажатию (US-2.7, решение 7): без escape-cancel и без смены режима."""
-    fsm, states = observed_fsm()
+    """Отказ третьему нажатию (US-2.7, решение 7): без escape-cancel и без смены режима.
+
+    TOGGLE — настроенный «Нажать-нажать» (tap→toggle в PTT снят решением 20.10, T-285).
+    """
+    fsm, states = observed_fsm(previous)
     fsm.press(0.0)
-    fsm.release(1.0 if previous is HotkeyMode.PTT else 0.1)
-    if previous is HotkeyMode.TOGGLE:
+    if previous is HotkeyMode.PTT:
+        fsm.release(1.0)
+    else:
         fsm.press(2.0)
     assert fsm.state == HotkeyState.PROCESSING and fsm.mode == previous
     fsm.press(3.0)
@@ -262,19 +266,49 @@ def test_record_limit_matches_worker_default() -> None:
     assert RECORD_LIMIT_S == LIMIT_S_DEFAULT == CORE_RECORD_LIMIT_S == 120.0
 
 
-def test_tap_switches_to_toggle_for_one_recording() -> None:
+# Q4, решение владельца 20.10: «без рук — только через режим „Нажать-нажать“». Короткое
+# касание PTT из IDLE больше не включает toggle (S4 tap→toggle снят): по US-2.4 «нажатие
+# < 0,3 с → ничего не вставлено и нет ошибки» автомат возвращается в IDLE с причиной
+# ``PTT_TAP_REASON`` (предлагаемая константа рядом с OVERLAP_TAP_REASON), оркестратор
+# тихо отменяет начатую запись.
+PTT_TAP_REASON = "tap-ignored"
+
+
+@pytest.mark.parametrize("held", [0.0, 0.1, 0.299])
+def test_ptt_tap_from_idle_returns_to_idle_not_toggle(held: float) -> None:
+    """T-285: тап < 0,3 с в «Удерживать» из IDLE → IDLE «tap-ignored», не toggle."""
     fsm, states = observed_fsm()
     fsm.press(0.0)
-    fsm.release(0.1)
-    assert fsm.state == HotkeyState.RECORDING
-    assert fsm.mode == HotkeyMode.TOGGLE
-    assert "tap→toggle" in states[-1][1]
-    assert fsm.limit_deadline == 120.0
-    fsm.press(2.0)
-    assert states[-1] == (HotkeyState.PROCESSING, "toggle-off")
-    fsm.done(3.0)
-    fsm.press(4.0)
-    assert fsm.mode.value == "ptt"
+    fsm.release(held)
+    assert states == [(HotkeyState.RECORDING, "press"), (HotkeyState.IDLE, PTT_TAP_REASON)]
+    assert fsm.state == HotkeyState.IDLE
+    assert fsm.mode == HotkeyMode.PTT
+    assert fsm.limit_deadline is None
+    # Предел записи после тапа не срабатывает: записи нет.
+    fsm.tick(200.0)
+    assert len(states) == 2
+    # Следующее удержание — обычная фраза PTT.
+    fsm.press(300.0)
+    fsm.release(301.0)
+    assert states[-1] == (HotkeyState.PROCESSING, "release (1.000 с)")
+    fsm.done(302.0)
+    assert states[-1] == (HotkeyState.IDLE, "done")
+
+
+def test_ptt_tap_via_manager_releases_escape_grab() -> None:
+    """T-285: тап через HotkeyManager снимает захват Escape (IDLE без записи)."""
+    backend = MagicMock()
+    backend.grab_combo.return_value = GrabResult("ok", keycode=65)
+    backend.grab_escape.return_value = GrabResult("ok", keycode=9)
+    manager = HotkeyManager(backend)
+    states: list[tuple[HotkeyState, str]] = []
+    manager.on_state = lambda state, reason: states.append((state, reason))
+    assert manager.grab("Ctrl+Alt+D", HotkeyMode.PTT).ok
+    manager.fsm.press(0.0)
+    backend.grab_escape.assert_called_once_with()
+    manager.fsm.release(0.1)
+    assert states[-1] == (HotkeyState.IDLE, PTT_TAP_REASON)
+    backend.ungrab_escape.assert_called_once_with()
 
 
 @pytest.mark.parametrize("release_at", [0.1, 1.0])
@@ -320,13 +354,13 @@ def test_limit(limit_at: float) -> None:
 @pytest.mark.parametrize(
     ("held", "expected"),
     [
-        (0.299, HotkeyState.RECORDING),
+        (0.299, HotkeyState.IDLE),
         (0.300, HotkeyState.PROCESSING),
         (0.301, HotkeyState.PROCESSING),
     ],
 )
 def test_threshold_equality_is_ptt(held: float, expected: HotkeyState) -> None:
-    """Только строго меньше 0,3 с — тап; ровно 0,3 с уже PTT."""
+    """Только строго меньше 0,3 с — тап (Q4: IDLE, не toggle); ровно 0,3 с уже PTT."""
     fsm = HotkeyFsm()
     fsm.press(0.0)
     fsm.release(held)
