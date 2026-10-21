@@ -1806,11 +1806,8 @@ class DictationOrchestrator:
             PasteOutcomeKind.CLIPBOARD_ONLY,
             PasteOutcomeKind.WINDOW_CHANGED,
         )
-        # Неотправленная A ещё занимает место очереди. Исключение — уже отменённое
-        # нажатие B: его отложенный Escape не должен отменять A вместо B.
-        self._delivered = delivered and (
-            not unsent or not self._press_queued() or overlap_cancelled
-        )
+        # Исход известен до разбора очереди: доставленную фразу отменить уже нельзя.
+        self._delivered = delivered
         if (
             kind == PasteOutcomeKind.PASTED
             and outcome is not None

@@ -234,6 +234,12 @@ def snapshot_mime(md: Any) -> dict[str, bytes]:
             log.debug("пропущен тяжёлый формат буфера: %s", fmt)
             continue
         data = md.data(fmt)
+        if fmt.lower() == KDE_HINT.lower():
+            # Объявленный hint мог исчезнуть при смене владельца между чтениями.
+            # Пустое значение не разрешает переиздать потенциальный секрет.
+            if snapshot.get(KDE_HINT) != b"secret":
+                snapshot[KDE_HINT] = bytes(data) if data else b"secret"
+            continue
         if _skip_mime(fmt, len(data)):
             log.debug("пропущен формат буфера свыше 1 МиБ: %s", fmt)
             continue

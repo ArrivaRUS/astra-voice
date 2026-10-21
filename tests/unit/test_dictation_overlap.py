@@ -1422,3 +1422,118 @@ def test_keys_held_without_second_recording_stays_final(rig: OverlapRig) -> None
     assert rig.pill.calls[-1] == (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED, None)
     assert dictation_results(rig) == ["ok"]
     assert rig.active(BUSY_RETRY_MS) == []
+
+
+def test_unsent_first_paste_allows_next_press_when_second_is_processing(rig: OverlapRig) -> None:
+    """Решение 6: исход A известен, поэтому нажатие C не теряется из-за keys-held."""
+    begin_overlap(rig, release_b=True)
+
+    def press() -> None:
+        rig.now += 0.05
+        rig.start()
+
+    rig.during_paste = press
+    rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+    rig.paste_reason = "keys-held"
+    rig.result_for(A, A_TEXT)
+    rig.during_paste = None
+    rig.paste_reason = ""
+    assert len(rig.uids) == 3, "нажатие C потеряно при разборе исхода A"
+    assert rig.refusals == 0
+    assert rig.sent_ids("record.cancel") == []
+    assert rig.core.pending_utterances == 3
+    assert dictation_results(rig) == []
+    assert clipboard_notices(rig) == 0
+    assert phase_of(rig) == DictationPhase.RECORDING and rig.recording
+    rig.stop()
+    assert rig.texts() == [A_TEXT, A_TEXT]
+    rig.result_for(C, "третья")
+    assert rig.texts() == [A_TEXT, A_TEXT], "C вставлена раньше B"
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT, A_TEXT, B_TEXT, "третья"]
+    assert dictation_results(rig) == ["ok", "ok", "ok"]
+    assert rig.core.pending_utterances == 0
+
+
+def test_escape_then_press_during_unsent_paste_keeps_next_recording(rig: OverlapRig) -> None:
+    """Escape до нажатия B не отменяет уже известный исход A и не теряет B."""
+    rig.start()
+    rig.stop()
+
+    def reenter() -> None:
+        rig.fsm.escape(rig.now)
+        rig.start()
+
+    rig.during_paste = reenter
+    rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+    rig.paste_reason = "keys-held"
+    rig.result_for(A, A_TEXT)
+    rig.during_paste = None
+    rig.paste_reason = ""
+    assert len(rig.uids) == 2, "нажатие B после Escape потеряно"
+    assert rig.sent_ids("record.cancel") == []
+    assert dictation_results(rig) == []
+    assert phase_of(rig) == DictationPhase.RECORDING and rig.recording
+    rig.stop()
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT, A_TEXT, B_TEXT]
+    assert dictation_results(rig) == ["ok", "ok"]
+    assert clipboard_notices(rig) == 0
+
+
+@pytest.mark.parametrize("reason", UNSENT_PASTE_REASONS)
+def test_press_then_escape_during_unsent_paste_retries_first(rig: OverlapRig, reason: str) -> None:
+    """Отменённое до replay нажатие B не начинает запись и не отменяет A."""
+    rig.start()
+    rig.stop()
+
+    def reenter() -> None:
+        rig.during_paste = None
+        rig.start()
+        rig.fsm.escape(rig.now)
+
+    rig.during_paste = reenter
+    rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+    rig.paste_reason = reason
+    rig.result_for(A, A_TEXT)
+    rig.paste_reason = ""
+    assert len(rig.uids) == 1
+    assert rig.sent_ids("record.cancel") == []
+    assert rig.texts() == [A_TEXT, A_TEXT]
+    assert dictation_results(rig) == ["ok"]
+    assert clipboard_notices(rig) == 0
+    assert rig.core.pending_utterances == 0
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+@pytest.mark.parametrize("reason", UNSENT_PASTE_REASONS)
+def test_unsent_first_paste_retries_after_second_cancelled_synchronously(
+    rig: OverlapRig, reason: str
+) -> None:
+    """B получает Escape и ACK отмены внутри record.start: A всё равно вставляется."""
+    rig.start()
+    rig.stop()
+
+    def react(message: dict[str, Any]) -> None:
+        if message["type"] == "record.start":
+            rig.fsm.escape(rig.now)
+        elif message["type"] == "record.cancel":
+            rig.event("cancelled", utterance_id=message["utterance_id"])
+
+    def press() -> None:
+        rig.during_paste = None
+        rig.start()
+
+    rig.during_send = react
+    rig.during_paste = press
+    rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+    rig.paste_reason = reason
+    rig.result_for(A, A_TEXT)
+    rig.paste_reason = ""
+    assert len(rig.uids) == 2
+    assert rig.sent_ids("record.cancel") == [rig.uids[B]]
+    assert rig.texts() == [A_TEXT, A_TEXT]
+    assert sorted(dictation_results(rig)) == ["cancelled", "ok"]
+    assert clipboard_notices(rig) == 0
+    assert rig.core.pending_utterances == 0
+    assert not rig.recording
