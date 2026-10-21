@@ -147,7 +147,7 @@ def find_tray_icon_path(name: str, size: int) -> Path:
 
 
 class TrayIconProvider:
-    """Загрузка иконок требует QApplication; после смены темы нужен refresh()."""
+    """Загрузка иконок требует QApplication; смена темы обновляет подписчиков."""
 
     def __init__(
         self,
@@ -157,10 +157,26 @@ class TrayIconProvider:
         panel_dark: Callable[[], bool | None] | None = None,
     ) -> None:
         self._session = session
-        self._theme = theme
+        self._theme: ThemeSource | None = None
         self._panel_dark = fly_panel_dark if panel_dark is None else panel_dark
         self._cache: dict[TrayState, QIcon] = {}
         self._command_cache: dict[TrayState, QIcon] = {}
+        self._listeners: list[Callable[[], None]] = []
+        self.set_theme(theme)
+
+    def set_theme(self, theme: ThemeSource | None) -> None:
+        """Заменить источник, отсоединив старый, и обновить уже установленный значок."""
+        if theme is self._theme:
+            return
+        if self._theme is not None:
+            self._theme.unsubscribe(self.refresh)
+        self._theme = theme
+        if theme is not None:
+            theme.subscribe(self.refresh)
+        self.refresh()
+
+    def subscribe(self, callback: Callable[[], None]) -> None:
+        self._listeners.append(callback)
 
     def _file_icon_dark(self) -> bool:
         """Цвет знака из файла: во Fly — по панели, иначе по теме окон."""
@@ -261,3 +277,5 @@ class TrayIconProvider:
         """Сбросить иконки, чтобы следующий запрос учитывал новую тему панели."""
         self._cache.clear()
         self._command_cache.clear()
+        for callback in list(self._listeners):
+            callback()

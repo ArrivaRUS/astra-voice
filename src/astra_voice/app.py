@@ -1769,6 +1769,8 @@ def main(argv: list[str] | None = None) -> int:
                 settings=settings, session_kind=session_kind, model_store=model_store
             )
             runtime.set_revoked_check(revoked_check)
+            if theme_bridge is not None:
+                runtime.set_theme_source(theme_bridge.source)
             if model is not None:
                 runtime.set_catalog_rtfx(model.catalog_rtfx)
             runtime.on_quit_requested = app.quit

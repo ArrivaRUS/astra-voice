@@ -474,6 +474,16 @@ class Tray(QObject):
         self._tray.setContextMenu(self._menu)
         self.set_state(TrayState.IDLE)
         self.set_models([], None)
+        self._provider.subscribe(self._icons_changed)
+
+    def _icons_changed(self) -> None:
+        # Источник темы может пережить runtime и его удалённый QObject.
+        if sip.isdeleted(self):
+            return
+        if self._has_icon():
+            self._tray.setIcon(self._display_icon())
+        else:
+            self._invalidate_registration()
 
     @staticmethod
     def _invoke(callback: Callable[[], None] | None) -> None:
