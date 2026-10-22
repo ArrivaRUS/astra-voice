@@ -79,6 +79,7 @@ class TrayPriorityStatus:
     kind: Kind
     code: str
     message: str
+    applied: bool = False
 
 
 @dataclass(frozen=True)
@@ -396,7 +397,12 @@ class FlyTrayPriority:
             else ("present_ours" if state is not None else "present_foreign")
         )
         code = {"absent": "absent", "present_ours": "already", "present_foreign": "foreign"}[kind]
-        return TrayPriorityStatus(kind, code, _MESSAGES[code]), line, state, apprc
+        return (
+            TrayPriorityStatus(kind, code, _MESSAGES[code], state is not None),
+            line,
+            state,
+            apprc,
+        )
 
     @staticmethod
     def _log(stage: str, code: str, op: str = "-", error_number: int = 0) -> None:

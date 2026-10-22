@@ -43,18 +43,22 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture(autouse=True)
 def refresh(monkeypatch: pytest.MonkeyPatch) -> Mock:
     monkeypatch.setattr(session, "detect", lambda: session.SessionKind.FLY)
-    original_is_file = Path.is_file
+    original_lstat = os.lstat
     original_access = os.access
     monkeypatch.setattr(
-        Path,
-        "is_file",
-        lambda path: True if path == Path("/usr/bin/fly-wmfunc") else original_is_file(path),
+        os,
+        "lstat",
+        lambda path, **kwargs: (
+            os.stat_result((stat.S_IFREG | 0o755, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            if path == "/usr/bin/fly-wmfunc"
+            else original_lstat(path, **kwargs)
+        ),
     )
     monkeypatch.setattr(
         os,
         "access",
         lambda path, mode: (
-            True if path == Path("/usr/bin/fly-wmfunc") else original_access(path, mode)
+            True if str(path) == "/usr/bin/fly-wmfunc" else original_access(path, mode)
         ),
     )
     monkeypatch.setattr(shutil, "which", Mock(side_effect=AssertionError("PATH lookup forbidden")))
@@ -111,6 +115,7 @@ def test_both_trees_exact_bytes_mode_and_idempotence(home: Path, refresh: Mock) 
         assert stat.S_IMODE(entry.stat().st_mode) == 0o644
     refresh.assert_called_once_with(
         ["/usr/bin/fly-wmfunc", "FLYWM_UPDATE_STARTMENU"],
+        shell=False,
         timeout=5,
         check=False,
         stdin=subprocess.DEVNULL,
@@ -227,19 +232,21 @@ def test_refresh_failures_nonfatal(
 ) -> None:
     section(home, "startmenu2", "tools", b"Name=Utility\n")
     if failure == "missing":
-        original_is_file = Path.is_file
-        monkeypatch.setattr(
-            Path,
-            "is_file",
-            lambda path: False if path == Path("/usr/bin/fly-wmfunc") else original_is_file(path),
-        )
+        original_lstat = os.lstat
+
+        def missing(path: str | Path, **kwargs: object) -> os.stat_result:
+            if str(path) == "/usr/bin/fly-wmfunc":
+                raise FileNotFoundError(errno.ENOENT, "missing")
+            return original_lstat(path, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "lstat", missing)
     elif failure == "not-executable":
         original_access = os.access
         monkeypatch.setattr(
             os,
             "access",
             lambda path, mode: (
-                False if path == Path("/usr/bin/fly-wmfunc") else original_access(path, mode)
+                False if str(path) == "/usr/bin/fly-wmfunc" else original_access(path, mode)
             ),
         )
     elif failure == "oserror":

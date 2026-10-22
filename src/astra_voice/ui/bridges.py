@@ -204,6 +204,23 @@ def microphone_device_model(
     return result
 
 
+class FlyTrayControl(Protocol):
+    """Статус панели Fly и явный выбор пользователя; реализация вне моста."""
+
+    changed: Any
+
+    @property
+    def visible(self) -> bool: ...
+
+    @property
+    def available(self) -> bool: ...
+
+    @property
+    def reason(self) -> str: ...
+
+    def set_enabled(self, enabled: bool, *, explicit: bool = True) -> None: ...
+
+
 class SettingsBridge(QObject):
     """Публикует настройки и ошибки записи; каждый сеттер сразу пишет файл."""
 
@@ -223,6 +240,8 @@ class SettingsBridge(QObject):
     soundCuesEnabledChanged = pyqtSignal()
     soundCuesStatusChanged = pyqtSignal()
     pillEnabledChanged = pyqtSignal()
+    flyTrayIconChanged = pyqtSignal()
+    flyTrayStatusChanged = pyqtSignal()
     modelUnloadMinutesChanged = pyqtSignal()
     trayXembedUnconfirmedChanged = pyqtSignal()
     languageChanged = pyqtSignal()
@@ -268,6 +287,7 @@ class SettingsBridge(QObject):
         "hotkeyMode": "hotkey_mode",
         "soundCuesEnabled": "sound_cues_enabled",
         "pillEnabled": "pill_enabled",
+        "flyTrayIcon": "fly_tray_icon",
         "modelUnloadMinutes": "model_unload_minutes",
         "language": "language",
         "checkAppUpdates": "check_app_updates",
@@ -295,9 +315,13 @@ class SettingsBridge(QObject):
         default_device_provider: Callable[[list[AudioDevice]], AudioDevice] | None = None,
         parent: QObject | None = None,
         tray: Tray | None = None,
+        fly_tray: FlyTrayControl | None = None,
     ) -> None:
         super().__init__(parent)
         self._tray = tray
+        self._fly_tray = fly_tray
+        if fly_tray is not None:
+            fly_tray.changed.connect(self.flyTrayStatusChanged)
         if tray is not None:
             tray.xembedUnconfirmedChanged.connect(self.trayXembedUnconfirmedChanged)
         self._settings = settings
@@ -712,6 +736,9 @@ class SettingsBridge(QObject):
 
     def _set_value(self, name: str, value: str | bool | int) -> None:
         field = self._FIELDS[name]
+        if name == "flyTrayIcon" and (not self.flyTrayVisible or not self.flyTrayAvailable):
+            self.flyTrayIconChanged.emit()
+            return
         if self.is_locked(field):
             log.info("%s: настройка задана администратором", field)
             getattr(self, name + "Changed").emit()
@@ -843,6 +870,8 @@ class SettingsBridge(QObject):
             if self._sound_cues_host is not None:
                 self._sound_cues_host.apply_sound_cues_enabled(self.soundCuesEnabled)
             self.soundCuesStatusChanged.emit()
+        if name == "flyTrayIcon" and self._fly_tray is not None:
+            self._fly_tray.set_enabled(self.flyTrayIcon, explicit=True)
         if name in ("commandHotkey", "commandEnabled", "commandPreview", "hotkeyMode"):
             if self._command_host is not None:
                 self._command_host.reload_command_hotkey()
@@ -1263,6 +1292,26 @@ class SettingsBridge(QObject):
     @pyqtProperty(bool, notify=trayXembedUnconfirmedChanged)
     def trayXembedUnconfirmed(self) -> bool:  # noqa: N802
         return self._tray.xembed_unconfirmed if self._tray is not None else False
+
+    @pyqtProperty(bool, notify=flyTrayStatusChanged)
+    def flyTrayVisible(self) -> bool:  # noqa: N802
+        return self._fly_tray is not None and self._fly_tray.visible
+
+    @pyqtProperty(bool, notify=flyTrayStatusChanged)
+    def flyTrayAvailable(self) -> bool:  # noqa: N802
+        return self._fly_tray is not None and self._fly_tray.available
+
+    @pyqtProperty(str, notify=flyTrayStatusChanged)
+    def flyTrayReason(self) -> str:  # noqa: N802
+        return self._fly_tray.reason if self._fly_tray is not None else ""
+
+    @pyqtProperty(bool, notify=flyTrayIconChanged)
+    def flyTrayIcon(self) -> bool:  # noqa: N802
+        return cast(bool, self._values["flyTrayIcon"])
+
+    @flyTrayIcon.setter  # type: ignore[no-redef]
+    def flyTrayIcon(self, value: bool) -> None:  # noqa: N802
+        self._set_value("flyTrayIcon", value)
 
     @pyqtProperty(bool, notify=pillEnabledChanged)
     def pillEnabled(self) -> bool:  # noqa: N802
