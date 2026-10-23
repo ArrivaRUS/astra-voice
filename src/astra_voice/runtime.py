@@ -10,12 +10,15 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier, Qt, QTimer
 
 from astra_voice.core import paths
+
+if TYPE_CHECKING:
+    from astra_voice.ui.fly_tray_controller import FlyTrayController
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.command_mode import CommandFeedback, CommandMode, SessionSnapshot
 from astra_voice.core.dictation import (
@@ -242,6 +245,8 @@ class DictationRuntime(QObject):
         self.settings = settings
         self.model_store = model_store
         self.session_kind = session_kind
+        self.fly_tray: FlyTrayController | None = None
+        self._fly_tray_reserved = False
         # Проверка подключается до start(): первый ответ воркера может вызвать загрузку.
         self._revoked_check: RevokedCheck | None = None
         self._catalog_rtfx: Callable[[str], float | None] | None = None
@@ -407,7 +412,7 @@ class DictationRuntime(QObject):
     def appimage_remove_busy_reason(self) -> str:
         """GUI-thread-only, fail-closed check including delayed input and paste."""
         try:
-            busy = self._work_pending()
+            busy = self._reservation_pending()
         except (AttributeError, RuntimeError):
             return "Не удалось проверить готовность программы. Повторите проверку."
         return (
@@ -421,6 +426,7 @@ class DictationRuntime(QObject):
         return bool(
             self._closed
             or self._appimage_removal_reserved
+            or self._fly_tray_reserved
             or self.supervisor.restarting
             or self.phase is not DictationPhase.IDLE
             or self._input_owner is not None
@@ -450,6 +456,14 @@ class DictationRuntime(QObject):
             )
         )
 
+    def _reservation_pending(self) -> bool:
+        """Before disruptive work, also wait for cancelled gestures to be released."""
+        return bool(
+            self._work_pending()
+            or self.hotkey.physical_key_down is True
+            or (self.command_hotkey is not None and self.command_hotkey.physical_key_down is True)
+        )
+
     def reserve_appimage_removal(self) -> bool:
         """Atomically reserve an idle runtime on its GUI thread; never cancel work."""
         if self.appimage_remove_busy_reason():
@@ -464,6 +478,43 @@ class DictationRuntime(QObject):
         if self._appimage_removal_reserved:
             self._appimage_removal_reserved = False
             self._release_input("appimage-removal")
+
+    def start_fly_tray(self, *, automatic: bool) -> None:
+        """Arm only after app startup has resolved onboarding and launch origin."""
+        if self._closed or self.session_kind is not SessionKind.FLY or self.fly_tray is not None:
+            return
+        from astra_voice.ui.fly_tray_controller import FlyTrayController
+
+        self.fly_tray = FlyTrayController(
+            self, self.settings.fly_tray_icon, automatic=automatic, parent=self
+        )
+        self.fly_tray.start()
+
+    def reserve_fly_tray_restart(self) -> bool:
+        """GUI-thread reservation: no pending input may cross a panel restart."""
+        if self.session_kind is not SessionKind.FLY or self._reservation_pending():
+            return False
+        self._fly_tray_reserved = True
+        self._input_owner = "fly-tray"
+        self._input_epoch += 1
+        self._stop_regrab()
+        self._stop_command_regrab()
+        self.hotkey.ungrab()
+        if self.command_hotkey is not None:
+            self.command_hotkey.ungrab()
+        return True
+
+    def release_fly_tray_restart(self) -> None:
+        if not self._fly_tray_reserved:
+            return
+        self._fly_tray_reserved = False
+        self._release_input("fly-tray")
+        if not self._closed:
+            self.apply_hotkey(self.settings.hotkey, self.settings.hotkey_mode)
+
+    def refresh_fly_tray_icon(self) -> None:
+        if not self._closed:
+            self.tray.refresh_after_panel_restart()
 
     def _command_publication_allowed(self) -> bool:
         return self.orchestrator.mode != "command" or (
@@ -518,7 +569,8 @@ class DictationRuntime(QObject):
 
     def _input_busy(self) -> bool:
         return bool(
-            self._input_owner is not None
+            self._fly_tray_reserved
+            or self._input_owner is not None
             or self._capture_watchdog is not None
             or self._preview_send is not None
             or self._pending_test is not None
@@ -545,7 +597,9 @@ class DictationRuntime(QObject):
 
     def _release_input(self, source: str) -> None:
         # Generic idle/cancel callbacks cannot release the removal reservation.
-        if source == "appimage-removal" and self._appimage_removal_reserved:
+        if (source == "appimage-removal" and self._appimage_removal_reserved) or (
+            source == "fly-tray" and self._fly_tray_reserved
+        ):
             return
         if self._input_owner != source:
             return
@@ -1198,7 +1252,7 @@ class DictationRuntime(QObject):
             manager.ungrab()
             self._stop_command_regrab()
             return False
-        if self._input_owner in ("mouse", "mouse-capture", "keyboard-capture"):
+        if self._input_owner in ("mouse", "mouse-capture", "keyboard-capture", "fly-tray"):
             if self._input_owner == "mouse":
                 manager.suspend(self.settings.command_hotkey, HotkeyMode(self.settings.hotkey_mode))
             else:
@@ -1279,7 +1333,7 @@ class DictationRuntime(QObject):
             or not self.settings.command_enabled
             or not self._command_snapshot().allowed
             or self._command_regrab_timer is not None
-            or self._input_owner in ("mouse", "mouse-capture", "keyboard-capture")
+            or self._input_owner in ("mouse", "mouse-capture", "keyboard-capture", "fly-tray")
         ):
             return
         timer = self._create_timer()
@@ -1778,7 +1832,7 @@ class DictationRuntime(QObject):
         """Перезапускает воркер, если текущая модель ещё не загружена и проверена."""
         if self._reject_terminal_gesture():
             return
-        if self._appimage_removal_reserved:
+        if self._appimage_removal_reserved or self._fly_tray_reserved:
             return
         try:
             request = self._resolve_model_request()
@@ -1816,6 +1870,7 @@ class DictationRuntime(QObject):
             or self._terminating_worker
             or self._appimage_removal_reserved
             or self._pending_switch is not None
+            or self._fly_tray_reserved
             or self._switch_active()
         ):
             return
@@ -3217,7 +3272,7 @@ class DictationRuntime(QObject):
 
     def _grab_hotkey(self) -> GrabResult:
         """Проверяет сочетание перед каждым захватом, включая старт и повторы."""
-        if self._command_suspended:
+        if self._command_suspended or self._fly_tray_reserved:
             return GrabResult("not-grabbed")
         if not is_valid_combo(self.settings.hotkey):
             log.warning("hotkey=%r недопустим, беру значение по умолчанию", self.settings.hotkey)
@@ -3693,6 +3748,8 @@ class DictationRuntime(QObject):
         if self._closed:
             return
         self._closed = True
+        if self.fly_tray is not None:
+            self._cleanup("операция панели Fly", self.fly_tray.shutdown)
         self.on_sound_cues_changed = None
         self._cleanup("звуковые сигналы", self.recording_cues.shutdown)
         self._cleanup("выбор кнопки мыши", self._invalidate_mouse_capture)

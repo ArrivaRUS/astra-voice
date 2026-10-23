@@ -44,8 +44,13 @@ def test_real_child_handoff_only_after_actual_finalizer_releases_lock_and_ipc(
     monkeypatch.setenv("APPIMAGE", "/test-only/current-image")
     monkeypatch.setenv("APPIMAGE_EXTRACT_AND_RUN", "1")
     monkeypatch.setenv("ASTRA_VOICE_ORIG_UNSET", "PYTHONHOME")
+    monkeypatch.setenv("ASTRA_VOICE_AFTER_UPDATE", "parent-value-must-not-be-inherited")
+    monkeypatch.setenv("ASTRA_VOICE_PARENT_ONLY", "must-not-leak")
     monkeypatch.setenv("PYTHONHOME", "/test-only/bundle-python")
     pending = case.prepare()
+    assert not any(
+        name.startswith(("ASTRA_VOICE_", "APPIMAGE")) for name, _value in pending.environment
+    )
     lock_stream = case.lock_path.open("wb")
     fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
     ipc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -131,7 +136,9 @@ def test_real_child_handoff_only_after_actual_finalizer_releases_lock_and_ipc(
             report = json.loads(case.output.read_bytes())
             assert report["argv"] == [str(case.image), "--appimage-extract-and-run"]
             assert report["lock_free"] and report["ipc_absent"] and report["session"]
-            assert not report["fd_inherited"] and report["bundle_vars"] == []
+            assert not report["fd_inherited"]
+            assert report["bundle_vars"] == ["ASTRA_VOICE_AFTER_UPDATE"]
+            assert report["after_update"] == "1"
             assert report["pythonhome"] is None and report["private_mode"] == 0o700
             assert report["tmp"] == dict(pending.environment)["TMPDIR"]
             record = json.loads(case.preparer.record_path.read_bytes())

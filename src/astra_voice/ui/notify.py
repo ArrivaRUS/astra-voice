@@ -846,3 +846,24 @@ def notify_command_unknown() -> None:
         actions=[("command-copy", "Скопировать ещё раз"), ("command-details", "Что случилось")],
         retry=False,
     )
+
+
+def notify_fly_tray(outcome: str) -> None:
+    """Fixed, path-free tray outcomes; no retry after an uncertain delivery."""
+    if outcome in {"show", "revert"}:
+        notify("Панель Fly", "Настройка сохранена, панель Fly перезапущена.", retry=False)
+    elif outcome == "fail":
+        notify(
+            "Панель Fly",
+            "Не удалось настроить значок на панели Fly. Подробности в журнале.",
+            retry=False,
+        )
+    elif outcome == "unknown":
+        notify(
+            "Панель Fly",
+            "Не удалось убедиться, что панель Fly вернулась. "
+            "Если значков нет — выйдите из сеанса и войдите снова.",
+            retry=False,
+        )
+    else:
+        raise KeyError(outcome)

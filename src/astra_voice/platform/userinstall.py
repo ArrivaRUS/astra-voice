@@ -939,27 +939,15 @@ def _fly_menu_targets() -> list[Path]:
 
 def _refresh_fly_menu() -> None:
     """Обновляет уже существующее меню; сбой оболочки не отменяет установку."""
+    from astra_voice.platform import fly_wmfunc
+
     if session.detect() is not session.SessionKind.FLY:
         log.info("Обновление меню Fly пропущено: текущая сессия не Fly.")
         return
     try:
-        utility = Path("/usr/bin/fly-wmfunc")
-        if not utility.is_file() or not os.access(utility, os.X_OK):
-            log.info("Меню Fly: /usr/bin/fly-wmfunc недоступен, обновление пропущено.")
-            return
-        result = subprocess.run(
-            [str(utility), "FLYWM_UPDATE_STARTMENU"],
-            timeout=5,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=childenv.clean_env(),
-        )
-        if result.returncode:
-            log.warning("Меню Fly не обновлено: код %s.", result.returncode)
-    except (OSError, subprocess.TimeoutExpired):
-        log.warning("Меню Fly не обновлено: утилита недоступна или превышено время ожидания.")
+        fly_wmfunc.run("FLYWM_UPDATE_STARTMENU")
+    except fly_wmfunc.FlyWmError as exc:
+        log.warning("Меню Fly не обновлено: code=%s.", exc.code)
 
 
 def _register_fly(

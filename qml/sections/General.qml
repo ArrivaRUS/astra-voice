@@ -2,6 +2,7 @@
 // Семь настроек в трёх группах; модель переехала в раздел «Модели».
 // Без моста настроек используются дефолты M1.
 import QtQuick 2.15
+import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import ".."
 import "../components"
@@ -575,6 +576,45 @@ Column {
             renderType: Text.NativeRendering
             wrapMode: Text.WordWrap
             bottomPadding: Theme.cardRowPaddingY
+        }
+
+        SettingRow {
+            id: flyTrayRow
+            objectName: "flyTrayRow"
+            readonly property string tooltipText: qsTr("Добавляет Astra Voice в список приоритетных значков панели Fly и один раз перезапускает панель. Отключение убирает только добавленную запись.")
+            width: parent.width
+            visible: !!root.settings && root.settings.flyTrayVisible === true
+            height: visible ? implicitHeight : 0
+            label: qsTr("Показывать значок на панели Fly")
+            sub: root.settings && root.settings.flyTrayReason ? root.settings.flyTrayReason : ""
+            locked: root.isLocked("fly_tray_icon")
+            toggle: flyTrayToggle
+            rowEnabled: flyTrayToggle.enabled
+
+            AvToggle {
+                id: flyTrayToggle
+                objectName: "flyTrayToggle"
+                locked: flyTrayRow.locked
+                enabled: !locked && !!root.settings && root.settings.flyTrayAvailable === true
+                Accessible.name: flyTrayRow.label
+                Accessible.description: flyTrayRow.tooltipText
+                Layout.alignment: Qt.AlignVCenter
+                ToolTip.visible: hovered
+                ToolTip.delay: 500
+                ToolTip.text: flyTrayRow.tooltipText
+
+                Binding {
+                    target: flyTrayToggle
+                    property: "checked"
+                    value: root.settings && typeof root.settings.flyTrayIcon === "boolean" ? root.settings.flyTrayIcon : true
+                }
+
+                onCheckedChanged: {
+                    if (root.settings && typeof root.settings.flyTrayIcon === "boolean" && root.settings.flyTrayIcon !== checked)
+                        root.settings.flyTrayIcon = checked
+                    checked = root.settings && typeof root.settings.flyTrayIcon === "boolean" ? root.settings.flyTrayIcon : true
+                }
+            }
         }
 
         SettingRow {

@@ -11,6 +11,7 @@ import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -24,6 +25,29 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # These tests own the private tree, not the runner's filesystem roots.
+    # Model standard system ancestors even when a sandbox hides their root uid
+    # or /tmp's sticky bit. Security attacks below tmp_path remain untouched.
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def system_info(path: Any, info: os.stat_result) -> os.stat_result:
+        if path not in {"/", "/tmp", "/home", Path("/"), Path("/tmp"), Path("/home")}:
+            return info
+        fields = list(info)
+        fields[4] = 0
+        if path in {"/tmp", Path("/tmp")}:
+            fields[0] = info.st_mode | stat.S_ISVTX
+        extras = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        extras["st_uid"] = 0
+        extras["st_mode"] = fields[0]
+        return os.stat_result(fields, extras)
+
+    monkeypatch.setattr(
+        os, "lstat", lambda path, **kwargs: system_info(path, real_lstat(path, **kwargs))
+    )
+    monkeypatch.setattr(
+        os, "stat", lambda path, **kwargs: system_info(path, real_stat(path, **kwargs))
+    )
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -43,18 +67,22 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture(autouse=True)
 def refresh(monkeypatch: pytest.MonkeyPatch) -> Mock:
     monkeypatch.setattr(session, "detect", lambda: session.SessionKind.FLY)
-    original_is_file = Path.is_file
+    original_lstat = os.lstat
     original_access = os.access
     monkeypatch.setattr(
-        Path,
-        "is_file",
-        lambda path: True if path == Path("/usr/bin/fly-wmfunc") else original_is_file(path),
+        os,
+        "lstat",
+        lambda path, **kwargs: (
+            os.stat_result((stat.S_IFREG | 0o755, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            if path == "/usr/bin/fly-wmfunc"
+            else original_lstat(path, **kwargs)
+        ),
     )
     monkeypatch.setattr(
         os,
         "access",
         lambda path, mode: (
-            True if path == Path("/usr/bin/fly-wmfunc") else original_access(path, mode)
+            True if str(path) == "/usr/bin/fly-wmfunc" else original_access(path, mode)
         ),
     )
     monkeypatch.setattr(shutil, "which", Mock(side_effect=AssertionError("PATH lookup forbidden")))
@@ -111,6 +139,7 @@ def test_both_trees_exact_bytes_mode_and_idempotence(home: Path, refresh: Mock) 
         assert stat.S_IMODE(entry.stat().st_mode) == 0o644
     refresh.assert_called_once_with(
         ["/usr/bin/fly-wmfunc", "FLYWM_UPDATE_STARTMENU"],
+        shell=False,
         timeout=5,
         check=False,
         stdin=subprocess.DEVNULL,
@@ -227,19 +256,21 @@ def test_refresh_failures_nonfatal(
 ) -> None:
     section(home, "startmenu2", "tools", b"Name=Utility\n")
     if failure == "missing":
-        original_is_file = Path.is_file
-        monkeypatch.setattr(
-            Path,
-            "is_file",
-            lambda path: False if path == Path("/usr/bin/fly-wmfunc") else original_is_file(path),
-        )
+        original_lstat = os.lstat
+
+        def missing(path: str | Path, **kwargs: object) -> os.stat_result:
+            if str(path) == "/usr/bin/fly-wmfunc":
+                raise FileNotFoundError(errno.ENOENT, "missing")
+            return original_lstat(path, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "lstat", missing)
     elif failure == "not-executable":
         original_access = os.access
         monkeypatch.setattr(
             os,
             "access",
             lambda path, mode: (
-                False if path == Path("/usr/bin/fly-wmfunc") else original_access(path, mode)
+                False if str(path) == "/usr/bin/fly-wmfunc" else original_access(path, mode)
             ),
         )
     elif failure == "oserror":
