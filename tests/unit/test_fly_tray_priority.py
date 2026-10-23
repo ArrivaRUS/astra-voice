@@ -424,9 +424,7 @@ def test_ib74_confirmation_bound_to_file_and_single_use(
     assert identity(backend.themerc) == before
 
 
-@pytest.mark.parametrize(
-    "setting", [b"UseSystemTray=false", b"TrayBlackList=other-astra-voice-app:"]
-)
+@pytest.mark.parametrize("setting", [b"UseSystemTray=false", b"TrayBlackList=astra-voice:"])
 def test_ib74_hidden_by_fly_settings(backend: FlyTrayPriority, setting: bytes) -> None:
     backend.themerc.write_bytes(setting + b"\nTrayPriorityList=fly-vkbd:\n")
     assert backend.status().code == "hidden"
@@ -437,6 +435,52 @@ def test_ib74_hidden_by_fly_settings(backend: FlyTrayPriority, setting: bytes) -
 def test_ib74_no_tray_apprc(backend: FlyTrayPriority) -> None:
     (Path.home() / ".fly/apprc").write_bytes(b"astra-voice NO_TRAY\n")
     assert backend.status().code == "hidden"
+
+
+@pytest.mark.parametrize(
+    ("rules", "hidden"),
+    [
+        (b"astra:", True),
+        (b"other:astra:unrelated:", True),
+        (b"ASTRA:", True),
+        (b"astra-voice-foo-other:", False),
+        (b"other-astra-voice-app:", False),
+        (b"::", False),
+    ],
+)
+def test_review4_blacklist_rule_matches_inside_our_class(
+    backend: FlyTrayPriority, rules: bytes, hidden: bool
+) -> None:
+    backend.themerc.write_bytes(b"TrayBlackList=" + rules + b"\nTrayPriorityList=fly-vkbd:\n")
+    before = identity(backend.themerc)
+    assert (backend.status().code == "hidden") is hidden
+    if hidden:
+        assert not backend.apply().ok
+    assert identity(backend.themerc) == before
+
+
+@pytest.mark.parametrize(
+    ("rules", "hidden"),
+    [
+        (b"astra NO_TRAY\n", True),
+        (b"ASTRA NO_TRAY\r\n", True),
+        (b"astra NO_FOCUS NO_TRAY\n", True),
+        (b"astra-voice-foo-other NO_TRAY\n", False),
+        (b"other NO_TRAY astra-voice\n", False),
+        (b"astra-voice NOT_NO_TRAY\n", False),
+        (b"astra-voice NO_FOCUS # NO_TRAY\n", False),
+        (b"# astra NO_TRAY\nastra NO_FOCUS\nother NO_TRAY\n", False),
+    ],
+)
+def test_review4_apprc_matches_class_rule_and_exact_flag(
+    backend: FlyTrayPriority, rules: bytes, hidden: bool
+) -> None:
+    (Path.home() / ".fly/apprc").write_bytes(rules)
+    before = identity(backend.themerc)
+    assert (backend.status().code == "hidden") is hidden
+    if hidden:
+        assert not backend.apply().ok
+    assert identity(backend.themerc) == before
 
 
 def test_ib74_no_background_mutations(backend: FlyTrayPriority) -> None:

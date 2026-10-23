@@ -105,7 +105,7 @@ def test_ib73_unknown_keeps_real_theme_and_provenance(
         "inserted": ":astra-voice",
     }
     for _ in range(3):
-        ctl.set_enabled(False)
+        ctl.start()
         QTest.qWait(2)
     assert target.read_bytes() == expected and runs == ["FLYWM_RESTART"]
 

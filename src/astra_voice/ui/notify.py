@@ -850,10 +850,20 @@ def notify_command_unknown() -> None:
 
 def notify_fly_tray(outcome: str) -> None:
     """Fixed, path-free tray outcomes; no retry after an uncertain delivery."""
-    messages = {
-        "show": "Значок Astra Voice добавлен на панель Fly.",
-        "revert": "Значок Astra Voice убран из приоритетных значков панели Fly.",
-        "fail": "Не удалось настроить значок на панели Fly. Подробности в журнале.",
-        "unknown": "Панель Fly перезапущена, но не удалось убедиться, что значок на месте.",
-    }
-    notify("Панель Fly", messages[outcome], retry=False)
+    if outcome in {"show", "revert"}:
+        notify("Панель Fly", "Настройка сохранена, панель Fly перезапущена.", retry=False)
+    elif outcome == "fail":
+        notify(
+            "Панель Fly",
+            "Не удалось настроить значок на панели Fly. Подробности в журнале.",
+            retry=False,
+        )
+    elif outcome == "unknown":
+        notify(
+            "Панель Fly",
+            "Не удалось убедиться, что панель Fly вернулась. "
+            "Если значков нет — выйдите из сеанса и войдите снова.",
+            retry=False,
+        )
+    else:
+        raise KeyError(outcome)

@@ -20,6 +20,23 @@ from astra_voice.ui import notify as notifications
 
 pytestmark = pytest.mark.unit
 
+
+@pytest.mark.parametrize("outcome", ["show", "revert", "unknown"])
+def test_review5_fly_notice_describes_only_observed_outcome(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    send = Mock()
+    monkeypatch.setattr(notifications, "notify", send)
+    notifications.notify_fly_tray(outcome)
+    message = (
+        "Не удалось убедиться, что панель Fly вернулась. "
+        "Если значков нет — выйдите из сеанса и войдите снова."
+        if outcome == "unknown"
+        else "Настройка сохранена, панель Fly перезапущена."
+    )
+    send.assert_called_once_with("Панель Fly", message, retry=False)
+
+
 ROOT = Path(__file__).resolve().parents[2]
 NOTIFY_PATH = ROOT / "src/astra_voice/ui/notify.py"
 

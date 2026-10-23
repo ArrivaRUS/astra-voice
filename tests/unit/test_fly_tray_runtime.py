@@ -16,7 +16,15 @@ from astra_voice import app as app_module
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.core.dictation import DictationPhase
 from astra_voice.core.settings import Settings
-from astra_voice.platform.hotkey import GrabResult, HotkeyFsm, HotkeyMode, HotkeyState
+from astra_voice.platform.hotkey import (
+    GrabResult,
+    HotkeyBackend,
+    HotkeyEvent,
+    HotkeyFsm,
+    HotkeyManager,
+    HotkeyMode,
+    HotkeyState,
+)
 from astra_voice.platform.mouse_button import MouseHoldState
 from astra_voice.platform.session import SessionKind
 
@@ -138,6 +146,28 @@ def test_ib73_shutdown_cancels_controller_without_regrabbing(rig: Rig) -> None:
     controller.shutdown.assert_called_once()
     rig.runtime.release_fly_tray_restart()
     rig.hotkey.grab.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["text", "command"])
+def test_review6_cancelled_fsm_waits_for_physical_release(rig: Rig, source: str) -> None:
+    backend = Mock(spec=HotkeyBackend)
+    backend.grab_combo.return_value = GrabResult("ok", keycode=65, mods=4)
+    backend.grab_escape.return_value = GrabResult("ok", keycode=9)
+    backend.fileno.return_value = -1
+    held = HotkeyManager(backend)
+    held.grab("Ctrl+Space", HotkeyMode.PTT)
+    held.handle_event(HotkeyEvent("KeyPress", 65, 1000, mods=4), rig.now)
+    held.fsm.escape(rig.now)
+    assert held.fsm.state is HotkeyState.IDLE and held.physical_key_down
+    if source == "text":
+        rig.runtime.hotkey = held
+    else:
+        rig.runtime.command_hotkey = held
+    assert not rig.runtime.reserve_fly_tray_restart()
+    held.handle_event(HotkeyEvent("KeyRelease", 65, 2000, mods=4), rig.now + 1)
+    assert not held.physical_key_down
+    assert rig.runtime.reserve_fly_tray_restart()
+    rig.runtime.release_fly_tray_restart()
 
 
 @pytest.mark.parametrize("reason", ["register", "hidden", "wizard", "update", "policy", "kde"])

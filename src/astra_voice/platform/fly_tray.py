@@ -381,15 +381,19 @@ class FlyTrayPriority:
                 continue
             if (
                 key.strip() == b"UseSystemTray" and value.strip().lower() in {b"false", b"0", b"no"}
-            ) or (key.strip() == b"TrayBlackList" and TOKEN in value.lower()):
+            ) or (
+                key.strip() == b"TrayBlackList"
+                and any(
+                    rule.strip() and rule.strip().lower() in TOKEN for rule in value.split(b":")
+                )
+            ):
                 raise FlyTrayError("hidden")
         apprc = self._apprc(home)
-        if any(
-            TOKEN in raw.lower() and b"NO_TRAY" in raw.upper()
-            for raw in apprc.split(b"\n")
-            if not raw.lstrip().startswith((b"#", b";"))
-        ):
-            raise FlyTrayError("hidden")
+        for raw in apprc.split(b"\n"):
+            # One class pattern followed by flags; comments/other rules are not flags.
+            fields = raw.split(b"#", 1)[0].split(b";", 1)[0].split()
+            if fields and fields[0].lower() in TOKEN and b"NO_TRAY" in fields[1:]:
+                raise FlyTrayError("hidden")
         state = self._state(home)
         kind: Kind = (
             "absent"

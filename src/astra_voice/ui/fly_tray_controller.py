@@ -40,6 +40,8 @@ class FlyTrayHost(Protocol):
 class LoopGuard(Protocol):
     def reset(self) -> None: ...
     def allow(self, disappeared: bool) -> bool: ...
+    def restart_started(self) -> None: ...
+    def restart_confirmed(self) -> None: ...
 
 
 def _preflight() -> list[str]:
@@ -116,7 +118,9 @@ def _execute(work: _Work) -> _Reply:
         _log("status", "unavailable")
         return _Reply(status=status, notice="fail", failed=True)
     noop = (request.enabled and status.kind in {"present_ours", "present_foreign"}) or (
-        not request.enabled and status.kind != "present_ours"
+        not request.enabled
+        and status.kind != "present_ours"
+        and not (status.kind == "absent" and status.applied)
     )
     if work.cancel.is_set():
         return _Reply(status=status)
@@ -140,6 +144,11 @@ def _execute(work: _Work) -> _Reply:
         _log("apply", "failed")
         return _Reply(status=status, notice="fail", failed=True)
     if not result.changed or work.cancel.is_set():
+        return _Reply(status=backend.status())
+    # Persist before sending the command: an interrupted worker/process must not
+    # automatically repeat a restart whose effect cannot be established.
+    guard.restart_started()
+    if work.cancel.is_set():
         return _Reply(status=backend.status())
     restarted_at = work.clock()
     uncertain = False
@@ -172,10 +181,12 @@ def _execute(work: _Work) -> _Reply:
         if work.clock() >= deadline:
             break
         if current and current != old_owner:
+            if not uncertain:
+                guard.restart_confirmed()
             return _Reply(
                 status=backend.status(),
                 notice="unknown" if uncertain else ("show" if request.enabled else "revert"),
-                failed=uncertain,
+                blocked=uncertain,
                 restarted_at=restarted_at,
                 returned=True,
             )
@@ -190,7 +201,7 @@ def _execute(work: _Work) -> _Reply:
     return _Reply(
         status=backend.status(),
         notice="unknown",
-        failed=True,
+        blocked=True,
         restarted_at=restarted_at,
     )
 

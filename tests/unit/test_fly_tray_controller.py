@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import pwd
 import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from PyQt5.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
 
-from astra_voice.platform.fly_tray import Result, TrayPriorityStatus
+from astra_voice.platform.fly_tray import FlyTrayPriority, Result, TrayPriorityStatus
+from astra_voice.platform.fly_tray_loop import FlyTrayLoopGuard
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.fly_tray_controller import FlyTrayController
 from helpers.qt_app import get_qapplication
@@ -54,10 +58,18 @@ class Guard:
     def __init__(self) -> None:
         self.count = 0
         self.blocked = False
+        self.in_progress = False
+
+    def restart_started(self) -> None:
+        self.in_progress = True
+
+    def restart_confirmed(self) -> None:
+        self.in_progress = False
 
     def reset(self) -> None:
         self.count = 0
         self.blocked = False
+        self.in_progress = False
 
     def allow(self, disappeared: bool) -> bool:
         if disappeared and not self.blocked:
@@ -65,7 +77,7 @@ class Guard:
             self.blocked = self.count > 3
         elif not disappeared and not self.blocked:
             self.count = 0
-        return not self.blocked
+        return not self.blocked and not self.in_progress
 
 
 class Host:
@@ -456,10 +468,14 @@ def test_worker_exception_logs_only_fixed_code(
 @pytest.mark.parametrize(
     ("outcome", "body"),
     [
-        ("show", "Значок Astra Voice добавлен на панель Fly."),
-        ("revert", "Значок Astra Voice убран из приоритетных значков панели Fly."),
+        ("show", "Настройка сохранена, панель Fly перезапущена."),
+        ("revert", "Настройка сохранена, панель Fly перезапущена."),
         ("fail", "Не удалось настроить значок на панели Fly. Подробности в журнале."),
-        ("unknown", "Панель Fly перезапущена, но не удалось убедиться, что значок на месте."),
+        (
+            "unknown",
+            "Не удалось убедиться, что панель Fly вернулась. "
+            "Если значков нет — выйдите из сеанса и войдите снова.",
+        ),
     ],
 )
 def test_notification_uses_fixed_text_without_retry(
@@ -499,7 +515,7 @@ def test_ready_toggle_burst_waits_for_timer_and_coalesces(setup: Any) -> None:
     assert not backend.calls and not notices and not runs
 
 
-def test_process_timeout_is_unknown_and_fused(setup: Any) -> None:
+def test_process_timeout_is_unknown_and_rate_limited(setup: Any) -> None:
     from astra_voice.platform.fly_wmfunc import FlyWmError
 
     def run(command: str) -> None:
@@ -744,3 +760,117 @@ def test_default_owner_uses_budgeted_helper_without_live_probe(
     assert budgets == pytest.approx([0.75, 0.75, 0.25])
     assert now[0] == pytest.approx(1.1)
     assert notices == ["unknown"] and host.releases == 1
+
+
+@pytest.fixture
+def real_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FlyTrayLoopGuard:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+    return FlyTrayLoopGuard(tmp_path / "private/fly-tray.json")
+
+
+def test_unknown_persistently_blocks_next_start_with_missing_token(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+) -> None:
+    ctl, host, backend, notices, runs = setup(
+        loop_guard=real_guard,
+        owner=lambda: 10,
+        watch_timeout=0,
+    )
+    ctl.start()
+    pump(lambda: bool(notices))
+    assert notices == ["unknown"] and runs == ["FLYWM_RESTART"]
+    assert json.loads(real_guard.path.read_bytes())["restart_in_progress"] is True
+    ctl.shutdown()
+    backend.value = TrayPriorityStatus("absent", "absent", "absent", True)
+    again, new_host, _, new_notices, new_runs = setup(
+        backend=backend,
+        loop_guard=FlyTrayLoopGuard(real_guard.path),
+    )
+    again.start()
+    pump(new_host.released_once)
+    assert backend.calls == ["show"] and not new_runs and not new_notices
+    assert again.available
+
+
+def test_explicit_disable_after_unknown_reverts_under_idle_and_interval(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+) -> None:
+    clock = [0.0]
+    ctl, host, backend, notices, runs = setup(
+        loop_guard=real_guard,
+        owner=lambda: 10,
+        watch_timeout=0,
+        clock=lambda: clock[0],
+    )
+    ctl.start()
+    pump(lambda: bool(notices))
+    assert notices == ["unknown"] and ctl.available
+    host.busy = True
+    ctl.set_enabled(False)
+    clock[0] = 9.0
+    ctl._poll()
+    assert backend.calls == ["show"]
+    clock[0] = 10.0
+    ctl._poll()
+    assert backend.calls == ["show"]
+    host.busy = False
+    pump(lambda: len(notices) == 2)
+    assert backend.calls == ["show", "revert"] and len(runs) == 2
+    assert host.releases == 2 and not host.held
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "cancelled", "exception"])
+def test_restart_marker_is_durable_before_command_and_only_confirmation_clears(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+    outcome: str,
+) -> None:
+    observed: list[bool] = []
+
+    def run(command: str) -> None:
+        observed.append(json.loads(real_guard.path.read_bytes())["restart_in_progress"])
+        if outcome == "cancelled":
+            ctl._cancel.set()
+        elif outcome == "exception":
+            raise RuntimeError("command state unknown")
+
+    ctl, host, backend, notices, runs = setup(loop_guard=real_guard, runner=run)
+    ctl.start()
+    pump(host.released_once)
+    assert observed == [True]
+    assert json.loads(real_guard.path.read_bytes())["restart_in_progress"] is (
+        outcome != "confirmed"
+    )
+
+
+def test_disable_lost_token_clears_provenance_and_preserves_later_foreign_token(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+    tmp_path: Path,
+) -> None:
+    theme = tmp_path / ".fly/theme/current.themerc"
+    theme.parent.mkdir(parents=True, mode=0o700)
+    theme.parent.parent.chmod(0o700)
+    original = b"TrayPriorityList=one:\n"
+    theme.write_bytes(original)
+    backend = FlyTrayPriority()
+    assert backend.apply().ok
+    theme.write_bytes(original)
+    assert backend.status().applied and backend.status().kind == "absent"
+    ctl, host, _, notices, runs = setup(backend=backend, enabled=False)
+    ctl.start()
+    pump(host.released_once)
+    assert not backend.status().applied
+    assert not backend.state_path.exists() and theme.read_bytes() == original
+    assert not runs and not notices
+    ctl.shutdown()
+    foreign = b"TrayPriorityList=one:astra-voice:\n"
+    theme.write_bytes(foreign)
+    assert backend.status().kind == "present_foreign"
+    again, new_host, _, new_notices, new_runs = setup(backend=backend, enabled=False)
+    again.start()
+    pump(new_host.released_once)
+    assert theme.read_bytes() == foreign and not new_runs and not new_notices

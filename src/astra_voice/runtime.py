@@ -442,11 +442,13 @@ class DictationRuntime(QObject):
             or self._loading_model
             or self._selfcheck not in ("idle", "ok", "failed")
             or self.hotkey.has_pending_press is not False
+            or self.hotkey.physical_key_down is True
             or self.hotkey.fsm.state is not HotkeyState.IDLE
             or (
                 self.command_hotkey is not None
                 and (
                     self.command_hotkey.has_pending_press is not False
+                    or self.command_hotkey.physical_key_down is True
                     or self.command_hotkey.fsm.state is not HotkeyState.IDLE
                 )
             )

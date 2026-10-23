@@ -8,6 +8,7 @@ import pwd
 import stat
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -27,11 +28,19 @@ def guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FlyTrayLoopGuard:
 def test_count_persists_and_blocks_fourth_then_explicit_reset(guard: FlyTrayLoopGuard) -> None:
     for expected in (True, True, True, False, False):
         assert FlyTrayLoopGuard(guard.path).allow(True) is expected
-    assert json.loads(guard.path.read_bytes()) == {"count": 4, "blocked": True}
+    assert json.loads(guard.path.read_bytes()) == {
+        "count": 4,
+        "blocked": True,
+        "restart_in_progress": False,
+    }
     assert stat.S_IMODE(guard.path.stat().st_mode) == 0o600
     guard.reset()
     assert guard.allow(False)
-    assert json.loads(guard.path.read_bytes()) == {"count": 0, "blocked": False}
+    assert json.loads(guard.path.read_bytes()) == {
+        "count": 0,
+        "blocked": False,
+        "restart_in_progress": False,
+    }
 
 
 @pytest.mark.parametrize("attack", ["symlink", "hardlink", "fifo", "mode", "large", "json"])
@@ -89,11 +98,53 @@ def test_automatic_present_cannot_clear_sticky_block(guard: FlyTrayLoopGuard) ->
         guard.allow(True)
     assert not guard.allow(False)
     assert not guard.allow(True)
-    assert json.loads(guard.path.read_bytes()) == {"count": 4, "blocked": True}
+    assert json.loads(guard.path.read_bytes()) == {
+        "count": 4,
+        "blocked": True,
+        "restart_in_progress": False,
+    }
 
 
 def test_present_resets_unblocked_disappearance_streak(guard: FlyTrayLoopGuard) -> None:
     guard.allow(True)
     guard.allow(True)
     assert guard.allow(False)
-    assert json.loads(guard.path.read_bytes()) == {"count": 0, "blocked": False}
+    assert json.loads(guard.path.read_bytes()) == {
+        "count": 0,
+        "blocked": False,
+        "restart_in_progress": False,
+    }
+
+
+def test_restart_in_progress_persists_until_confirmed_or_explicit_reset(
+    guard: FlyTrayLoopGuard,
+) -> None:
+    guard.restart_started()
+    reopened = FlyTrayLoopGuard(guard.path)
+    assert not reopened.allow(True)
+    assert not reopened.allow(False)
+    assert json.loads(guard.path.read_bytes())["restart_in_progress"] is True
+    reopened.restart_confirmed()
+    assert FlyTrayLoopGuard(guard.path).allow(False)
+    guard.restart_started()
+    reopened.reset()
+    assert FlyTrayLoopGuard(guard.path).allow(True)
+
+
+def test_legacy_guard_state_migrates_without_unblocking(guard: FlyTrayLoopGuard) -> None:
+    guard.path.parent.mkdir(mode=0o700)
+    guard.path.write_text('{"count": 4, "blocked": true}')
+    guard.path.chmod(0o600)
+    assert not guard.allow(False)
+    assert json.loads(guard.path.read_bytes())["restart_in_progress"] is False
+
+
+@pytest.mark.parametrize("progress", [1, "true", None, []])
+def test_invalid_restart_marker_fails_closed(guard: FlyTrayLoopGuard, progress: Any) -> None:
+    guard.path.parent.mkdir(mode=0o700)
+    guard.path.write_text(
+        json.dumps({"count": 0, "blocked": False, "restart_in_progress": progress})
+    )
+    guard.path.chmod(0o600)
+    with pytest.raises(ThemercError):
+        guard.allow(False)
