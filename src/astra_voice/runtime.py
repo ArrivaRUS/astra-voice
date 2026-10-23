@@ -412,7 +412,7 @@ class DictationRuntime(QObject):
     def appimage_remove_busy_reason(self) -> str:
         """GUI-thread-only, fail-closed check including delayed input and paste."""
         try:
-            busy = self._work_pending()
+            busy = self._reservation_pending()
         except (AttributeError, RuntimeError):
             return "Не удалось проверить готовность программы. Повторите проверку."
         return (
@@ -442,13 +442,11 @@ class DictationRuntime(QObject):
             or self._loading_model
             or self._selfcheck not in ("idle", "ok", "failed")
             or self.hotkey.has_pending_press is not False
-            or self.hotkey.physical_key_down is True
             or self.hotkey.fsm.state is not HotkeyState.IDLE
             or (
                 self.command_hotkey is not None
                 and (
                     self.command_hotkey.has_pending_press is not False
-                    or self.command_hotkey.physical_key_down is True
                     or self.command_hotkey.fsm.state is not HotkeyState.IDLE
                 )
             )
@@ -456,6 +454,14 @@ class DictationRuntime(QObject):
                 self.command_mouse is not None
                 and self.command_mouse.state is not MouseHoldState.IDLE
             )
+        )
+
+    def _reservation_pending(self) -> bool:
+        """Before disruptive work, also wait for cancelled gestures to be released."""
+        return bool(
+            self._work_pending()
+            or self.hotkey.physical_key_down is True
+            or (self.command_hotkey is not None and self.command_hotkey.physical_key_down is True)
         )
 
     def reserve_appimage_removal(self) -> bool:
@@ -486,7 +492,7 @@ class DictationRuntime(QObject):
 
     def reserve_fly_tray_restart(self) -> bool:
         """GUI-thread reservation: no pending input may cross a panel restart."""
-        if self.session_kind is not SessionKind.FLY or self._work_pending():
+        if self.session_kind is not SessionKind.FLY or self._reservation_pending():
             return False
         self._fly_tray_reserved = True
         self._input_owner = "fly-tray"

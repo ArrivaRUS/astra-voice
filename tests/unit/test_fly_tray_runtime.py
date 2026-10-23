@@ -163,9 +163,17 @@ def test_review6_cancelled_fsm_waits_for_physical_release(rig: Rig, source: str)
         rig.runtime.hotkey = held
     else:
         rig.runtime.command_hotkey = held
+    # The cancelled gesture is no model work; disruptive reservations must still
+    # wait for the physical release so they cannot lose that input boundary.
+    assert not rig.runtime._work_pending()
     assert not rig.runtime.reserve_fly_tray_restart()
+    assert rig.runtime.appimage_remove_busy_reason()
+    assert not rig.runtime.reserve_appimage_removal()
     held.handle_event(HotkeyEvent("KeyRelease", 65, 2000, mods=4), rig.now + 1)
     assert not held.physical_key_down
+    assert not rig.runtime.appimage_remove_busy_reason()
+    assert rig.runtime.reserve_appimage_removal()
+    rig.runtime.release_appimage_removal()
     assert rig.runtime.reserve_fly_tray_restart()
     rig.runtime.release_fly_tray_restart()
 
