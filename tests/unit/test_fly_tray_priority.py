@@ -22,6 +22,8 @@ import pytest
 
 from astra_voice.platform.fly_tray import FlyTrayError, FlyTrayPriority
 from helpers.fly_deadline import fifo_deadline
+from helpers.fly_user import REAL_GETUID
+from helpers.fly_user import fly_user as fly_user
 
 pytestmark = pytest.mark.unit
 
@@ -745,7 +747,9 @@ def _acl() -> bytes:
     # Linux POSIX ACL xattr, owner=rw, named user=r, group=r, mask=r, other=none.
     entries = [
         (1, 6, 0xFFFFFFFF),
-        (2, 4, os.getuid()),
+        # This ACL is passed to the real kernel, not the fixture's logical uid.
+        # unshare -r maps only uid 0; a synthetic uid 1000 would be unmapped.
+        (2, 4, REAL_GETUID()),
         (4, 4, 0xFFFFFFFF),
         (16, 4, 0xFFFFFFFF),
         (32, 0, 0xFFFFFFFF),

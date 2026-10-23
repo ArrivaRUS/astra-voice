@@ -583,10 +583,10 @@ Column {
             objectName: "flyTrayRow"
             readonly property string tooltipText: qsTr("Добавляет Astra Voice в список приоритетных значков панели Fly и один раз перезапускает панель. Отключение убирает только добавленную запись.")
             width: parent.width
-            visible: root.settings !== null && root.settings.flyTrayVisible
+            visible: !!root.settings && root.settings.flyTrayVisible === true
             height: visible ? implicitHeight : 0
             label: qsTr("Показывать значок на панели Fly")
-            sub: root.settings ? root.settings.flyTrayReason : ""
+            sub: root.settings && root.settings.flyTrayReason ? root.settings.flyTrayReason : ""
             locked: root.isLocked("fly_tray_icon")
             toggle: flyTrayToggle
             rowEnabled: flyTrayToggle.enabled
@@ -595,7 +595,7 @@ Column {
                 id: flyTrayToggle
                 objectName: "flyTrayToggle"
                 locked: flyTrayRow.locked
-                enabled: !locked && root.settings !== null && root.settings.flyTrayAvailable
+                enabled: !locked && !!root.settings && root.settings.flyTrayAvailable === true
                 Accessible.name: flyTrayRow.label
                 Accessible.description: flyTrayRow.tooltipText
                 Layout.alignment: Qt.AlignVCenter
@@ -606,13 +606,13 @@ Column {
                 Binding {
                     target: flyTrayToggle
                     property: "checked"
-                    value: root.settings ? root.settings.flyTrayIcon : true
+                    value: root.settings && typeof root.settings.flyTrayIcon === "boolean" ? root.settings.flyTrayIcon : true
                 }
 
                 onCheckedChanged: {
-                    if (root.settings && root.settings.flyTrayIcon !== checked)
+                    if (root.settings && typeof root.settings.flyTrayIcon === "boolean" && root.settings.flyTrayIcon !== checked)
                         root.settings.flyTrayIcon = checked
-                    checked = root.settings ? root.settings.flyTrayIcon : true
+                    checked = root.settings && typeof root.settings.flyTrayIcon === "boolean" ? root.settings.flyTrayIcon : true
                 }
             }
         }

@@ -18,6 +18,7 @@ from astra_voice.platform.fly_tray import FlyTrayPriority, Result, TrayPriorityS
 from astra_voice.platform.fly_tray_loop import FlyTrayLoopGuard
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.fly_tray_controller import FlyTrayController
+from helpers.fly_user import fly_user as fly_user
 from helpers.qt_app import get_qapplication
 
 pytestmark = pytest.mark.unit

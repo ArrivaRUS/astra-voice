@@ -14,6 +14,7 @@ import pytest
 
 from astra_voice.platform.fly_themerc import ThemercError
 from astra_voice.platform.fly_tray_loop import FlyTrayLoopGuard
+from helpers.fly_user import fly_user as fly_user
 
 pytestmark = pytest.mark.unit
 
@@ -41,6 +42,66 @@ def test_count_persists_and_blocks_fourth_then_explicit_reset(guard: FlyTrayLoop
         "blocked": False,
         "restart_in_progress": False,
     }
+
+
+@pytest.mark.parametrize("identity", ["root", "effective-root"])
+def test_root_identity_is_rejected_without_creating_guard(
+    guard: FlyTrayLoopGuard, monkeypatch: pytest.MonkeyPatch, identity: str
+) -> None:
+    if identity == "root":
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    with pytest.raises(ThemercError, match="administrator"):
+        guard.restart_started()
+    assert not guard.path.parent.exists()
+
+
+def test_root_owned_metadata_is_mapped_without_hiding_foreign_owners(tmp_path: Path) -> None:
+    from helpers.fly_user import user_stat
+
+    original = tmp_path.stat()
+    fields = list(original)
+    fields[4] = 0
+    root_owned = os.stat_result(
+        fields,
+        {"st_mtime_ns": original.st_mtime_ns, "st_ctime_ns": original.st_ctime_ns},
+    )
+    mapped = user_stat(root_owned, kernel_uid=0, user_uid=1000)
+    assert mapped.st_uid == 1000
+    assert mapped.st_mode == root_owned.st_mode
+    assert mapped.st_ino == root_owned.st_ino
+    assert mapped.st_mtime_ns == original.st_mtime_ns
+    assert mapped.st_ctime_ns == original.st_ctime_ns
+    fields[4] = 1001
+    foreign = os.stat_result(fields)
+    assert user_stat(foreign, kernel_uid=0, user_uid=1000) is foreign
+
+
+def test_user_fixture_handles_root_kernel_and_keeps_system_ownership(
+    guard: FlyTrayLoopGuard, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from helpers.fly_user import normal_user, user_stat
+
+    real_stat, real_fstat = os.stat, os.fstat
+    kernel_owner = tmp_path.stat().st_uid
+
+    def kernel_stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        return user_stat(real_stat(path, *args, **kwargs), kernel_uid=kernel_owner, user_uid=0)
+
+    def kernel_fstat(fd: int) -> os.stat_result:
+        return user_stat(real_fstat(fd), kernel_uid=kernel_owner, user_uid=0)
+
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "stat", kernel_stat)
+    monkeypatch.setattr(os, "fstat", kernel_fstat)
+    normal_user(tmp_path, monkeypatch)
+    assert os.getuid() == os.geteuid() == 1000
+    assert tmp_path.stat().st_uid == 1000
+    assert guard.allow(True)
+    assert guard.path.stat().st_uid == 1000
+    # The private-tree adapter must not reinterpret the privileged executable.
+    assert os.stat("/usr/bin/env").st_uid == kernel_stat("/usr/bin/env").st_uid
 
 
 @pytest.mark.parametrize("attack", ["symlink", "hardlink", "fifo", "mode", "large", "json"])

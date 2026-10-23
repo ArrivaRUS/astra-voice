@@ -25,6 +25,7 @@ from astra_voice.platform import command_hotkey
 from astra_voice.platform.fly_tray import FlyTrayPriority
 from astra_voice.platform.session import SessionKind
 from astra_voice.worker import command_hotkey as broker_module
+from helpers.fly_user import fly_user as fly_user
 
 pytestmark = pytest.mark.unit
 

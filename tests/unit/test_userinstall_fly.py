@@ -11,6 +11,7 @@ import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -24,6 +25,29 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # These tests own the private tree, not the runner's filesystem roots.
+    # Model standard system ancestors even when a sandbox hides their root uid
+    # or /tmp's sticky bit. Security attacks below tmp_path remain untouched.
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def system_info(path: Any, info: os.stat_result) -> os.stat_result:
+        if path not in {"/", "/tmp", "/home", Path("/"), Path("/tmp"), Path("/home")}:
+            return info
+        fields = list(info)
+        fields[4] = 0
+        if path in {"/tmp", Path("/tmp")}:
+            fields[0] = info.st_mode | stat.S_ISVTX
+        extras = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        extras["st_uid"] = 0
+        extras["st_mode"] = fields[0]
+        return os.stat_result(fields, extras)
+
+    monkeypatch.setattr(
+        os, "lstat", lambda path, **kwargs: system_info(path, real_lstat(path, **kwargs))
+    )
+    monkeypatch.setattr(
+        os, "stat", lambda path, **kwargs: system_info(path, real_stat(path, **kwargs))
+    )
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
