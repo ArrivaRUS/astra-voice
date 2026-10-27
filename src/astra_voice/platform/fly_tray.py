@@ -194,9 +194,14 @@ def _parse(data: bytes) -> _Line:
     if len(found) != 1:
         raise FlyTrayError("ambiguous")
     line = found[0]
-    # Section names have not been confirmed by ИБ-77: only a flat file is supported.
-    before_key = data[: line.start].split(b"\n")
-    if any(part.lstrip(b"\xef\xbb\xbf \t").startswith(b"[") for part in before_key):
+    # Fly 1.8.4's [Variables] was confirmed in a live file on 27.10.
+    # Only the last header before the key determines its section; keep flat files.
+    section = None
+    for part in data[: line.start].split(b"\n"):
+        header = part.removesuffix(b"\r").lstrip(b"\xef\xbb\xbf \t")
+        if header.startswith(b"["):
+            section = header
+    if section not in (None, b"[Variables]"):
         raise FlyTrayError("section")
     value = line.value
     if (

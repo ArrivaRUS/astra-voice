@@ -85,6 +85,38 @@ def test_ib76_normal_consumers_unchanged(tmp_path: Path) -> None:
     assert _fly_blacklist_type((path,)) == "application/first"
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_ib76_sectioned_variables_are_read_by_existing_consumers(
+    tmp_path: Path, newline: bytes
+) -> None:
+    path = tmp_path / "current.themerc"
+    source = b"\xef\xbb\xbf" + newline.join(
+        [
+            b"[General]",
+            b"Name=Fly 1.8.4 fixture",
+            b"[Variables]",
+            b"TaskbarColor=#202020",
+            b"TrayBlackList=unrelated-app:",
+            b"UseSystemTray=true",
+            b"ClipboardManagerTypesBlacklist=application/section-private:",
+            b"TrayPriorityList=fly-notifications:qbat:fly-vkbd:",
+            b"[Other]",
+            b"Untouched=keep",
+            b"",
+        ]
+    )
+    path.write_bytes(source)
+    assert fly_themerc.read_themerc(path) == source
+    values = _theme_variables(path)
+    assert values is not None
+    assert values["TaskbarColor"] == "#202020"
+    assert values["TrayBlackList"] == "unrelated-app:"
+    assert values["UseSystemTray"] == "true"
+    assert fly_panel_dark((path,)) is True
+    assert _fly_blacklist_type((path,)) == "application/section-private"
+    assert path.read_bytes() == source
+
+
 def test_ib76_regular_read_error_is_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

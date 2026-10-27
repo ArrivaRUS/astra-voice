@@ -48,6 +48,124 @@ def identity(path: Path) -> tuple[bytes, int, int]:
     return path.read_bytes(), info.st_ino, info.st_mtime_ns
 
 
+def owner_sectioned_themerc(*, newline: bytes = b"\n", bom: bytes = b"") -> bytes:
+    """Synthetic Fly 1.8.4 shape confirmed on 27.10; priority is line 344."""
+    lines = [b"[General]", b"Name=keep", b"[Other]", b"Other=unchanged"]
+    lines.extend([b"# padding"] * (342 - len(lines)))
+    lines.extend(
+        [
+            b"[Variables]",
+            b"TrayPriorityList=fly-notifications:qbat:fly-vkbd:",
+            b"TaskbarColor=#123456",
+            b"[AfterPriority]",
+            b"Other2=keep",
+        ]
+    )
+    assert lines[343].startswith(b"TrayPriorityList=")
+    return bom + newline.join(lines) + newline
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("bom", [b"", b"\xef\xbb\xbf"], ids=["plain", "bom"])
+def test_ib67_confirmed_variables_owner_shape_byte_exact_roundtrip(
+    backend: FlyTrayPriority, newline: bytes, bom: bytes
+) -> None:
+    original = owner_sectioned_themerc(newline=newline, bom=bom)
+    expected = original.replace(b"fly-vkbd:", b"fly-vkbd:astra-voice:")
+    backend.themerc.write_bytes(original)
+    original_hash = hashlib.sha256(original).hexdigest()
+    assert backend.status().kind == "absent"
+    applied = backend.apply()
+    assert applied.ok and applied.changed
+    assert backend.themerc.read_bytes() == expected
+    assert backend.status().kind == "present_ours"
+    reverted = backend.revert()
+    assert reverted.ok and reverted.changed
+    assert hashlib.sha256(backend.themerc.read_bytes()).hexdigest() == original_hash
+    assert not backend.state_path.exists()
+
+
+def test_ib74_confirmed_variables_foreign_then_absent(backend: FlyTrayPriority) -> None:
+    original = owner_sectioned_themerc()
+    foreign = original.replace(b"fly-vkbd:", b"fly-vkbd:astra-voice:")
+    backend.themerc.write_bytes(foreign)
+    status = backend.status()
+    assert (status.kind, status.code) == ("present_foreign", "foreign")
+    result = backend.apply()
+    assert result.ok and not result.changed
+    assert backend.themerc.read_bytes() == foreign
+    assert not backend.state_path.exists()
+    backend.themerc.write_bytes(original)
+    assert backend.status().kind == "absent"
+
+
+@pytest.mark.parametrize("policy", [b"UseSystemTray=false", b"TrayBlackList=astra:"])
+def test_ib74_confirmed_variables_keeps_administrator_hiding_policy(
+    backend: FlyTrayPriority, policy: bytes
+) -> None:
+    source = b"[Variables]\nTrayPriorityList=one:\n" + policy + b"\n"
+    backend.themerc.write_bytes(source)
+    before = identity(backend.themerc)
+    assert backend.status().code == "hidden"
+    assert not backend.apply().changed
+    assert identity(backend.themerc) == before
+    assert not backend.backups_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [b"[Tray]", b"[General]", b"[unknown]", b"[ Variables ]", b"[variables]", b"[Variables] "],
+)
+def test_ib67_unconfirmed_priority_section_never_writes(
+    backend: FlyTrayPriority, header: bytes
+) -> None:
+    backend.themerc.write_bytes(header + b"\nTrayPriorityList=one:\n")
+    before = identity(backend.themerc)
+    assert backend.status().code == "section"
+    with pytest.raises(FlyTrayError, match="section"):
+        backend.prepare("show")
+    assert identity(backend.themerc) == before
+    assert not backend.backups_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"[Variables]\nTrayPriorityList=one:\n[Tray]\nTrayPriorityList=two:\n",
+        b"[Tray]\nTrayPriorityList=one:\n[Variables]\nTrayPriorityList=two:\n",
+    ],
+)
+def test_ib67_duplicate_priority_across_sections_is_ambiguous(
+    backend: FlyTrayPriority, source: bytes
+) -> None:
+    backend.themerc.write_bytes(source)
+    before = identity(backend.themerc)
+    assert backend.status().code == "ambiguous"
+    with pytest.raises(FlyTrayError, match="ambiguous"):
+        backend.prepare("show")
+    assert identity(backend.themerc) == before
+    assert not backend.backups_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"[General]\nOther=keep\n \t[Variables]\nTrayPriorityList=one:\n",
+        b"[Variables]\n# [Tray]\n; [General]\nTrayPriorityList=one:\n[Tray]\n",
+        b"TrayPriorityList=one:\n[Tray]\nOther=keep\n",
+    ],
+)
+def test_ib67_only_last_real_header_before_priority_controls_section(
+    backend: FlyTrayPriority, source: bytes
+) -> None:
+    backend.themerc.write_bytes(source)
+    assert backend.status().kind == "absent"
+    assert backend.apply().changed
+    assert backend.themerc.read_bytes() == source.replace(b"one:", b"one:astra-voice:")
+    assert backend.revert().changed
+    assert backend.themerc.read_bytes() == source
+
+
 @pytest.mark.parametrize(
     ("source", "shown"),
     [
