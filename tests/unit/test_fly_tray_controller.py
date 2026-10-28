@@ -961,3 +961,234 @@ def test_disable_lost_token_clears_provenance_and_preserves_later_foreign_token(
     again.start()
     pump(new_host.released_once)
     assert theme.read_bytes() == foreign and not new_runs and not new_notices
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_panel_deferred_preserves_real_files_and_guard(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    from unittest.mock import Mock
+
+    from astra_voice.ui import fly_tray_controller
+
+    theme = tmp_path / ".fly/theme/current.themerc"
+    theme.parent.mkdir(parents=True, mode=0o700)
+    theme.parent.parent.chmod(0o700)
+    theme.write_bytes(b"TrayPriorityList=one:\n")
+    backend = FlyTrayPriority()
+    assert backend.apply().ok
+    theme.write_bytes(b"TrayPriorityList=one:\n")
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    factory = Mock(side_effect=AssertionError("guard must not be instantiated"))
+    monkeypatch.setattr(fly_tray_controller, "FlyTrayLoopGuard", factory)
+    now = [0.0]
+    ctl, host, _, notices, runs = setup(
+        backend=backend,
+        automatic=not explicit,
+        loop_guard=None,
+        owner=lambda: 0,
+        clock=lambda: now[0],
+        watch_timeout=0,
+    )
+    if explicit:
+        ctl.set_enabled(True)
+    ctl.start()
+    pump(host.released_once)
+    assert ctl._pending is not None and not ctl._fused
+    assert not runs and not notices and not host.held
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_panel_deferred_rate_then_owner_appears(setup: Any, explicit: bool) -> None:
+    now = [0.0]
+    probes: list[float] = []
+
+    def owner() -> int:
+        probes.append(now[0])
+        return 0 if now[0] < 7 else 10 + len(probes)
+
+    ctl, host, backend, notices, runs = setup(
+        owner=owner,
+        clock=lambda: now[0],
+        automatic=not explicit,
+        watch_timeout=0.01,
+    )
+    if explicit:
+        ctl.set_enabled(True)
+    ctl.start()
+    pump(host.released_once)
+    assert probes == [0.0] and not host.held and not backend.calls
+    for value in (0.1, 1.0, 4.999):
+        now[0] = value
+        ctl._poll()
+    assert probes == [0.0]
+    now[0] = 5.0
+    ctl._poll()
+    pump(lambda: host.releases == 2)
+    assert probes == [0.0, 5.0]
+    now[0] = 7.0
+    ctl._poll()
+    assert not backend.calls
+    now[0] = 10.0
+    pump(lambda: bool(notices))
+    assert backend.calls == ["show"] and runs == ["FLYWM_RESTART"]
+    assert notices == ["show"]
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_panel_deferred_deadline_drops_once_and_allows_new_request(
+    setup: Any,
+    caplog: pytest.LogCaptureFixture,
+    busy: bool,
+) -> None:
+    now = [0.0]
+    ctl, host, backend, notices, runs = setup(
+        owner=lambda: 0,
+        clock=lambda: now[0],
+        watch_timeout=0,
+    )
+    ctl.start()
+    pump(host.released_once)
+    host.busy = busy
+    now[0] = 300.0
+    ctl._poll()
+    ctl._poll()
+    assert [r.getMessage() for r in caplog.records] == [
+        "fly_tray_controller stage=panel code=not_ready"
+    ]
+    assert ctl._pending is None and not ctl._fused and not host.held
+    assert not backend.calls and not runs and not notices
+    assert ctl._reserve_busy_since is ctl._reserve_busy_warning_at is None
+    host.busy = False
+    owners = iter([10, 11])
+    ctl._owner = lambda: next(owners)
+    ctl._watch_timeout = 1
+    ctl.set_enabled(True)
+    pump(lambda: bool(notices))
+    assert notices == ["show"]
+
+
+def test_panel_deferred_old_worker_preserves_new_pending(setup: Any) -> None:
+    entered, proceed = threading.Event(), threading.Event()
+    now = [0.0]
+
+    def owner() -> int:
+        entered.set()
+        assert proceed.wait(3)
+        return 0
+
+    ctl, host, backend, notices, runs = setup(owner=owner, watch_timeout=0, clock=lambda: now[0])
+    ctl.start()
+    try:
+        pump(entered.is_set)
+        ctl.set_enabled(False)
+        proceed.set()
+        pump(host.released_once)
+        assert ctl._pending is not None and ctl._pending.enabled is False
+        now[0] = 4.999
+        ctl._poll()
+        assert host.releases == 1 and not host.held
+        now[0] = 5.0
+        pump(lambda: host.releases >= 2)
+        assert not backend.calls and not runs and not notices
+        assert ctl._pending is None
+    finally:
+        proceed.set()
+
+
+def test_new_pending_starts_new_busy_warning_episode(
+    setup: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [0.0]
+    ctl, host, _, _, _ = setup(clock=lambda: now[0])
+    monkeypatch.setattr(ctl, "_launch", lambda request: None)
+    host.busy = True
+    ctl.start()
+    ctl._timer.stop()
+    ctl._poll()
+    now[0] = 29
+    ctl.set_enabled(False)
+    ctl._poll()
+    now[0] = 30
+    ctl._poll()
+    assert not caplog.records
+    now[0] = 59
+    ctl._poll()
+    assert len(caplog.records) == 1
+    ctl.shutdown()
+    assert ctl._reserve_busy_since is ctl._reserve_busy_warning_at is None
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        lambda: ("/home/SECRET",),
+        lambda: ("phase:SECRET",),
+        lambda: ("input_owner:/home/SECRET",),
+        lambda: ["phase:processing"],
+        lambda: "SECRET",
+        lambda: (object(),),
+        lambda: None,
+        lambda: (_ for _ in ()).throw(RuntimeError("SECRET")),
+        lambda: (type("Private", (str,), {})("SECRET"),),
+    ],
+)
+def test_busy_warning_sanitizes_host_boundary(
+    setup: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    diagnostic: Any,
+) -> None:
+    now = [0.0]
+    ctl, host, _, _, _ = setup(clock=lambda: now[0])
+    monkeypatch.setattr(ctl, "_launch", lambda request: None)
+    monkeypatch.setattr(host, "reservation_blockers", diagnostic, raising=False)
+    host.busy = True
+    ctl.start()
+    ctl._timer.stop()
+    ctl._poll()
+    now[0] = 30
+    ctl._poll()
+    assert [r.getMessage() for r in caplog.records] == [
+        "fly_tray_controller stage=reserve code=busy blockers=unknown"
+    ]
+
+
+def test_new_explicit_preserves_panel_retry_and_total_deadline(
+    setup: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [0.0]
+    probes: list[float] = []
+
+    def owner() -> int:
+        probes.append(now[0])
+        return 0
+
+    ctl, host, _, _, _ = setup(owner=owner, clock=lambda: now[0], watch_timeout=0)
+    ctl.start()
+    pump(host.released_once)
+    now[0] = 4.999
+    ctl.set_enabled(True)
+    ctl._poll()
+    assert probes == [0.0]
+    now[0] = 5.0
+    pump(lambda: host.releases == 2)
+    now[0] = 299.999
+    ctl.set_enabled(True)
+    pump(lambda: host.releases == 3)
+    assert ctl._pending is not None and not caplog.records
+    now[0] = 300.0
+    ctl._poll()
+    assert ctl._pending is None and not ctl._fused
+    assert [r.getMessage() for r in caplog.records] == [
+        "fly_tray_controller stage=panel code=not_ready"
+    ]

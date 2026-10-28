@@ -434,16 +434,62 @@ class DictationRuntime(QObject):
 
     def reservation_blockers(self) -> tuple[str, ...]:
         """GUI-thread snapshot of fixed diagnostic codes, without input or paths."""
+        # Shutdown can remove components before the final idle query. No object
+        # access is valid after close; a partial live graph must fail closed too.
+        missing = object()
+        if getattr(self, "_closed", missing) is True:
+            return ("closed",)
+        fields = (
+            "_closed",
+            "_appimage_removal_reserved",
+            "_fly_tray_reserved",
+            "_input_owner",
+            "_capture_watchdog",
+            "_mouse_capture_token",
+            "_preview_send",
+            "_pending_test",
+            "_pending_switch",
+            "_switch_in_progress",
+            "_loading_model",
+            "_selfcheck",
+            "command_hotkey",
+            "command_mouse",
+        )
+        if any(getattr(self, name, missing) is missing for name in fields):
+            return ("teardown",)
+        supervisor = getattr(self, "supervisor", None)
+        orchestrator = getattr(self, "orchestrator", None)
+        hotkey = getattr(self, "hotkey", None)
+        if supervisor is None or orchestrator is None or hotkey is None:
+            return ("teardown",)
+        required = [
+            (supervisor, ("restarting",)),
+            (orchestrator, ("phase", "test_active", "level_active", "cleanup_pending")),
+        ]
+        for manager in (hotkey, self.command_hotkey):
+            if manager is None:
+                continue  # Command devices are optional, the text hotkey is not.
+            fsm = getattr(manager, "fsm", None)
+            if fsm is None:
+                return ("teardown",)
+            required.extend(
+                [
+                    (manager, ("has_pending_press", "physical_key_down")),
+                    (fsm, ("state",)),
+                ]
+            )
+        if self.command_mouse is not None:
+            required.append((self.command_mouse, ("state",)))
+        if any(getattr(obj, name, missing) is missing for obj, names in required for name in names):
+            return ("teardown",)
         blockers: list[str] = []
-        if self._closed:
-            blockers.append("closed")
         if self._appimage_removal_reserved:
             blockers.append("appimage_removal")
         if self._fly_tray_reserved:
             blockers.append("fly_tray_reserved")
         if self.supervisor.restarting:
             blockers.append("supervisor_restarting")
-        phase = self.phase
+        phase = orchestrator.phase
         if phase is not DictationPhase.IDLE:
             name = phase.value if type(phase) is DictationPhase else "unknown"
             blockers.append("phase:" + name)

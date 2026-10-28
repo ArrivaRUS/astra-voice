@@ -17,13 +17,64 @@ from typing import Protocol
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
+from astra_voice.core.dictation import DictationPhase
 from astra_voice.platform.fly_tray import FlyTrayPriority, TrayPriorityStatus
 from astra_voice.platform.fly_tray_loop import FlyTrayLoopGuard
 from astra_voice.platform.fly_wmfunc import FlyWmError
+from astra_voice.platform.hotkey import HotkeyState
+from astra_voice.platform.mouse_button import MouseHoldState
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.notify import notify_fly_tray
 
 _LOG = logging.getLogger(__name__)
+# The host is a protocol boundary: only exact, fixed codes may reach logging.
+_BLOCKER_CODES = frozenset(
+    {
+        "closed",
+        "teardown",
+        "appimage_removal",
+        "fly_tray_reserved",
+        "supervisor_restarting",
+        "capture_watchdog",
+        "mouse_capture",
+        "preview_send",
+        "pending_test",
+        "test_active",
+        "level_active",
+        "cleanup_pending",
+        "pending_switch",
+        "switch_active",
+        "loading_model",
+        "hotkey_pending_press",
+        "command_hotkey_pending_press",
+        "physical_key_down",
+        "command_physical_key_down",
+        "unknown",
+    }
+) | frozenset(
+    prefix + ":" + value
+    for prefix, values in (
+        ("phase", tuple(state.value for state in DictationPhase) + ("unknown",)),
+        ("hotkey_fsm", tuple(state.value for state in HotkeyState) + ("unknown",)),
+        ("command_hotkey_fsm", tuple(state.value for state in HotkeyState) + ("unknown",)),
+        ("command_mouse", tuple(state.value for state in MouseHoldState) + ("unknown",)),
+        (
+            "input_owner",
+            (
+                "text",
+                "keyboard",
+                "mouse",
+                "mouse-capture",
+                "keyboard-capture",
+                "appimage-removal",
+                "fly-tray",
+                "unknown",
+            ),
+        ),
+        ("selfcheck", ("running", "retrying", "unknown")),
+    )
+    for value in values
+)
 _REASON_FAILED = "Не удалось настроить значок на панели Fly. Подробности в журнале."
 _REASON_LOOP = "Автоматическая настройка панели приостановлена. Переключите настройку ещё раз."
 
@@ -86,6 +137,7 @@ class _Reply:
     blocked: bool = False
     restarted_at: float | None = None
     returned: bool = False
+    deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,6 +181,12 @@ def _execute(work: _Work) -> _Reply:
     if not noop and work.preflight() != backend.restart_command():
         _log("preflight", "argv")
         return _Reply(status=status, notice="fail", failed=True)
+    # A missing panel is a retryable precondition, before *any* guard/file change.
+    old_owner = work.owner() if not noop else 0
+    if not noop and old_owner == 0:
+        return _Reply(status=status, deferred=True)
+    if work.cancel.is_set():
+        return _Reply(status=status)
     guard = work.guard if work.guard is not None else FlyTrayLoopGuard(backend.state_path)
     if request.explicit:
         guard.reset()
@@ -136,9 +194,6 @@ def _execute(work: _Work) -> _Reply:
         _log("loop", "blocked")
         return _Reply(status=status, blocked=True)
     if noop or work.cancel.is_set():
-        return _Reply(status=status)
-    old_owner = work.owner()
-    if work.cancel.is_set():
         return _Reply(status=status)
     result = backend.apply() if request.enabled else backend.revert()
     if not result.ok:
@@ -265,6 +320,9 @@ class FlyTrayController(QObject):
         self._thread: threading.Thread | None = None
         self._threads: list[threading.Thread] = []
         self._pending: _Request | None = None
+        self._inflight: _Request | None = None
+        self._deferred_at: float | None = None
+        self._first_deferred_at: float | None = None
         self._started = False
         self._stopped = False
         self._fused = False
@@ -312,8 +370,10 @@ class FlyTrayController(QObject):
         if not explicit:
             # Configuration synchronization must not manufacture another startup action.
             if self._pending is not None:
+                self._reset_busy_wait()
                 self._pending = _Request(enabled, self._pending.explicit)
             return
+        self._reset_busy_wait()
         self._pending = _Request(enabled, True)
         # The timer coalesces every toggle burst before acquiring the host reservation.
 
@@ -333,9 +393,19 @@ class FlyTrayController(QObject):
             self._watch_timeout,
         )
         thread = threading.Thread(target=_worker, args=(work,), name="fly-tray-worker")
+        self._inflight = request
         self._thread = thread
         self._threads.append(thread)
         thread.start()
+
+    def _reset_busy_wait(self) -> None:
+        self._reserve_busy_since = None
+        self._reserve_busy_warning_at = None
+
+    def _reset_pending_wait(self) -> None:
+        self._reset_busy_wait()
+        self._deferred_at = None
+        self._first_deferred_at = None
 
     def _release(self) -> None:
         if self._reserved:
@@ -357,6 +427,7 @@ class FlyTrayController(QObject):
                 return
             self._thread.join()
             self._thread = None
+            request, self._inflight = self._inflight, None
             try:
                 reply = self._mailbox.get_nowait()
             except queue.Empty:
@@ -372,9 +443,18 @@ class FlyTrayController(QObject):
                 if reply.failed:
                     self._fused = True
                     self._pending = None
+                    self._reset_pending_wait()
                     self._available = False
                     if reply.status is None or reply.status.kind != "unavailable":
                         self._reason = _REASON_FAILED
+                if reply.deferred and request is not None:
+                    if self._pending is None:
+                        self._pending = request
+                    self._deferred_at = self._clock()
+                    if self._first_deferred_at is None:
+                        self._first_deferred_at = self._deferred_at
+                else:
+                    self._reset_pending_wait()
                 if reply.blocked:
                     self._available = True
                     self._reason = _REASON_LOOP
@@ -389,13 +469,20 @@ class FlyTrayController(QObject):
                 self._release()
         if self._stopped or self._pending is None or self._fused:
             return
+        now = self._clock()
+        if self._first_deferred_at is not None and now - self._first_deferred_at >= 300.0:
+            self._pending = None
+            self._reset_pending_wait()
+            _LOG.warning("fly_tray_controller stage=panel code=not_ready")
+            return
+        if self._deferred_at is not None and now - self._deferred_at < 5.0:
+            return
         if self._last_restart is not None and self._clock() - self._last_restart < 10.0:
             return
         if not self._host.reserve_fly_tray_restart():
             self._warn_reservation_busy()
             return
-        self._reserve_busy_since = None
-        self._reserve_busy_warning_at = None
+        self._reset_busy_wait()
         self._reserved = True
         request, self._pending = self._pending, None
         try:
@@ -403,6 +490,9 @@ class FlyTrayController(QObject):
         except Exception:
             self._release()
             self._fused = True
+            self._pending = None
+            self._inflight = None
+            self._reset_pending_wait()
             self._notify("fail")
 
     def _warn_reservation_busy(self) -> None:
@@ -416,8 +506,18 @@ class FlyTrayController(QObject):
             and now - self._reserve_busy_warning_at < 300.0
         ):
             return
-        diagnostics = getattr(self._host, "reservation_blockers", None)
-        blockers = diagnostics() if diagnostics is not None else ("unknown",)
+        try:
+            diagnostics = getattr(self._host, "reservation_blockers", None)
+            blockers = diagnostics() if callable(diagnostics) else ("unknown",)
+            if type(blockers) is not tuple:
+                blockers = ("unknown",)
+            else:
+                blockers = tuple(
+                    code if type(code) is str and code in _BLOCKER_CODES else "unknown"
+                    for code in blockers
+                )
+        except Exception:
+            blockers = ("unknown",)
         _LOG.warning(
             "fly_tray_controller stage=reserve code=busy blockers=%s",
             ",".join(blockers) or "none",
@@ -430,6 +530,8 @@ class FlyTrayController(QObject):
         self._stopped = True
         self._cancel.set()
         self._pending = None
+        self._inflight = None
+        self._reset_pending_wait()
         self._timer.stop()
         self._release()
         for thread in self._threads:

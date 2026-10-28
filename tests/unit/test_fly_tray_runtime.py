@@ -122,10 +122,10 @@ def test_reservation_blockers_each_existing_predicate(
 
 
 def test_reservation_blockers_all_causes_keep_formula_order(reservation_runtime: Any) -> None:
-    for path, value, _ in RESERVATION_CASES:
+    for path, value, _ in RESERVATION_CASES[1:]:
         set_reservation_value(reservation_runtime, path, value)
     assert reservation_runtime.reservation_blockers() == tuple(
-        blocker for _, _, blocker in RESERVATION_CASES
+        blocker for _, _, blocker in RESERVATION_CASES[1:]
     )
 
 
@@ -421,3 +421,69 @@ def test_ib73_updated_image_marks_origin_without_changing_arguments(
     )
     assert launcher.call_args.kwargs["env"]["ASTRA_VOICE_AFTER_UPDATE"] == "1"
     assert launcher.call_args.args[0] == [str(download.path), "--appimage-extract-and-run"]
+
+
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "supervisor",
+        "orchestrator",
+        "hotkey",
+        "hotkey.fsm",
+        "command_hotkey.fsm",
+    ],
+)
+@pytest.mark.parametrize("missing", [False, True])
+def test_reservation_partial_required_objects(
+    reservation_runtime: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    closed: bool,
+    path: str,
+    missing: bool,
+) -> None:
+    with monkeypatch.context() as patch:
+        target = reservation_runtime
+        for part in path.split(".")[:-1]:
+            target = getattr(target, part)
+        if missing:
+            patch.delattr(target, path.split(".")[-1])
+        else:
+            patch.setattr(target, path.split(".")[-1], None)
+        patch.setattr(reservation_runtime, "_closed", closed)
+        assert reservation_runtime.reservation_blockers() == (
+            ("closed",) if closed else ("teardown",)
+        )
+        assert reservation_runtime._reservation_pending() is True
+        assert reservation_runtime._work_pending() is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [case[0] for case in RESERVATION_CASES]
+    + [
+        "command_hotkey",
+        "command_mouse",
+    ],
+)
+def test_reservation_missing_required_fields(
+    reservation_runtime: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    with monkeypatch.context() as patch:
+        target = reservation_runtime
+        for part in path.split(".")[:-1]:
+            target = getattr(target, part)
+        patch.delattr(target, path.split(".")[-1])
+        assert reservation_runtime.reservation_blockers() == ("teardown",)
+
+
+def test_reservation_optional_devices_none_is_idle(
+    reservation_runtime: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(reservation_runtime, "command_hotkey", None)
+        patch.setattr(reservation_runtime, "command_mouse", None)
+        assert reservation_runtime.reservation_blockers() == ()
