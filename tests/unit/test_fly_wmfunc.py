@@ -157,11 +157,14 @@ def test_no_atom(connection: Mock) -> None:
 
 @pytest.mark.parametrize("failure", ["dead", "foreign", "wrong-exe"])
 def test_process_identity(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
-    monkeypatch.setattr(os, "open", Mock(return_value=42))
+    # Keep fake proc descriptors away from pytest's own file inspection.
+    process_os = SimpleNamespace(**vars(os))
+    monkeypatch.setattr(helper, "os", process_os)
+    monkeypatch.setattr(process_os, "open", Mock(return_value=42))
     close = Mock()
-    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(process_os, "close", close)
     monkeypatch.setattr(
-        os,
+        process_os,
         "fstat",
         Mock(
             return_value=SimpleNamespace(
@@ -172,19 +175,21 @@ def test_process_identity(monkeypatch: pytest.MonkeyPatch, failure: str) -> None
     read = Mock(return_value="/usr/bin/other" if failure == "wrong-exe" else "/usr/bin/fly-wm")
     if failure == "dead":
         read.side_effect = FileNotFoundError(errno.ENOENT, "private-process-path")
-    monkeypatch.setattr(os, "readlink", read)
+    monkeypatch.setattr(process_os, "readlink", read)
     with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
         helper._check_process(12345)
     close.assert_called_once_with(42)
 
 
 def test_process_identity_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "open", Mock(return_value=42))
-    monkeypatch.setattr(os, "close", Mock())
-    monkeypatch.setattr(os, "fstat", Mock(return_value=SimpleNamespace(st_uid=os.getuid())))
-    monkeypatch.setattr(os, "readlink", Mock(return_value="/usr/bin/fly-wm"))
+    process_os = SimpleNamespace(**vars(os))
+    monkeypatch.setattr(helper, "os", process_os)
+    monkeypatch.setattr(process_os, "open", Mock(return_value=42))
+    monkeypatch.setattr(process_os, "close", Mock())
+    monkeypatch.setattr(process_os, "fstat", Mock(return_value=SimpleNamespace(st_uid=os.getuid())))
+    monkeypatch.setattr(process_os, "readlink", Mock(return_value="/usr/bin/fly-wm"))
     helper._check_process(12345)
-    os.readlink.assert_called_once_with("exe", dir_fd=42)  # type: ignore[attr-defined]
+    process_os.readlink.assert_called_once_with("exe", dir_fd=42)
 
 
 @pytest.mark.parametrize("owner", [0, 987])
