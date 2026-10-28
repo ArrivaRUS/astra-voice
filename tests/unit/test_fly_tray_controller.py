@@ -181,6 +181,92 @@ def test_busy_wait_and_last_pending(setup: Any) -> None:
     assert len(runs) == 1
 
 
+@pytest.mark.parametrize("automatic", [True, False])
+def test_reserve_busy_warning_deadline_rate_and_success_reset(
+    setup: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    automatic: bool,
+) -> None:
+    now = [0.0]
+    ctl, host, backend, notices, runs = setup(automatic=automatic, clock=lambda: now[0])
+    # Exercise polling deterministically: no worker, event loop or real wait.
+    launches: list[Any] = []
+    monkeypatch.setattr(ctl, "_launch", launches.append)
+    calls: list[int] = []
+
+    def blockers() -> tuple[str, ...]:
+        assert threading.get_ident() == host.thread
+        calls.append(1)
+        return ("phase:processing", "preview_send")
+
+    monkeypatch.setattr(host, "reservation_blockers", blockers, raising=False)
+    host.busy = True
+    ctl.start()
+    ctl._timer.stop()
+    if not automatic:
+        now[0] = 100.0
+        ctl._poll()
+        assert not caplog.records and not calls
+        ctl.set_enabled(True)
+    start = now[0]
+    ctl._poll()
+    now[0] = start + 29.999
+    ctl._poll()
+    assert not caplog.records and not calls
+    now[0] = start + 30.0
+    ctl._poll()
+    expected = "fly_tray_controller stage=reserve code=busy blockers=phase:processing,preview_send"
+    assert [record.getMessage() for record in caplog.records] == [expected]
+    assert caplog.records[0].levelname == "WARNING"
+    now[0] += 240.0
+    ctl._poll()
+    assert len(caplog.records) == len(calls) == 1
+    now[0] += 60.0
+    ctl._poll()
+    assert [record.getMessage() for record in caplog.records] == [expected, expected]
+    assert len(calls) == 2
+    assert not backend.calls and not notices and not runs and not host.held
+
+    host.busy = False
+    ctl._poll()
+    assert host.held and len(launches) == 2
+    ctl._release()
+    host.busy = True
+    ctl.set_enabled(False)
+    ctl._poll()
+    now[0] += 29.999
+    ctl._poll()
+    assert len(caplog.records) == 2
+    now[0] = start + 360.0
+    ctl._poll()
+    assert [record.getMessage() for record in caplog.records] == [expected] * 3
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_reserve_busy_warning_missing_or_empty_diagnostics(
+    setup: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    available: bool,
+) -> None:
+    now = [0.0]
+    ctl, host, _, _, _ = setup(clock=lambda: now[0])
+    monkeypatch.setattr(ctl, "_launch", lambda request: None)
+    if available:
+        monkeypatch.setattr(host, "reservation_blockers", lambda: (), raising=False)
+    host.busy = True
+    ctl.start()
+    ctl._timer.stop()
+    ctl._poll()
+    now[0] = 30.0
+    ctl._poll()
+    assert [record.getMessage() for record in caplog.records] == [
+        "fly_tray_controller stage=reserve code=busy blockers="
+        + ("none" if available else "unknown")
+    ]
+
+
 def test_suppressed_auto_still_reads_and_explicit_works(setup: Any) -> None:
     ctl, host, backend, notices, runs = setup(automatic=False)
     ctl.start()

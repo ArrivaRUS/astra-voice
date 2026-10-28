@@ -33,6 +33,7 @@ class FlyTrayHost(Protocol):
     def session_kind(self) -> SessionKind: ...
 
     def reserve_fly_tray_restart(self) -> bool: ...
+    def reservation_blockers(self) -> tuple[str, ...]: ...
     def release_fly_tray_restart(self) -> None: ...
     def refresh_fly_tray_icon(self) -> None: ...
 
@@ -271,6 +272,8 @@ class FlyTrayController(QObject):
         self._reserved = False
         self._status: TrayPriorityStatus | None = None
         self._last_restart: float | None = None
+        self._reserve_busy_since: float | None = None
+        self._reserve_busy_warning_at: float | None = None
         self._timer = QTimer(self)
         self._timer.setInterval(poll_interval_ms)
         self._timer.timeout.connect(self._poll)
@@ -389,7 +392,10 @@ class FlyTrayController(QObject):
         if self._last_restart is not None and self._clock() - self._last_restart < 10.0:
             return
         if not self._host.reserve_fly_tray_restart():
+            self._warn_reservation_busy()
             return
+        self._reserve_busy_since = None
+        self._reserve_busy_warning_at = None
         self._reserved = True
         request, self._pending = self._pending, None
         try:
@@ -398,6 +404,25 @@ class FlyTrayController(QObject):
             self._release()
             self._fused = True
             self._notify("fail")
+
+    def _warn_reservation_busy(self) -> None:
+        now = self._clock()
+        if self._reserve_busy_since is None:
+            self._reserve_busy_since = now
+        if now - self._reserve_busy_since < 30.0:
+            return
+        if (
+            self._reserve_busy_warning_at is not None
+            and now - self._reserve_busy_warning_at < 300.0
+        ):
+            return
+        diagnostics = getattr(self._host, "reservation_blockers", None)
+        blockers = diagnostics() if diagnostics is not None else ("unknown",)
+        _LOG.warning(
+            "fly_tray_controller stage=reserve code=busy blockers=%s",
+            ",".join(blockers) or "none",
+        )
+        self._reserve_busy_warning_at = now
 
     def shutdown(self) -> None:
         if self._stopped:

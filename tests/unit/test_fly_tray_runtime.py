@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -28,6 +28,197 @@ from astra_voice.platform.mouse_button import MouseHoldState
 from astra_voice.platform.session import SessionKind
 
 pytestmark = pytest.mark.unit
+
+
+# Attribute paths keep every cause independently observable, including identity
+# checks that intentionally differ from ordinary truthiness.
+RESERVATION_CASES = [
+    ("_closed", True, "closed"),
+    ("_appimage_removal_reserved", True, "appimage_removal"),
+    ("_fly_tray_reserved", True, "fly_tray_reserved"),
+    ("supervisor.restarting", True, "supervisor_restarting"),
+    ("orchestrator.phase", DictationPhase.PROCESSING, "phase:processing"),
+    ("_input_owner", "keyboard-capture", "input_owner:keyboard-capture"),
+    ("_capture_watchdog", 0, "capture_watchdog"),
+    ("_mouse_capture_token", 0, "mouse_capture"),
+    ("_preview_send", 0, "preview_send"),
+    ("_pending_test", 0, "pending_test"),
+    ("orchestrator.test_active", True, "test_active"),
+    ("orchestrator.level_active", True, "level_active"),
+    ("orchestrator.cleanup_pending", True, "cleanup_pending"),
+    ("_pending_switch", 0, "pending_switch"),
+    ("_switch_in_progress", True, "switch_active"),
+    ("_loading_model", True, "loading_model"),
+    ("_selfcheck", "retrying", "selfcheck:retrying"),
+    ("hotkey.has_pending_press", None, "hotkey_pending_press"),
+    ("hotkey.fsm.state", HotkeyState.PROCESSING, "hotkey_fsm:processing"),
+    ("command_hotkey.has_pending_press", None, "command_hotkey_pending_press"),
+    ("command_hotkey.fsm.state", HotkeyState.RECORDING, "command_hotkey_fsm:recording"),
+    ("command_mouse.state", MouseHoldState.PENDING, "command_mouse:pending"),
+    ("hotkey.physical_key_down", True, "physical_key_down"),
+    ("command_hotkey.physical_key_down", True, "command_physical_key_down"),
+]
+
+
+@pytest.fixture
+def reservation_runtime(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    runtime = rig.runtime
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runtime,
+            "orchestrator",
+            SimpleNamespace(
+                phase=DictationPhase.IDLE,
+                test_active=False,
+                level_active=False,
+                cleanup_pending=False,
+            ),
+        )
+        for name in ("hotkey", "command_hotkey"):
+            patch.setattr(
+                runtime,
+                name,
+                SimpleNamespace(
+                    has_pending_press=False,
+                    physical_key_down=False,
+                    fsm=SimpleNamespace(state=HotkeyState.IDLE),
+                ),
+            )
+        patch.setattr(runtime, "command_mouse", SimpleNamespace(state=MouseHoldState.IDLE))
+        saved = []
+        for path, _, _ in RESERVATION_CASES:
+            target = runtime
+            for part in path.split(".")[:-1]:
+                target = getattr(target, part)
+            saved.append((path, getattr(target, path.split(".")[-1])))
+        try:
+            yield runtime
+        finally:
+            for path, value in saved:
+                set_reservation_value(runtime, path, value)
+
+
+def set_reservation_value(runtime: Any, path: str, value: Any) -> None:
+    parts = path.split(".")
+    for part in parts[:-1]:
+        runtime = getattr(runtime, part)
+    setattr(runtime, parts[-1], value)
+
+
+def test_reservation_blockers_idle(reservation_runtime: Any) -> None:
+    assert reservation_runtime.reservation_blockers() == ()
+    assert reservation_runtime._work_pending() is False
+    assert reservation_runtime._reservation_pending() is False
+
+
+@pytest.mark.parametrize(("path", "value", "blocker"), RESERVATION_CASES)
+def test_reservation_blockers_each_existing_predicate(
+    reservation_runtime: Any, path: str, value: Any, blocker: str
+) -> None:
+    set_reservation_value(reservation_runtime, path, value)
+    assert reservation_runtime.reservation_blockers() == (blocker,)
+    assert reservation_runtime._reservation_pending() is True
+    assert reservation_runtime._work_pending() is ("physical_key_down" not in blocker)
+
+
+def test_reservation_blockers_all_causes_keep_formula_order(reservation_runtime: Any) -> None:
+    for path, value, _ in RESERVATION_CASES:
+        set_reservation_value(reservation_runtime, path, value)
+    assert reservation_runtime.reservation_blockers() == tuple(
+        blocker for _, _, blocker in RESERVATION_CASES
+    )
+
+
+@pytest.mark.parametrize("prefix", ["hotkey", "command_hotkey"])
+@pytest.mark.parametrize("value", [False, True, None, 0, 1, Mock()])
+def test_reservation_blockers_preserve_identity_checks(
+    reservation_runtime: Any, prefix: str, value: Any
+) -> None:
+    set_reservation_value(reservation_runtime, prefix + ".has_pending_press", value)
+    label = "hotkey_pending_press" if prefix == "hotkey" else "command_hotkey_pending_press"
+    expected = () if value is False else (label,)
+    assert reservation_runtime.reservation_blockers() == expected
+    assert reservation_runtime._work_pending() is (value is not False)
+    set_reservation_value(reservation_runtime, prefix + ".has_pending_press", False)
+    set_reservation_value(reservation_runtime, prefix + ".physical_key_down", value)
+    label = "physical_key_down" if prefix == "hotkey" else "command_physical_key_down"
+    assert reservation_runtime.reservation_blockers() == ((label,) if value is True else ())
+    assert reservation_runtime._work_pending() is False
+    assert reservation_runtime._reservation_pending() is (value is True)
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "text",
+        "keyboard",
+        "mouse",
+        "mouse-capture",
+        "keyboard-capture",
+        "appimage-removal",
+        "fly-tray",
+    ],
+)
+def test_reservation_blockers_allow_only_fixed_input_owners(
+    reservation_runtime: Any, owner: str
+) -> None:
+    reservation_runtime._input_owner = owner
+    assert reservation_runtime.reservation_blockers() == ("input_owner:" + owner,)
+
+
+@pytest.mark.parametrize(
+    ("path", "label"),
+    [
+        ("orchestrator.phase", "phase"),
+        ("_input_owner", "input_owner"),
+        ("_selfcheck", "selfcheck"),
+        ("hotkey.fsm.state", "hotkey_fsm"),
+        ("command_hotkey.fsm.state", "command_hotkey_fsm"),
+        ("command_mouse.state", "command_mouse"),
+    ],
+)
+@pytest.mark.parametrize("value", ["PRIVATE-PATH-AND-TEXT", Mock(value="PRIVATE-VALUE"), 0])
+def test_reservation_blockers_never_format_unknown_values(
+    reservation_runtime: Any, path: str, label: str, value: Any
+) -> None:
+    set_reservation_value(reservation_runtime, path, value)
+    assert reservation_runtime.reservation_blockers() == (label + ":unknown",)
+
+
+@pytest.mark.parametrize("phase", list(DictationPhase)[1:])
+def test_reservation_blockers_phase_enum_values(
+    reservation_runtime: Any, phase: DictationPhase
+) -> None:
+    reservation_runtime.orchestrator.phase = phase
+    assert reservation_runtime.reservation_blockers() == ("phase:" + phase.value,)
+
+
+@pytest.mark.parametrize("state", list(HotkeyState)[1:])
+def test_reservation_blockers_hotkey_enum_values(
+    reservation_runtime: Any, state: HotkeyState
+) -> None:
+    reservation_runtime.hotkey.fsm.state = state
+    reservation_runtime.command_hotkey.fsm.state = state
+    assert reservation_runtime.reservation_blockers() == (
+        "hotkey_fsm:" + state.value,
+        "command_hotkey_fsm:" + state.value,
+    )
+
+
+@pytest.mark.parametrize("state", list(MouseHoldState)[1:])
+def test_reservation_blockers_mouse_enum_values(
+    reservation_runtime: Any, state: MouseHoldState
+) -> None:
+    reservation_runtime.command_mouse.state = state
+    assert reservation_runtime.reservation_blockers() == ("command_mouse:" + state.value,)
+
+
+@pytest.mark.parametrize("state", ["idle", "ok", "failed", "running", "retrying"])
+def test_reservation_blockers_selfcheck_values(reservation_runtime: Any, state: str) -> None:
+    reservation_runtime._selfcheck = state
+    assert reservation_runtime.reservation_blockers() == (
+        ("selfcheck:" + state,) if state in ("running", "retrying") else ()
+    )
 
 
 @pytest.fixture

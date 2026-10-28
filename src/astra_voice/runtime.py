@@ -423,46 +423,98 @@ class DictationRuntime(QObject):
 
     def _work_pending(self) -> bool:
         """Идёт или отложена любая работа с вводом, моделью или вставкой."""
-        return bool(
-            self._closed
-            or self._appimage_removal_reserved
-            or self._fly_tray_reserved
-            or self.supervisor.restarting
-            or self.phase is not DictationPhase.IDLE
-            or self._input_owner is not None
-            or self._capture_watchdog is not None
-            or self._mouse_capture_token is not None
-            or self._preview_send is not None
-            or self._pending_test is not None
-            or self.orchestrator.test_active
-            or self.orchestrator.level_active
-            or self.orchestrator.cleanup_pending
-            or self._pending_switch is not None
-            or self._switch_active()
-            or self._loading_model
-            or self._selfcheck not in ("idle", "ok", "failed")
-            or self.hotkey.has_pending_press is not False
-            or self.hotkey.fsm.state is not HotkeyState.IDLE
-            or (
-                self.command_hotkey is not None
-                and (
-                    self.command_hotkey.has_pending_press is not False
-                    or self.command_hotkey.fsm.state is not HotkeyState.IDLE
-                )
-            )
-            or (
-                self.command_mouse is not None
-                and self.command_mouse.state is not MouseHoldState.IDLE
-            )
+        return any(
+            blocker not in ("physical_key_down", "command_physical_key_down")
+            for blocker in self.reservation_blockers()
         )
 
     def _reservation_pending(self) -> bool:
         """Before disruptive work, also wait for cancelled gestures to be released."""
-        return bool(
-            self._work_pending()
-            or self.hotkey.physical_key_down is True
-            or (self.command_hotkey is not None and self.command_hotkey.physical_key_down is True)
-        )
+        return bool(self.reservation_blockers())
+
+    def reservation_blockers(self) -> tuple[str, ...]:
+        """GUI-thread snapshot of fixed diagnostic codes, without input or paths."""
+        blockers: list[str] = []
+        if self._closed:
+            blockers.append("closed")
+        if self._appimage_removal_reserved:
+            blockers.append("appimage_removal")
+        if self._fly_tray_reserved:
+            blockers.append("fly_tray_reserved")
+        if self.supervisor.restarting:
+            blockers.append("supervisor_restarting")
+        phase = self.phase
+        if phase is not DictationPhase.IDLE:
+            name = phase.value if type(phase) is DictationPhase else "unknown"
+            blockers.append("phase:" + name)
+        owner = self._input_owner
+        if owner is not None:
+            name = (
+                owner
+                if type(owner) is str
+                and owner
+                in (
+                    "text",
+                    "keyboard",
+                    "mouse",
+                    "mouse-capture",
+                    "keyboard-capture",
+                    "appimage-removal",
+                    "fly-tray",
+                )
+                else "unknown"
+            )
+            blockers.append("input_owner:" + name)
+        if self._capture_watchdog is not None:
+            blockers.append("capture_watchdog")
+        if self._mouse_capture_token is not None:
+            blockers.append("mouse_capture")
+        if self._preview_send is not None:
+            blockers.append("preview_send")
+        if self._pending_test is not None:
+            blockers.append("pending_test")
+        if self.orchestrator.test_active:
+            blockers.append("test_active")
+        if self.orchestrator.level_active:
+            blockers.append("level_active")
+        if self.orchestrator.cleanup_pending:
+            blockers.append("cleanup_pending")
+        if self._pending_switch is not None:
+            blockers.append("pending_switch")
+        if self._switch_active():
+            blockers.append("switch_active")
+        if self._loading_model:
+            blockers.append("loading_model")
+        if self._selfcheck not in ("idle", "ok", "failed"):
+            name = (
+                self._selfcheck
+                if type(self._selfcheck) is str and self._selfcheck in ("running", "retrying")
+                else "unknown"
+            )
+            blockers.append("selfcheck:" + name)
+        if self.hotkey.has_pending_press is not False:
+            blockers.append("hotkey_pending_press")
+        hotkey_state = self.hotkey.fsm.state
+        if hotkey_state is not HotkeyState.IDLE:
+            name = hotkey_state.value if type(hotkey_state) is HotkeyState else "unknown"
+            blockers.append("hotkey_fsm:" + name)
+        if self.command_hotkey is not None:
+            if self.command_hotkey.has_pending_press is not False:
+                blockers.append("command_hotkey_pending_press")
+            command_state = self.command_hotkey.fsm.state
+            if command_state is not HotkeyState.IDLE:
+                name = command_state.value if type(command_state) is HotkeyState else "unknown"
+                blockers.append("command_hotkey_fsm:" + name)
+        if self.command_mouse is not None:
+            mouse_state = self.command_mouse.state
+            if mouse_state is not MouseHoldState.IDLE:
+                name = mouse_state.value if type(mouse_state) is MouseHoldState else "unknown"
+                blockers.append("command_mouse:" + name)
+        if self.hotkey.physical_key_down is True:
+            blockers.append("physical_key_down")
+        if self.command_hotkey is not None and self.command_hotkey.physical_key_down is True:
+            blockers.append("command_physical_key_down")
+        return tuple(blockers)
 
     def reserve_appimage_removal(self) -> bool:
         """Atomically reserve an idle runtime on its GUI thread; never cancel work."""
