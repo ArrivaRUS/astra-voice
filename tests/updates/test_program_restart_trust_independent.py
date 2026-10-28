@@ -64,6 +64,7 @@ class SignedRestart:
             f"'ipc_absent':not os.path.exists({str(self.ipc_path)!r}),"
             "'session':os.getsid(0)==os.getpid(),"
             "'bundle_vars':[n for n in os.environ if n.startswith(('ASTRA_VOICE_', 'APPIMAGE'))],"
+            "'after_update':os.environ.get('ASTRA_VOICE_AFTER_UPDATE'),"
             "'pythonhome':os.environ.get('PYTHONHOME')}\n"
             f"open({str(self.output)!r},'w').write(json.dumps(report))\n"
         ).encode()

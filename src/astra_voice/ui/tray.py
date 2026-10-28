@@ -377,6 +377,7 @@ class Tray(QObject):
         self._provider = provider
         self._hotkey = hotkey
         factory = tray_factory if tray_factory is not None else lambda: QSystemTrayIcon()
+        self._tray_factory = factory
         self._tray = factory()
         # Qt выбирает бэкенд в конструкторе значка; stop/start его не меняют.
         self._sni_backend_proven = False
@@ -485,6 +486,28 @@ class Tray(QObject):
             self._tray.setIcon(self._display_icon())
         else:
             self._invalidate_registration()
+
+    def refresh_after_panel_restart(self) -> None:
+        """Recreate Qt's tray backend after an observed Fly manager replacement."""
+        if self._is_kde or not self._running:
+            return
+        old = self._tray
+        self.stop()
+        fresh = self._tray_factory()
+        if fresh is not old:
+            old.activated.disconnect(self._on_activated)
+            old.setContextMenu(None)
+            old.deleteLater()
+        self._tray = fresh
+        fresh.setParent(self)
+        fresh.activated.connect(self._on_activated)
+        fresh.setContextMenu(self._menu)
+        self._sni_backend_proven = False
+        self._provider.refresh()
+        if self._has_icon():
+            fresh.setIcon(self._display_icon())
+        self._update_tooltip()
+        self.start()
 
     @staticmethod
     def _invoke(callback: Callable[[], None] | None) -> None:

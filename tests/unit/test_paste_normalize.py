@@ -142,7 +142,14 @@ def isolated_session_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[int]]:
     """Весь ввод/вывод подменён до вызова цепочки, включая определение сеанса."""
     cb = FakeClipboard()
-    x = Mock()
+    # Context patches must restore concrete attributes, not delete dynamic Mock children.
+    x = Mock(
+        open=Mock(),
+        close=Mock(),
+        send_combo=Mock(),
+        grab_keyboard=Mock(),
+        ungrab_keyboard=Mock(),
+    )
     x.wm_class.return_value = ("kate", "kate")
     x.active_window.return_value = 42
     x.send_combo.return_value = True

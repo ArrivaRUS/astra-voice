@@ -58,6 +58,7 @@ class Settings:
     command_mouse_button: int = 2
     sound_cues_enabled: bool = False
     pill_enabled: bool = True
+    fly_tray_icon: bool = True
     model_unload_minutes: int = 0
     autostart: bool = True  # PRD, экран 5 онбординга (решение заказчика)
     model_id: str | None = None

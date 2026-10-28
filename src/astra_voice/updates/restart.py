@@ -297,6 +297,8 @@ class RestartPreparer:
             if _identity(pending.download.path) != pending.download.identity:
                 raise RestartError("file-changed")
             environment = dict(pending.environment)
+            # main consumes this single-launch origin marker; it is never persisted.
+            environment["ASTRA_VOICE_AFTER_UPDATE"] = "1"
             _private_directory(Path(environment["TMPDIR"]))
             self._record(pending, "launch_requested")
             subprocess.Popen(  # noqa: S603 — signed local image, fixed runtime argument

@@ -114,6 +114,11 @@ def _copy_shutdown_resources(
     processes: list[Any] = []
     threads = [getattr(downloads, "_model_thread", None), getattr(update_checker, "_thread", None)]
     if runtime is not None:
+        fly_tray = getattr(runtime, "fly_tray", None)
+        if fly_tray is not None:
+            workers = getattr(fly_tray, "worker_threads", ())
+            if isinstance(workers, (tuple, list)):
+                threads.extend(workers)
         cues = getattr(runtime, "recording_cues", None)
         if cues is not None:
             threads.append(cues.thread)
@@ -1588,8 +1593,13 @@ def _unregister() -> int:
     return 0
 
 
+def _fly_tray_automatic_allowed(kind: SessionKind, *, policy_disabled: bool = False) -> bool:
+    return kind is SessionKind.FLY and not policy_disabled
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    os.environ.pop("ASTRA_VOICE_AFTER_UPDATE", "")
     if args.uninstall:
         return _uninstall()
     if args.unregister:
@@ -1833,6 +1843,14 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         capture = HotkeyCapture(capture_host)
+        if runtime_ready and runtime is not None:
+            runtime.start_fly_tray(
+                automatic=_fly_tray_automatic_allowed(
+                    session_kind,
+                    policy_disabled="fly_tray_icon" in locked_settings
+                    and not settings.fly_tray_icon,
+                )
+            )
         settings_bridge = SettingsBridge(
             stored,
             mirror=settings,
@@ -1842,6 +1860,7 @@ def main(argv: list[str] | None = None) -> int:
             locked=locked_settings,
             autostart=autostart,
             tray=runtime.tray if runtime_ready and runtime is not None else None,
+            fly_tray=runtime.fly_tray if runtime_ready and runtime is not None else None,
         )
         if runtime_ready and runtime is not None:
 
@@ -2111,6 +2130,16 @@ def main(argv: list[str] | None = None) -> int:
                 resources_stopped = False
                 log.warning("Не удалось подтвердить остановку обновлений программы")
             threads.extend(program_threads)
+        if runtime is not None:
+            fly_controller = getattr(runtime, "fly_tray", None)
+            fly_threads = getattr(fly_controller, "worker_threads", ())
+            if isinstance(fly_threads, (tuple, list)):
+                for thread in fly_threads:
+                    thread.join(6.0)
+                    if thread.is_alive():
+                        resources_stopped = False
+                        log.warning("fly_tray stage=shutdown code=busy errno=0")
+                threads.extend(fly_threads)
         if copy_key is not None or program_updates is not None:
             try:
                 # ungrab/close брокера может впервые запустить восстановление меню.

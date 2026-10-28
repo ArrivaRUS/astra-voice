@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from astra_voice.core import paths
 from astra_voice.core.theme import ThemeSource, _FileThemeSource
+from astra_voice.platform.fly_themerc import read_themerc
 from astra_voice.platform.session import SessionKind
 
 if TYPE_CHECKING:
@@ -81,10 +82,10 @@ def fly_theme_files(home: Path | None = None) -> tuple[Path, ...]:
 
 
 def _theme_variables(path: Path) -> dict[str, str] | None:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    data = read_themerc(path)
+    if data is None:
         return None
+    text = data.decode("utf-8", errors="replace")
     values: dict[str, str] = {}
     for line in text.splitlines():
         if line.lstrip().startswith((";", "#", "[")):

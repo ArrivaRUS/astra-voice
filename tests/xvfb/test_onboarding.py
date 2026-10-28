@@ -812,6 +812,27 @@ class FakeSettings(QObject):
     commandMouseStateChanged = pyqtSignal()
     commandMouseCaptureChanged = pyqtSignal()
 
+    @pyqtProperty(bool, notify=changed)
+    def flyTrayVisible(self) -> bool:  # noqa: N802
+        return False
+
+    @pyqtProperty(bool, notify=changed)
+    def flyTrayAvailable(self) -> bool:  # noqa: N802
+        return False
+
+    @pyqtProperty(str, notify=changed)
+    def flyTrayReason(self) -> str:  # noqa: N802
+        return ""
+
+    def _get_flyTrayIcon(self) -> bool:
+        return getattr(self, "_flyTrayIcon", True)
+
+    def _set_flyTrayIcon(self, value: bool) -> None:
+        self._flyTrayIcon = value
+        self.changed.emit()
+
+    flyTrayIcon = pyqtProperty(bool, _get_flyTrayIcon, _set_flyTrayIcon, notify=changed)
+
     def _get_commandMouseEnabled(self) -> bool:
         return getattr(self, "_commandMouseEnabled", False)
 
@@ -2559,6 +2580,24 @@ def render_case(
             extra_wait_ms=extra_wait_ms,
         )
     return render_onboarding(app, fake, dark, extra_wait_ms=extra_wait_ms)
+
+
+def test_settings_fly_tray_fake_matches_bridge_contract(onboarding_app: Any) -> None:
+    from astra_voice.core.settings import Settings
+    from astra_voice.ui.bridges import SettingsBridge
+
+    actual = SettingsBridge(Settings(), save=lambda _settings: None, device_provider=lambda: [])
+    fake = FakeSettings()
+    for name in ("flyTrayVisible", "flyTrayAvailable", "flyTrayReason", "flyTrayIcon"):
+        actual_index = actual.metaObject().indexOfProperty(name)
+        fake_index = fake.metaObject().indexOfProperty(name)
+        assert actual_index >= 0 and fake_index >= 0, name
+        expected = actual.metaObject().property(actual_index)
+        provided = fake.metaObject().property(fake_index)
+        assert provided.typeName() == expected.typeName(), name
+        assert provided.isWritable() == expected.isWritable(), name
+        assert provided.hasNotifySignal() == expected.hasNotifySignal(), name
+        assert fake.property(name) == actual.property(name), name
 
 
 def assert_no_messages(messages: list[str], case: str) -> None:
