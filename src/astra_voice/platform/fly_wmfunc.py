@@ -81,8 +81,17 @@ def _connection(stage: str) -> Iterator[Any]:
     except FlyWmError:
         raise
     except Exception as exc:  # Xlib has several exception classes, sometimes no dependency.
+        code = "display_unavailable"
+        if conn is not None and stage == "session":
+            try:
+                from Xlib.error import BadAtom, BadWindow
+            except ImportError:  # Optional Xlib; connection failures keep their existing code.
+                pass
+            else:
+                if isinstance(exc, (BadAtom, BadWindow)):
+                    code = "wm_unavailable"
         error = exc if isinstance(exc, OSError) else None
-        raise _failure(stage, "display_unavailable", error) from None
+        raise _failure(stage, code, error) from None
     finally:
         if conn is not None:
             try:
@@ -110,23 +119,31 @@ def _check_process(pid: int) -> None:
 
 
 def _check_session_local() -> None:
-    """Require Fly detection plus a live, same-user WM PID on this DISPLAY root."""
+    """Require Fly plus a legacy PID or a live, self-linked EWMH Fly window.
+
+    Any PID used for verification must identify a live, same-user fly-wm. Fly versions
+    with no PID properties can instead be identified by the EWMH window alone.
+    """
     if session.detect() is not session.SessionKind.FLY:
         raise _failure("session", "session_not_fly")
     with _connection("session") as conn:
-        atom = conn.intern_atom("_FLY_WM_PID", only_if_exists=True)
-        prop = conn.screen().root.get_full_property(atom, _XA_CARDINAL) if atom else None
-        if (
-            prop is None
-            or prop.format != 32
-            or prop.property_type != _XA_CARDINAL
-            or len(prop.value) != 1
-            or not isinstance(prop.value[0], int)
-            or isinstance(prop.value[0], bool)
-            or prop.value[0] <= 0
-        ):
-            raise _failure("session", "wm_unavailable")
-        _check_process(prop.value[0])
+        root = conn.screen().root
+        try:
+            prop = session._x11_property(conn, root, "_FLY_WM_PID")
+            if prop is not None:
+                # A malformed legacy PID must not fall through to the weaker EWMH path.
+                pid = session._x11_uint32(prop, _XA_CARDINAL)
+            else:
+                window, name = session._ewmh_wm(conn, root)
+                if name != "fly-wm":
+                    raise ValueError("not Fly WM")
+                prop = session._x11_property(conn, window, "_NET_WM_PID")
+                if prop is None:
+                    return
+                pid = session._x11_uint32(prop, _XA_CARDINAL)
+        except ValueError:
+            raise _failure("session", "wm_unavailable") from None
+        _check_process(pid)
 
 
 def _tray_owner_local() -> int:

@@ -479,3 +479,202 @@ def test_probe_paths_missing_or_relative_fail(
     monkeypatch.setattr(importlib.util, "find_spec", Mock(return_value=spec))
     with pytest.raises(helper.FlyWmError, match="display_unavailable"):
         _REAL_PROBE_PATHS()
+
+
+@pytest.fixture
+def ewmh_connection(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    atoms = {
+        "_FLY_WM_PID": 100,
+        "_NET_SUPPORTING_WM_CHECK": 101,
+        "_NET_WM_NAME": 102,
+        "UTF8_STRING": 103,
+        "WM_NAME": 39,
+        "_NET_WM_PID": 104,
+    }
+    root_props = {101: SimpleNamespace(property_type=33, format=32, value=[500])}
+    wm_props = {
+        101: SimpleNamespace(property_type=33, format=32, value=[500]),
+        102: SimpleNamespace(property_type=103, format=8, value=b"fly-wm"),
+        104: SimpleNamespace(property_type=6, format=32, value=[12345]),
+    }
+    root = Mock()
+    root.get_full_property.side_effect = lambda atom, kind: root_props.get(atom)
+    window = Mock()
+    window.get_full_property.side_effect = lambda atom, kind: wm_props.get(atom)
+    conn = Mock()
+    conn.intern_atom.side_effect = lambda name, only_if_exists=True: atoms.get(name, 0)
+    conn.screen.return_value = SimpleNamespace(root=root)
+    conn.create_resource_object.return_value = window
+    monkeypatch.setattr(helper, "_connect", Mock(return_value=conn))
+    return SimpleNamespace(conn=conn, root=root_props, wm=wm_props, window=window)
+
+
+def test_ewmh_pid_without_legacy(ewmh_connection: SimpleNamespace, process: None) -> None:
+    helper._check_session_local()
+    helper._check_process.assert_called_once_with(12345)  # type: ignore[attr-defined]
+    ewmh_connection.conn.create_resource_object.assert_called_once_with("window", 500)
+    ewmh_connection.conn.close.assert_called_once()
+
+
+def test_ewmh_without_pid(ewmh_connection: SimpleNamespace, process: None) -> None:
+    del ewmh_connection.wm[104]
+    helper._check_session_local()
+    helper._check_process.assert_not_called()  # type: ignore[attr-defined]
+    ewmh_connection.conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize("source", ["wm", "root"])
+def test_ewmh_legacy_name(ewmh_connection: SimpleNamespace, process: None, source: str) -> None:
+    del ewmh_connection.wm[102]
+    getattr(ewmh_connection, source)[39] = SimpleNamespace(
+        property_type=31, format=8, value=b"fly-wm"
+    )
+    helper._check_session_local()
+    ewmh_connection.conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "target,atom,prop",
+    [
+        ("root", 101, None),
+        ("root", 101, SimpleNamespace(property_type=6, format=32, value=[500])),
+        ("root", 101, SimpleNamespace(property_type=33, format=8, value=[500])),
+        ("root", 101, SimpleNamespace(property_type=33, format=32, value=[500, 501])),
+        ("root", 101, SimpleNamespace(property_type=33, format=32, value=[True])),
+        ("root", 101, SimpleNamespace(property_type=33, format=32, value=[0])),
+        ("root", 101, SimpleNamespace(property_type=33, format=32, value=[-1])),
+        ("root", 101, SimpleNamespace(property_type=33, format=32, value=[2**32])),
+        ("wm", 101, None),
+        ("wm", 101, SimpleNamespace(property_type=33, format=32, value=[501])),
+        ("wm", 101, SimpleNamespace(property_type=6, format=32, value=[500])),
+        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"KWin")),
+        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"fly-wm\0")),
+        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"Fly-wm")),
+        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"")),
+        ("wm", 102, SimpleNamespace(property_type=31, format=8, value=b"fly-wm")),
+        ("wm", 102, SimpleNamespace(property_type=103, format=32, value=b"fly-wm")),
+        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=[102, 108, 121])),
+        ("wm", 104, SimpleNamespace(property_type=31, format=32, value=[12345])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=8, value=[12345])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=32, value=[])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=32, value=[1, 2])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=32, value=[True])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=32, value=[0])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=32, value=[-1])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=32, value=[2**32])),
+        ("wm", 104, SimpleNamespace(property_type=6, format=32, value=["12345"])),
+        ("root", 100, SimpleNamespace(property_type=31, format=32, value=[12345])),
+    ],
+)
+def test_ewmh_rejects_malformed_or_wrong_identity(
+    ewmh_connection: SimpleNamespace, process: None, target: str, atom: int, prop: object
+) -> None:
+    getattr(ewmh_connection, target)[atom] = prop
+    # A root name must never override a wrong or malformed check-window name.
+    ewmh_connection.root[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
+    with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
+        helper._check_session_local()
+    helper._check_process.assert_not_called()  # type: ignore[attr-defined]
+    ewmh_connection.conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize("value", [b"KWin", b"", b"fly-wm\0"])
+def test_ewmh_root_cannot_override_wm_name(
+    ewmh_connection: SimpleNamespace, process: None, value: bytes
+) -> None:
+    del ewmh_connection.wm[102]
+    ewmh_connection.wm[39] = SimpleNamespace(property_type=31, format=8, value=value)
+    ewmh_connection.root[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
+    with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
+        helper._check_session_local()
+    helper._check_process.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_ewmh_requires_name(ewmh_connection: SimpleNamespace, process: None) -> None:
+    del ewmh_connection.wm[102]
+    with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
+        helper._check_session_local()
+
+
+def test_ewmh_foreign_pid(
+    ewmh_connection: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_os = SimpleNamespace(**vars(os))
+    monkeypatch.setattr(helper, "os", process_os)
+    process_os.open = Mock(return_value=42)
+    process_os.close = Mock()
+    process_os.fstat = Mock(return_value=SimpleNamespace(st_uid=os.getuid() + 1))
+    process_os.readlink = Mock(side_effect=AssertionError("foreign executable must not be read"))
+    with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
+        helper._check_session_local()
+    process_os.open.assert_called_once()
+    process_os.close.assert_called_once_with(42)
+    ewmh_connection.conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize("error_name", ["BadWindow", "BadAtom"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_stale_x11_property_is_wm_unavailable(
+    ewmh_connection: SimpleNamespace,
+    caplog: pytest.LogCaptureFixture,
+    error_name: str,
+    legacy: bool,
+) -> None:
+    errors = pytest.importorskip("Xlib.error")
+    error = getattr(errors, error_name)(
+        SimpleNamespace(get_resource_class=lambda name: None), bytes(32)
+    )
+    if legacy:
+        ewmh_connection.conn.screen().root.get_full_property.side_effect = error
+    else:
+        ewmh_connection.window.get_full_property.side_effect = error
+    with caplog.at_level(logging.DEBUG), pytest.raises(helper.FlyWmError) as exc:
+        helper._check_session_local()
+    assert exc.value.code == "wm_unavailable"
+    assert exc.value.__cause__ is None
+    assert "resource_id" not in caplog.text + str(exc.value)
+    assert all(record.exc_info is None for record in caplog.records)
+    ewmh_connection.conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize("legacy_type", [31, 6])
+def test_ewmh_modern_name_takes_precedence(
+    ewmh_connection: SimpleNamespace, process: None, legacy_type: int
+) -> None:
+    ewmh_connection.wm[39] = SimpleNamespace(property_type=legacy_type, format=8, value=b"KWin")
+    helper._check_session_local()
+    helper._check_process.assert_called_once_with(12345)  # type: ignore[attr-defined]
+    ewmh_connection.conn.close.assert_called_once()
+
+
+def test_ewmh_wrong_modern_name_cannot_fall_back(
+    ewmh_connection: SimpleNamespace, process: None
+) -> None:
+    ewmh_connection.wm[102].value = b"KWin"
+    ewmh_connection.wm[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
+    with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
+        helper._check_session_local()
+    helper._check_process.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_legacy_pid_takes_precedence(ewmh_connection: SimpleNamespace, process: None) -> None:
+    ewmh_connection.root[100] = SimpleNamespace(property_type=6, format=32, value=[6789])
+    ewmh_connection.wm[102].value = b"KWin"
+    helper._check_session_local()
+    helper._check_process.assert_called_once_with(6789)  # type: ignore[attr-defined]
+    ewmh_connection.conn.create_resource_object.assert_not_called()
+    ewmh_connection.conn.screen().root.get_full_property.assert_called_once_with(100, 0)
+
+
+def test_wrong_type_is_not_requested_as_absent(
+    ewmh_connection: SimpleNamespace, process: None
+) -> None:
+    # XGetProperty(type=CARDINAL) would obscure the wrong-type value; request Any.
+    def property_value(atom: int, kind: int) -> SimpleNamespace | None:
+        assert kind == 0
+        return SimpleNamespace(property_type=31, format=32, value=[12345])
+
+    ewmh_connection.conn.screen().root.get_full_property.side_effect = property_value
+    with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
+        helper._check_session_local()
+    ewmh_connection.conn.create_resource_object.assert_not_called()
