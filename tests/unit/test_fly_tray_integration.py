@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pwd
 import socket
@@ -61,8 +62,14 @@ def test_ib74_general_keyboard_space_and_tab() -> None:
 )
 @pytest.mark.parametrize("present", [False, True], ids=["absent", "present"])
 def test_ib73_main_wires_all_launch_origins_to_one_idle_action(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, setup: Any, origin: str, present: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    setup: Any,
+    origin: str,
+    present: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger=app_module.__name__)
     rig = AppRig(monkeypatch, tmp_path)
     rig.runtime.fly_tray = None
     rig.settings.extra["onboarding_done"] = origin != "wizard"
@@ -97,6 +104,9 @@ def test_ib73_main_wires_all_launch_origins_to_one_idle_action(
     automatic = origin not in {"policy", "kde"}
     rig.runtime.start_fly_tray.assert_called_once_with(automatic=automatic)
     assert "ASTRA_VOICE_AFTER_UPDATE" not in os.environ
+    assert sum(record.getMessage() == "startup origin=update" for record in caplog.records) == int(
+        origin == "update"
+    )
     ctl, host, backend, notices, runs = controllers[0]
     if kind is SessionKind.KDE:
         assert not ctl.visible and not backend.threads
@@ -114,6 +124,20 @@ def test_ib73_main_wires_all_launch_origins_to_one_idle_action(
         QTest.qWait(2)
     assert len(runs) == int(automatic and not present)
     assert len(backend.calls) == int(automatic and not present)
+
+
+def test_startup_noncanonical_update_marker_is_consumed_without_origin_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rig = AppRig(monkeypatch, tmp_path)
+    rig.runtime.fly_tray = None
+    monkeypatch.setenv("ASTRA_VOICE_AFTER_UPDATE", "true")
+    with caplog.at_level(logging.INFO, logger=app_module.__name__):
+        assert app_module.main([]) == 7
+    assert "ASTRA_VOICE_AFTER_UPDATE" not in os.environ
+    assert not any(record.getMessage() == "startup origin=update" for record in caplog.records)
 
 
 def test_ib73_unknown_keeps_real_theme_and_provenance(
