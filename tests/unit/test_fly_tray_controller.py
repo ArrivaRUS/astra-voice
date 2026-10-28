@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import pwd
+import queue
 import threading
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from PyQt5.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
@@ -31,6 +35,11 @@ class Backend:
         self.calls: list[str] = []
         self.threads: list[int] = []
         self.fail = False
+
+    @contextmanager
+    def hold_lock(self, *, create: bool = True) -> Iterator[bool]:
+        self.threads.append(threading.get_ident())
+        yield True
 
     def status(self) -> TrayPriorityStatus:
         self.threads.append(threading.get_ident())
@@ -1192,3 +1201,353 @@ def test_new_explicit_preserves_panel_retry_and_total_deadline(
     assert [r.getMessage() for r in caplog.records] == [
         "fly_tray_controller stage=panel code=not_ready"
     ]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "confirmed",
+        "timeout",
+        "cancelled",
+        "runner_exception",
+        "watchdog_exception",
+        "prepare_exception",
+        "apply_failure",
+    ],
+)
+def test_worker_flock_covers_prepare_restart_watchdog_and_releases(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from astra_voice.platform.fly_tray import Action
+
+    theme = tmp_path / ".fly/theme/current.themerc"
+    theme.parent.mkdir(parents=True, mode=0o700)
+    theme.parent.parent.chmod(0o700)
+    theme.write_bytes(b"TrayPriorityList=one:\n")
+    backend = FlyTrayPriority()
+    lock_path = backend.backups_dir / "fly-theme.lock"
+    observations: list[tuple[str, bool]] = []
+    competitors: list[str] = []
+    now = [0.0]
+    owner_calls = 0
+
+    def probe(stage: str) -> None:
+        try:
+            fd = os.open(lock_path, os.O_RDWR)
+        except FileNotFoundError:
+            observations.append((stage, False))
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                observations.append((stage, True))
+            else:
+                observations.append((stage, False))
+        finally:
+            os.close(fd)
+
+    prepare = backend.prepare
+
+    def checked_prepare(action: Action) -> str:
+        probe("prepare")
+        if outcome == "prepare_exception":
+            raise RuntimeError("prepare interrupted")
+        return prepare(action)
+
+    monkeypatch.setattr(backend, "prepare", checked_prepare)
+    if outcome == "apply_failure":
+        monkeypatch.setattr(backend, "confirm", lambda op: Result(False, False, "io", "io"))
+
+    def run(command: str) -> None:
+        probe("runner")
+        competitors.append(FlyTrayPriority().apply().code)
+        if outcome == "runner_exception":
+            raise RuntimeError("restart interrupted")
+
+    def owner() -> int:
+        nonlocal owner_calls
+        owner_calls += 1
+        if owner_calls == 1:
+            return 10
+        probe("watchdog")
+        if outcome == "cancelled":
+            ctl._cancel.set()
+        if outcome == "watchdog_exception":
+            raise RuntimeError("watchdog interrupted")
+        return 10 if outcome in {"timeout", "cancelled"} else 11
+
+    def wait(delay: float) -> bool:
+        now[0] += delay
+        return False
+
+    ctl, host, _, notices, _ = setup(
+        backend=backend,
+        loop_guard=real_guard,
+        runner=run,
+        owner=owner,
+        clock=lambda: now[0],
+        wait=wait,
+        watch_timeout=0.2,
+    )
+    ctl.start()
+    pump(host.released_once)
+    assert observations and all(held for _, held in observations), observations
+    stages = [stage for stage, _ in observations]
+    assert stages[0] == "prepare"
+    if outcome not in {"prepare_exception", "apply_failure"}:
+        assert "runner" in stages and competitors == ["busy"]
+        if outcome != "runner_exception":
+            assert "watchdog" in stages
+    expected_notice = {
+        "confirmed": ["show"],
+        "timeout": ["unknown"],
+        "cancelled": [],
+    }.get(outcome, ["fail"])
+    assert notices == expected_notice
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+    assert FlyTrayPriority().apply().ok
+
+
+def test_status_rechecked_under_operation_lock_before_noop_and_guard(
+    setup: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = Backend(tmp_path)
+    backend.value = TrayPriorityStatus("absent", "absent", "absent", True)
+    guard = Guard()
+    held = False
+    checks: list[bool] = []
+
+    @contextmanager
+    def lock(*, create: bool = True) -> Iterator[bool]:
+        nonlocal held
+        if not create:
+            yield False
+            return
+        # Another operation completed between initial status and lock acquisition.
+        backend.value = TrayPriorityStatus("present_foreign", "foreign", "foreign")
+        held = True
+        try:
+            yield True
+        finally:
+            held = False
+
+    def allow(disappeared: bool) -> bool:
+        assert held
+        checks.append(disappeared)
+        return True
+
+    monkeypatch.setattr(backend, "hold_lock", lock)
+    monkeypatch.setattr(guard, "allow", allow)
+    ctl, host, _, notices, runs = setup(backend=backend, loop_guard=guard)
+    ctl.start()
+    pump(host.released_once)
+    assert checks == [False]
+    assert not backend.calls and not runs and not notices
+    assert not held
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "automatic"])
+@pytest.mark.parametrize("second_kind", ["absent", "present_foreign", "unavailable"])
+def test_cancel_during_locked_status_preserves_guard_and_releases_lock(
+    real_guard: FlyTrayLoopGuard,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+    second_kind: Literal["absent", "present_foreign", "unavailable"],
+) -> None:
+    from astra_voice.ui import fly_tray_controller as module
+
+    theme = tmp_path / ".fly/theme/current.themerc"
+    theme.parent.mkdir(parents=True, mode=0o700)
+    theme.parent.parent.chmod(0o700)
+    original = b"TrayPriorityList=one:\n"
+    theme.write_bytes(original)
+    backend = FlyTrayPriority()
+    competitor = FlyTrayPriority()
+    assert real_guard.allow(True)
+    real_guard.restart_started()
+    guard_before = real_guard.path.read_bytes()
+    cancel = threading.Event()
+    statuses: list[TrayPriorityStatus] = []
+    calls: list[str] = []
+    noop_calls: list[str] = []
+    status = backend.status
+    noop = module._noop
+
+    def cancelling_status() -> TrayPriorityStatus:
+        snapshot = status()
+        if statuses:
+            assert competitor.apply().code == "busy"
+            cancel.set()
+            snapshot = TrayPriorityStatus(second_kind, second_kind, "absent")
+        statuses.append(snapshot)
+        return snapshot
+
+    def checked_noop(request: Any, snapshot: TrayPriorityStatus) -> bool:
+        noop_calls.append(snapshot.kind)
+        return noop(request, snapshot)
+
+    def reset() -> None:
+        calls.append("reset")
+
+    def allow(disappeared: bool) -> bool:
+        calls.append("allow")
+        return True
+
+    def mutation() -> Result:
+        calls.append("mutation")
+        return Result(True, True, "ok", "ok")
+
+    monkeypatch.setattr(backend, "status", cancelling_status)
+    monkeypatch.setattr(module, "_noop", checked_noop)
+    monkeypatch.setattr(real_guard, "reset", reset)
+    monkeypatch.setattr(real_guard, "allow", allow)
+    monkeypatch.setattr(backend, "apply", mutation)
+    monkeypatch.setattr(backend, "revert", mutation)
+    reply = module._execute(
+        module._Work(
+            backend=backend,
+            request=module._Request(enabled=True, explicit=explicit),
+            cancel=cancel,
+            mailbox=queue.SimpleQueue(),
+            preflight=backend.restart_command,
+            runner=calls.append,
+            owner=lambda: 10,
+            owner_budgeted=None,
+            clock=time.monotonic,
+            wait=cancel.wait,
+            guard=real_guard,
+            watch_timeout=0,
+        )
+    )
+    # A different backend must acquire the same real flock after cancellation.
+    with competitor.hold_lock(create=False) as held:
+        assert held
+    assert len(statuses) == 2 and cancel.is_set()
+    assert calls == []
+    assert noop_calls == ["absent"]
+    assert reply == module._Reply(status=statuses[-1])
+    assert theme.read_bytes() == original
+    assert real_guard.path.read_bytes() == guard_before
+    assert not backend.state_path.exists()
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "automatic"])
+def test_first_lock_busy_fails_without_theme_guard_or_restart_changes(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    theme = tmp_path / ".fly/theme/current.themerc"
+    theme.parent.mkdir(parents=True, mode=0o700)
+    theme.parent.parent.chmod(0o700)
+    original = b"TrayPriorityList=one:\n"
+    theme.write_bytes(original)
+    backend = FlyTrayPriority()
+    competitor = FlyTrayPriority()
+    real_guard.restart_started()
+    guard_before = real_guard.path.read_bytes()
+    attempts: list[bool] = []
+    hold_lock = backend.hold_lock
+
+    @contextmanager
+    def checked_lock(*, create: bool = True) -> Iterator[bool]:
+        attempts.append(create)
+        with hold_lock(create=create) as held:
+            yield held
+
+    monkeypatch.setattr(backend, "hold_lock", checked_lock)
+    ctl, host, _, notices, runs = setup(
+        backend=backend, loop_guard=real_guard, automatic=not explicit
+    )
+    with competitor.hold_lock():
+        if explicit:
+            ctl.set_enabled(True)
+        ctl.start()
+        pump(host.released_once)
+        assert notices == ["fail"]
+        assert attempts == [False]
+        assert not runs and not host.held
+        assert theme.read_bytes() == original
+        assert real_guard.path.read_bytes() == guard_before
+        assert not backend.state_path.exists()
+    with backend.hold_lock(create=False) as held:
+        assert held
+
+
+def test_initial_noop_cannot_clear_concurrent_restart_marker(
+    setup: Any,
+    real_guard: FlyTrayLoopGuard,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    theme = tmp_path / ".fly/theme/current.themerc"
+    theme.parent.mkdir(parents=True, mode=0o700)
+    theme.parent.parent.chmod(0o700)
+    theme.write_bytes(b"TrayPriorityList=one:\n")
+    idle_backend = FlyTrayPriority()
+    observed = threading.Event()
+    resume_noop = threading.Event()
+    restarting = threading.Event()
+    resume_restart = threading.Event()
+    status = idle_backend.status
+    status_calls = 0
+
+    def paused_status() -> TrayPriorityStatus:
+        nonlocal status_calls
+        status_calls += 1
+        snapshot = status()
+        if status_calls == 1:  # Controller initialization only reads status.
+            return snapshot
+        observed.set()
+        assert resume_noop.wait(3)
+        return snapshot
+
+    def paused_runner(command: str) -> None:
+        restarting.set()
+        assert resume_restart.wait(3)
+
+    monkeypatch.setattr(idle_backend, "status", paused_status)
+    idle, idle_host, _, idle_notices, _ = setup(
+        backend=idle_backend,
+        enabled=False,
+        automatic=False,
+        loop_guard=real_guard,
+    )
+    active, active_host, _, active_notices, _ = setup(
+        backend=FlyTrayPriority(),
+        loop_guard=real_guard,
+        runner=paused_runner,
+        owner=lambda: 10,
+        watch_timeout=0,
+    )
+    try:
+        idle.set_enabled(False)  # Explicit no-op must not reset a concurrent marker.
+        idle.start()
+        pump(observed.is_set)
+        assert not idle_backend.backups_dir.exists()
+        active.start()
+        pump(restarting.is_set)
+        assert json.loads(real_guard.path.read_bytes())["restart_in_progress"] is True
+        resume_noop.set()
+        pump(idle_host.released_once)
+        assert not idle_notices
+        assert json.loads(real_guard.path.read_bytes())["restart_in_progress"] is True
+        resume_restart.set()
+        pump(active_host.released_once)
+        assert active_notices == ["unknown"]
+        assert json.loads(real_guard.path.read_bytes())["restart_in_progress"] is True
+    finally:
+        resume_noop.set()
+        resume_restart.set()

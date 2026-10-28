@@ -1143,3 +1143,157 @@ def test_ib69_persistent_enospc_after_theme_commit_needs_no_rollback_write(
     assert not perform(backend, action).ok
     assert exhausted and backend.themerc.read_bytes() == original
     assert (backend.state_path.read_bytes() if backend.state_path.exists() else None) == old_state
+
+
+@pytest.mark.parametrize("outcome", ["return", "exception"])
+def test_ib69_operation_lock_reentrant_and_released(backend: FlyTrayPriority, outcome: str) -> None:
+    other = FlyTrayPriority()
+    probe = None
+    try:
+        with backend.hold_lock():
+            probe = os.open(backend.backups_dir / "fly-theme.lock", os.O_RDWR)
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert other.apply().code == "busy"
+            with backend.hold_lock():
+                assert backend.apply().changed
+            # The nested confirm must not release the outer lock, even for a no-op.
+            assert other.apply().code == "busy"
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                assert pool.submit(backend.apply).result(timeout=1).code == "busy"
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if outcome == "exception":
+                raise RuntimeError("simulated worker exit")
+    except RuntimeError:
+        assert outcome == "exception"
+    finally:
+        if probe is not None:
+            # Normal and exceptional exit both release the kernel lock.
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.close(probe)
+    assert other.revert().changed
+
+
+def test_ib69_existing_operation_lock_probe_does_not_create_files(
+    backend: FlyTrayPriority,
+) -> None:
+    with backend.hold_lock(create=False):
+        assert backend.status().kind == "absent"
+    assert not backend.backups_dir.exists()
+
+
+def test_ib69_missing_lock_in_existing_backups_probe_does_not_create_files(
+    backend: FlyTrayPriority,
+) -> None:
+    backend.backups_dir.mkdir(parents=True, mode=0o700)
+    before = identity(backend.themerc)
+    with backend.hold_lock(create=False) as acquired:
+        assert acquired is False
+        assert not list(backend.backups_dir.iterdir())
+    assert not list(backend.backups_dir.iterdir())
+    assert identity(backend.themerc) == before
+    assert not backend.state_path.exists()
+
+
+@pytest.mark.parametrize("create", [False, True], ids=["probe", "create"])
+def test_ib69_operation_lock_symlink_refused_without_following_target(
+    backend: FlyTrayPriority, monkeypatch: pytest.MonkeyPatch, create: bool
+) -> None:
+    import astra_voice.platform.fly_tray as module
+
+    backend.backups_dir.mkdir(parents=True, mode=0o700)
+    target = backend.backups_dir / "target"
+    target.write_bytes(b"foreign-lock-target")
+    target.chmod(0o600)
+    link = backend.backups_dir / "fly-theme.lock"
+    link.symlink_to(target)
+    before = identity(target), target.stat().st_mode
+    flags_seen: list[int] = []
+
+    def checked_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if path == link.name:
+            flags_seen.append(flags)
+        return os.open(path, flags, *args, **kwargs)
+
+    module_os = SimpleNamespace(**vars(os))
+    module_os.open = checked_open
+    monkeypatch.setattr(module, "os", module_os)
+    with pytest.raises(FlyTrayError) as error, backend.hold_lock(create=create):
+        pytest.fail("a symlink cannot reserve the operation lock")
+    assert error.value.code == "symlink"
+    assert error.value.error_number == errno.ELOOP
+    assert flags_seen and all(flags & os.O_NOFOLLOW for flags in flags_seen)
+    assert link.is_symlink() and link.readlink() == target
+    assert (identity(target), target.stat().st_mode) == before
+    assert not backend.state_path.exists()
+
+
+@pytest.mark.parametrize("unsafe", ["backups-0755", "lock-0644", "foreign-uid"])
+@pytest.mark.parametrize("create", [False, True], ids=["probe", "create"])
+def test_ib69_operation_lock_refuses_unsafe_permissions_and_owner(
+    backend: FlyTrayPriority, monkeypatch: pytest.MonkeyPatch, unsafe: str, create: bool
+) -> None:
+    import astra_voice.platform.fly_tray as module
+
+    backend.backups_dir.mkdir(parents=True, mode=0o700)
+    lock = backend.backups_dir / "fly-theme.lock"
+    lock.write_bytes(b"keep-lock")
+    lock.chmod(0o600)
+    if unsafe == "backups-0755":
+        backend.backups_dir.chmod(0o755)
+    elif unsafe == "lock-0644":
+        lock.chmod(0o644)
+    else:
+        lock_inode = lock.stat().st_ino
+
+        def foreign_stat(fd: int) -> Any:
+            info = os.fstat(fd)
+            if info.st_ino == lock_inode and stat.S_ISREG(info.st_mode):
+                return SimpleNamespace(
+                    **{
+                        name: getattr(info, name)
+                        for name in dir(info)
+                        if name.startswith("st_") and name != "st_uid"
+                    },
+                    st_uid=os.getuid() + 1,
+                )
+            return info
+
+        module_os = SimpleNamespace(**vars(os))
+        module_os.fstat = foreign_stat
+        module_os.geteuid = os.getuid
+        monkeypatch.setattr(module, "os", module_os)
+    before = identity(backend.themerc), identity(lock), lock.stat().st_mode
+    with pytest.raises(FlyTrayError) as error, backend.hold_lock(create=create):
+        pytest.fail("unsafe lock metadata must refuse the reservation")
+    assert error.value.code == "administrator"
+    assert (identity(backend.themerc), identity(lock), lock.stat().st_mode) == before
+    assert not backend.state_path.exists()
+
+
+@pytest.mark.parametrize("changed", ["home", "backups-dir"])
+def test_ib69_nested_operation_lock_refuses_holder_path_mismatch(
+    backend: FlyTrayPriority, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    other = FlyTrayPriority()
+    before = identity(backend.themerc)
+    alternate = Path.home() / "other-lock-scope"
+    with backend.hold_lock() as acquired:
+        assert acquired is True
+        with monkeypatch.context() as context:
+            if changed == "home":
+                # Exercise reuse of an already-held reservation after home resolution changes.
+                context.setattr(backend, "_home", lambda: alternate)
+            else:
+                context.setattr(backend, "backups_dir", alternate)
+            with pytest.raises(FlyTrayError) as error, backend.hold_lock():
+                pytest.fail("a reservation must not migrate to another path scope")
+            assert error.value.code == "administrator"
+        assert not alternate.exists()
+        # A rejected nested scope must leave the original kernel reservation held.
+        assert other.apply().code == "busy"
+    with other.hold_lock(create=False) as acquired:
+        assert acquired is True
+    assert identity(backend.themerc) == before
+    assert not backend.state_path.exists()
