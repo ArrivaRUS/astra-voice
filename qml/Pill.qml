@@ -120,6 +120,9 @@ Item {
 
     Behavior on opacity {
         id: visibilityTransition
+        // Замороженный кадр должен сразу иметь конечную альфу, независимо от
+        // времени доставки первого animation tick после показа окна.
+        enabled: !root.freezeAnimations
         NumberAnimation {
             duration: visibilityTransition.targetValue ? root.enterDuration : root.exitDuration
             easing.type: Easing.Bezier
