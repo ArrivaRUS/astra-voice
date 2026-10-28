@@ -298,7 +298,7 @@ def test_x11_failure_redacted(
 
 def test_property_failure_still_closes(connection: Mock) -> None:
     connection.screen().root.get_full_property.side_effect = RuntimeError("secret server")
-    with pytest.raises(helper.FlyWmError, match="display_unavailable"):
+    with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
         helper._check_session_local()
     connection.close.assert_called_once()
 
@@ -403,7 +403,7 @@ def test_probe_timeout_kills_and_reaps_fake_child(monkeypatch: pytest.MonkeyPatc
         (20, "session_not_fly"),
         (21, "wm_unavailable"),
         (22, "display_unavailable"),
-        (-9, "display_unavailable"),
+        (-9, "wm_unavailable"),
     ],
 )
 def test_probe_error_codes(monkeypatch: pytest.MonkeyPatch, code: int, expected: str) -> None:
@@ -548,7 +548,7 @@ def test_ewmh_legacy_name(ewmh_connection: SimpleNamespace, process: None, sourc
         ("wm", 101, SimpleNamespace(property_type=33, format=32, value=[501])),
         ("wm", 101, SimpleNamespace(property_type=6, format=32, value=[500])),
         ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"KWin")),
-        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"fly-wm\0")),
+        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"fly\0-wm")),
         ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"Fly-wm")),
         ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"")),
         ("wm", 102, SimpleNamespace(property_type=31, format=8, value=b"fly-wm")),
@@ -578,7 +578,7 @@ def test_ewmh_rejects_malformed_or_wrong_identity(
     ewmh_connection.conn.close.assert_called_once()
 
 
-@pytest.mark.parametrize("value", [b"KWin", b"", b"fly-wm\0"])
+@pytest.mark.parametrize("value", [b"KWin", b"", b"fly\0-wm"])
 def test_ewmh_root_cannot_override_wm_name(
     ewmh_connection: SimpleNamespace, process: None, value: bytes
 ) -> None:
@@ -678,3 +678,193 @@ def test_wrong_type_is_not_requested_as_absent(
     with pytest.raises(helper.FlyWmError, match="wm_unavailable"):
         helper._check_session_local()
     ewmh_connection.conn.create_resource_object.assert_not_called()
+
+
+@pytest.mark.parametrize("name", [b"fly-wm\0", b"  fly-wm  ", b"  fly-wm  \0\0"])
+@pytest.mark.parametrize("modern", [True, False])
+def test_ewmh_clean_name(
+    ewmh_connection: SimpleNamespace, process: None, name: bytes, modern: bool
+) -> None:
+    if modern:
+        ewmh_connection.wm[102].value = name
+    else:
+        del ewmh_connection.wm[102]
+        ewmh_connection.wm[39] = SimpleNamespace(property_type=31, format=8, value=name)
+    helper._check_session_local()
+    helper._check_process.assert_called_once_with(12345)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "modern",
+    [
+        SimpleNamespace(property_type=31, format=8, value=b"fly-wm"),
+        SimpleNamespace(property_type=103, format=32, value=b"fly-wm"),
+        SimpleNamespace(property_type=103, format=8, value=[102, 108, 121]),
+        SimpleNamespace(property_type=103, format=8, value=b"\xff"),
+    ],
+)
+def test_ewmh_invalid_modern_uses_typed_check_legacy(
+    ewmh_connection: SimpleNamespace, process: None, modern: object
+) -> None:
+    ewmh_connection.wm[102] = modern
+    ewmh_connection.wm[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm\0")
+    helper._check_session_local()
+    helper._check_process.assert_called_once_with(12345)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "failure,exit_code,detail",
+    [
+        ("missing", 23, "wm_check_missing"),
+        ("root-type", 23, "wm_check_missing"),
+        ("root-count", 23, "wm_check_missing"),
+        ("root-id", 23, "wm_check_missing"),
+        ("link-missing", 24, "wm_check_link"),
+        ("link-mismatch", 24, "wm_check_link"),
+        ("link-type", 24, "wm_check_link"),
+        ("check-bad-window", 24, "wm_check_link"),
+        ("pid-bad-window", 24, "wm_check_link"),
+        ("names-missing", 25, "wm_name_type"),
+        ("names-type", 25, "wm_name_type"),
+        ("modern-decode", 25, "wm_name_type"),
+        ("modern-malformed-root", 25, "wm_name_type"),
+        ("legacy-malformed-root", 25, "wm_name_type"),
+        ("foreign", 26, "wm_name_mismatch"),
+        ("interior-nul", 26, "wm_name_mismatch"),
+        ("legacy-pid", 27, "wm_pid_invalid"),
+        ("ewmh-pid", 27, "wm_pid_invalid"),
+        ("process-dead", 28, "wm_process"),
+        ("process-uid", 28, "wm_process"),
+        ("process-exe", 28, "wm_process"),
+        ("root-bad-window", 24, "wm_check_link"),
+        ("bad-atom", 29, "wm_x11_error"),
+        ("read-error", 29, "wm_x11_error"),
+    ],
+)
+def test_session_branch_child_protocol(
+    ewmh_connection: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    exit_code: int,
+    detail: str,
+) -> None:
+    x11 = ewmh_connection
+    # Real identity check with fake proc syscalls: never inspect a live process.
+    process_os = SimpleNamespace(**vars(os))
+    monkeypatch.setattr(helper, "os", process_os)
+    process_os.open = Mock(return_value=42)
+    process_os.close = Mock()
+    process_os.fstat = Mock(return_value=SimpleNamespace(st_uid=os.getuid()))
+    process_os.readlink = Mock(return_value="/usr/bin/fly-wm")
+    if failure == "missing":
+        x11.root.clear()
+    elif failure.startswith("root-") and failure != "root-bad-window":
+        if failure == "root-type":
+            x11.root[101].property_type = 6
+        else:
+            x11.root[101].value = [500, 501] if failure == "root-count" else [0]
+    elif failure == "link-missing":
+        del x11.wm[101]
+    elif failure == "link-mismatch":
+        x11.wm[101].value = [501]
+    elif failure == "link-type":
+        x11.wm[101].property_type = 6
+    elif failure == "names-missing":
+        del x11.wm[102]
+    elif failure == "names-type":
+        x11.wm[102].property_type = 31
+        x11.wm[39] = SimpleNamespace(property_type=103, format=8, value=b"fly-wm")
+        x11.root[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
+    elif failure == "modern-decode":
+        x11.wm[102].value = b"\xffPRIVATE_CANARY"
+    elif failure == "modern-malformed-root":
+        x11.wm[102].format = 32
+        x11.root[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
+    elif failure == "legacy-malformed-root":
+        del x11.wm[102]
+        x11.wm[39] = SimpleNamespace(property_type=31, format=32, value=b"fly-wm")
+        x11.root[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
+    elif failure == "foreign":
+        x11.wm[102].value = b"PRIVATE_CANARY"
+        x11.wm[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
+    elif failure == "interior-nul":
+        x11.wm[102].value = b"fly\0-wm"
+    elif failure == "legacy-pid":
+        x11.root[100] = SimpleNamespace(property_type=31, format=32, value=[12345])
+    elif failure == "ewmh-pid":
+        x11.wm[104].value = [True]
+    elif failure == "process-dead":
+        process_os.readlink.side_effect = FileNotFoundError(errno.ENOENT, "PRIVATE_CANARY")
+    elif failure == "process-uid":
+        process_os.fstat.return_value.st_uid += 1
+    elif failure == "process-exe":
+        process_os.readlink.return_value = "/PRIVATE_CANARY/other"
+    elif failure == "read-error":
+        x11.window.get_full_property.side_effect = RuntimeError("PRIVATE_CANARY")
+    else:
+        errors = pytest.importorskip("Xlib.error")
+        error_cls = errors.BadAtom if failure == "bad-atom" else errors.BadWindow
+        error = error_cls(SimpleNamespace(get_resource_class=lambda name: None), bytes(32))
+        if failure == "root-bad-window":
+            x11.conn.screen().root.get_full_property.side_effect = error
+        elif failure == "pid-bad-window":
+
+            def read_property(atom: int, kind: int) -> object:
+                if atom == 104:
+                    raise error
+                return x11.wm.get(atom)
+
+            x11.window.get_full_property.side_effect = read_property
+        else:
+            x11.window.get_full_property.side_effect = error
+    with pytest.raises(helper.FlyWmError) as exc:
+        helper._check_session_local()
+    assert exc.value.code == str(exc.value) == "wm_unavailable"
+    assert exc.value.detail == detail
+    assert helper._probe_child("session") == exit_code
+    assert capsys.readouterr().out == ""
+    assert "PRIVATE_CANARY" not in caplog.text + str(exc.value)
+    assert all(record.exc_info is None for record in caplog.records)
+    assert x11.conn.close.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "exit_code,detail",
+    [
+        (21, "unknown"),
+        (23, "wm_check_missing"),
+        (24, "wm_check_link"),
+        (25, "wm_name_type"),
+        (26, "wm_name_mismatch"),
+        (27, "wm_pid_invalid"),
+        (28, "wm_process"),
+        (29, "wm_x11_error"),
+        (-9, "unknown"),
+        (255, "unknown"),
+    ],
+)
+def test_parent_fixed_wm_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exit_code: int,
+    detail: str,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        Mock(
+            return_value=subprocess.CompletedProcess(
+                [], exit_code, stdout=b"PRIVATE_CANARY", stderr=b"PRIVATE_CANARY"
+            )
+        ),
+    )
+    with pytest.raises(helper.FlyWmError) as exc:
+        helper.check_session()
+    assert exc.value.code == str(exc.value) == "wm_unavailable"
+    assert exc.value.detail == detail
+    assert [r.getMessage() for r in caplog.records] == [
+        f"fly_wmfunc stage=probe code=wm_unavailable detail={detail}"
+    ]
+    assert "PRIVATE_CANARY" not in caplog.text

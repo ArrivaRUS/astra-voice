@@ -28,6 +28,16 @@ _XA_CARDINAL = 6  # X11 predefined CARDINAL atom.
 _COMMANDS = frozenset({"FLYWM_UPDATE_STARTMENU", "FLYWM_RESTART"})
 _PROBE_TIMEOUT = 0.75
 _PROBE_ERRORS = {20: "session_not_fly", 21: "wm_unavailable", 22: "display_unavailable"}
+_PROBE_DETAILS = {
+    23: "wm_check_missing",
+    24: "wm_check_link",
+    25: "wm_name_type",
+    26: "wm_name_mismatch",
+    27: "wm_pid_invalid",
+    28: "wm_process",
+    29: "wm_x11_error",
+}
+_PROBE_ERRORS.update(dict.fromkeys(_PROBE_DETAILS, "wm_unavailable"))
 _PROBE_SCRIPT = """import json, sys
 sys.path.extend(json.loads(sys.argv[1]))
 from astra_voice.platform.fly_wmfunc import _probe_child
@@ -38,14 +48,23 @@ raise SystemExit(_probe_child(sys.argv[2]))
 class FlyWmError(RuntimeError):
     """Stable error code; no command output or private paths in the message."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, detail: str | None = None) -> None:
         self.code = code
+        self.detail = detail if detail in _PROBE_DETAILS.values() else "unknown"
         super().__init__(code)
 
 
-def _failure(stage: str, code: str, error: OSError | None = None) -> FlyWmError:
-    log.warning("fly_wmfunc stage=%s code=%s errno=%s", stage, code, error.errno if error else 0)
-    return FlyWmError(code)
+def _failure(
+    stage: str, code: str, error: OSError | None = None, *, detail: str | None = None
+) -> FlyWmError:
+    failure = FlyWmError(code, detail)
+    if code == "wm_unavailable":
+        log.warning("fly_wmfunc stage=%s code=%s detail=%s", stage, code, failure.detail)
+    else:
+        log.warning(
+            "fly_wmfunc stage=%s code=%s errno=%s", stage, code, error.errno if error else 0
+        )
+    return failure
 
 
 def check_binary(command: str = "FLYWM_RESTART") -> list[str]:
@@ -82,16 +101,18 @@ def _connection(stage: str) -> Iterator[Any]:
         raise
     except Exception as exc:  # Xlib has several exception classes, sometimes no dependency.
         code = "display_unavailable"
+        detail = None
         if conn is not None and stage == "session":
+            code, detail = "wm_unavailable", "wm_x11_error"
             try:
-                from Xlib.error import BadAtom, BadWindow
+                from Xlib.error import BadWindow
             except ImportError:  # Optional Xlib; connection failures keep their existing code.
                 pass
             else:
-                if isinstance(exc, (BadAtom, BadWindow)):
-                    code = "wm_unavailable"
+                if isinstance(exc, BadWindow):
+                    detail = "wm_check_link"
         error = exc if isinstance(exc, OSError) else None
-        raise _failure(stage, code, error) from None
+        raise _failure(stage, code, error, detail=detail) from None
     finally:
         if conn is not None:
             try:
@@ -107,15 +128,18 @@ def _check_process(pid: int) -> None:
         # against a potentially recycled PID. A zombie/dead process has no exe link.
         fd = os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         if os.fstat(fd).st_uid != os.getuid():
-            raise _failure("session", "wm_unavailable")
+            raise _failure("session", "wm_unavailable", detail="wm_process")
         executable = os.readlink("exe", dir_fd=fd)
         if executable.rsplit("/", 1)[-1] != "fly-wm":
-            raise _failure("session", "wm_unavailable")
+            raise _failure("session", "wm_unavailable", detail="wm_process")
     except OSError as exc:
-        raise _failure("session", "wm_unavailable", exc) from None
+        raise _failure("session", "wm_unavailable", exc, detail="wm_process") from None
     finally:
         if fd >= 0:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError as exc:
+                raise _failure("session", "wm_unavailable", exc, detail="wm_process") from None
 
 
 def _check_session_local() -> None:
@@ -136,13 +160,15 @@ def _check_session_local() -> None:
             else:
                 window, name = session._ewmh_wm(conn, root)
                 if name != "fly-wm":
-                    raise ValueError("not Fly WM")
+                    raise _failure("session", "wm_unavailable", detail="wm_name_mismatch")
                 prop = session._x11_property(conn, window, "_NET_WM_PID")
                 if prop is None:
                     return
                 pid = session._x11_uint32(prop, _XA_CARDINAL)
+        except session._WmIdentityError as exc:
+            raise _failure("session", "wm_unavailable", detail=exc.detail) from None
         except ValueError:
-            raise _failure("session", "wm_unavailable") from None
+            raise _failure("session", "wm_unavailable", detail="wm_pid_invalid") from None
         _check_process(pid)
 
 
@@ -200,6 +226,8 @@ def _probe_child(operation: str) -> int:
         if not 0 <= value <= 0xFFFFFFFF:
             return 22
     except FlyWmError as exc:
+        if exc.code == "wm_unavailable":
+            return next((key for key, detail in _PROBE_DETAILS.items() if detail == exc.detail), 21)
         return next((key for key, code in _PROBE_ERRORS.items() if code == exc.code), 22)
     except Exception:
         return 22
@@ -242,7 +270,11 @@ def _probe(operation: str, timeout: float = _PROBE_TIMEOUT) -> int:
         error = exc if isinstance(exc, OSError) else None
         raise _failure("probe", "display_unavailable", error) from None
     if result.returncode:
-        raise _failure("probe", _PROBE_ERRORS.get(result.returncode, "display_unavailable"))
+        raise _failure(
+            "probe",
+            _PROBE_ERRORS.get(result.returncode, "wm_unavailable"),
+            detail=_PROBE_DETAILS.get(result.returncode),
+        )
     output = result.stdout
     if (
         not isinstance(output, bytes)

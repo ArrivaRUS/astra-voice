@@ -147,7 +147,7 @@ def test_x11_ewmh_wm_name(x11: SimpleNamespace, source: str) -> None:
         ("wm", 101, None),
         ("wm", 101, SimpleNamespace(property_type=33, format=32, value=[501])),
         ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"butterfly")),
-        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"fly-wm\0")),
+        ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"fly\0-wm")),
         ("wm", 102, SimpleNamespace(property_type=103, format=32, value=b"fly-wm")),
         ("wm", 102, SimpleNamespace(property_type=31, format=8, value=b"fly-wm")),
         ("wm", 102, SimpleNamespace(property_type=103, format=8, value=b"\xff")),
@@ -173,4 +173,39 @@ def test_x11_errors_close_and_redact(
 
 def test_x11_missing_library(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "Xlib", None)
+    assert session._from_x11(":9") is None
+
+
+@pytest.mark.parametrize("name", [b"fly-wm\0", b"  fly-wm  ", b"  fly-wm  \0\0"])
+def test_x11_clean_ewmh_name(x11: SimpleNamespace, name: bytes) -> None:
+    x11.wm[102].value = name
+    assert session._from_x11(":9") == SessionKind.FLY
+
+
+@pytest.mark.parametrize("marker", [b"fly\0", b" fly ", b" fly \0"])
+def test_x11_session_marker_requires_exact_bytes(x11: SimpleNamespace, marker: bytes) -> None:
+    x11.root.clear()
+    x11.root[100] = SimpleNamespace(property_type=31, format=8, value=marker)
+    assert session._from_x11(":9") is None
+
+
+@pytest.mark.parametrize(
+    "modern",
+    [
+        SimpleNamespace(property_type=31, format=8, value=b"fly-wm"),
+        SimpleNamespace(property_type=103, format=32, value=b"fly-wm"),
+        SimpleNamespace(property_type=103, format=8, value=[102, 108, 121]),
+        SimpleNamespace(property_type=103, format=8, value=b"\xff"),
+    ],
+)
+def test_x11_invalid_modern_uses_check_legacy(x11: SimpleNamespace, modern: object) -> None:
+    x11.wm[102] = modern
+    x11.wm[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm\0")
+    assert session._from_x11(":9") == SessionKind.FLY
+
+
+def test_x11_both_names_invalid_cannot_use_root(x11: SimpleNamespace) -> None:
+    x11.wm[102].property_type = 31
+    x11.wm[39] = SimpleNamespace(property_type=103, format=8, value=b"fly-wm")
+    x11.root[39] = SimpleNamespace(property_type=31, format=8, value=b"fly-wm")
     assert session._from_x11(":9") is None
