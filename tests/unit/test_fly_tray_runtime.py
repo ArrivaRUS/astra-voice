@@ -15,7 +15,6 @@ from test_runtime import Rig
 from astra_voice import app as app_module
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.core.dictation import DictationPhase
-from astra_voice.core.settings import Settings
 from astra_voice.platform.hotkey import (
     GrabResult,
     HotkeyBackend,
@@ -179,20 +178,15 @@ def test_review6_cancelled_fsm_waits_for_physical_release(rig: Rig, source: str)
 
 
 @pytest.mark.parametrize("reason", ["register", "hidden", "wizard", "update", "policy", "kde"])
-def test_ib73_startup_modes_never_arm_automatic_fly_action(reason: str) -> None:
-    args = SimpleNamespace(register=reason == "register", hidden=reason == "hidden")
-    settings = Settings()
-    settings.extra["onboarding_done"] = reason != "wizard"
+def test_ib73_all_fly_startup_modes_are_eligible_unless_policy_disabled(reason: str) -> None:
     kind = SessionKind.KDE if reason == "kde" else SessionKind.FLY
-    assert not app_module._fly_tray_automatic_allowed(
-        args, settings, kind, after_update=reason == "update", policy_disabled=reason == "policy"
+    assert app_module._fly_tray_automatic_allowed(kind, policy_disabled=reason == "policy") is (
+        reason not in {"policy", "kde"}
     )
 
 
-def test_ib73_normal_completed_fly_startup_is_eligible() -> None:
-    args = SimpleNamespace(register=False, hidden=False)
-    settings = Settings(extra={"onboarding_done": True})
-    assert app_module._fly_tray_automatic_allowed(args, settings, SessionKind.FLY)
+def test_ib73_normal_fly_startup_is_eligible() -> None:
+    assert app_module._fly_tray_automatic_allowed(SessionKind.FLY)
 
 
 def test_ib73_runtime_refreshes_tray_after_return(rig: Rig) -> None:

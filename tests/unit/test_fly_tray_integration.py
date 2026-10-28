@@ -16,13 +16,14 @@ import pytest
 from PyQt5.QtCore import QEventLoop, Qt, QTimer
 from PyQt5.QtTest import QTest
 from test_app_shutdown import Rig as AppRig
-from test_fly_tray_controller import pump
+from test_fly_tray_controller import Host, pump
 from test_fly_tray_controller import setup as setup
 from test_fly_tray_settings import FakeFlyTray, general_qml
 
 from astra_voice import app as app_module
+from astra_voice.core import policy as policy_mod
 from astra_voice.platform import command_hotkey
-from astra_voice.platform.fly_tray import FlyTrayPriority
+from astra_voice.platform.fly_tray import FlyTrayPriority, TrayPriorityStatus
 from astra_voice.platform.session import SessionKind
 from astra_voice.worker import command_hotkey as broker_module
 from helpers.fly_user import fly_user as fly_user
@@ -55,22 +56,64 @@ def test_ib74_general_keyboard_space_and_tab() -> None:
         assert not messages, messages
 
 
-@pytest.mark.parametrize("origin", ["normal", "hidden", "register", "wizard", "update"])
-def test_ib73_main_wires_launch_origin(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, origin: str
+@pytest.mark.parametrize(
+    "origin", ["normal", "hidden", "register", "wizard", "update", "policy", "kde"]
+)
+@pytest.mark.parametrize("present", [False, True], ids=["absent", "present"])
+def test_ib73_main_wires_all_launch_origins_to_one_idle_action(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, setup: Any, origin: str, present: bool
 ) -> None:
     rig = AppRig(monkeypatch, tmp_path)
     rig.runtime.fly_tray = None
     rig.settings.extra["onboarding_done"] = origin != "wizard"
-    monkeypatch.setattr(app_module, "detect", lambda: SessionKind.FLY)
-    monkeypatch.delenv("ASTRA_VOICE_AFTER_UPDATE", raising=False)
-    if origin == "update":
-        monkeypatch.setenv("ASTRA_VOICE_AFTER_UPDATE", "1")
+    kind = SessionKind.KDE if origin == "kde" else SessionKind.FLY
+    monkeypatch.setattr(app_module, "detect", lambda: kind)
+    if origin == "policy":
+        monkeypatch.setattr(
+            policy_mod,
+            "load",
+            lambda: policy_mod.Policy(
+                values={"fly_tray_icon": False}, locked_keys=frozenset({"fly_tray_icon"})
+            ),
+        )
+    # The marker remains one-shot even though it no longer suppresses tray setup.
+    monkeypatch.setenv("ASTRA_VOICE_AFTER_UPDATE", "1" if origin == "update" else "0")
+    controllers: list[Any] = []
+
+    def start_fly_tray(*, automatic: bool) -> None:
+        host = Host()
+        host.session_kind = kind
+        host.busy = True
+        controller = setup(host=host, automatic=automatic)
+        ctl, host, backend, _notices, _runs = controller
+        if present:
+            backend.value = TrayPriorityStatus("present_foreign", "already", "present")
+        controllers.append(controller)
+        ctl.start()
+
+    rig.runtime.start_fly_tray.side_effect = start_fly_tray
     args = ["--" + origin] if origin in {"hidden", "register"} else []
     assert app_module.main(args) == 7
-    rig.runtime.start_fly_tray.assert_called_once_with(automatic=origin == "normal")
-    if origin == "update":
-        assert "ASTRA_VOICE_AFTER_UPDATE" not in os.environ
+    automatic = origin not in {"policy", "kde"}
+    rig.runtime.start_fly_tray.assert_called_once_with(automatic=automatic)
+    assert "ASTRA_VOICE_AFTER_UPDATE" not in os.environ
+    ctl, host, backend, notices, runs = controllers[0]
+    if kind is SessionKind.KDE:
+        assert not ctl.visible and not backend.threads
+        assert not backend.calls and not runs
+        return
+    pump(lambda: ctl.available and not any(t.is_alive() for t in ctl.worker_threads))
+    assert not backend.calls and not runs and not host.held
+    host.busy = False
+    if automatic and not present:
+        pump(lambda: notices == ["show"])
+        assert backend.calls == ["show"] and runs == ["FLYWM_RESTART"]
+        assert host.refreshes == host.releases == 1
+    for _ in range(3):
+        ctl.start()
+        QTest.qWait(2)
+    assert len(runs) == int(automatic and not present)
+    assert len(backend.calls) == int(automatic and not present)
 
 
 def test_ib73_unknown_keeps_real_theme_and_provenance(

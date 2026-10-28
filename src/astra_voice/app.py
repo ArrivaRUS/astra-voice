@@ -1593,27 +1593,13 @@ def _unregister() -> int:
     return 0
 
 
-def _fly_tray_automatic_allowed(
-    args: Any,
-    stored: settings_mod.Settings,
-    kind: SessionKind,
-    *,
-    after_update: bool = False,
-    policy_disabled: bool = False,
-) -> bool:
-    return bool(
-        kind is SessionKind.FLY
-        and not args.register
-        and not args.hidden
-        and not after_update
-        and not policy_disabled
-        and stored.extra.get("onboarding_done") is True
-    )
+def _fly_tray_automatic_allowed(kind: SessionKind, *, policy_disabled: bool = False) -> bool:
+    return kind is SessionKind.FLY and not policy_disabled
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    after_update = os.environ.pop("ASTRA_VOICE_AFTER_UPDATE", "") == "1"
+    os.environ.pop("ASTRA_VOICE_AFTER_UPDATE", "")
     if args.uninstall:
         return _uninstall()
     if args.unregister:
@@ -1860,10 +1846,7 @@ def main(argv: list[str] | None = None) -> int:
         if runtime_ready and runtime is not None:
             runtime.start_fly_tray(
                 automatic=_fly_tray_automatic_allowed(
-                    args,
-                    stored,
                     session_kind,
-                    after_update=after_update,
                     policy_disabled="fly_tray_icon" in locked_settings
                     and not settings.fly_tray_icon,
                 )

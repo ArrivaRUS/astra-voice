@@ -480,7 +480,7 @@ class DictationRuntime(QObject):
             self._release_input("appimage-removal")
 
     def start_fly_tray(self, *, automatic: bool) -> None:
-        """Arm only after app startup has resolved onboarding and launch origin."""
+        """Arm after startup policy is known; the controller reserves runtime idle."""
         if self._closed or self.session_kind is not SessionKind.FLY or self.fly_tray is not None:
             return
         from astra_voice.ui.fly_tray_controller import FlyTrayController
