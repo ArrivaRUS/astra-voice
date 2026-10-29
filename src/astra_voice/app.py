@@ -1666,11 +1666,11 @@ def main(argv: list[str] | None = None) -> int:
 
     session_kind = detect()
     setup_logging(session_kind.value, debug=args.debug)
-    if after_update:
-        log.info("startup origin=update")
     if not _mark_running_copy():
         lock.unlock()
         return 1
+    if after_update:
+        log.info("startup origin=update")
     try:
         deny_pulse_autospawn()
     except Exception:
