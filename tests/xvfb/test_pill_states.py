@@ -464,6 +464,79 @@ def test_pill_snapshots_are_deterministic(
     )
 
 
+@pytest.mark.parametrize("state", ["processing", "command-delivering"])
+def test_frozen_processing_has_final_opacity_before_first_frame(pill_app: Any, state: str) -> None:
+    from PyQt5 import sip
+    from PyQt5.QtQuick import QQuickView
+    from PyQt5.QtTest import QTest
+
+    from astra_voice.ui.pill import Pill, PillState
+
+    view = QQuickView()
+    pill = Pill(view_factory=lambda: view)
+    try:
+        root = view.rootObject()
+        assert root.setProperty("freezeAnimations", True)
+        pill.show_state(PillState(state))
+        dots = [
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("modelData") >= 0
+        ]
+        assert len(dots) == 3
+        # Заморозка должна завершать и fade-in: qWait отсчитывает время теста,
+        # а первый animation tick может быть доставлен позже show_state().
+        # Проверяем до доставки событий, без допуска «почти непрозрачно».
+        assert root.opacity() == 1
+        assert [dot.opacity() for dot in dots] == [1, 1, 1]
+        QTest.qWait(250)
+        assert root.opacity() == 1
+        assert [dot.opacity() for dot in dots] == [1, 1, 1]
+    finally:
+        pill.hide()
+        sip.delete(pill)
+        sip.delete(view)
+        pill_app.processEvents()
+
+
+def test_unfrozen_visibility_behavior_animates_show_and_hide(pill_app: Any) -> None:
+    from PyQt5 import sip
+    from PyQt5.QtQuick import QQuickView
+    from PyQt5.QtTest import QTest
+
+    from astra_voice.ui.pill import Pill, PillState
+
+    view = QQuickView()
+    pill = Pill(view_factory=lambda: view)
+    root = view.rootObject()
+    try:
+        assert root.property("freezeAnimations") is False
+        behaviors = [
+            child for child in root.children() if child.metaObject().className() == "QQuickBehavior"
+        ]
+        assert len(behaviors) == 1
+        assert behaviors[0].property("enabled") is True
+        assert root.opacity() == 0
+        pill.show_state(PillState.LISTENING)
+        # Enabled Behavior defers the target value until animation events arrive.
+        # A stalled event loop may legitimately skip intermediate rendered frames.
+        assert root.opacity() == 0
+        QTest.qWait(int(root.property("enterDuration")) + 250)
+        assert root.opacity() == 1
+        assert root.isVisible()
+
+        pill.hide()
+        assert root.opacity() == 1
+        QTest.qWait(int(root.property("exitDuration")) + 250)
+        assert root.opacity() == 0
+        assert not root.isVisible()
+    finally:
+        pill.hide()
+        sip.delete(pill)
+        sip.delete(view)
+        pill_app.processEvents()
+
+
 @pytest.mark.parametrize("state", [state for state in LABELS if state not in INVISIBLE])
 def test_pill_snapshot_shadow(state: str, rendered_states: dict[str, RenderedState]) -> None:
     rendered = rendered_states[state]

@@ -54,7 +54,7 @@ jobs:
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"
-          "$VENV/bin/pip" install --quiet ruff mypy pytest
+          "$VENV/bin/pip" install --quiet ruff==0.17.1 mypy==2.4.0 pytest==9.2.0
       - run: make lint VENV=$VENV
 
   unit:
@@ -83,7 +83,7 @@ jobs:
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"
-          "$VENV/bin/pip" install --quiet pytest pyyaml
+          "$VENV/bin/pip" install --quiet pytest==9.2.0 pyyaml
       # tests/unit/test_app_lock.py поднимает настоящий процесс GUI: нужен
       # PyQt5 (выше) и платформа без дисплея.
       - name: Зависимости unit-тестов обязаны быть установлены
@@ -123,7 +123,7 @@ jobs:
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"
-          "$VENV/bin/pip" install --quiet pytest
+          "$VENV/bin/pip" install --quiet pytest==9.2.0
       # Гейт против ложной зелени: `pytest.importorskip` на машине разработчика
       # — вежливый пропуск, а в CI — тихо выключенная проверка. Скрипт сам
       # вычитывает зависимости из тестов, руками список вести не нужно.
@@ -181,7 +181,7 @@ jobs:
         run: |
           python3 -m venv --system-site-packages "$VENV"
           "$VENV/bin/pip" install --quiet --no-deps --require-hashes -r packaging/wheels.lock
-          "$VENV/bin/pip" install --quiet pytest==9.1.1
+          "$VENV/bin/pip" install --quiet pytest==9.2.0
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.0.1
         id: model-cache
         with:

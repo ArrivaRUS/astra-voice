@@ -1599,7 +1599,8 @@ def _fly_tray_automatic_allowed(kind: SessionKind, *, policy_disabled: bool = Fa
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    os.environ.pop("ASTRA_VOICE_AFTER_UPDATE", "")
+    # The one-shot marker is consumed only by the startup log.
+    after_update = os.environ.pop("ASTRA_VOICE_AFTER_UPDATE", "") == "1"
     if args.uninstall:
         return _uninstall()
     if args.unregister:
@@ -1668,6 +1669,8 @@ def main(argv: list[str] | None = None) -> int:
     if not _mark_running_copy():
         lock.unlock()
         return 1
+    if after_update:
+        log.info("startup origin=update")
     try:
         deny_pulse_autospawn()
     except Exception:

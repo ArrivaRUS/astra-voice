@@ -276,6 +276,7 @@ class FlyTrayPriority:
         self.state_path = state_path if state_path is not None else base / "fly-tray.json"
         self._pending: dict[str, _Prepared] = {}
         self._mutex = threading.Lock()
+        self._lock_local = threading.local()
 
     @staticmethod
     def restart_command() -> list[str]:
@@ -291,9 +292,27 @@ class FlyTrayPriority:
 
     def _perform(self, action: Action) -> Result:
         try:
-            return self.confirm(self.prepare(action))
+            # Respect an ongoing restart even if this request would be a no-op.
+            # An untouched installation still needs no lock file for a no-op.
+            with self.hold_lock(create=False):
+                return self.confirm(self.prepare(action))
         except FlyTrayError as error:
             return Result(False, False, error.code, error.message)
+
+    @contextmanager
+    def hold_lock(self, *, create: bool = True) -> Iterator[bool]:
+        """Hold the safe nonblocking flock through a worker's whole operation.
+
+        Nested apply/revert on this instance reuse only this thread's holder.
+        Other instances and threads must acquire their own flock and get busy.
+        Yield whether a lock was acquired. With create=False, a missing lock
+        is left untouched; that scope permits reads only, including loop state.
+        """
+        try:
+            with self._locked(self._home(), create=create) as directory:
+                yield directory is not None
+        except (OSError, ThemercError) as exc:
+            raise _error(exc) from None
 
     def _home(self) -> Path:
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -461,16 +480,41 @@ class FlyTrayPriority:
         return "colon-prefix", b":" + TOKEN
 
     @contextmanager
-    def _locked(self, home: Path) -> Iterator[int]:
-        with open_directory(self.backups_dir, home=home, create=True) as directory:
+    def _locked(self, home: Path, *, create: bool = True) -> Iterator[int | None]:
+        held: tuple[Path, Path, int] | None = getattr(self._lock_local, "held", None)
+        if held is not None:
+            if held[:2] != (home, self.backups_dir):
+                raise FlyTrayError("administrator")
+            yield held[2]
+            return
+        with ExitStack() as stack:
+            try:
+                directory = stack.enter_context(
+                    open_directory(self.backups_dir, home=home, create=create)
+                )
+            except FileNotFoundError:
+                if create:
+                    raise
+                yield None
+                return
             if stat.S_IMODE(os.fstat(directory).st_mode) != 0o700:
                 raise FlyTrayError("administrator")
-            fd = os.open(
-                "fly-theme.lock",
-                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                0o600,
-                dir_fd=directory,
-            )
+            try:
+                fd = os.open(
+                    "fly-theme.lock",
+                    os.O_RDWR
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK
+                    | os.O_CLOEXEC
+                    | (os.O_CREAT if create else 0),
+                    0o600,
+                    dir_fd=directory,
+                )
+            except FileNotFoundError:
+                if create:
+                    raise
+                yield None
+                return
             try:
                 info = os.fstat(fd)
                 if (
@@ -484,7 +528,11 @@ class FlyTrayPriority:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     raise FlyTrayError("busy") from None
-                yield directory
+                self._lock_local.held = (home, self.backups_dir, directory)
+                try:
+                    yield directory
+                finally:
+                    del self._lock_local.held
             finally:
                 os.close(fd)
 
@@ -740,6 +788,7 @@ class FlyTrayPriority:
                 if prepared.action == "show" and line.count():
                     return Result(True, False, "already", _MESSAGES["already"])
                 with self._locked(home) as copies:
+                    assert copies is not None  # create=True always owns a directory.
                     # Re-read only under flock: another instance may have committed meanwhile.
                     current = self._snapshot(directory)
                     status, line, state, apprc = self._inspect(current, home)

@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -161,8 +162,25 @@ def _log(stage: str, code: str) -> None:
     _LOG.info("fly_tray_controller stage=%s code=%s", stage, code)
 
 
+def _noop(request: _Request, status: TrayPriorityStatus) -> bool:
+    return (request.enabled and status.kind in {"present_ours", "present_foreign"}) or (
+        not request.enabled
+        and status.kind != "present_ours"
+        and not (status.kind == "absent" and status.applied)
+    )
+
+
 def _execute(work: _Work) -> _Reply:
     backend = work.backend if work.backend is not None else FlyTrayPriority()
+    if work.request is None or work.cancel.is_set():
+        return _Reply(backend=backend, status=backend.status())
+    # Probe without creating anything before preflight/panel readiness. If a lock
+    # exists, keep it through status decisions, mutation, restart and watchdog.
+    with backend.hold_lock(create=False) as held, ExitStack() as locks:
+        return _execute_request(work, backend, locks, held)
+
+
+def _execute_request(work: _Work, backend: FlyTrayPriority, locks: ExitStack, held: bool) -> _Reply:
     status = backend.status()
     request = work.request
     if request is None or work.cancel.is_set():
@@ -170,11 +188,7 @@ def _execute(work: _Work) -> _Reply:
     if status.kind == "unavailable":
         _log("status", "unavailable")
         return _Reply(status=status, notice="fail", failed=True)
-    noop = (request.enabled and status.kind in {"present_ours", "present_foreign"}) or (
-        not request.enabled
-        and status.kind != "present_ours"
-        and not (status.kind == "absent" and status.applied)
-    )
+    noop = _noop(request, status)
     if work.cancel.is_set():
         return _Reply(status=status)
     # For a mutation even guard persistence must follow binary/session preflight.
@@ -186,6 +200,21 @@ def _execute(work: _Work) -> _Reply:
     if not noop and old_owner == 0:
         return _Reply(status=status, deferred=True)
     if work.cancel.is_set():
+        return _Reply(status=status)
+    if not noop:
+        # Creation follows preflight and owner!=0. The outer ExitStack releases
+        # the holder on every return, cancellation and exception from the worker.
+        locks.enter_context(backend.hold_lock())
+        status = backend.status()
+        if work.cancel.is_set():
+            return _Reply(status=status)
+        if status.kind == "unavailable":
+            return _Reply(status=status, notice="fail", failed=True)
+        noop = _noop(request, status)
+    elif not held:
+        # A missing lock means this is only an observation, not ownership. Even
+        # guard.reset/allow can write and erase another worker's restart marker
+        # if its first lock/mutation started after our initial read-only probe.
         return _Reply(status=status)
     guard = work.guard if work.guard is not None else FlyTrayLoopGuard(backend.state_path)
     if request.explicit:
