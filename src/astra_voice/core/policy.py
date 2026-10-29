@@ -55,7 +55,12 @@ class Policy:
         return key in self.locked_keys
 
 
-_SETTINGS_TYPES = {f.name: f.type for f in fields(Settings) if f.name != "extra"}
+# Meeting keys must remain raw until their separate fail-closed parser (E13 M1).
+_SETTINGS_TYPES = {
+    f.name: f.type
+    for f in fields(Settings)
+    if f.name != "extra" and not f.name.startswith(("meeting_", "meetings_"))
+}
 
 
 def _coerce(key: str, raw: str) -> Any:

@@ -384,7 +384,7 @@ def test_fresh_deb_then_appimage_migrates_and_saves_marker(path: Path) -> None:
     deb = st.load(path, appimage=False)
     st.save(deb, path)
     saved_deb = json.loads(path.read_text(encoding="utf-8"))
-    assert saved_deb["schema_version"] == 2
+    assert saved_deb["schema_version"] == st.SCHEMA_VERSION == 3
     assert "update_defaults_migrated" not in saved_deb
     assert saved_deb["check_app_updates"] is saved_deb["check_model_updates"] is False
 
@@ -558,7 +558,7 @@ def test_device_label_is_optional_without_schema_or_migration_change() -> None:
     assert labelled.device_label_id == "usb"
     assert labelled.to_dict()["device_label"] == "USB-гарнитура"
     assert labelled.to_dict()["device_label_id"] == "usb"
-    assert labelled.to_dict()["schema_version"] == st.SCHEMA_VERSION == 2
+    assert labelled.to_dict()["schema_version"] == st.SCHEMA_VERSION == 3
     assert st.from_dict(labelled.to_dict()).to_dict() == labelled.to_dict()
 
 
