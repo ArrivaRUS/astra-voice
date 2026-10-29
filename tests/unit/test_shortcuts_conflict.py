@@ -9,7 +9,7 @@ import time
 import unicodedata
 from collections.abc import Iterator
 from pathlib import Path
-from types import FrameType
+from types import FrameType, SimpleNamespace
 
 import pytest
 
@@ -382,7 +382,10 @@ def test_t47_growth_after_descriptor_stat(tmp_path: Path, monkeypatch: pytest.Mo
             assert os.lseek(fd, 0, os.SEEK_CUR) == 1024 * 1024
         return info
 
-    monkeypatch.setattr(os, "fstat", grow_after_stat)
+    # Count only the reader's descriptor stats, not pytest's file inspection.
+    reader_os = SimpleNamespace(**vars(os))
+    reader_os.fstat = grow_after_stat
+    monkeypatch.setattr(sc, "os", reader_os)
     source = sc.for_session(SessionKind.KDE, kde_path=path)
     assert calls == 2
     assert not source.available

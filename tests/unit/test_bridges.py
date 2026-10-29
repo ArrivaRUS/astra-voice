@@ -57,6 +57,7 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui import model_downloads
 from astra_voice.ui.bridges import (
+    FlyTrayControl,
     OnboardingController,
     OnboardingHost,
     SettingsApply,
@@ -464,15 +465,29 @@ def allow_mouse_setting(bridge: SettingsBridge, name: str) -> None:
         )
 
 
+@pytest.fixture
+def fly_tray_control() -> FlyTrayControl:
+    return cast(
+        FlyTrayControl,
+        SimpleNamespace(
+            visible=True, available=True, reason="", changed=Mock(), set_enabled=Mock()
+        ),
+    )
+
+
 @pytest.mark.parametrize("name", writable_properties())
 @pytest.mark.parametrize("with_mirror", [False, True])
-def test_each_property_saves_and_notifies_once(name: str, with_mirror: bool) -> None:
+def test_each_property_saves_and_notifies_once(
+    name: str, with_mirror: bool, fly_tray_control: FlyTrayControl
+) -> None:
     settings = Settings()
     mirror = policy_mod.effective(settings, policy_mod.Policy()) if with_mirror else None
     save = Mock()
     apply = Mock(spec=SettingsApply)
     apply.hotkey.return_value = "ok"
-    bridge = SettingsBridge(settings, mirror=mirror, save=save, apply=apply)
+    bridge = SettingsBridge(
+        settings, mirror=mirror, save=save, apply=apply, fly_tray=fly_tray_control
+    )
     allow_mouse_setting(bridge, name)
     spy = QSignalSpy(getattr(bridge, name + "Changed"))
     value = changed_value(bridge, name)
@@ -577,7 +592,7 @@ def test_real_save_preserves_user_choices_under_policy(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("name", writable_properties())
 def test_locked_property_rejects_changes_and_notifies(
-    name: str, caplog: pytest.LogCaptureFixture
+    name: str, caplog: pytest.LogCaptureFixture, fly_tray_control: FlyTrayControl
 ) -> None:
     settings = Settings()
     user_bridge = SettingsBridge(settings, save=Mock())
@@ -587,7 +602,14 @@ def test_locked_property_rejects_changes_and_notifies(
     mirror = policy_mod.effective(settings, policy)
     save = Mock()
     apply = Mock(spec=SettingsApply)
-    bridge = SettingsBridge(settings, mirror=mirror, locked=policy.values, save=save, apply=apply)
+    bridge = SettingsBridge(
+        settings,
+        mirror=mirror,
+        locked=policy.values,
+        save=save,
+        apply=apply,
+        fly_tray=fly_tray_control,
+    )
     original, effective = settings.to_dict(), mirror.to_dict()
     spy = QSignalSpy(getattr(bridge, name + "Changed"))
     seen = []
@@ -628,10 +650,14 @@ def test_locked_settings_are_sorted_immutable_and_available_without_mirror() -> 
     save.assert_not_called()
 
 
-def test_s19_a5_all_writable_properties_reach_file(tmp_path: Path) -> None:
+def test_s19_a5_all_writable_properties_reach_file(
+    tmp_path: Path, fly_tray_control: FlyTrayControl
+) -> None:
     path = tmp_path / "settings.json"
     settings = Settings()
-    bridge = SettingsBridge(settings, save=partial(settings_mod.save, path=path))
+    bridge = SettingsBridge(
+        settings, save=partial(settings_mod.save, path=path), fly_tray=fly_tray_control
+    )
     changed: dict[str, str | bool | int] = {}
     for name in writable_properties():
         allow_mouse_setting(bridge, name)
@@ -650,7 +676,7 @@ def test_s19_a5_all_writable_properties_reach_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize("name", writable_properties())
 @pytest.mark.parametrize("with_mirror", [False, True])
 def test_save_error_rolls_back_value_and_runtime(
-    name: str, with_mirror: bool, caplog: pytest.LogCaptureFixture
+    name: str, with_mirror: bool, caplog: pytest.LogCaptureFixture, fly_tray_control: FlyTrayControl
 ) -> None:
     settings = Settings()
     original = settings.to_dict()
@@ -658,7 +684,9 @@ def test_save_error_rolls_back_value_and_runtime(
     save = Mock(side_effect=OSError("PRIVATE FILE CONTENT"))
     apply = Mock(spec=SettingsApply)
     apply.hotkey.return_value = "ok"
-    bridge = SettingsBridge(settings, mirror=mirror, save=save, apply=apply)
+    bridge = SettingsBridge(
+        settings, mirror=mirror, save=save, apply=apply, fly_tray=fly_tray_control
+    )
     allow_mouse_setting(bridge, name)
     old = getattr(bridge, name)
     value = changed_value(bridge, name)
