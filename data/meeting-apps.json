@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "apps": [
+    {
+      "id": "dion",
+      "title": "DION",
+      "binary": ["dion"],
+      "exe": [],
+      "class": "dion"
+    }
+  ]
+}

@@ -7,11 +7,17 @@ Loading and disabling settings never traverses or deletes meeting data.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
-from typing import Any
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, replace
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 from astra_voice.meetings import MeetingValidationError
 from astra_voice.meetings.model import normalize_text
+
+if TYPE_CHECKING:
+    from astra_voice.core.settings import Settings
+    from astra_voice.meetings.policy import MeetingPolicy, PolicyValue
 
 NOTICE_TEXT = "Я веду запись и расшифровку этой встречи для протокола."
 INVITE_TEXT = (
@@ -78,3 +84,96 @@ def validate_setting(name: str, value: Any) -> Any:
         )
     except MeetingValidationError:
         return invalid()
+
+
+@dataclass(frozen=True)
+class EffectiveMeetingSettings:
+    """A settings copy plus UI metadata; computing it performs no I/O or opt-in."""
+
+    settings: Settings
+    policy: MeetingPolicy
+    controls: Mapping[str, PolicyValue[object]]
+    explanation: str
+    key_editable: bool = True  # V3: the API key is not in Settings or policy.
+
+    @property
+    def recording_allowed(self) -> bool:
+        return self.settings.meetings_enabled and self.policy.recording_allowed
+
+    @property
+    def detector_allowed(self) -> bool:
+        return (
+            self.recording_allowed
+            and self.settings.meeting_offer_on_call
+            and self.policy.detector_allowed
+        )
+
+
+def effective_settings(settings: Settings, policy: MeetingPolicy) -> EffectiveMeetingSettings:
+    """Intersect user choices with meeting policy without enabling the feature.
+
+    Local imports avoid a settings → policy → settings import cycle. No UI,
+    filesystem access, subscriptions or writes are triggered by this function.
+    """
+    from astra_voice.meetings.policy import (
+        POLICY_EXPLANATION,
+        REASON_ADMIN,
+        REASON_MANUAL,
+        REASON_RECORD_OFF,
+        PolicyValue,
+        RecordMode,
+        validate_endpoint,
+    )
+
+    result = replace(settings, extra=dict(settings.extra))
+    controls: dict[str, PolicyValue[object]] = {}
+    for name in MEETING_DEFAULTS:
+        value = validate_setting(name, getattr(settings, name))
+        setattr(result, name, value)
+        controls[name] = PolicyValue(value)
+    for name in (
+        "meeting_diarization",
+        "meeting_audio_retention_days",
+        "meeting_notice_text",
+        "meeting_ai_endpoint",
+    ):
+        decision = policy.decisions[name]
+        if decision.locked:
+            value = (
+                "" if name == "meeting_ai_endpoint" and decision.value == "off" else decision.value
+            )
+            setattr(result, name, value)
+            controls[name] = PolicyValue(value, True, decision.reason, decision.code)
+    if policy.meeting_record.value == RecordMode.OFF:
+        reason = (
+            REASON_RECORD_OFF
+            if policy.meeting_record.reason == REASON_ADMIN
+            else policy.meeting_record.reason
+        )
+        for name in ("meetings_enabled", "meeting_offer_on_call"):
+            setattr(result, name, False)
+            controls[name] = PolicyValue(False, True, reason, policy.meeting_record.code)
+    elif policy.meeting_record.value == RecordMode.MANUAL:
+        result.meeting_offer_on_call = False
+        controls["meeting_offer_on_call"] = PolicyValue(
+            False, True, REASON_MANUAL, policy.meeting_record.code
+        )
+    if result.meeting_ai_endpoint:
+        try:
+            # A user URL cannot borrow a plaintext grant intended for an endpoint
+            # from the same administrative snapshot. DNS/transport remains M9.
+            result.meeting_ai_endpoint = validate_endpoint(
+                result.meeting_ai_endpoint,
+                allow_http=policy.meeting_ai_endpoint.locked
+                and policy.meeting_ai_allow_plaintext.value,
+            )
+        except (ValueError, UnicodeError):
+            result.meeting_ai_endpoint = ""
+    endpoint_control = controls["meeting_ai_endpoint"]
+    controls["meeting_ai_endpoint"] = replace(endpoint_control, value=result.meeting_ai_endpoint)
+    return EffectiveMeetingSettings(
+        result,
+        policy,
+        MappingProxyType(controls),
+        POLICY_EXPLANATION if any(d.locked for d in policy.decisions.values()) else "",
+    )
