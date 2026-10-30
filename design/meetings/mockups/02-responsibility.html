@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Встречи — экран ответственности</title><style>
+@font-face{font-family:'PT Root UI';font-weight:400;src:url('../../../tests/fixtures/fonts/pt-root-ui/PTRootUI-Regular.ttf')}
+@font-face{font-family:'PT Root UI';font-weight:500;src:url('../../../tests/fixtures/fonts/pt-root-ui/PTRootUI-Medium.ttf')}
+@font-face{font-family:'PT Root UI';font-weight:700;src:url('../../../tests/fixtures/fonts/pt-root-ui/PTRootUI-Bold.ttf')}
+:root{--font-ui:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;
+ --font-mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+ --bg-app:#F7F9FC;--bg-surface:#FFFFFF;--bg-sunk:#EDF1F7;--bg-tbar:#E7ECF4;
+ --border:#D7DEEA;--border-soft:#EDF1F7;--hover:#EDF1F7;
+ --fg1:#0E1729;--fg2:#243350;--fg3:#5A6884;--fg4:#AAB4C7;--fgdis:#616D83;
+ --primary:#1B3A73;--primary-fg:#FFFFFF;--primary-bg:#E8EDF7;
+ --accent:#12B3A0;--accent-ink:#0A776A;--accent-bg:#E3F7F4;
+ --ok-ink:#1F7D50;--ok-bg:#E7F5EE;--warn-ink:#8F5E12;--warn-bg:#FAF0DC;--err-ink:#C0322F;--err-bg:#FBECEB;
+ --canvas:#DDE3EE;--canvas-fg:#3A4761;--shadow:rgba(14,23,41,.18);
+ --desk1:#C9D6EA;--desk2:#9FB4D6;
+ /* fixed — поверх чужого рабочего стола, с темой не меняются */
+ --pill-bg:rgba(14,23,41,.94);--pill-fg:#F2F5FA;--pill-muted:#C4CDDC;--pill-neutral:#8C97AC;
+ --pill-live:#12B3A0;--pill-warn:#F2B559;--pill-err:#F0645F;
+ --nt-bg:#1B2331;--nt-border:rgba(255,255,255,.12);--nt-btn:rgba(255,255,255,.10);
+ --nt-pri:#6C93E8;--nt-pri-fg:#0B1220;--nt-muted:#8C97AC;--pill-close-bg:rgba(255,255,255,.12);
+ /* спикеры — только направление B (новые токены, контраст проверять) */
+ --sp1:#2F6FD0;--sp2:#B5487A;--sp3:#7A5BC4;--sp4:#B36A12;
+}
+body.dark{
+ --bg-app:#0B1220;--bg-surface:#151E30;--bg-sunk:#080D18;--bg-tbar:#101A2B;
+ --border:rgba(255,255,255,.10);--border-soft:rgba(255,255,255,.06);--hover:#232C3C;
+ --fg1:#F2F5FA;--fg2:#C4CDDC;--fg3:#8C97AC;--fg4:#5A6884;--fgdis:#7E889B;
+ --primary:#6C93E8;--primary-fg:#0B1220;--primary-bg:rgba(108,147,232,.12);
+ --accent:#2FD9C4;--accent-ink:#2FD9C4;--accent-bg:rgba(47,217,196,.13);
+ --ok-ink:#4FBF88;--ok-bg:rgba(79,191,136,.13);--warn-ink:#F2B559;--warn-bg:rgba(242,181,89,.13);
+ --err-ink:#F0645F;--err-bg:rgba(240,100,95,.13);
+ --canvas:#05080F;--canvas-fg:#8C97AC;--shadow:rgba(0,0,0,.55);
+ --desk1:#16233B;--desk2:#0A1222;
+ --sp1:#7FA8F0;--sp2:#E58AB4;--sp3:#B29BF0;--sp4:#E8B060;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:58px 20px 40px;background:var(--canvas);color:var(--canvas-fg);
+ font-family:var(--font-ui);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.page{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:16px;align-items:center}
+.stand{position:fixed;top:0;left:0;right:0;z-index:50;display:flex;align-items:center;gap:12px;
+ padding:10px 20px;background:var(--canvas);border-bottom:1px solid var(--border);font-size:12.5px}
+.stand a{color:var(--canvas-fg)} .stand .sp{flex:1}
+.stand button{font:inherit;font-size:12.5px;padding:3px 10px;border-radius:6px;border:1px solid var(--border);
+ background:var(--bg-surface);color:var(--fg1);cursor:pointer}
+.stand button.on{background:var(--primary);color:var(--primary-fg);border-color:var(--primary)}
+h1.ptitle{font-size:20px;margin:0 0 2px;color:var(--fg1);align-self:stretch}
+.lead{align-self:stretch;font-size:13px;max-width:none}
+.sec{align-self:stretch;font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;
+ color:var(--canvas-fg);margin:18px 0 -4px}
+.cap{align-self:stretch;font-size:13px}
+.cap b{color:var(--fg1)}
+.legend{align-self:stretch;font-size:12.5px;line-height:1.55}
+.legend b{color:var(--fg1)}
+.grid2{align-self:stretch;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid3{align-self:stretch;display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.tile{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;
+ display:flex;flex-direction:column;gap:10px;color:var(--fg1)}
+.tile .tl{font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3)}
+.tile .tl code{font-family:var(--font-mono);text-transform:none;letter-spacing:0;color:var(--fg4);margin-left:6px}
+.tile .tn{font-size:12px;color:var(--fg3);line-height:1.45}
+.mono{font-family:var(--font-mono);letter-spacing:.02em}
+code{font-family:var(--font-mono);font-size:.92em}
+.ico{width:16px;height:16px;flex:none;display:inline-block;vertical-align:middle}
+.ico svg{width:100%;height:100%;display:block}
+
+/* окно */
+.win{background:var(--bg-app);color:var(--fg1);border-radius:8px;overflow:hidden;box-shadow:0 14px 44px var(--shadow);
+ display:flex;flex-direction:column;flex:none}
+.tbar{height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 10px;background:var(--bg-tbar);
+ border-bottom:1px solid var(--border)}
+.tbar .t{font-size:12.5px;color:var(--fg2);font-weight:500}
+.tbar .sp{flex:1}
+.wbtn{width:14px;height:14px;border-radius:3px;background:var(--border);display:inline-block}
+.wbtn.c{background:#D96B62} body.dark .wbtn.c{background:#8C3B36}
+.body{display:flex;flex:1;min-height:0}
+.side{width:184px;flex:none;border-right:1px solid var(--border);padding:12px 10px;display:flex;flex-direction:column;gap:2px;background:var(--bg-app)}
+.brand{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:500;padding:4px 6px 12px;
+ border-bottom:1px solid var(--border);margin-bottom:8px}
+.nav{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;font-size:13.5px;font-weight:500;color:var(--fg2)}
+.nav.on{background:var(--primary);color:var(--primary-fg)}
+.nav.new:not(.on){box-shadow:inset 0 0 0 1.5px var(--accent)}
+.nav .cnt{margin-left:auto;font-size:11.5px;font-weight:400;opacity:.8}
+.side .grow{flex:1}
+.side .dbg{font-size:13px;color:var(--fg3);font-weight:400}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.content{flex:1;padding:12px 22px 16px;overflow:hidden;position:relative}
+.content.scrollmark{border-right:6px solid transparent}
+.shead{display:flex;align-items:flex-start;gap:12px;margin-bottom:8px}
+.shead .h{flex:1}
+.h2{font-size:20px;line-height:1.25;font-weight:700;margin:0}
+.h3{font-size:16px;line-height:1.3;font-weight:500;margin:0}
+.ssub{font-size:13px;color:var(--fg3)}
+.sbar{height:36px;flex:none;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:0 14px;
+ font-size:12.5px;color:var(--fg2);background:var(--bg-app)}
+.sbar .sp{flex:1} .sbar .v{font-family:var(--font-mono);font-size:12px;color:var(--fg3)}
+
+.grp{font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3);margin:14px 0 5px 2px}
+.card{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.card>.r+.r,.card>.r+.mrow,.card>.mrow+.mrow,.card>.mrow+.r{border-top:1px solid var(--border-soft)}
+.r{display:flex;align-items:center;gap:10px;padding:7px 14px;min-height:38px}
+.r .left{flex:1;min-width:0}
+.r .lbl{font-size:14px} .r .sub{font-size:12px;color:var(--fg3);line-height:1.5}
+.r.dis .lbl,.r.dis .sub{color:var(--fgdis)}
+.r.col{flex-direction:column;align-items:stretch}
+.hint{width:15px;height:15px;flex:none;border-radius:50%;border:1px solid var(--fg4);color:var(--fg3);
+ font-size:10px;line-height:13px;text-align:center;display:inline-block;font-weight:500}
+.lockb{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--fg3);background:var(--bg-sunk);
+ border-radius:5px;padding:2px 6px;white-space:nowrap}
+.lockb .ico{width:11px;height:11px}
+.lockb.err{color:var(--err-ink);background:var(--err-bg)}
+.tgl{width:38px;height:21px;border-radius:11px;background:var(--fg4);position:relative;flex:none}
+.tgl i{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;display:block}
+.tgl.on{background:var(--primary)} .tgl.on i{left:19px}
+.btn{font-family:var(--font-ui);font-size:13px;font-weight:500;color:var(--fg1);background:var(--bg-surface);
+ border:1px solid var(--border);border-radius:7px;padding:6px 12px;display:inline-flex;align-items:center;gap:6px;
+ white-space:nowrap;line-height:1.5}
+.btn .ico{width:13px;height:13px}
+.btn.pri{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+.btn.gh{background:transparent;border-color:transparent;color:var(--primary);padding:6px 8px}
+.btn.dan{background:var(--bg-surface);border-color:var(--border);color:var(--err-ink)}
+.btn.dis{color:var(--fgdis);background:var(--bg-sunk);border-color:var(--border)}
+.btn.sm{font-size:12.5px;padding:4px 9px}
+.btn.icon{width:34px;height:34px;padding:0;justify-content:center}
+.btn.icon.sm{width:28px;height:28px}
+.btn.focus{box-shadow:0 0 0 2px var(--bg-app),0 0 0 4px var(--accent-ink)}
+.sel{font-size:13px;color:var(--fg1);background:var(--bg-surface);border:1px solid var(--border);border-radius:7px;
+ padding:6px 10px;display:inline-flex;align-items:center;gap:8px;white-space:nowrap;min-width:150px;justify-content:space-between}
+.sel.dis{color:var(--fgdis);background:var(--bg-sunk)}
+.field{font-size:13px;color:var(--fg1);background:var(--bg-surface);border:1px solid var(--border);border-radius:7px;
+ padding:7px 11px;display:flex;align-items:center;gap:8px;min-width:0}
+.field.ph{color:var(--fg3)} .field.dis{color:var(--fgdis);background:var(--bg-sunk)}
+.field.area{align-items:flex-start;line-height:1.45}
+.field.foc{box-shadow:0 0 0 2px var(--bg-app),0 0 0 4px var(--accent-ink)}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:500;border-radius:5px;padding:2px 7px;
+ white-space:nowrap;line-height:1.5}
+.b-pri{background:var(--primary-bg);color:var(--primary)}
+.b-n{background:var(--bg-sunk);color:var(--fg2)}
+.b-ok{background:var(--ok-bg);color:var(--ok-ink)}
+.b-warn{background:var(--warn-bg);color:var(--warn-ink)}
+.b-err{background:var(--err-bg);color:var(--err-ink)}
+.b-acc{background:var(--accent-bg);color:var(--accent-ink)}
+.badge .ico{width:11px;height:11px}
+.note{display:flex;gap:9px;padding:10px 12px;border-radius:9px;font-size:12.5px;line-height:1.45;background:var(--bg-sunk);color:var(--fg2)}
+.note .ico{width:15px;height:15px;margin-top:1px;color:var(--fg3)}
+.note.warn{background:var(--warn-bg);color:var(--fg1)} .note.warn .ico{color:var(--warn-ink)}
+.note.err{background:var(--err-bg);color:var(--fg1)} .note.err .ico{color:var(--err-ink)}
+.note.ok{background:var(--ok-bg);color:var(--fg1)} .note.ok .ico{color:var(--ok-ink)}
+.note.info{background:var(--primary-bg);color:var(--fg1)} .note.info .ico{color:var(--primary)}
+.ok-t{color:var(--ok-ink)} .warn-t{color:var(--warn-ink)} .err-t{color:var(--err-ink)} .mut{color:var(--fg3)}
+.prog{height:4px;background:var(--bg-sunk);border-radius:3px;overflow:hidden}
+.prog i{display:block;height:100%;background:var(--primary)}
+.chk{width:16px;height:16px;border-radius:4px;border:1.5px solid var(--fg4);flex:none;display:inline-flex;align-items:center;justify-content:center;background:var(--bg-surface)}
+.chk.on{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+.chk.on .ico{width:12px;height:12px}
+.chk.dis{background:var(--bg-sunk)}
+.radio{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--fg4);flex:none;position:relative;background:var(--bg-surface)}
+.radio.on{border-color:var(--primary)} .radio.on::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--primary)}
+
+/* строка встречи */
+.mrow{display:flex;align-items:center;gap:10px;padding:8px 10px 8px 14px;min-height:56px;position:relative}
+.mrow .left{flex:1;min-width:0}
+.mrow .nm{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mrow .meta{font-size:12px;color:var(--fg3);font-family:var(--font-mono);letter-spacing:.01em}
+.mrow .meta .t{font-family:var(--font-ui)}
+.mrow .pbar{position:absolute;left:0;right:0;bottom:0;height:4px;background:var(--bg-sunk)}
+.mrow .pbar i{display:block;height:100%;background:var(--primary)}
+.mrow.live{background:var(--primary-bg)}
+.cfoot{display:flex;align-items:center;gap:8px;padding:8px 14px;border-top:1px solid var(--border-soft);font-size:12px;color:var(--fg3);background:var(--bg-surface)}
+.cfoot .mono{color:var(--fg2)}
+
+/* диалог */
+.dlg{background:var(--bg-app);border:1px solid var(--border);border-radius:9px;box-shadow:0 16px 44px var(--shadow);
+ overflow:hidden;color:var(--fg1);flex:none}
+.dlg .dh{height:30px;background:var(--bg-tbar);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:7px;
+ padding:0 10px;font-size:12.5px;color:var(--fg2)}
+.dlg .db{padding:16px 18px 6px;display:flex;flex-direction:column;gap:12px;font-size:13.5px}
+.dlg .df{padding:12px 18px 14px;display:flex;gap:8px;align-items:center}
+.dlg .df .sp{flex:1}
+.scrim{position:relative;background:rgba(14,23,41,.35);display:flex;align-items:center;justify-content:center;padding:30px}
+body.dark .scrim{background:rgba(0,0,0,.5)}
+
+/* рабочий стол и окна поверх */
+.desk{position:relative;border-radius:10px;overflow:hidden;background:linear-gradient(160deg,var(--desk1),var(--desk2));
+ align-self:stretch}
+.desk .panel{position:absolute;left:0;right:0;bottom:0;height:34px;background:rgba(10,16,28,.82);display:flex;align-items:center;
+ gap:8px;padding:0 10px;color:#C4CDDC;font-size:12px}
+.desk .panel .sp{flex:1}
+.desk .panel .task{background:rgba(255,255,255,.08);border-radius:4px;padding:2px 9px}
+.desk .panel .clock{font-family:var(--font-mono);background:rgba(255,255,255,.08);border-radius:4px;padding:2px 8px}
+.vks{position:absolute;background:#1A1F27;border-radius:8px;box-shadow:0 12px 36px rgba(0,0,0,.45);overflow:hidden;color:#DCE2EC}
+.vks .vt{height:26px;background:#232A35;display:flex;align-items:center;padding:0 10px;font-size:11.5px;color:#AEB7C6;gap:8px}
+.vks .tiles{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px}
+.vks .tiles div{background:#2B3340;border-radius:6px;height:96px;display:flex;align-items:flex-end;padding:6px 8px;font-size:11px;color:#C9D1DE}
+.vks .ctl{display:flex;justify-content:center;gap:10px;padding:8px 0 10px}
+.vks .ctl i{width:30px;height:30px;border-radius:50%;background:#3A4352;display:block}
+.vks .ctl i.end{background:#C8483F;width:44px;border-radius:15px}
+.ov{position:absolute;color:var(--pill-fg)}
+.ntf{width:380px;background:var(--nt-bg);border:1px solid var(--nt-border);border-radius:10px;padding:12px 14px 12px;
+ box-shadow:0 14px 36px rgba(0,0,0,.5);color:#F2F5FA;font-size:12.5px;line-height:1.45;position:relative;overflow:hidden}
+.ntf .nh{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--nt-muted);margin-bottom:6px}
+.ntf .nh .x{margin-left:auto;width:18px;height:18px;border-radius:50%;background:rgba(255,255,255,.1);display:inline-flex;align-items:center;justify-content:center;color:#C4CDDC}
+.ntf .nh .x .ico{width:10px;height:10px}
+.ntf .nt{font-size:13.5px;font-weight:500;margin-bottom:3px}
+.ntf .nb{display:flex;gap:7px;margin-top:10px;align-items:center;flex-wrap:wrap}
+.nbtn{font-family:var(--font-ui);font-size:12.5px;padding:5px 10px;border-radius:6px;background:var(--nt-btn);color:#F2F5FA;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
+.nbtn.p{background:var(--nt-pri);color:var(--nt-pri-fg);font-weight:500}
+.nbtn .ico{width:12px;height:12px}
+.ntf .cnt{margin-left:auto;font-size:11.5px;color:var(--nt-muted)}
+.ntf .timer{position:absolute;left:0;bottom:0;height:2px;background:var(--nt-pri)}
+.ntf.native{width:340px;border-radius:8px;padding:11px 12px}
+.ntf .txtbox{border:1px solid var(--nt-border);border-radius:7px;padding:8px 10px;margin:8px 0 2px;font-size:13px;color:#F2F5FA}
+.ntf .muted{color:var(--nt-muted)}
+
+/* плашка записи */
+.rbar{height:36px;border-radius:18px;background:var(--pill-bg);box-shadow:0 6px 18px rgba(0,0,0,.4);display:inline-flex;align-items:center;
+ gap:8px;padding:0 5px 0 8px;color:var(--pill-fg);font-size:12.5px;white-space:nowrap}
+.rbar .grip{width:8px;height:16px;opacity:.55;background:radial-gradient(circle,#C4CDDC 1px,transparent 1.3px) 0 0/4px 5px}
+.rbar .lab{font-weight:700}
+.rbar .tm{font-family:var(--font-mono);font-size:13px;letter-spacing:.02em;font-variant-numeric:tabular-nums}
+.rbar .dim{color:var(--pill-neutral)}
+.rbar .wn{color:var(--pill-warn)}
+.rbar .sep{width:1px;height:18px;background:var(--pill-close-bg)}
+.rb{height:26px;border-radius:13px;background:rgba(255,255,255,.10);color:var(--pill-fg);display:inline-flex;align-items:center;gap:5px;
+ padding:0 10px;font-size:12.5px}
+.rb .ico{width:12px;height:12px}
+.rb.i{width:26px;padding:0;justify-content:center}
+.rb.p{background:var(--nt-pri);color:var(--nt-pri-fg);font-weight:500}
+.rbar .sym{width:14px;height:14px;flex:none}
+.rbar .sym svg{width:100%;height:100%;display:block}
+.tip{position:absolute;background:#0E1729;color:#F2F5FA;font-size:12px;padding:5px 9px;border-radius:6px;box-shadow:0 6px 18px rgba(0,0,0,.35);white-space:nowrap}
+
+/* трей-меню */
+.tmenu{width:262px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:5px;box-shadow:0 12px 34px var(--shadow);font-size:13px;color:var(--fg1)}
+.tmenu .mi{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:6px}
+.tmenu .mi .k{margin-left:auto;font-family:var(--font-mono);font-size:11.5px;color:var(--fg3)}
+.tmenu .mi.st{font-size:12px;color:var(--fg3);padding:3px 9px}
+.tmenu .mi.st.live{color:var(--fg3)}
+.tmenu .mi.dis{color:var(--fgdis)}
+.tmenu .mi.hl{background:var(--primary);color:var(--primary-fg)}
+.tmenu .mi.new{}
+.tmenu .sepm{height:1px;background:var(--border-soft);margin:4px 6px}
+.trayicon{display:inline-flex;align-items:center;justify-content:center;width:44px;height:30px;border-radius:6px;background:rgba(10,16,28,.82);color:#E7ECF4}
+body:not(.dark) .trayicon.light{background:#E7ECF4;color:#243350}
+
+/* расшифровка */
+.tr{display:grid;grid-template-columns:76px 124px 1fr;gap:0 10px;padding:7px 14px;font-size:13.5px;line-height:1.5;border-top:1px solid var(--border-soft)}
+.tr:first-child{border-top:0}
+.tr .tc{font-family:var(--font-mono);font-size:12px;color:var(--fg3);padding-top:2px}
+.tr .who{font-weight:500;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-top:1px}
+.tr .who.me{color:var(--accent-ink)}
+.sn{display:inline-flex;align-items:center;justify-content:center;min-width:17px;height:17px;border-radius:9px;padding:0 4px;
+ background:var(--bg-sunk);border:1px solid var(--border);color:var(--fg2);font-family:var(--font-mono);font-size:10.5px;font-weight:700;margin-right:6px;vertical-align:1px}
+.drawer{position:absolute;top:0;right:0;bottom:0;width:300px;background:var(--bg-app);border-left:1px solid var(--border);box-shadow:-12px 0 34px var(--shadow);padding:12px 14px;display:flex;flex-direction:column;gap:10px;z-index:4}
+.toast{display:inline-flex;align-items:center;gap:10px;white-space:nowrap;max-width:var(--toast-max,708px);background:#0E1729;color:#F2F5FA;font-size:12.5px;border-radius:8px;padding:7px 8px 7px 12px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
+.toast .btn{background:var(--pill-close-bg);border-color:transparent;color:#F2F5FA}
+.hist{align-self:stretch;background:var(--warn-bg);color:var(--fg1);border-radius:9px;padding:10px 14px;font-size:13px}
+.tr.mark{grid-template-columns:76px 1fr;background:var(--bg-sunk);font-size:12px;color:var(--fg3)}
+.spk{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:500;border-radius:10px;padding:1px 8px 1px 2px;white-space:nowrap}
+.spk .n{width:16px;height:16px;border-radius:50%;color:#fff;font-size:10px;display:inline-flex;align-items:center;justify-content:center;font-weight:700}
+body.dark .spk .n{color:#0B1220}
+.bub{max-width:76%;padding:7px 11px;border-radius:12px;font-size:13.5px;line-height:1.5;background:var(--bg-surface);border:1px solid var(--border)}
+.bub.me{background:var(--primary-bg);border-color:transparent}
+.msg{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.msg.me{align-items:flex-end}
+.msg .mh{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--fg3)}
+</style><script>
+function setTheme(d){document.body.classList.toggle('dark',d);
+ document.getElementById('tl').classList.toggle('on',!d);document.getElementById('td').classList.toggle('on',d);
+ if(location.hash.indexOf('measure')<0)history.replaceState(null,'',d?'#dark':'#');}
+window.addEventListener('DOMContentLoaded',function(){setTheme(location.hash.indexOf('dark')>=0);});
+/* стенд: #measure — замер ширин после загрузки шрифтов (в продукт не входит) */
+var MEASURE=location.hash.indexOf('measure')>=0;
+window.addEventListener('load',function(){if(!MEASURE)return;
+ document.fonts.ready.then(function(){var r=[];document.querySelectorAll('.rbar,.dlg,.toast,.win,.ntf').forEach(function(e){var b=e.getBoundingClientRect();
+ r.push([e.className.split(' ')[0],Math.round(b.width*10)/10,Math.round(b.height*10)/10,(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,48)]);});
+ var p=document.createElement('pre');p.id='measure';p.setAttribute('data-font',document.fonts.check('13px "PT Root UI"')?'PT Root UI':'fallback');p.textContent=JSON.stringify(r);document.body.appendChild(p);});});
+</script></head>
+<body><div class="stand"><b>Astra Voice · Встречи (E13)</b><span><a href="index.html">Оглавление</a> · <a href="01-section.html">01 Раздел</a> · <a href="02-responsibility.html">02 Ответственность</a> · <a href="03-offer.html">03 Предложение</a> · <a href="04-recording.html">04 Запись</a> · <a href="05-meeting-A.html">05 Карточка</a> · <a href="06-meeting-states.html">06 Состояния</a> · <a href="07-templates.html">07 Шаблоны</a></span><span class="sp"></span>
+<span>Тема:</span><button id="tl" onclick="setTheme(false)">светлая</button><button id="td" onclick="setTheme(true)">тёмная</button></div>
+<div class="page"><h1 class="ptitle">02 · Экран ответственности (US-13.1, M4)</h1><div class="lead legend">Пять пунктов из PRD F18.1 (б), разбитые по смыслу, чтобы их прочитали, а не пролистали. Обязанность предупреждать — выделена. Тексты — spec.md §4.2.</div>
+<div class="sec">1 · Личный контур — окно 1024×620: диалог не выше клиентской области − 48, тело прокручивается</div><div class="win" style="width:1024px;height:620px"><div class="tbar"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg><span class="t">Astra Voice — Настройки</span><span class="sp"></span><span class="wbtn"></span><span class="wbtn"></span><span class="wbtn c"></span></div><div class="scrim" style="height:588px;padding:24px"><div class="dlg" style="width:520px;max-height:540px;display:flex;flex-direction:column"><div class="dh" style="flex:none"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg>Запись встреч</div><div class="db" style="flex:1;min-height:0;overflow-y:auto;border-bottom:1px solid var(--border-soft);"><div class="h3">Перед тем как включить</div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 3.5h7a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H6l-2.5 2v-2h-1a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z"/><path d="M12.5 6.5h1a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-1v2l-2.5-2H8"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Что записывается</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Ваш микрофон и звук собеседников из программы видеосвязи. Из записи программа делает текст — на этом компьютере, без интернета.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.6"/><circle cx="8" cy="8" r="2.4" fill="currentColor" stroke="none"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Когда</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только после того, как вы нажмёте «Начать запись». Пока идёт запись, на экране видна плашка с таймером — скрыть её нельзя, остановить можно одним нажатием.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 7.5 8 3l5.5 4.5M4 6.5v6.5h8V6.5"/><path d="M6.8 13v-3.2h2.4V13"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Где хранится</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только на этом компьютере. Звук удаляется сразу после расшифровки, если вы не выберете иначе. Встречу можно удалить целиком в любой момент.</div></div></div><div style="display:flex;gap:11px;background:var(--warn-bg);border-radius:8px;padding:9px 10px;margin:0 -10px;"><span style="color:var(--warn-ink);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Предупреждать участников — ваша обязанность</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">При каждом начале записи программа покажет готовый текст для чата встречи — скопируйте его и скажите вслух. Лучше предупреждать заранее — например, в приглашении на встречу.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5.5" r="2.2"/><path d="M2 13c.3-2.3 1.9-3.6 4-3.6s3.7 1.3 4 3.6"/><circle cx="11.3" cy="6" r="1.8"/><path d="M11 9.4c1.7.1 2.8 1.2 3 3.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Только свои встречи</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Записывайте только встречи, в которых участвуете сами, и не передавайте запись другим без согласия участников.</div></div></div><div style="font-size:13px;color:var(--fg2)">На рабочем компьютере действуют правила вашей организации о записи совещаний.</div><div style="display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--border-soft);padding-top:12px"><span class="chk" style="margin-top:2px"></span><div style="flex:1"><div style="font-size:13.5px">Предлагать запись, когда начинается звонок</div><div style="font-size:12px;color:var(--fg3)">Программа только спросит — запись сама не начнётся</div></div></div></div><div class="df" style="flex:none"><span class="sp"></span><span class="btn focus">Отмена</span><span class="btn pri">Понятно, включить</span></div></div></div></div><div class="cap"><b>Высота D1</b> по содержимому — 685 px (замер с PT Root UI), это больше клиентской области окна (588 при 1024×620, 556 при 900×588). Поэтому: <b>max-height = клиентская высота окна − 48</b> (по 24 сверху и снизу): 540 / 508. Шапка и кнопки закреплены, тело прокручивается штатным Flickable, полоса прокрутки видна сразу, над кнопками — разделитель. Прокрутка до конца для «Понятно, включить» <b>не требуется</b>. <b>Фокус по умолчанию — «Отмена»</b>: Enter ничего не включает (M4). Ширина 520 — исключение из 420.</div><div class="sec">2 · Окно 900×588 (минимум)</div><div class="win" style="width:900px;height:588px"><div class="tbar"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg><span class="t">Astra Voice — Настройки</span><span class="sp"></span><span class="wbtn"></span><span class="wbtn"></span><span class="wbtn c"></span></div><div class="scrim" style="height:556px;padding:24px"><div class="dlg" style="width:520px;max-height:508px;display:flex;flex-direction:column"><div class="dh" style="flex:none"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg>Запись встреч</div><div class="db" style="flex:1;min-height:0;overflow-y:auto;border-bottom:1px solid var(--border-soft);"><div class="h3">Перед тем как включить</div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 3.5h7a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H6l-2.5 2v-2h-1a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z"/><path d="M12.5 6.5h1a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-1v2l-2.5-2H8"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Что записывается</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Ваш микрофон и звук собеседников из программы видеосвязи. Из записи программа делает текст — на этом компьютере, без интернета.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.6"/><circle cx="8" cy="8" r="2.4" fill="currentColor" stroke="none"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Когда</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только после того, как вы нажмёте «Начать запись». Пока идёт запись, на экране видна плашка с таймером — скрыть её нельзя, остановить можно одним нажатием.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 7.5 8 3l5.5 4.5M4 6.5v6.5h8V6.5"/><path d="M6.8 13v-3.2h2.4V13"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Где хранится</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только на этом компьютере. Звук удаляется сразу после расшифровки, если вы не выберете иначе. Встречу можно удалить целиком в любой момент.</div></div></div><div style="display:flex;gap:11px;background:var(--warn-bg);border-radius:8px;padding:9px 10px;margin:0 -10px;"><span style="color:var(--warn-ink);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Предупреждать участников — ваша обязанность</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">При каждом начале записи программа покажет готовый текст для чата встречи — скопируйте его и скажите вслух. Лучше предупреждать заранее — например, в приглашении на встречу.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5.5" r="2.2"/><path d="M2 13c.3-2.3 1.9-3.6 4-3.6s3.7 1.3 4 3.6"/><circle cx="11.3" cy="6" r="1.8"/><path d="M11 9.4c1.7.1 2.8 1.2 3 3.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Только свои встречи</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Записывайте только встречи, в которых участвуете сами, и не передавайте запись другим без согласия участников.</div></div></div><div style="font-size:13px;color:var(--fg2)">На рабочем компьютере действуют правила вашей организации о записи совещаний.</div><div style="display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--border-soft);padding-top:12px"><span class="chk" style="margin-top:2px"></span><div style="flex:1"><div style="font-size:13.5px">Предлагать запись, когда начинается звонок</div><div style="font-size:12px;color:var(--fg3)">Программа только спросит — запись сама не начнётся</div></div></div></div><div class="df" style="flex:none"><span class="sp"></span><span class="btn focus">Отмена</span><span class="btn pri">Понятно, включить</span></div></div></div></div><div class="sec">3 · Корпоративный контур и <code>meeting_record=manual</code> (диалог целиком, без ограничения высоты — для чтения текста)</div><div class="grid2"><div class="tile"><div class="tl">Есть ключи <code>meeting_*</code></div><div class="dlg" style="width:470px;display:flex;flex-direction:column"><div class="dh" style="flex:none"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg>Запись встреч</div><div class="db" style=""><div class="h3">Перед тем как включить</div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 3.5h7a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H6l-2.5 2v-2h-1a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z"/><path d="M12.5 6.5h1a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-1v2l-2.5-2H8"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Что записывается</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Ваш микрофон и звук собеседников из программы видеосвязи. Из записи программа делает текст — на этом компьютере, без интернета.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.6"/><circle cx="8" cy="8" r="2.4" fill="currentColor" stroke="none"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Когда</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только после того, как вы нажмёте «Начать запись». Пока идёт запись, на экране видна плашка с таймером — скрыть её нельзя, остановить можно одним нажатием.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 7.5 8 3l5.5 4.5M4 6.5v6.5h8V6.5"/><path d="M6.8 13v-3.2h2.4V13"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Где хранится</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только на этом компьютере. Звук удаляется сразу после расшифровки, если вы не выберете иначе. Встречу можно удалить целиком в любой момент.</div></div></div><div style="display:flex;gap:11px;background:var(--warn-bg);border-radius:8px;padding:9px 10px;margin:0 -10px;"><span style="color:var(--warn-ink);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Предупреждать участников — ваша обязанность</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">При каждом начале записи программа покажет готовый текст для чата встречи — скопируйте его и скажите вслух. Лучше предупреждать заранее — например, в приглашении на встречу.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5.5" r="2.2"/><path d="M2 13c.3-2.3 1.9-3.6 4-3.6s3.7 1.3 4 3.6"/><circle cx="11.3" cy="6" r="1.8"/><path d="M11 9.4c1.7.1 2.8 1.2 3 3.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Только свои встречи</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Записывайте только встречи, в которых участвуете сами, и не передавайте запись другим без согласия участников.</div></div></div><div style="font-size:13px;color:var(--fg2)">Этим компьютером управляет ваша организация. Записывайте совещания по её правилам — их можно узнать у администратора.</div><div style="display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--border-soft);padding-top:12px"><span class="chk" style="margin-top:2px"></span><div style="flex:1"><div style="font-size:13.5px">Предлагать запись, когда начинается звонок</div><div style="font-size:12px;color:var(--fg3)">Программа только спросит — запись сама не начнётся</div></div></div></div><div class="df" style="flex:none"><span class="sp"></span><span class="btn focus">Отмена</span><span class="btn pri">Понятно, включить</span></div></div><div class="tn">Меняется только последний абзац. Текст экрана — не юридическая консультация; формулировки — к очному юристу до G5 (PRD A37).</div></div><div class="tile"><div class="tl">manual <code>галочка недоступна</code></div><div class="dlg" style="width:470px;display:flex;flex-direction:column"><div class="dh" style="flex:none"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg>Запись встреч</div><div class="db" style=""><div class="h3">Перед тем как включить</div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 3.5h7a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H6l-2.5 2v-2h-1a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z"/><path d="M12.5 6.5h1a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-1v2l-2.5-2H8"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Что записывается</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Ваш микрофон и звук собеседников из программы видеосвязи. Из записи программа делает текст — на этом компьютере, без интернета.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.6"/><circle cx="8" cy="8" r="2.4" fill="currentColor" stroke="none"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Когда</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только после того, как вы нажмёте «Начать запись». Пока идёт запись, на экране видна плашка с таймером — скрыть её нельзя, остановить можно одним нажатием.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 7.5 8 3l5.5 4.5M4 6.5v6.5h8V6.5"/><path d="M6.8 13v-3.2h2.4V13"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Где хранится</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Только на этом компьютере. Звук удаляется сразу после расшифровки, если вы не выберете иначе. Встречу можно удалить целиком в любой момент.</div></div></div><div style="display:flex;gap:11px;background:var(--warn-bg);border-radius:8px;padding:9px 10px;margin:0 -10px;"><span style="color:var(--warn-ink);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Предупреждать участников — ваша обязанность</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">При каждом начале записи программа покажет готовый текст для чата встречи — скопируйте его и скажите вслух. Лучше предупреждать заранее — например, в приглашении на встречу.</div></div></div><div style="display:flex;gap:11px;"><span style="color:var(--fg3);margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5.5" r="2.2"/><path d="M2 13c.3-2.3 1.9-3.6 4-3.6s3.7 1.3 4 3.6"/><circle cx="11.3" cy="6" r="1.8"/><path d="M11 9.4c1.7.1 2.8 1.2 3 3.1"/></svg></span></span><div><div style="font-size:14px;font-weight:500">Только свои встречи</div><div style="font-size:13px;color:var(--fg2);line-height:1.5">Записывайте только встречи, в которых участвуете сами, и не передавайте запись другим без согласия участников.</div></div></div><div style="font-size:13px;color:var(--fg2)">Этим компьютером управляет ваша организация. Записывайте совещания по её правилам — их можно узнать у администратора.</div><div style="display:flex;gap:10px;align-items:flex-start;border-top:1px solid var(--border-soft);padding-top:12px"><span class="chk dis" style="margin-top:2px"></span><div style="flex:1"><div style="font-size:13.5px;color:var(--fgdis)">Предлагать запись, когда начинается звонок</div><div style="font-size:12px;color:var(--fg3)">Недоступно — так настроено администратором вашей организации</div></div></div></div><div class="df" style="flex:none"><span class="sp"></span><span class="btn focus">Отмена</span><span class="btn pri">Понятно, включить</span></div></div><div class="tn">Если программа не узнаёт ни одной программы видеосвязи (до спайков SP3), строки с галочкой нет вовсе.</div></div></div>
+</div></body></html>

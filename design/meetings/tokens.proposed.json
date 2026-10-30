@@ -1,0 +1,1458 @@
+{
+  "$schema-note": "ИСТОРИЯ: ВЛИТО в design/tokens.json 2.4.0 (2026-10-12, после G3; коммит — после PR). Канон — tokens.json, этот файл не редактировать и не читать генератором; оставлен как след ревизии 2 и справка $resolved-colors (в tokens.json не переносилась). Исходная пометка: ПРЕДЛОЖЕНИЕ-ДИФФ к design/tokens.json 2.3.1. Вливать в одноимённые ветки tokens.json как есть: генератор scripts/gen_theme.py читает лист по ключу .value, остальные поля (src/note/status/reuse) игнорирует. Всё геометрическое для окон поверх чужого рабочего стола (W1/W2/W3) лежит в component.pill.* — уйдёт в PillTheme.qml без правки генератора (имена pillMeeting…). Остальное — в Theme.qml. Новых цветов НЕТ: строковые значения вида 'bg-surface-2' — ссылки на существующие color.light/dark (генератор делает их алиасами Theme.bgSurface2 и т.п.). Блок $resolved-colors генератор не читает — справка о цветах макета, заменённых токенами (рев. 2).",
+  "$meta": {
+    "project": "Astra Voice",
+    "step": "E13 «Запись встреч» — токены к G3 (предложение)",
+    "base-version": "2.3.1",
+    "proposed-version": "2.4.0",
+    "revision": "2 — пересверка после правок UX 12.10 (вечер)",
+    "date": "2026-10-12",
+    "author": "design-engineer",
+    "sources": [
+      "design/meetings/spec.md §5, §5.2, §3, §4, §6, §9",
+      "design/meetings/mockups/_base.py",
+      "design/meetings/mockups/_p1.py",
+      "design/meetings/mockups/_p2.py",
+      "design/meetings/mockups/_p3.py",
+      "design/meetings/mockups/_p4.py",
+      "design/meetings/mockups/_p5.py"
+    ],
+    "verified": "геометрия сверена с рендером: google-chrome --headless=new --dump-dom (getBoundingClientRect); PT Root UI — из tests/fixtures/fonts/pt-root-ui (загрузка подтверждена: ширина эталонной строки 491.8 против 552.4 у DejaVu Sans); PT Mono на VPS нет — моноширинное набрано DejaVu Sans Mono (шаг 0.602 em против 0.600 em у PT Mono — практически равны), поэтому к ширинам с таймером применён запас ≥ 8 %; PT Astra Sans (Fly) не мерилась",
+    "status-legend": {
+      "conflict": "макет и spec.md расходятся — значение взято по spec.md, решить до G3 (см. design/meetings/tokens.md §8)",
+      "derived": "производное (вычислено), в макете явно не задано"
+    }
+  },
+  "size": {
+    "meeting-split-content-w": {
+      "value": "760px",
+      "src": "design/meetings/spec.md §5.2",
+      "note": "ширина КОНТЕНТА, с которой панель «Участники» стоит справа (≥ 760); меньше — полоса над таблицей + выезжающая панель"
+    },
+    "meeting-split-window-w": {
+      "value": "988px",
+      "src": "design/meetings/spec.md §5.2",
+      "note": "ПРОИЗВОДНОЕ: 760 + сайдбар 184 + 2×22; в spec округлено до «≈ 990»",
+      "status": "derived"
+    }
+  },
+  "shadow": {
+    "toast": {
+      "value": "0 10px 28px rgba(0,0,0,.35)",
+      "src": "design/meetings/mockups/_base.py:258",
+      "note": "НОВАЯ тень (у tooltip 0 6px 18px того же цвета); цвет не новый — как shadow.tooltip"
+    },
+    "meeting-drawer": {
+      "value": "-12px 0 34px {shadow}",
+      "src": "design/meetings/mockups/_base.py:257",
+      "note": "выезжающая панель «Участники»; цвет — color.*.shadow"
+    }
+  },
+  "zindex": {
+    "meeting-drawer": {
+      "value": 4,
+      "src": "design/meetings/mockups/_base.py:257",
+      "note": "ниже popover (5)"
+    },
+    "meeting-toast": {
+      "value": 6,
+      "src": "design/meetings/mockups/_p5.py body()",
+      "note": "в макете 5 (= popover); предложено 6 — тост поверх всего контента, с поповером одновременно не живёт"
+    }
+  },
+  "motion": {
+    "duration": {
+      "meeting-toast": {
+        "value": "4000ms",
+        "src": "design/meetings/spec.md §3.7, §5",
+        "note": "тосты «объединён», «Сохранено в…»"
+      },
+      "meeting-bar-note": {
+        "value": "8000ms",
+        "src": "design/meetings/spec.md §3.5",
+        "note": "вторая строка W2: app-closed, paused-indicator, paused-hang, notify-fallback"
+      },
+      "meeting-offer-timeout": {
+        "value": "60000ms",
+        "src": "design/meetings/spec.md §2.2, §3.3",
+        "note": "W1 закрывается сам; полоска убывает linear"
+      },
+      "meeting-offer-guard": {
+        "value": "500ms",
+        "src": "design/meetings/mockups/03-offer.html (подпись, T1 MN-7)",
+        "note": "первые 500 мс после появления W1 нажатия не принимаются"
+      },
+      "meeting-stopping-max": {
+        "value": "1000ms",
+        "src": "design/meetings/spec.md §2.4, §3.5",
+        "note": "«Сохраняю запись…» — потолок"
+      },
+      "meeting-list-skeleton-delay": {
+        "value": "300ms",
+        "src": "design/meetings/spec.md §3.1",
+        "note": "заглушки списка — только если чтение дольше"
+      }
+    }
+  },
+  "component": {
+    "progress": {
+      "h-thin": {
+        "value": "4px",
+        "src": "design/meetings/mockups/_base.py:154 · :169",
+        "note": "ДОПОЛНЕНИЕ к component.progress: тонкая полоса — строка списка (у нижнего края, без скругления), карточка «Расшифровано…», панели состояний; цвета progress.bg / progress.fill"
+      }
+    },
+    "speaker-num": {
+      "h": {
+        "value": "17px",
+        "src": "design/meetings/mockups/_base.py:255"
+      },
+      "min-w": {
+        "value": "17px",
+        "src": "design/meetings/mockups/_base.py:255"
+      },
+      "radius": {
+        "value": "9px",
+        "src": "design/meetings/mockups/_base.py:255",
+        "note": "фактически полукруг: в QML radius = height / 2 (8.5)"
+      },
+      "padding": {
+        "value": "0px 4px",
+        "src": "design/meetings/mockups/_base.py:255"
+      },
+      "gap": {
+        "value": "6px",
+        "src": "design/meetings/mockups/_base.py:256",
+        "note": "отступ справа до имени"
+      },
+      "size": {
+        "value": "10.5px",
+        "src": "design/meetings/mockups/_base.py:256"
+      },
+      "weight": {
+        "value": 700,
+        "src": "design/meetings/mockups/_base.py:256"
+      },
+      "font": {
+        "value": "mono",
+        "src": "design/meetings/mockups/_base.py:256",
+        "note": "Theme.fontMono"
+      },
+      "border": {
+        "value": "1px",
+        "src": "design/meetings/mockups/_base.py:256"
+      },
+      "bg": {
+        "value": "bg-surface-2",
+        "src": "design/meetings/mockups/_base.py:256"
+      },
+      "border-color": {
+        "value": "border",
+        "src": "design/meetings/mockups/_base.py:256"
+      },
+      "fg": {
+        "value": "fg-secondary",
+        "src": "design/meetings/mockups/_base.py:256"
+      }
+    },
+    "transcript": {
+      "col-time-w": {
+        "value": "76px",
+        "src": "design/meetings/mockups/_base.py:250"
+      },
+      "col-who-w": {
+        "value": "124px",
+        "src": "design/meetings/mockups/_base.py:250"
+      },
+      "col-gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_base.py:250",
+        "note": "между колонками; строк — 0"
+      },
+      "row-padding": {
+        "value": "7px 14px",
+        "src": "design/meetings/mockups/_base.py:250"
+      },
+      "row-divider": {
+        "value": "1px",
+        "src": "design/meetings/mockups/_base.py:250",
+        "note": "цвет border-soft; у первой строки нет"
+      },
+      "row-h": {
+        "value": "35.5px",
+        "src": "замер 05-meeting-A.html",
+        "note": "ИЗМЕРЕНО: однострочная реплика 13.5×1.5 + 2×7 + 1"
+      },
+      "text-size": {
+        "value": "13.5px",
+        "src": "design/meetings/mockups/_base.py:250"
+      },
+      "text-line-height": {
+        "value": 1.5,
+        "src": "design/meetings/mockups/_base.py:250"
+      },
+      "time-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_base.py:252"
+      },
+      "time-offset-top": {
+        "value": "2px",
+        "src": "design/meetings/mockups/_base.py:252",
+        "note": "выравнивание по первой строке реплики"
+      },
+      "time-fg": {
+        "value": "fg-muted",
+        "src": "design/meetings/mockups/_base.py:252"
+      },
+      "who-size": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_base.py:253"
+      },
+      "who-weight": {
+        "value": 500,
+        "src": "design/meetings/mockups/_base.py:253"
+      },
+      "who-offset-top": {
+        "value": "1px",
+        "src": "design/meetings/mockups/_base.py:253"
+      },
+      "me-fg": {
+        "value": "accent-ink",
+        "src": "design/meetings/mockups/_base.py:254",
+        "note": "«Я» — акцент и слово"
+      },
+      "mark-bg": {
+        "value": "bg-surface-2",
+        "src": "design/meetings/mockups/_base.py:261"
+      },
+      "mark-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_base.py:261"
+      },
+      "mark-fg": {
+        "value": "fg-muted",
+        "src": "design/meetings/mockups/_base.py:261"
+      },
+      "mark-icon": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p3.py table()"
+      },
+      "tail-size": {
+        "value": "12.5px",
+        "src": "design/meetings/mockups/_p5.py LIVE_TAIL",
+        "note": "строка «Дальше — по мере расшифровки», цвет fg-muted"
+      }
+    },
+    "participants": {
+      "panel-w": {
+        "value": "232px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "panel-gap": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py body()",
+        "note": "между таблицей и панелью"
+      },
+      "head-padding": {
+        "value": "9px 12px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "title-size": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "head-icon": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "item-padding": {
+        "value": "9px 12px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "item-gap": {
+        "value": "5px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "name-size": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p5.py ppanel()",
+        "note": "наследуется от body 14; вес 500"
+      },
+      "minutes-size": {
+        "value": "11.5px",
+        "src": "design/meetings/mockups/_p5.py ppanel()",
+        "note": "PT Mono, fg-muted, справа"
+      },
+      "quote-size": {
+        "value": "11.5px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "quote-line-height": {
+        "value": 1.4,
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "field-padding": {
+        "value": "4px 8px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "field-size": {
+        "value": "12.5px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "foot-padding": {
+        "value": "8px 12px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "caption-size": {
+        "value": "11.5px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "caption-padding": {
+        "value": "0px 12px 10px",
+        "src": "design/meetings/mockups/_p5.py ppanel()"
+      },
+      "highlight-bg": {
+        "value": "primary-bg",
+        "src": "design/meetings/mockups/_p5.py ppanel()",
+        "note": "спикер, для которого открыт поповер «Это один человек»"
+      }
+    },
+    "participants-strip": {
+      "padding": {
+        "value": "7px 10px 7px 12px",
+        "src": "design/meetings/mockups/_p5.py strip()"
+      },
+      "gap": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py strip()"
+      },
+      "margin-bottom": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p5.py strip()"
+      },
+      "label-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py strip()"
+      },
+      "chip-size": {
+        "value": "12.5px",
+        "src": "design/meetings/mockups/_p5.py strip()"
+      },
+      "h": {
+        "value": "44.8px",
+        "src": "замер 05-meeting-A.html (PT Root UI)",
+        "note": "ИЗМЕРЕНО, одна строка (кнопка sm 28.8); при переносе растёт"
+      }
+    },
+    "participants-drawer": {
+      "w": {
+        "value": "300px",
+        "src": "design/meetings/mockups/_base.py:257"
+      },
+      "bg": {
+        "value": "bg-app",
+        "src": "design/meetings/mockups/_base.py:257"
+      },
+      "border-left": {
+        "value": "1px",
+        "src": "design/meetings/mockups/_base.py:257",
+        "note": "цвет border"
+      },
+      "padding": {
+        "value": "0px",
+        "src": "design/meetings/mockups/_p5.py body()",
+        "note": "в _base.py:257 стоит 12px 14px, но _p5.py:90 переопределяет на 0 — внутри панель без рамки"
+      }
+    },
+    "merge-popover": {
+      "w": {
+        "value": "300px",
+        "src": "design/meetings/mockups/_p5.py merge_pop()"
+      },
+      "padding": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py merge_pop()"
+      },
+      "gap": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_p5.py merge_pop()"
+      },
+      "title-size": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p5.py merge_pop()"
+      },
+      "text-size": {
+        "value": "12.5px",
+        "src": "design/meetings/mockups/_p5.py merge_pop()"
+      },
+      "warn-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py merge_pop()"
+      },
+      "warn-icon": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py merge_pop()"
+      }
+    },
+    "transcribe-progress": {
+      "padding": {
+        "value": "10px 12px",
+        "src": "design/meetings/mockups/_p5.py live_bar()"
+      },
+      "gap": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py live_bar()"
+      },
+      "margin-bottom": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p5.py live_bar()"
+      },
+      "icon": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_p5.py live_bar()",
+        "note": "clock, цвет primary"
+      },
+      "text-size": {
+        "value": "13.5px",
+        "src": "design/meetings/mockups/_p5.py live_bar()"
+      },
+      "sub-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py live_bar()"
+      },
+      "track-margin-top": {
+        "value": "6px",
+        "src": "design/meetings/mockups/_p5.py live_bar()"
+      }
+    },
+    "meeting-state-panel": {
+      "padding": {
+        "value": "16px 18px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      },
+      "gap": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      },
+      "icon": {
+        "value": "22px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      },
+      "col-gap": {
+        "value": "6px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      },
+      "title-size": {
+        "value": "15px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      },
+      "text-size": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      },
+      "actions-gap": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      },
+      "actions-margin-top": {
+        "value": "4px",
+        "src": "design/meetings/mockups/_p4.py panel()"
+      }
+    },
+    "meeting-player": {
+      "padding": {
+        "value": "8px 12px",
+        "src": "design/meetings/mockups/_p5.py player()"
+      },
+      "gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p5.py player()"
+      },
+      "time-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p5.py player()"
+      },
+      "button": {
+        "value": "34px",
+        "src": "design/meetings/mockups/_base.py:129 · design/meetings/spec.md §5.2",
+        "note": "primary icon 34×34"
+      }
+    },
+    "meeting-head": {
+      "back-size": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p5.py head()"
+      },
+      "back-icon": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p5.py head()"
+      },
+      "back-gap": {
+        "value": "4px",
+        "src": "design/meetings/mockups/_p5.py head()"
+      },
+      "back-margin-bottom": {
+        "value": "6px",
+        "src": "design/meetings/mockups/_p5.py head()"
+      },
+      "title-gap": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_p5.py head()"
+      },
+      "edit-icon": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p5.py head()"
+      },
+      "actions-gap": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_p5.py head()"
+      },
+      "icon-button": {
+        "value": "34px",
+        "src": "design/meetings/mockups/_base.py:129 · design/meetings/spec.md §5.2",
+        "note": "«⋯» 34×34 (.btn.icon)"
+      },
+      "marks-gap": {
+        "value": "6px",
+        "src": "design/meetings/mockups/_p3.py marks()"
+      },
+      "marks-margin": {
+        "value": "6px 0px 10px",
+        "src": "design/meetings/mockups/_p3.py marks()"
+      }
+    },
+    "meeting-row": {
+      "min-h": {
+        "value": "56px",
+        "src": "design/meetings/mockups/_base.py:166 · design/meetings/spec.md §5",
+        "note": "свой компонент (решение UX 12.10); у SettingRow с подстрокой — 55"
+      },
+      "padding": {
+        "value": "8px 10px 8px 14px",
+        "src": "design/meetings/mockups/_base.py:164"
+      },
+      "gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_base.py:164"
+      },
+      "name-size": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_base.py:166"
+      },
+      "meta-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_base.py:167",
+        "note": "PT Mono для чисел, PT Root UI для слов; fg-muted"
+      },
+      "live-bg": {
+        "value": "primary-bg",
+        "src": "design/meetings/mockups/_base.py:171"
+      },
+      "progress-bg": {
+        "value": "bg-surface-2",
+        "src": "design/meetings/mockups/_base.py:169"
+      },
+      "progress-fill": {
+        "value": "primary",
+        "src": "design/meetings/mockups/_base.py:170"
+      },
+      "more-button": {
+        "value": "28px",
+        "src": "design/meetings/mockups/_base.py:130 · design/meetings/spec.md §5",
+        "note": "«⋯» 28×28 ghost (.btn.icon.sm); подстрока строки — трекинг fontMonoInlineTracking 0.02em (spec §5)"
+      }
+    },
+    "meeting-list": {
+      "foot-padding": {
+        "value": "8px 14px",
+        "src": "design/meetings/mockups/_base.py:172"
+      },
+      "foot-gap": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_base.py:172"
+      },
+      "foot-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_base.py:172"
+      },
+      "foot-num-fg": {
+        "value": "fg-secondary",
+        "src": "design/meetings/mockups/_base.py:173"
+      },
+      "foot-h": {
+        "value": "35px",
+        "src": "замер 01-section.html",
+        "note": "ИЗМЕРЕНО"
+      },
+      "empty-min-h": {
+        "value": "64px",
+        "src": "design/meetings/mockups/_p1.py meetings_list('empty')"
+      },
+      "empty-size": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p1.py meetings_list('empty')"
+      },
+      "skeleton-bar-h": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p1.py p01() заглушки",
+        "note": "первая полоска; вторая 10px"
+      },
+      "skeleton-bar2-h": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p1.py p01() заглушки"
+      },
+      "skeleton-radius": {
+        "value": "4px",
+        "src": "design/meetings/mockups/_p1.py p01() заглушки"
+      },
+      "skeleton-gap": {
+        "value": "7px",
+        "src": "design/meetings/mockups/_p1.py p01() заглушки"
+      },
+      "skeleton-bg": {
+        "value": "bg-surface-2",
+        "src": "design/meetings/mockups/_p1.py p01() заглушки"
+      }
+    },
+    "meeting-entry": {
+      "padding": {
+        "value": "18px 20px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "gap": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "icon-tile": {
+        "value": "40px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "icon-tile-radius": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "icon": {
+        "value": "22px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "icon-tile-bg": {
+        "value": "primary-bg",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "icon-fg": {
+        "value": "primary",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "col-gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "text-size": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "text-line-height": {
+        "value": 1.5,
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "text-max-w": {
+        "value": "560px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "policy-size": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "policy-icon": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "policy-gap": {
+        "value": "5px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "error-size": {
+        "value": "12.5px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      },
+      "foot-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p1.py entry_card()"
+      }
+    },
+    "meeting-section": {
+      "rec-caption-size": {
+        "value": "11.5px",
+        "src": "design/meetings/mockups/_p1.py section_on()",
+        "note": "«Уже идёт запись встречи» под кнопкой шапки; fg-muted"
+      },
+      "rec-caption-gap": {
+        "value": "3px",
+        "src": "design/meetings/mockups/_p1.py section_on()"
+      },
+      "policy-note-margin": {
+        "value": "2px 0px 4px",
+        "src": "design/meetings/mockups/_p1.py section_on()",
+        "note": "общая строка v1.1 (NoteBanner, глиф lock)"
+      },
+      "ai-class-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p1.py ai_group()",
+        "note": "класс адреса под полем «Адрес сервиса ИИ»"
+      },
+      "ai-class-icon": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p1.py ai_group()"
+      },
+      "ai-class-margin-top": {
+        "value": "5px",
+        "src": "design/meetings/mockups/_p1.py ai_group()"
+      },
+      "admin-row-padding": {
+        "value": "6px 14px",
+        "src": "design/meetings/mockups/_p1.py ai_group()",
+        "note": "строка «Адрес задан администратором…» на bg-surface-2, 12 fg-muted"
+      },
+      "field-me-w": {
+        "value": "200px",
+        "src": "design/meetings/mockups/_p1.py settings_groups()"
+      },
+      "field-ai-w": {
+        "value": "260px",
+        "src": "design/meetings/mockups/_p1.py ai_group()"
+      },
+      "row-field-margin-top": {
+        "value": "6px",
+        "src": "design/meetings/mockups/_p1.py settings_groups()"
+      },
+      "off-block-margin-top": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_p1.py settings_groups()"
+      },
+      "off-block-gap": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p1.py settings_groups()"
+      }
+    },
+    "meeting-start": {
+      "w": {
+        "value": "460px",
+        "src": "design/meetings/spec.md §5 · design/meetings/mockups/_p2.py start_card()",
+        "note": "во всех состояниях"
+      },
+      "max-h": {
+        "value": "600px",
+        "src": "design/meetings/spec.md §5",
+        "note": "высота по содержимому (ЗАМЕР 371…523); больше 600 — прокручивается список вариантов"
+      },
+      "body-padding": {
+        "value": "14px 16px 0px",
+        "src": "design/meetings/mockups/_p2.py start_card()"
+      },
+      "body-gap": {
+        "value": "9px",
+        "src": "design/meetings/mockups/_p2.py start_card()"
+      },
+      "option-radius": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-padding": {
+        "value": "10px 12px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-gap": {
+        "value": "11px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-border": {
+        "value": "1px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-border-selected": {
+        "value": "1.5px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-bg": {
+        "value": "bg-surface",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-selected-bg": {
+        "value": "primary-bg",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-selected-border": {
+        "value": "primary",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-icon": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_p2.py opt()",
+        "note": "цвет fg-muted"
+      },
+      "option-title-size": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-sub-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-sub-line-height": {
+        "value": 1.45,
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-warn-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "option-warn-icon": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p2.py opt()"
+      },
+      "mic-row-gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p2.py start_card()"
+      },
+      "reminder-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p2.py start_card()"
+      },
+      "footer-padding": {
+        "value": "12px 16px 14px",
+        "src": "design/meetings/mockups/_p2.py start_card()",
+        "note": "у диалога 12 18 14 — окно W4 не диалог"
+      }
+    },
+    "checkbox": {
+      "size": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_base.py:156"
+      },
+      "radius": {
+        "value": "4px",
+        "src": "design/meetings/mockups/_base.py:156"
+      },
+      "border": {
+        "value": "1.5px",
+        "src": "design/meetings/mockups/_base.py:156"
+      },
+      "border-color": {
+        "value": "fg-faint",
+        "src": "design/meetings/mockups/_base.py:156"
+      },
+      "bg": {
+        "value": "bg-surface",
+        "src": "design/meetings/mockups/_base.py:156"
+      },
+      "on-bg": {
+        "value": "primary",
+        "src": "design/meetings/mockups/_base.py:157"
+      },
+      "on-fg": {
+        "value": "primary-fg",
+        "src": "design/meetings/mockups/_base.py:157"
+      },
+      "icon": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_base.py:158"
+      },
+      "disabled-bg": {
+        "value": "bg-surface-2",
+        "src": "design/meetings/mockups/_base.py:159"
+      },
+      "label-gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      }
+    },
+    "radio": {
+      "size": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_base.py:160"
+      },
+      "border": {
+        "value": "1.5px",
+        "src": "design/meetings/mockups/_base.py:160"
+      },
+      "border-color": {
+        "value": "fg-faint",
+        "src": "design/meetings/mockups/_base.py:160"
+      },
+      "on-border": {
+        "value": "primary",
+        "src": "design/meetings/mockups/_base.py:161"
+      },
+      "dot-inset": {
+        "value": "3px",
+        "src": "design/meetings/mockups/_base.py:161"
+      },
+      "dot": {
+        "value": "primary",
+        "src": "design/meetings/mockups/_base.py:161"
+      }
+    },
+    "responsibility-dialog": {
+      "w": {
+        "value": "520px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()",
+        "note": "исключение из dialog.w 420"
+      },
+      "body-gap": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_base.py:182 · design/meetings/spec.md §5",
+        "note": "исключение из dialog.body-gap 13 (решение UX)"
+      },
+      "max-h-inset": {
+        "value": "48px",
+        "src": "design/meetings/spec.md §5 · design/meetings/mockups/_p1.py resp_dialog()",
+        "note": "max-height = клиентская высота окна − 48 (по 24 сверху и снизу): 540 при 1024×620; шапка и низ закреплены, тело прокручивается"
+      },
+      "item-gap": {
+        "value": "11px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "icon": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "icon-offset-top": {
+        "value": "2px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "item-title-size": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "item-text-size": {
+        "value": "13px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "warn-radius": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "warn-padding": {
+        "value": "9px 10px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "warn-bleed": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()",
+        "note": "margin 0 -10px"
+      },
+      "check-padding-top": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "check-label-size": {
+        "value": "13.5px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      },
+      "check-sub-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p1.py resp_dialog()"
+      }
+    },
+    "meeting-dialog": {
+      "rename-w": {
+        "value": "380px",
+        "src": "design/meetings/mockups/_p4.py p06() D3"
+      },
+      "send-w": {
+        "value": "460px",
+        "src": "design/meetings/mockups/_p4.py d5()"
+      },
+      "save-w": {
+        "value": "760px",
+        "src": "design/meetings/mockups/_p4.py tpl_window() · design/meetings/spec.md §1"
+      },
+      "save-list-w": {
+        "value": "250px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()",
+        "note": "190 при ширине окна < 700"
+      },
+      "save-item-padding": {
+        "value": "8px 10px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()"
+      },
+      "save-item-radius": {
+        "value": "7px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()"
+      },
+      "save-item-title-size": {
+        "value": "13.5px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()"
+      },
+      "save-item-desc-size": {
+        "value": "11.5px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()"
+      },
+      "save-pane-padding": {
+        "value": "14px 16px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()"
+      },
+      "save-pane-gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()"
+      },
+      "save-foot-size": {
+        "value": "12px",
+        "src": "design/meetings/mockups/_p4.py tpl_window()"
+      },
+      "icon": {
+        "value": "22px",
+        "src": "design/meetings/mockups/_p4.py dialog()",
+        "note": "иконка D2/D5/выхода"
+      }
+    },
+    "toast": {
+      "radius": {
+        "value": "8px",
+        "src": "design/meetings/mockups/_base.py:258"
+      },
+      "padding": {
+        "value": "7px 8px 7px 12px",
+        "src": "design/meetings/mockups/_base.py:258"
+      },
+      "gap": {
+        "value": "10px",
+        "src": "design/meetings/mockups/_base.py:258"
+      },
+      "size": {
+        "value": "12.5px",
+        "src": "design/meetings/mockups/_base.py:258"
+      },
+      "icon": {
+        "value": "16px",
+        "src": "design/meetings/mockups/_base.py:66",
+        "note": "check, наследует .ico 16"
+      },
+      "bottom": {
+        "value": "14px",
+        "src": "design/meetings/mockups/_p5.py body()",
+        "note": "от низа области контента, по центру; цвета — PillTheme.tooltipBg / tooltipFg (fixed), кнопка — pillCloseBg"
+      },
+      "max-w-inset": {
+        "value": "44px",
+        "src": "design/meetings/spec.md §5 · design/meetings/mockups/_base.py:260",
+        "note": "max-width = ширина контента − 44 (752 / 628); одна строка; не помещается — многоточие в СЕРЕДИНЕ имени файла"
+      },
+      "h": {
+        "value": "32.8px",
+        "src": "замер 05-meeting-A.html",
+        "note": "ИЗМЕРЕНО: без кнопки; с кнопкой sm — 42.8"
+      }
+    },
+    "pill": {
+      "meeting-bar": {
+        "padding": {
+          "value": "0px 5px 0px 8px",
+          "src": "design/meetings/mockups/_base.py:222"
+        },
+        "gap": {
+          "value": "8px",
+          "src": "design/meetings/mockups/_base.py:222",
+          "note": "между элементами ряда; в spec §5 «gap 4» — см. №35"
+        },
+        "min-w": {
+          "value": "340px",
+          "src": "design/meetings/spec.md §5",
+          "note": "ширина по содержимому"
+        },
+        "max-w": {
+          "value": "524px",
+          "src": "design/meetings/spec.md §5",
+          "note": "ПОПРАВКА ШРИФТА: spec 520; ЗАМЕР PT Root UI + DejaVu Sans Mono — ряд 1 до 481.7 (запас до 520 — 7.95 %, PT Mono не даёт заметного выигрыша: шаг 0.600 em против 0.602); 481.7 × 1.08 = 520.2 → 524 гарантирует ≥ 8 % (8.8 %)",
+          "status": "derived"
+        },
+        "row1-measured-w": {
+          "value": "481.7px",
+          "src": "замер 04-recording.html",
+          "note": "ИЗМЕРЕНО, самый широкий постоянный ряд (запись / лимит / микрофон); пауза 463.2; ошибка 479.3"
+        },
+        "compact-w": {
+          "value": "141.6px",
+          "src": "замер 04-recording.html · design/meetings/spec.md §5 (≈ 142)",
+          "note": "ИЗМЕРЕНО"
+        },
+        "symbol": {
+          "value": "14px",
+          "src": "design/meetings/mockups/_base.py:232"
+        },
+        "size": {
+          "value": "12.5px",
+          "src": "design/meetings/mockups/_base.py:220"
+        },
+        "label-weight": {
+          "value": 700,
+          "src": "design/meetings/mockups/_base.py:222"
+        },
+        "timer-size": {
+          "value": "13px",
+          "src": "design/meetings/mockups/_base.py:223",
+          "note": "PT Mono, табличные цифры"
+        },
+        "timer-tracking": {
+          "value": "0.02em",
+          "src": "design/meetings/mockups/_base.py:223"
+        },
+        "btn-h": {
+          "value": "26px",
+          "src": "design/meetings/mockups/_base.py:227"
+        },
+        "btn-radius": {
+          "value": "13px",
+          "src": "design/meetings/mockups/_base.py:227"
+        },
+        "btn-padding": {
+          "value": "0px 10px",
+          "src": "design/meetings/mockups/_base.py:227"
+        },
+        "btn-gap": {
+          "value": "5px",
+          "src": "design/meetings/mockups/_base.py:227"
+        },
+        "btn-icon": {
+          "value": "12px",
+          "src": "design/meetings/mockups/_base.py:229"
+        },
+        "icon-btn": {
+          "value": "26px",
+          "src": "design/meetings/mockups/_base.py:230"
+        },
+        "sep-w": {
+          "value": "1px",
+          "src": "design/meetings/mockups/_base.py:226"
+        },
+        "sep-h": {
+          "value": "18px",
+          "src": "design/meetings/mockups/_base.py:226"
+        },
+        "grip-w": {
+          "value": "8px",
+          "src": "design/meetings/mockups/_base.py:221"
+        },
+        "grip-h": {
+          "value": "16px",
+          "src": "design/meetings/mockups/_base.py:221"
+        },
+        "grip-cols": {
+          "value": 2,
+          "src": "design/meetings/mockups/_base.py:221"
+        },
+        "grip-rows": {
+          "value": 3,
+          "src": "design/meetings/mockups/_base.py:221"
+        },
+        "grip-dot": {
+          "value": "2px",
+          "src": "design/meetings/mockups/_base.py:221",
+          "note": "диаметр ≈ 2 (radial-gradient 1px), шаг 4×5"
+        },
+        "grip-opacity": {
+          "value": 0.55,
+          "src": "design/meetings/mockups/_base.py:221"
+        },
+        "multiline-radius": {
+          "value": "14px",
+          "src": "design/meetings/mockups/_p2.py rbar() two()"
+        },
+        "multiline-padding": {
+          "value": "0px 5px 7px 8px",
+          "src": "design/meetings/mockups/_p2.py rbar() two()",
+          "note": "ряд 1 сохраняет высоту 36"
+        },
+        "multiline-gap": {
+          "value": "2px",
+          "src": "design/meetings/mockups/_p2.py rbar() two()",
+          "note": "между рядом 1 и рядом 2"
+        },
+        "row2-gap": {
+          "value": "6px 8px",
+          "src": "design/meetings/mockups/_p2.py rbar() two()",
+          "note": "перенос: между строками 6, между текстом и кнопкой 8"
+        },
+        "row2-padding-right": {
+          "value": "4px",
+          "src": "design/meetings/mockups/_p2.py rbar() two()"
+        },
+        "row2-text-basis": {
+          "value": "200px",
+          "src": "design/meetings/mockups/_p2.py rbar() two()",
+          "note": "кнопка уходит под текст, если тексту остаётся меньше 200"
+        },
+        "multiline-h-min": {
+          "value": "63.8px",
+          "src": "замер 04-recording.html",
+          "note": "ИЗМЕРЕНО; spec 64–120, наибольшее — mic-long 120"
+        },
+        "multiline-indent": {
+          "value": "22px",
+          "src": "design/meetings/mockups/_p2.py rbar() two()",
+          "note": "ряд 2 шириной ряда 1; отступ слева 22"
+        },
+        "screen-offset": {
+          "value": "12px",
+          "src": "design/meetings/spec.md §5",
+          "note": "от верхнего края availableGeometry активного монитора, по центру"
+        },
+        "notice-gap": {
+          "value": "8px",
+          "src": "design/meetings/spec.md §5 · design/meetings/mockups/_p2.py p04() desk",
+          "note": "зазор до W3 под плашкой"
+        }
+      },
+      "meeting-offer": {
+        "w": {
+          "value": "380px",
+          "src": "design/meetings/mockups/_base.py:202"
+        },
+        "radius": {
+          "value": "10px",
+          "src": "design/meetings/mockups/_base.py:202"
+        },
+        "padding": {
+          "value": "12px 14px",
+          "src": "design/meetings/mockups/_base.py:202"
+        },
+        "h": {
+          "value": "148px",
+          "src": "design/meetings/spec.md §5",
+          "note": "ИЗМЕРЕНО 146.9 (DION); браузер — 170.6 (3 строки)"
+        },
+        "head-gap": {
+          "value": "8px",
+          "src": "design/meetings/mockups/_base.py:206 · design/meetings/spec.md §5",
+          "note": "= §11.2"
+        },
+        "head-margin-bottom": {
+          "value": "6px",
+          "src": "design/meetings/mockups/_base.py:204"
+        },
+        "head-icon": {
+          "value": "13px",
+          "src": "design/meetings/mockups/_p1.py offer()"
+        },
+        "close": {
+          "value": "18px",
+          "src": "design/meetings/mockups/_base.py:205"
+        },
+        "close-icon": {
+          "value": "10px",
+          "src": "design/meetings/mockups/_base.py:206"
+        },
+        "title-weight": {
+          "value": 500,
+          "src": "design/meetings/mockups/_base.py:207"
+        },
+        "title-margin-bottom": {
+          "value": "3px",
+          "src": "design/meetings/mockups/_base.py:207"
+        },
+        "body-size": {
+          "value": "12.5px",
+          "src": "design/meetings/mockups/_base.py:202"
+        },
+        "body-line-height": {
+          "value": 1.45,
+          "src": "design/meetings/mockups/_base.py:202"
+        },
+        "buttons-margin-top": {
+          "value": "10px",
+          "src": "design/meetings/mockups/_base.py:208"
+        },
+        "btn-icon": {
+          "value": "12px",
+          "src": "design/meetings/mockups/_base.py:211"
+        },
+        "counter-size": {
+          "value": "11.5px",
+          "src": "design/meetings/mockups/_base.py:212"
+        },
+        "timer-h": {
+          "value": "2px",
+          "src": "design/meetings/mockups/_base.py:213"
+        },
+        "screen-offset": {
+          "value": "12px",
+          "src": "design/meetings/spec.md §5"
+        }
+      },
+      "meeting-notice": {
+        "w": {
+          "value": "340px",
+          "src": "design/meetings/mockups/_p2.py notice()"
+        },
+        "radius": {
+          "value": "10px",
+          "src": "design/meetings/mockups/_base.py:202"
+        },
+        "padding": {
+          "value": "12px 14px",
+          "src": "design/meetings/mockups/_base.py:202"
+        },
+        "head-icon": {
+          "value": "13px",
+          "src": "design/meetings/mockups/_p2.py notice()"
+        },
+        "textbox-radius": {
+          "value": "7px",
+          "src": "design/meetings/mockups/_base.py:215"
+        },
+        "textbox-padding": {
+          "value": "8px 10px",
+          "src": "design/meetings/mockups/_base.py:215"
+        },
+        "textbox-size": {
+          "value": "13px",
+          "src": "design/meetings/mockups/_base.py:215"
+        },
+        "textbox-margin": {
+          "value": "8px 0px 2px",
+          "src": "design/meetings/mockups/_base.py:215"
+        },
+        "textbox-border": {
+          "value": "1px",
+          "src": "design/meetings/mockups/_base.py:215",
+          "note": "цвет notify-border"
+        },
+        "admin-size": {
+          "value": "11.5px",
+          "src": "design/meetings/mockups/_p2.py notice('admin')"
+        },
+        "admin-margin-top": {
+          "value": "4px",
+          "src": "design/meetings/mockups/_p2.py notice('admin')"
+        },
+        "hint-margin-top": {
+          "value": "8px",
+          "src": "design/meetings/mockups/_p2.py notice()"
+        },
+        "foot-margin-top": {
+          "value": "6px",
+          "src": "design/meetings/mockups/_p2.py notice()"
+        },
+        "foot-padding-top": {
+          "value": "6px",
+          "src": "design/meetings/mockups/_p2.py notice()"
+        }
+      }
+    },
+    "tray": {
+      "state-colors-meeting": {
+        "value": {
+          "meeting-rec": "#12B3A0",
+          "meeting-paused": "currentColor"
+        },
+        "src": "design/meetings/spec.md §3.9 · design/meetings/mockups/_base.py:337-344",
+        "note": "дополнение к component.tray.state-colors; цвет несёт только третья позиция, отличие — форма"
+      },
+      "geometry-22-meeting": {
+        "value": {
+          "rec-ring": {
+            "cx": 14.8,
+            "cy": 8.4849,
+            "r": 2.5,
+            "stroke": 1
+          },
+          "rec-dot": {
+            "cx": 14.8,
+            "cy": 8.4849,
+            "r": 1.15
+          },
+          "paused-bars": [
+            {
+              "x": 12.36,
+              "y": 6.17,
+              "w": 1.6,
+              "h": 4.63,
+              "rx": 0.6
+            },
+            {
+              "x": 15.16,
+              "y": 6.17,
+              "w": 1.6,
+              "h": 4.63,
+              "rx": 0.6
+            }
+          ]
+        },
+        "src": "design/meetings/icons/22x22/*.svg · design/meetings/spec.md §3.9",
+        "note": "канон §9.1: точки 1–2 и строка без изменений; зазор кольца до точки 2 — 0.65, до строки — 0.52"
+      },
+      "geometry-16-meeting": {
+        "value": {
+          "rec-ring": {
+            "cx": 11.5,
+            "cy": 5,
+            "r": 2.5,
+            "stroke": 1
+          },
+          "rec-dot": {
+            "cx": 11.5,
+            "cy": 5,
+            "r": 1
+          },
+          "paused-bars": [
+            {
+              "x": 9,
+              "y": 3,
+              "w": 2,
+              "h": 4
+            },
+            {
+              "x": 12,
+              "y": 3,
+              "w": 2,
+              "h": 4
+            }
+          ]
+        },
+        "src": "design/meetings/icons/16x16/*.svg · design/meetings/spec.md §3.9",
+        "note": "свой рисунок на сетке 16 (точки 2/3, строка 14×4); черты по пикселям; кольцо по X на полупикселе — см. №36 (не блокирует)"
+      },
+      "names-meeting": {
+        "value": [
+          "astravoice-tray-meeting-rec",
+          "astravoice-tray-meeting-paused"
+        ],
+        "src": "design/meetings/spec.md §6",
+        "note": "hicolor/{22x22,16x16}/status/*.svg; предложения файлов — design/meetings/icons/{22x22,16x16}/"
+      }
+    }
+  },
+  "icon": {
+    "names-meeting": {
+      "value": [
+        "meeting",
+        "rec",
+        "pause",
+        "stop",
+        "play",
+        "chat",
+        "chevl",
+        "collapse",
+        "expand",
+        "more",
+        "home",
+        "mic",
+        "people",
+        "edit",
+        "save",
+        "spark",
+        "merge",
+        "copy",
+        "head",
+        "speaker",
+        "doc",
+        "chart"
+      ],
+      "src": "design/meetings/mockups/_base.py:289-329",
+      "note": "НОВЫЕ для icons.py (дополнение к icon.names): chevl в icons.py ещё НЕТ (spec §5 называет его существующим); collapse ›‹ / expand ‹› — W2; rec/stop/play/more — с заливкой, ждут решения архитектора (№34); spinner — анимированный индикатор §8.4 У9"
+    }
+  },
+  "$resolved-colors": {
+    "note": "Все 7 цветов макета вне токенов заменены UX 12.10: разделитель W2 и кнопка тоста → pill-close-bg; поле W3 без фона; «Не удалось скопировать» → notify-btn-bg + notify-fg + глиф alert pill-error; текст W1 → pill-icon-muted; ручка тумблера → toggle.knob-bg (#FFFFFF). Новых цветов нет."
+  }
+}
