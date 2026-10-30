@@ -19,6 +19,14 @@ from astra_voice.worker.meeting_roles import MeetingRole, run_role
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def no_parent_stderr_redirection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The entry point runs in pytest here; never redirect the runner's fd2."""
+    from astra_voice.worker import meeting_roles
+
+    monkeypatch.setattr(meeting_roles, "silence_native_stderr", lambda: True)
+
+
 @pytest.mark.parametrize("role", COMMANDS)
 def test_role_commands_are_correlated_stubs_and_idempotent(role: str) -> None:
     handler = MeetingRole(role, clock=lambda: 10.0)

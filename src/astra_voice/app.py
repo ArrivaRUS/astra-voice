@@ -64,6 +64,19 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def collect_diagnostics(
+    destination: Path, *, settings: settings_mod.Settings, data_dir: Path | None = None
+) -> Path:
+    """Backend for the future diagnostic action; no GUI is created here."""
+    from astra_voice.core.diagnostics import collect_diagnostics as collect
+
+    return collect(
+        destination,
+        settings=settings,
+        data_dir=paths.data_dir_path() if data_dir is None else data_dir,
+    )
+
+
 def _settings_migration_locks(policy: policy_mod.Policy) -> tuple[frozenset[str], bool]:
     """Запрет сети сохраняет legacy-флаги, как и явные значения/замки политики."""
     from astra_voice.net.gate import NetworkGate

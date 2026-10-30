@@ -173,7 +173,7 @@ def meeting_main(role: str, argv: list[str]) -> int:
     The only socket is the inherited private AF_UNIX/SOCK_STREAM connection.
     """
     from astra_voice.worker.meeting_contract import ROLES
-    from astra_voice.worker.meeting_roles import run_role
+    from astra_voice.worker.meeting_roles import run_role, silence_native_stderr
 
     raw_fd = argv[0] if argv else os.environ.get("ASTRA_VOICE_IPC_FD")
     if (
@@ -193,6 +193,8 @@ def meeting_main(role: str, argv: list[str]) -> int:
     ):
         return 2
     parent_pid = os.getppid()
+    if not silence_native_stderr():
+        return 3
     if not harden_process(
         parent_pid, strict=True, oom_score=300 if role == "meeting-capture" else 500
     ):

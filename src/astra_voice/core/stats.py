@@ -124,6 +124,10 @@ def _number(value: object) -> bool:
 
 
 def _event(event_type: str, fields: Mapping[str, object], *, warn_unknown: bool = True) -> Event:
+    if event_type.startswith("meeting_"):
+        from astra_voice.meetings.events import stats_event
+
+        return stats_event(event_type, fields)
     if event_type not in _FIELDS:
         raise ValueError("Неизвестный вид события статистики")
     event: Event = {"type": event_type}
@@ -267,7 +271,7 @@ class Stats:
         listener = self.on_append
         if listener is not None:
             try:
-                listener(event_type)
+                listener(str(event["type"]))
             except Exception:  # noqa: BLE001 — сбой слушателя не ломает статистику
                 log.warning("Слушатель статистики завершился с ошибкой")
 

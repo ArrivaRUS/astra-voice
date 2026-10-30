@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-from astra_voice.meetings import MeetingValidationError
+from astra_voice.meetings import MeetingValidationError, events
 from astra_voice.meetings.model import normalize_text
 
 if TYPE_CHECKING:
@@ -56,7 +56,7 @@ def validate_setting(name: str, value: Any) -> Any:
     default = MEETING_DEFAULTS[name]
 
     def invalid() -> Any:
-        log.warning("Настройка встреч %s недопустима, использовано значение по умолчанию", name)
+        log.warning(events.SETTING_INVALID, events.setting_key(name))
         return default
 
     if type(value) is not type(default):

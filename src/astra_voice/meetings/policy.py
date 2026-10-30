@@ -19,6 +19,8 @@ from typing import Generic, TypeVar
 from urllib.parse import unquote, urlsplit
 
 from astra_voice.core.policy import MEETING_POLICY_KEYS, Policy, PolicyStatus
+from astra_voice.meetings import events
+from astra_voice.meetings.events import PolicyCode as PolicyCode
 from astra_voice.meetings.model import normalize_text
 from astra_voice.meetings.settings_ext import NOTICE_TEXT
 
@@ -40,36 +42,6 @@ class RecordMode(StrEnum):
     OFF = "off"
     MANUAL = "manual"
     PROMPT = "prompt"
-
-
-class PolicyCode(StrEnum):
-    RECORD_USER = "meeting-policy-record-user"
-    RECORD_ADMIN = "meeting-policy-record-admin"
-    RECORD_INVALID = "meeting-policy-record-invalid"
-    DIAR_USER = "meeting-policy-diar-user"
-    DIAR_ADMIN = "meeting-policy-diar-admin"
-    DIAR_INVALID = "meeting-policy-diar-invalid"
-    ENDPOINT_USER = "meeting-policy-endpoint-user"
-    ENDPOINT_ADMIN = "meeting-policy-endpoint-admin"
-    ENDPOINT_INVALID = "meeting-policy-endpoint-invalid"
-    EXTERNAL_USER = "meeting-policy-external-user"
-    EXTERNAL_ADMIN = "meeting-policy-external-admin"
-    EXTERNAL_INVALID = "meeting-policy-external-invalid"
-    RETENTION_USER = "meeting-policy-retention-user"
-    RETENTION_ADMIN = "meeting-policy-retention-admin"
-    RETENTION_INVALID = "meeting-policy-retention-invalid"
-    NOTICE_USER = "meeting-policy-notice-user"
-    NOTICE_ADMIN = "meeting-policy-notice-admin"
-    NOTICE_INVALID = "meeting-policy-notice-invalid"
-    PLAINTEXT_USER = "meeting-policy-plaintext-user"
-    PLAINTEXT_ADMIN = "meeting-policy-plaintext-admin"
-    PLAINTEXT_INVALID = "meeting-policy-plaintext-invalid"
-    INVALID = "meeting-policy-invalid"
-    UNSAFE = "meeting-policy-unsafe"
-    UNKNOWN_KEY = "meeting-policy-unknown-key"
-    SECURE = "meeting-policy-plaintext-secure"
-    HTTP_DENIED = "meeting-policy-http-denied"
-    USER_SETTING = "meeting-policy-user-setting"
 
 
 T_co = TypeVar("T_co", covariant=True)
@@ -171,6 +143,17 @@ _HTTP_NETWORKS = tuple(
 )
 
 
+def internal_address(host: str) -> bool:
+    """Literal loopback/RFC1918/ULA classification, no DNS or authorization."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return any(address in network for network in _HTTP_NETWORKS)
+
+
 def validate_endpoint(value: str, *, allow_http: bool = False) -> str:
     """Validate a base URL without DNS or I/O; M9 still owes network checks."""
     value = normalize_text(value, 2048, minimum=1)
@@ -248,7 +231,7 @@ def _decision(
 ) -> PolicyValue[T]:
     if key not in raw:
         if key in locked_keys:
-            log.warning(codes[2].value)
+            log.warning(events.POLICY_REJECTED, events.policy_code(codes[2]))
             return PolicyValue(fallback, True, REASON_INVALID, codes[2])
         return PolicyValue(default, code=codes[0])
     try:
@@ -257,12 +240,12 @@ def _decision(
             raise ValueError("Недопустимый тип политики встреч")
         return PolicyValue(parse(text), True, REASON_ADMIN, codes[1])
     except (ValueError, TypeError, UnicodeError):
-        log.warning(codes[2].value)
+        log.warning(events.POLICY_REJECTED, events.policy_code(codes[2]))
         return PolicyValue(fallback, True, REASON_INVALID, codes[2])
 
 
 def _closed(code: PolicyCode) -> MeetingPolicy:
-    log.warning(code.value)
+    log.warning(events.POLICY_REJECTED, events.policy_code(code))
     return MeetingPolicy(
         PolicyValue(RecordMode.OFF, True, REASON_UNTRUSTED, code),
         PolicyValue(False, True, REASON_UNTRUSTED, code),

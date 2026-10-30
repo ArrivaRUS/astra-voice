@@ -233,6 +233,7 @@ class WorkerSupervisor:
             options: dict[str, Any] = {"pass_fds": [child.fileno()]}
             if self.role != "worker":
                 options["start_new_session"] = True
+                options["stderr"] = subprocess.DEVNULL
                 environment = dict(os.environ)
                 if self.role == "meeting-diar":
                     environment.pop("HOME", None)

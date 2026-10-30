@@ -22,6 +22,20 @@ Message = dict[str, Any]
 MAX_SEND_BUFFER = 4 * ipc.MAX_FRAME_BYTES
 
 
+def silence_native_stderr() -> bool:
+    """Suppress fd2 before native imports; failure refuses role startup."""
+    try:
+        descriptor = os.open(os.devnull, os.O_WRONLY | os.O_CLOEXEC)
+        try:
+            os.dup2(descriptor, 2)
+        finally:
+            if descriptor != 2:
+                os.close(descriptor)
+    except OSError:
+        return False
+    return True
+
+
 def failure(message: Message, code: str) -> Message:
     return {
         "type": "error",
