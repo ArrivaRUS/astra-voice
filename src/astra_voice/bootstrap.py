@@ -23,9 +23,10 @@ import os
 import sys
 from pathlib import Path
 
-COMMANDS = ("app", "worker", "helper", "selfinstall", "command-hotkey")
+MEETING_ROLES = ("meeting-capture", "meeting-transcribe", "meeting-diar")
+COMMANDS = ("app", "worker", "helper", "selfinstall", "command-hotkey", *MEETING_ROLES)
 
-USAGE = "usage: bootstrap.py {app|worker|helper|selfinstall|command-hotkey} [аргументы]\n"
+USAGE = "usage: bootstrap.py {" + "|".join(COMMANDS) + "} [аргументы]\n"
 
 # Рендер Qt Quick. По умолчанию программный: GL-контекст стоит 65 МБ RSS
 # (167 740 → 102 580 кБ, замеры `spikes/m1_live/rss.md`), картинка совпадает.
@@ -179,6 +180,13 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(USAGE)
         return 2
     command, rest = args[0], args[1:]
+
+    if command in MEETING_ROLES:
+        # Strict hardening is checked by the role entry point, unlike the legacy
+        # best-effort _harden. No pulse setup, logging paths, Qt or ASR work.
+        from astra_voice.worker.main import meeting_main
+
+        return meeting_main(command, rest)
 
     if command in ("app", "selfinstall"):
         # Совещательный запрет трека до любых действий (arch/appimage.md §5).

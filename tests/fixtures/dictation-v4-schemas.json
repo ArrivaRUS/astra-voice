@@ -1,0 +1,303 @@
+{
+  "audio.close": {
+    "optional": {},
+    "required": {}
+  },
+  "audio.closed": {
+    "optional": {
+      "request_type": [
+        "str"
+      ]
+    },
+    "required": {}
+  },
+  "audio.device.changed": {
+    "optional": {
+      "audio_ms": [
+        "int"
+      ],
+      "label": [
+        "str"
+      ]
+    },
+    "required": {
+      "kind": [
+        "str"
+      ],
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "audio.ready": {
+    "optional": {
+      "changed": [
+        "str"
+      ],
+      "device": [
+        "str"
+      ],
+      "mics": [
+        "int"
+      ]
+    },
+    "required": {}
+  },
+  "cancelled": {
+    "optional": {
+      "request_type": [
+        "str"
+      ]
+    },
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "error": {
+    "optional": {
+      "request_type": [
+        "str"
+      ],
+      "utterance_id": [
+        "str"
+      ]
+    },
+    "required": {
+      "code": [
+        "str"
+      ],
+      "message": [
+        "str"
+      ]
+    }
+  },
+  "hello": {
+    "optional": {},
+    "required": {
+      "build": [
+        "str"
+      ],
+      "protocol": [
+        "int"
+      ],
+      "runtime": [
+        "dict"
+      ]
+    }
+  },
+  "level": {
+    "optional": {},
+    "required": {
+      "peak_dbfs": [
+        "int",
+        "float"
+      ],
+      "rms_dbfs": [
+        "int",
+        "float"
+      ],
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "measure": {
+    "optional": {},
+    "required": {}
+  },
+  "measured": {
+    "optional": {
+      "request_type": [
+        "str"
+      ],
+      "sessions": [
+        "int"
+      ]
+    },
+    "required": {
+      "pss_kb": [
+        "int",
+        "NoneType"
+      ],
+      "vm_hwm_kb": [
+        "int"
+      ]
+    }
+  },
+  "model.load": {
+    "optional": {},
+    "required": {
+      "dir": [
+        "str"
+      ],
+      "id": [
+        "str"
+      ],
+      "layout": [
+        "str"
+      ],
+      "min_ram_mb": [
+        "int"
+      ],
+      "revision": [
+        "str"
+      ],
+      "threads": [
+        "int"
+      ],
+      "variant": [
+        "str"
+      ]
+    }
+  },
+  "model.loaded": {
+    "optional": {
+      "request_type": [
+        "str"
+      ]
+    },
+    "required": {
+      "engine_version": [
+        "str"
+      ],
+      "id": [
+        "str"
+      ],
+      "load_ms": [
+        "int",
+        "float"
+      ],
+      "revision": [
+        "str"
+      ],
+      "variant": [
+        "str"
+      ]
+    }
+  },
+  "model.unload": {
+    "optional": {},
+    "required": {}
+  },
+  "ping": {
+    "optional": {},
+    "required": {}
+  },
+  "pong": {
+    "optional": {
+      "request_type": [
+        "str"
+      ]
+    },
+    "required": {}
+  },
+  "recognize": {
+    "optional": {},
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "record.cancel": {
+    "optional": {},
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "record.limit": {
+    "optional": {},
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "record.start": {
+    "optional": {
+      "device": [
+        "str"
+      ],
+      "limit_s": [
+        "int",
+        "float"
+      ]
+    },
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "record.started": {
+    "optional": {},
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "record.stop": {
+    "optional": {},
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "record.stopped": {
+    "optional": {},
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "result": {
+    "optional": {
+      "request_type": [
+        "str"
+      ]
+    },
+    "required": {
+      "audio_ms": [
+        "int",
+        "float"
+      ],
+      "infer_ms": [
+        "int",
+        "float"
+      ],
+      "t_ms": [
+        "int",
+        "float"
+      ],
+      "text": [
+        "str"
+      ],
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "silent": {
+    "optional": {},
+    "required": {
+      "utterance_id": [
+        "str"
+      ]
+    }
+  },
+  "transcribe.file": {
+    "optional": {},
+    "required": {
+      "path": [
+        "str"
+      ]
+    }
+  }
+}

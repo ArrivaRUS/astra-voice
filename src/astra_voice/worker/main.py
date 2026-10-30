@@ -13,17 +13,30 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from queue import Empty, SimpleQueue
-from typing import NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from astra_voice.core.audio_env import deny_pulse_autospawn
 from astra_voice.core.logging import setup_logging
 from astra_voice.worker import ipc
-from astra_voice.worker.audio import AudioSource, CaptureStopTimeout, PulseSimpleSource
-from astra_voice.worker.state import Message, WorkerState
+
+if TYPE_CHECKING:
+    from astra_voice.worker.audio import AudioSource
+    from astra_voice.worker.state import WorkerState as WorkerStateType
+
+Message = dict[str, Any]
+
+
+def WorkerState(*, on_event: Callable[[Message], None]) -> WorkerStateType:
+    """Legacy injection seam; state/audio imports are deferred to dictation."""
+    from astra_voice.worker.state import WorkerState as State
+
+    return State(on_event=on_event)
+
 
 logger = logging.getLogger(__name__)
 PR_SET_PDEATHSIG = 1
 PR_SET_DUMPABLE = 4
+PR_GET_DUMPABLE = 3
 MIN_ADDRESS_SPACE = 3 * 1024 * 1024 * 1024
 # Запас к дедлайну в секунду на отправку и освобождение устройства.
 POLL_INTERVAL = 0.25
@@ -47,6 +60,8 @@ def _log_backend_fallback() -> None:
 def select_audio_source(env: Mapping[str, str]) -> AudioSource:
     """Выбирает источник только по переданному окружению, не открывая устройство."""
     if audio_backend(env)[0] == "simple":
+        from astra_voice.worker.audio import PulseSimpleSource
+
         return PulseSimpleSource()
     from astra_voice.worker.pulse_stream import StreamWithFallback
 
@@ -61,26 +76,38 @@ def _prctl(option: int, value: int) -> None:
         raise OSError(errno, os.strerror(errno))
 
 
-def set_oom_score_adj(path: Path = Path("/proc/self/oom_score_adj")) -> None:
+def _get_dumpable() -> int:
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    result = int(libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0))
+    if result < 0:
+        raise OSError("meeting-hardening-failed")
+    return result
+
+
+def set_oom_score_adj(path: Path = Path("/proc/self/oom_score_adj"), *, score: int = 500) -> bool:
     """Повышает приоритет завершения воркера при нехватке памяти."""
     try:
-        path.write_text("500", encoding="ascii")
+        path.write_text(str(score), encoding="ascii")
     except Exception:
         try:
-            if path.read_text(encoding="ascii").strip() == "500":
+            if path.read_text(encoding="ascii").strip() == str(score):
                 logger.debug("значение уже установлено родительским бутстрапом")
-                return
+                return True
         except (OSError, UnicodeError):
             pass
         logger.warning("Не удалось установить oom_score_adj.")
+        return False
+    return True
 
 
-def harden_process(parent_pid: int) -> bool:
+def harden_process(parent_pid: int, *, strict: bool = False, oom_score: int = 500) -> bool:
     """Привязывает процесс к родителю и запрещает дампы; ошибки не фатальны."""
     try:
         _prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
     except Exception:
         logger.warning("Не удалось установить сигнал смерти родителя.")
+        if strict:
+            return False
     # Проверка закрывает гонку между запоминанием pid и установкой prctl.
     if os.getppid() != parent_pid or parent_pid == 1:
         return False
@@ -88,12 +115,98 @@ def harden_process(parent_pid: int) -> bool:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     except Exception:
         logger.warning("Не удалось запретить core dump через RLIMIT_CORE.")
-    set_oom_score_adj()
+        if strict:
+            return False
+    if strict:
+        if not set_oom_score_adj(score=oom_score):
+            return False
+    else:
+        set_oom_score_adj()
     try:
         _prctl(PR_SET_DUMPABLE, 0)
     except Exception:
         logger.warning("Не удалось запретить дампы через prctl.")
+        if strict:
+            return False
+    if strict:
+        try:
+            if resource.getrlimit(resource.RLIMIT_CORE) != (0, 0) or _get_dumpable() != 0:
+                return False
+        except (OSError, ValueError):
+            return False
     return True
+
+
+def harden_meeting_limits(role: str) -> bool:
+    """Initial role limits; M4 raises transcribe's floor from trusted model RAM."""
+    requested = {
+        "meeting-capture": 512 * 1024**2,
+        "meeting-transcribe": 2 * 1024**3,
+        "meeting-diar": 1536 * 1024**2,
+    }.get(role)
+    if requested is None:
+        return False
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        actual = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
+        if actual <= 0:
+            return False
+        resource.setrlimit(resource.RLIMIT_AS, (actual, hard))
+        if resource.getrlimit(resource.RLIMIT_AS) != (actual, hard):
+            return False
+        if role != "meeting-capture":
+            current = os.getpriority(os.PRIO_PROCESS, 0)
+            if current != 19:
+                os.nice(19 - current)
+            if os.getpriority(os.PRIO_PROCESS, 0) != 19:
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def meeting_main(role: str, argv: list[str]) -> int:
+    """Strict inherited-socket entry point. No audio/model constructors or files.
+
+    Bootstrap's role branch arrives here before legacy WorkerLoop construction.
+    Unknown roles, malformed fd/environment and hardening failures refuse work.
+    The only socket is the inherited private AF_UNIX/SOCK_STREAM connection.
+    """
+    from astra_voice.worker.meeting_contract import ROLES
+    from astra_voice.worker.meeting_roles import run_role
+
+    raw_fd = argv[0] if argv else os.environ.get("ASTRA_VOICE_IPC_FD")
+    if (
+        role not in ROLES
+        or len(argv) > 1
+        or raw_fd is None
+        or len(raw_fd) > 10
+        or not raw_fd.isascii()
+        or not raw_fd.isdecimal()
+    ):
+        return 2
+    fd = int(raw_fd)
+    if fd < 3 or fd > 2147483647:
+        return 2
+    if role == "meeting-diar" and (
+        "HOME" in os.environ or os.environ.get("TMPDIR") != "/nonexistent/astra-voice-diar"
+    ):
+        return 2
+    parent_pid = os.getppid()
+    if not harden_process(
+        parent_pid, strict=True, oom_score=300 if role == "meeting-capture" else 500
+    ):
+        return 3
+    if not harden_meeting_limits(role):
+        return 3
+    try:
+        connection = socket.socket(fileno=fd)
+    except (OSError, ValueError, OverflowError):
+        return 2
+    if connection.family != socket.AF_UNIX or connection.type != socket.SOCK_STREAM:
+        connection.close()
+        return 2
+    return run_role(connection, role, parent_pid=parent_pid)
 
 
 def apply_address_space_limit(min_ram_mb: int | None) -> int:
@@ -229,6 +342,8 @@ class WorkerLoop:
 
     def run(self) -> int:
         """Шлёт hello, обслуживает IPC и освобождает ресурсы при потере родителя."""
+        from astra_voice.worker.audio import CaptureStopTimeout
+
         fatal = False
         try:
             self.connection.setblocking(False)
