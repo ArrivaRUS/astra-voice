@@ -625,6 +625,7 @@ class ShowServer(QObject):
 SECTION_GENERAL = "general"
 SECTION_MODELS = "models"
 SECTION_OUTPUT = "output"
+SECTION_MEETINGS = "meetings"
 SECTION_NETWORK = "network"
 SECTION_ADVANCED = "advanced"
 SECTION_ABOUT = "about"
@@ -726,6 +727,7 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
     context.setContextProperty("showOnboarding", False)
     # Runtime создаётся после shell; до подключения контроллера действия недоступны.
     context.setContextProperty("appImageManagement", None)
+    context.setContextProperty("meetingBridge", None)
     # themeSource обязан быть виден ДО load(): Theme.qml читает его в биндинге
     # `dark` при создании корневого объекта. Theme.qml — `pragma Singleton`, а
     # синглтоны не видят контекстных свойств, поэтому объект кладётся ещё и в
@@ -763,6 +765,45 @@ def _set_context_property(shell: Any, name: str, obj: Any) -> None:
     root_context = getattr(shell, "rootContext", None)
     if callable(root_context):
         root_context().setContextProperty(name, obj)
+
+
+def _make_meeting_bridge(
+    stored: settings_mod.Settings,
+    effective: settings_mod.Settings,
+    policy: policy_mod.Policy,
+    session: SessionKind,
+) -> Any | None:
+    """Prepare the inert section; the constructor never starts capture/detection."""
+    try:
+        from astra_voice.ui.meeting_bridge import MeetingBridge
+
+        return MeetingBridge(stored, mirror=effective, policy=policy, session=session)
+    except Exception:  # noqa: BLE001 — the other settings remain available
+        log.warning("meeting-bridge-unavailable")
+        return None
+
+
+def _wire_tray_meetings(
+    tray: Any, bridge: Any, show_meetings: Callable[[], None]
+) -> Callable[[], None]:
+    """Publish effective visibility and test-only recording flags, without IPC."""
+    from astra_voice.ui.tray_icons import TrayState
+
+    def refresh() -> None:
+        tray.set_meetings_enabled(bridge.enabled)
+        tray.set_meeting_state(TrayState.MEETING_REC if bridge.recording else None)
+
+    bridge.changed.connect(refresh)
+    tray.on_meeting_record = bridge.requestRecording
+    tray.on_meeting_open = show_meetings
+    refresh()
+
+    def disconnect() -> None:
+        bridge.changed.disconnect(refresh)
+        tray.on_meeting_record = None
+        tray.on_meeting_open = None
+
+    return disconnect
 
 
 class _RuntimeSettingsApply:
@@ -1748,6 +1789,8 @@ def main(argv: list[str] | None = None) -> int:
     update_checker: UpdateChecker | None = None
     updates_bridge: Any = None  # держим Python-обёртку живой до выхода из main
     about_bridge: Any = None  # держим Python-обёртку живой до выхода из main
+    meeting_bridge: Any = None
+    meeting_tray_disconnect: Callable[[], None] | None = None
     appimage_management: Any = None
     program_updates: _ProgramUpdates | None = None
     gui_calls = _GuiCalls()
@@ -1913,6 +1956,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
+        meeting_bridge = _make_meeting_bridge(stored, settings, policy, session_kind)
+        if meeting_bridge is not None:
+            QQmlEngine.setObjectOwnership(meeting_bridge, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "meetingBridge", meeting_bridge)
+            settings_bridge.offlineChanged.connect(meeting_bridge.changed.emit)
+            if runtime_ready and runtime is not None:
+
+                def show_meetings() -> None:
+                    focuser.focus_shell()
+                    app_info.show_section(SECTION_MEETINGS)
+
+                meeting_tray_disconnect = _wire_tray_meetings(
+                    runtime.tray, meeting_bridge, show_meetings
+                )
         # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
         settings_bridge.offlineChanged.connect(downloads.network_changed)
         about_bridge = _make_about_bridge(runtime if runtime_ready else None)
@@ -2017,6 +2074,10 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = int(app.exec_())
     finally:
         program_updates = cast(_ProgramUpdates | None, locals().get("program_updates"))
+        meeting_bridge = locals().get("meeting_bridge")
+        meeting_tray_disconnect = cast(
+            Callable[[], None] | None, locals().get("meeting_tray_disconnect")
+        )
         program_threads: list[Any] = []
         if program_updates is not None:
             program_threads.extend(program_updates.worker_threads)
@@ -2073,6 +2134,16 @@ def main(argv: list[str] | None = None) -> int:
         runtime_stats = getattr(runtime, "stats", None) if runtime is not None else None
         if runtime_stats is not None:
             runtime_stats.on_append = None
+        if meeting_bridge is not None:
+            try:
+                try:
+                    if meeting_tray_disconnect is not None:
+                        meeting_tray_disconnect()
+                finally:
+                    meeting_bridge.shutdown()
+            except Exception:  # noqa: BLE001 — continue closing other resources
+                resources_stopped = False
+                log.warning("meeting-bridge-shutdown-failed")
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
         # сюда. После отмены фокуса освобождаем воркер и захваты, затем lock/ipc и UI.
         if onboarding is not None:

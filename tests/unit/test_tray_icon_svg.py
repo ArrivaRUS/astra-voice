@@ -21,7 +21,10 @@ COLORS = {
 }
 STATES = {*COLORS, "idle", "mono", "nokey"}
 ICONS = sorted(
-    path for size in ("16x16", "22x22") for path in (DATA / size / "status").glob("*.svg")
+    path
+    for size in ("16x16", "22x22")
+    for path in (DATA / size / "status").glob("*.svg")
+    if "-meeting-" not in path.name
 )
 
 
@@ -31,6 +34,12 @@ def test_tray_icon_inventory_and_names() -> None:
         for size in ("16x16", "22x22")
         for state in STATES
     }
+    meeting = {
+        Path(size) / "status" / f"astravoice-tray-meeting-{state}.svg"
+        for size in ("16x16", "22x22")
+        for state in ("rec", "paused")
+    }
+    assert {path.relative_to(DATA) for path in DATA.glob("**/status/*.svg")} == expected | meeting
     assert {path.relative_to(DATA) for path in ICONS} == expected
     assert all(path.name.startswith("astravoice-") for path in ICONS)
 
@@ -90,7 +99,13 @@ def test_tray_svg_style_and_third_dot(path: Path) -> None:
 
 def test_design_and_bundled_status_svgs_match() -> None:
     design = {path.relative_to(DESIGN): path for path in DESIGN.glob("**/status/*.svg")}
-    bundled = {path.relative_to(DATA): path for path in DATA.glob("**/status/*.svg")}
+    bundled = {
+        path.relative_to(DATA): path
+        for path in DATA.glob("**/status/*.svg")
+        if "-meeting-" not in path.name
+    }
+    # Meeting sources live in design/meetings; byte equality is tested there.
+    assert len(list(DATA.glob("**/status/astravoice-tray-meeting-*.svg"))) == 4
     assert design
     assert design.keys() == bundled.keys()
     for relative, path in design.items():

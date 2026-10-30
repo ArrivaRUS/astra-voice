@@ -2,7 +2,9 @@
 
 Собственные контуры (не Breeze) из design/mockups/directions/_base.py:261 (_IC).
 Правила: design/tokens.json icon.* — viewBox 0 0 16 16, stroke 1.5,
-fill none, скруглённые концы и стыки, цвет задаёт вызывающий компонент.
+fill none по умолчанию, скруглённые концы и стыки, цвет задаёт вызывающий
+компонент. Глифы встреч: design/meetings/tokens.md §8.2; fill=True включает
+заливку rec/stop/play/more по решению №34, rec сохраняет контур внешнего кольца.
 """
 
 from __future__ import annotations
@@ -53,9 +55,72 @@ PATHS: dict[str, str] = {
     "clock": "M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 4.7V8l2.4 1.5",
 }
 
+MEETING_PATHS = {
+    "meeting": (
+        "M2.5 3.5h7a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H6l-2.5 2v-2h-1a1 1 0 0 1-1-1v-4a1 1 0"
+        " 0 1 1-1zM12.5 6.5h1a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-1v2l-2.5-2H8"
+    ),
+    "rec": (
+        "M13.6 8a5.6 5.6 0 1 0-11.2 0 5.6 5.6 0 1 0 11.2 0zM10.4 8a2.4 2.4 0 1 0-4.8 0 "
+        "2.4 2.4 0 1 0 4.8 0z"
+    ),
+    "pause": "M6 3.5v9M10 3.5v9",
+    "stop": (
+        "M5.2 4h5.6a1.2 1.2 0 0 1 1.2 1.2v5.6a1.2 1.2 0 0 1-1.2 1.2H5.2A1.2 1.2 0 0 1 4"
+        " 10.8V5.2A1.2 1.2 0 0 1 5.2 4z"
+    ),
+    "play": "M5 3.3v9.4L12.8 8z",
+    "chat": (
+        "M2.5 3h11a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7l-3 2.5v-2.5H2.5a1 1 0 0 1-1-1V4a1 "
+        "1 0 0 1 1-1zM4.5 6h7M4.5 8.5h4.5"
+    ),
+    "collapse": "M2 4.5 5.5 8 2 11.5M14 4.5 10.5 8 14 11.5",
+    "expand": "M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5",
+    "chevl": "M10 4L6 8l4 4",
+    "more": (
+        "M4.4 8a.9.9 0 1 0-1.8 0 .9.9 0 1 0 1.8 0zM8.9 8a.9.9 0 1 0-1.8 0 .9.9 0 1 0 1."
+        "8 0zM13.4 8a.9.9 0 1 0-1.8 0 .9.9 0 1 0 1.8 0z"
+    ),
+    "home": "M2.5 7.5 8 3l5.5 4.5M4 6.5v6.5h8V6.5M6.8 13v-3.2h2.4V13",
+    "mic": (
+        "M8 2a2 2 0 0 1 2 2v3.5a2 2 0 0 1-4 0V4a2 2 0 0 1 2-2zM3.8 7.8a4.2 4.2 0 0 0 8.4 0M8 12v2.2"
+    ),
+    "people": (
+        "M8.2 5.5a2.2 2.2 0 1 0-4.4 0 2.2 2.2 0 1 0 4.4 0zM2 13c.3-2.3 1.9-3.6 4-3.6s3."
+        "7 1.3 4 3.6M13.1 6a1.8 1.8 0 1 0-3.6 0 1.8 1.8 0 1 0 3.6 0zM11 9.4c1.7.1 2.8 1"
+        ".2 3 3.1"
+    ),
+    "edit": "M10.8 2.7l2.5 2.5-7.8 7.8-3 .5.5-3z",
+    "save": "M8 2.2v8M4.8 7.2 8 10.4l3.2-3.2M2.8 12.2v1.5h10.4v-1.5",
+    "spark": (
+        "M8 1.8l1.4 4 4 1.4-4 1.4L8 12.6 6.6 8.6l-4-1.4 4-1.4zM12.6 11.2l.6 1.5 1.5.6-1"
+        ".5.6-.6 1.5-.6-1.5-1.5-.6 1.5-.6z"
+    ),
+    "merge": "M4 2.5v3.2c0 1.8 1.5 3 4 3s4-1.2 4-3V2.5M8 8.7v4.8M5.8 11.4 8 13.6l2.2-2.2",
+    "copy": (
+        "M6.7 5.5h5.6a1.2 1.2 0 0 1 1.2 1.2v6.1a1.2 1.2 0 0 1-1.2 1.2H6.7a1.2 1.2 0 0 1"
+        "-1.2-1.2V6.7a1.2 1.2 0 0 1 1.2-1.2zM10.5 5.5V3a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v"
+        "7.5a1 1 0 0 0 1 1h2"
+    ),
+    "head": (
+        "M2.8 10V8a5.2 5.2 0 0 1 10.4 0v2M3 9.2h1a1 1 0 0 1 1 1v2.3a1 1 0 0 1-1 1H3a1 1"
+        " 0 0 1-1-1v-2.3a1 1 0 0 1 1-1zM12 9.2h1a1 1 0 0 1 1 1v2.3a1 1 0 0 1-1 1h-1a1 1"
+        " 0 0 1-1-1v-2.3a1 1 0 0 1 1-1z"
+    ),
+    "speaker": (
+        "M2.5 6.2h2.7L8.8 3v10L5.2 9.8H2.5zM11 5.5a3.5 3.5 0 0 1 0 5M12.8 3.8a6 6 0 0 1 0 8.4"
+    ),
+    "doc": "M4 1.8h8V14H4zM6 5h4M6 7.5h4M6 10h2.5",
+    "chart": "M2.5 13.5h11M4.5 11V8M8 11V4.5M11.5 11V6.5",
+}
+
+MEETING_NAMES = frozenset(MEETING_PATHS)
+FILLED_NAMES = frozenset({"rec", "stop", "play", "more"})
+PATHS.update(MEETING_PATHS)
+
 _REQUEST = re.compile(
     r"([^?&/]+)\?c=([0-9a-f]{6}(?:[0-9a-f]{2})?)"
-    r"&w=((?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)\Z"
+    r"&w=((?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)(?:&f=([01]))?\Z"
 )
 
 
@@ -66,13 +131,24 @@ def _transparent(size: QSize) -> QImage:
 
 
 @lru_cache(maxsize=512)
-def _render_icon(name: str, color: str, stroke: float, width: int, height: int) -> QImage:
+def _render_icon(
+    name: str, color: str, stroke: float, width: int, height: int, fill: bool = False
+) -> QImage:
     opacity = int(color[6:], 16) / 255 if len(color) == 8 else 1.0
+    paint_fill = fill and name in FILLED_NAMES
+    outline = PATHS[name]
+    solid = ""
+    if paint_fill and name == "rec":
+        outline, dot = outline.split("zM", 1)
+        outline += "z"
+        solid = f'<path d="M{dot}" fill="#{color[:6]}" fill-opacity="{opacity}" stroke="none"/>'
+        paint_fill = False
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">'
-        f'<path d="{PATHS[name]}" fill="none" stroke="#{color[:6]}" '
+        f'<path d="{outline}" fill="{"#" + color[:6] if paint_fill else "none"}" '
+        f'fill-opacity="{opacity}" stroke="{"none" if paint_fill else "#" + color[:6]}" '
         f'stroke-opacity="{opacity}" stroke-width="{stroke}" '
-        'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        f'stroke-linecap="round" stroke-linejoin="round"/>{solid}</svg>'
     ).encode("ascii")
     buffer = QBuffer()
     buffer.setData(QByteArray(svg))
@@ -108,7 +184,9 @@ class IconProvider(QQuickImageProvider):
             return _transparent(size), size
         # Копия QImage разделяет пиксели до первой записи, затем отделяется,
         # не меняя исходное изображение в кеше.
-        return QImage(_render_icon(match[1], match[2], stroke, size.width(), size.height())), size
+        return QImage(
+            _render_icon(match[1], match[2], stroke, size.width(), size.height(), match[4] == "1")
+        ), size
 
 
 def install_icon_provider(engine: QQmlEngine) -> None:

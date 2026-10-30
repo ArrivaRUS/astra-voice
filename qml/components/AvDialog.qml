@@ -9,6 +9,9 @@ Dialog {
 
     property string heading: ""
     property string iconName: ""
+    // The responsibility screen uses the application mark from its mockup.
+    // Existing confirmation dialogs keep their requested glyph unchanged.
+    property bool brandHeader: false
     property string message: ""
     property string confirmText: qsTr("Продолжить")
     property bool confirmEnabled: true
@@ -123,9 +126,19 @@ Dialog {
 
             Icon {
                 name: root.iconName
-                visible: name !== ""
+                visible: !root.brandHeader && name !== ""
                 size: 14 // Макет 02-models-file-dialogs.html: .dh svg.
                 color: Theme.fgMuted
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            BrandMark {
+                objectName: "dialogHeaderBrand"
+                visible: root.brandHeader
+                tray: true
+                size: 22
+                color: Theme.fgMuted
+                accentColor: Theme.accent
                 Layout.alignment: Qt.AlignVCenter
             }
 

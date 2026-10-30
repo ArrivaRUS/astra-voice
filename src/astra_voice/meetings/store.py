@@ -353,6 +353,45 @@ class MeetingStore:
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось прочитать данные встречи") from None
 
+    def list(self) -> list[Meeting]:
+        """Read metadata only, newest first, without creating a data directory.
+
+        Service entries and deletion tombstones are omitted. A damaged or unsafe
+        live entry fails the catalogue as a whole, so the UI can offer retry
+        instead of silently hiding a saved meeting. Directory handles pin every
+        read; no paths or document contents enter the error message.
+        """
+        resources = contextlib.ExitStack()
+        try:
+            try:
+                root = resources.enter_context(private_directory(self.root))
+            except FileNotFoundError:
+                return []
+            with resources:
+                result: list[Meeting] = []
+                for name in os.listdir(root):
+                    if re.fullmatch(MEETING_ID_PATTERN, name) is None:
+                        continue
+                    try:
+                        os.stat(f".deleting-{name}", dir_fd=root, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        continue
+                    with _child(root, name) as directory:
+                        meeting = _metadata(directory, name)
+                    if meeting.state != MeetingState.DELETING:
+                        result.append(meeting)
+                return sorted(
+                    result,
+                    key=lambda row: (datetime.fromisoformat(row.started_at), row.id),
+                    reverse=True,
+                )
+        except (OSError, ValueError, TypeError, RecursionError, MeetingStoreError):
+            raise MeetingStoreError("Не удалось прочитать список встреч") from None
+        finally:
+            resources.close()
+
     @contextlib.contextmanager
     def writer(self, meeting_id: str, role: Writer) -> Iterator[MeetingWriter]:
         """Single non-reentrant lifetime lease; contention fails without waiting."""

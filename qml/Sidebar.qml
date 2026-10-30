@@ -1,5 +1,5 @@
 // Сайдбар — design/spec.md §1.3. Ширина 184, не тянется.
-// Шесть разделов в фиксированном порядке; «Отладка» внизу через распорку — только по флагу.
+// Семь разделов в фиксированном порядке; «Отладка» внизу через распорку — только по флагу.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
 import "."
@@ -7,8 +7,10 @@ import "components"
 
 FocusScope {
     id: root
+    objectName: "settingsSidebar"
 
     property int currentIndex: 0
+    property bool freezeAnimations: false
     property bool debugVisible: false
     property bool debugCurrent: currentIndex === sections.length
 
@@ -26,6 +28,9 @@ FocusScope {
         { "key": "output", "title": qsTr("Вывод"),
             "subtitle": qsTr("Куда попадает текст и что происходит с буфером обмена"),
             "icon": "out", "counter": "" },
+        { "key": "meetings", "title": qsTr("Встречи"),
+            "subtitle": qsTr("Запись встреч и расшифровка на этом компьютере"),
+            "icon": "meeting", "counter": "" },
         { "key": "network", "title": qsTr("Сеть и обновления"),
             "subtitle": qsTr("Сетевые проверки и обновления программы"),
             "icon": "refresh", "counter": "" },
@@ -127,6 +132,7 @@ FocusScope {
                     // Список разделов остаётся статическим; цифра приходит из моста.
                     counter: modelData.key === "models" ? root.modelsCounter : modelData.counter
                     current: index === root.currentIndex
+                    freezeAnimations: root.freezeAnimations
                     onActivated: root.currentIndex = index
                 }
             }
@@ -144,6 +150,7 @@ FocusScope {
         iconName: "sliders"
         muted: true
         current: root.debugCurrent
+        freezeAnimations: root.freezeAnimations
         onActivated: root.currentIndex = root.sections.length
     }
 }

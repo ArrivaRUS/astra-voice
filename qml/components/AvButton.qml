@@ -12,6 +12,7 @@ Button {
     property string variant: "secondary"
     property bool small: false
     property string iconName: ""
+    property bool iconFill: false
 
     readonly property bool ghost: variant === "ghost"
     readonly property bool primary: variant === "primary"
@@ -77,6 +78,7 @@ Button {
 
         Icon {
             name: control.iconName
+            fill: control.iconFill
             size: Theme.buttonIconSize
             color: control.fgColor
             visible: control.iconName !== ""
