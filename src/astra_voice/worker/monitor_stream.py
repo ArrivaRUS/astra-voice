@@ -13,6 +13,8 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
@@ -47,6 +49,11 @@ class MonitorStreamSource:
         self.ended = False
         self.change: str | None = None
         self.opened = False
+        self.admission_check: Callable[[], bool] = lambda: True
+        self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
+        if isinstance(pulse, NativePulse):
+            pulse.admission_check = lambda: self.admission_check()
+            pulse.admission_guard = lambda: self.admission_guard()
 
     def open(self, device: str | None = None) -> None:
         with self.lock:
@@ -71,7 +78,12 @@ class MonitorStreamSource:
         else:
             self.target = None
             self.monitor = self.pulse.default_monitor()
+        if not self.admission_check():
+            raise ValueError("admission-stale")
         self.pulse.open_record(self.monitor, self.target.index if self.target else None, self.token)
+        if not self.admission_check():
+            self.pulse.close_record()
+            raise ValueError("admission-stale")
         self.opened = True
         self.ended = False
 
@@ -103,7 +115,13 @@ class MonitorStreamSource:
                         self.pulse.close_record()
                         self.target = fresh
                         self.monitor = fresh.monitor
+                        if not self.admission_check():
+                            self.opened = False
+                            return None
                         self.pulse.open_record(self.monitor, fresh.index, self.token)
+                        if not self.admission_check():
+                            self.close()
+                            return None
                         self.change = "sink-moved"
                         return b""
             elif kind == "server":
@@ -111,7 +129,13 @@ class MonitorStreamSource:
                 if fresh_monitor != self.monitor:
                     self.pulse.close_record()
                     self.monitor = fresh_monitor
+                    if not self.admission_check():
+                        self.opened = False
+                        return None
                     self.pulse.open_record(self.monitor, None, self.token)
+                    if not self.admission_check():
+                        self.close()
+                        return None
                     self.change = "sink-moved"
                     return b""
         if self.ended:
@@ -253,6 +277,8 @@ def _meeting_pulse_type() -> Any:
                 lib.pa_stream_set_monitor_stream.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
                 lib.pa_stream_set_monitor_stream.restype = ctypes.c_int
             self.token = uuid.uuid4().hex
+            self.admission_check: Callable[[], bool] = lambda: True
+            self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
 
         def peek(self, stream: int) -> bytes | int | None:
             fragment = super().peek(stream)
@@ -272,16 +298,26 @@ def _meeting_pulse_type() -> Any:
                 ):
                     if self.lib.pa_proplist_sets(prop, key, value) < 0:
                         raise ValueError("audio-failed")
-                return cast(
-                    int | None,
-                    self.lib.pa_stream_new_with_proplist(ctx, b"meeting", spec, None, prop),
-                )
+                # The gate only covers this nonblocking native enqueue. It is
+                # shared with epoch publication, never with READY or storage.
+                with self.admission_guard():
+                    if not self.admission_check():
+                        raise ValueError("admission-stale")
+                    return cast(
+                        int | None,
+                        self.lib.pa_stream_new_with_proplist(ctx, b"meeting", spec, None, prop),
+                    )
             finally:
                 self.lib.pa_proplist_free(prop)
 
         def stream_connect_record(self, stream: int, name: bytes, attr: Any, flags: int) -> int:
             meeting_attr = _PaBufferAttr(64000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 3200)
-            return super().stream_connect_record(stream, name, ctypes.byref(meeting_attr), flags)
+            with self.admission_guard():
+                if not self.admission_check():
+                    raise ValueError("admission-stale")
+                return super().stream_connect_record(
+                    stream, name, ctypes.byref(meeting_attr), flags
+                )
 
     return MeetingPulse
 
@@ -292,7 +328,11 @@ class NativePulse:
     def __init__(self) -> None:
         from astra_voice.worker.pulse_stream import SubscribeCallback
 
+        self.admission_check: Callable[[], bool] = lambda: True
+        self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
         self.pulse: Any = _meeting_pulse_type()()
+        self.pulse.admission_check = lambda: self.admission_check()
+        self.pulse.admission_guard = lambda: self.admission_guard()
         self.context: int | None = None
         self.stream: int | None = None
         self.events: deque[tuple[str, int]] = deque(maxlen=64)
@@ -565,6 +605,8 @@ def microphone_source() -> Any:
     from astra_voice.worker.pulse_stream import PulseStreamSource
 
     class MeetingMicrophone(PulseStreamSource):
+        admission_check: Callable[[], bool]
+        admission_guard: Callable[[], AbstractContextManager[Any]]
         anchor: tuple[int, int] | None = None
 
         def open(self, device: str | None = None, **kwargs: Any) -> None:
@@ -577,7 +619,16 @@ def microphone_source() -> Any:
                     raise ValueError("audio-failed")
                 return _sample_clock(self._pulse, self._stream, len(self._buffer), self)
 
-    return MeetingMicrophone(pulse_factory=_meeting_pulse_type())
+    def pulse_factory() -> Any:
+        pulse = _meeting_pulse_type()()
+        pulse.admission_check = lambda: source.admission_check()
+        pulse.admission_guard = lambda: source.admission_guard()
+        return pulse
+
+    source = MeetingMicrophone(pulse_factory=pulse_factory)
+    source.admission_check = lambda: True
+    source.admission_guard = nullcontext
+    return source
 
 
 class CapturePulseBackend:

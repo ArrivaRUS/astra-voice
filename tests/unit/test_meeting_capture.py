@@ -15,6 +15,7 @@ from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.worker import ipc
 from astra_voice.worker.meeting_capture import MeetingCaptureState
+from astra_voice.worker.meeting_session import SessionAdmission
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 MID = "2026-10-31_120000-ab12"
@@ -95,6 +96,10 @@ class Rig:
         self.store = MeetingStore(tmp_path / "meetings")
         self.store.create(Meeting(id=MID, started_at="2026-10-31T12:00:00+00:00"))
         self.directory = tmp_path / "meetings" / MID
+        if "session" not in kwargs:
+            session = SessionAdmission(kind="KDE", clock=self.clock, max_age=float("inf"))
+            session.update(known=True, active=True, locked=False, sleeping=False)
+            kwargs["session"] = session
         self.state = MeetingCaptureState(
             clock=self.clock,
             mic_factory=self.mic,

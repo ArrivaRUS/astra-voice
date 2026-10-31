@@ -148,6 +148,9 @@ def test_worker_unknown_meetings_message() -> None:
 
 
 def test_run_role_shutdown_uses_only_inherited_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    from astra_voice.worker.meeting_session import MeetingSession
+
+    monkeypatch.setattr(MeetingSession, "start", lambda self: None)
     incoming = [b"placeholder"]
     connection = Mock(spec=socket.socket)
     from astra_voice.worker import ipc

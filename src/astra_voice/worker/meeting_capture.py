@@ -24,6 +24,7 @@ from astra_voice.security.files import private_directory
 from astra_voice.worker import ipc
 from astra_voice.worker.meeting_contract import COMMAND_FIELDS, RequestLedger
 from astra_voice.worker.meeting_roles import failure
+from astra_voice.worker.meeting_session import MeetingSession, SessionAdmission
 
 Message = dict[str, Any]
 MAX_PCM_BYTES = 128000  # two tracks, at most two seconds each
@@ -72,10 +73,10 @@ class _Archive:
         identity: Message,
         index: int,
         fsync: Callable[[int], None],
-        notify: Callable[[Message], None],
+        emit_event: Callable[[Message], None],
     ) -> None:
         self.directory, self.identity = directory, identity
-        self.fsync, self.notify = fsync, notify
+        self.fsync, self.emit_event = fsync, emit_event
         self.jobs: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=256)
         self.lock = threading.Lock()
         self.pending_bytes = 0
@@ -108,7 +109,19 @@ class _Archive:
         if payload["kind"] == "close" and len(self.intervals) % 2 == 0:
             return
         self.journal.boundaries.append(
-            {key: payload[key] for key in ("kind", "t_mono_ms", "recorded_ms", "reason")}
+            {
+                key: payload[key]
+                for key in (
+                    "kind",
+                    "t_mono_ms",
+                    "recorded_ms",
+                    "reason",
+                    "pause_reasons",
+                    "manual_resume_required",
+                    "blocked_epoch",
+                )
+                if key in payload
+            }
         )
         if payload["kind"] in {"open", "close"}:
             self.intervals.append({key: payload[key] for key in ("t_mono_ms", "recorded_ms")})
@@ -208,7 +221,7 @@ class _Archive:
         del self.segments[track]
         self.next_sample[track] = sidecar.sample_end
         self.counts[track] += 1
-        self.notify({"type": "segment", "sidecar": sidecar.to_dict()})
+        self.emit_event({"type": "segment", "sidecar": sidecar.to_dict()})
 
     def _pcm(self, payload: Any, audio: int, owner: Any) -> None:
         track, data, stamp, recorded = payload
@@ -287,10 +300,15 @@ class _Archive:
                             elif kind == "close":
                                 self.identity["state_rev"] = payload["state_rev"]
                                 for track in list(self.segments):
+                                    sidecar = self.segments[track][2]
+                                    sidecar.manual_resume_required = payload.get(
+                                        "manual_resume_required", False
+                                    )
+                                    sidecar.blocked_epoch = payload.get("blocked_epoch", 0)
                                     self._finish(track, payload["reason"], owner)
                                 self._edge(payload, owner)
                                 self.fsync(audio)
-                                self.notify(
+                                self.emit_event(
                                     {
                                         "type": "finalized",
                                         "request": payload.get("request"),
@@ -307,7 +325,7 @@ class _Archive:
                                     self.pending_bytes -= len(payload[1])
         except Exception:
             self.failed.set()
-            self.notify({"type": "disk-failed"})
+            self.emit_event({"type": "disk-failed"})
         finally:
             for wav, file, _ in self.segments.values():
                 # Do not claim durability/closed on storage failure.
@@ -327,7 +345,16 @@ class MeetingCaptureState:
         backend_factory: Callable[[], Backend] = _backend,
         free_mb: Callable[[], int] | None = None,
         fsync: Callable[[int], None] = os.fsync,
+        session: SessionAdmission | None = None,
     ) -> None:
+        self.session_monitor = MeetingSession.production() if session is None else None
+        self.session = session if session is not None else self.session_monitor.state  # type: ignore[union-attr]
+        self.manual_resume_required = False
+        self.session_terminal = False
+        self.auto_resume_pending = False
+        self.lease_tracks: set[str] = set()
+        if self.session_monitor is not None:
+            self.session_monitor.start()
         self.clock, self.mic_factory = clock, mic_factory
         self.backend_factory, self.fsync = backend_factory, fsync
         self.backend: Backend | None = None
@@ -345,13 +372,14 @@ class MeetingCaptureState:
         self.stopped = False
         self.exit_code = 0
         self.state = "stopped"
-        self.pause_reasons: list[str] = []
+        self.pause_reasons: set[str] = set()
         self.recorded_ms = 0
         self.active_at: float | None = None
         self.last_lease = self.last_alive = self.last_disk = self.clock()
         self.close_deadline: float | None = None
         self.close_wall: float | None = None
         self.closing_request: Message | None = None
+        self.close_waiters: list[Message] = []
         self.pending: dict[str, list[Message]] = {}
         self.opening = False
         self.finalizing = False
@@ -385,10 +413,104 @@ class MeetingCaptureState:
 
     def _pause(self) -> Message:
         return {
-            "pause_reasons": list(self.pause_reasons),
-            "manual_resume_required": bool(self.pause_reasons),
-            "blocked_epoch": 0,
+            "pause_reasons": sorted(self.pause_reasons),
+            "manual_resume_required": self.manual_resume_required,
+            "blocked_epoch": self.session.snapshot().blocked_epoch,
+            "lock_signal_unavailable": self.session.snapshot().lock_signal_unavailable,
         }
+
+    def _admitted(self, request: Message) -> bool:
+        return (
+            not self.session_terminal
+            and self.session.allowed(request["blocked_epoch"])
+            and 0 <= self.clock() * 1000 - request["admission_mono_ms"] <= 1000
+        )
+
+    def _add_reason(self, reason: str) -> bool:
+        if reason not in {
+            "user",
+            "lock",
+            "unknown",
+            "lease",
+            "indicators",
+            "mic_change",
+            "audio_failed",
+            "disk",
+        }:
+            return False
+        added = reason not in self.pause_reasons
+        self.pause_reasons.add(reason)
+        if reason in {"lock", "unknown"} and self.close_deadline is not None:
+            self.close_deadline = min(self.close_deadline, self.clock() + 0.2)
+            self.close_wall = min(self.close_wall or float("inf"), time.monotonic() + 0.2)
+        if reason not in {"lease", "indicators"}:
+            self.manual_resume_required = True
+            self.auto_resume_pending = False
+        if added and self.archive is not None and self.state == "paused":
+            self.archive.put(
+                "edge",
+                {
+                    "kind": "pause_state",
+                    "t_mono_ms": int(self.clock() * 1000),
+                    "recorded_ms": self._recorded(),
+                    "reason": reason,
+                    **{
+                        key: value
+                        for key, value in self._pause().items()
+                        if key != "lock_signal_unavailable"
+                    },
+                },
+            )
+        return added
+
+    def _session_events(self, result: list[Message]) -> None:
+        snapshots = self.session.drain()
+        snapshots.append(self.session.snapshot())
+        for snapshot in snapshots:
+            if not self.identity or self.state in {"stopped", "closing-unknown"}:
+                continue
+            reason = snapshot.reason
+            if reason in {"sleep", "session"}:
+                self.session_terminal = True
+                self.auto_resume_pending = False
+                if self.sources or self.opening:
+                    self._close(None, reason)
+                self.state = "stopped"
+            elif reason in {"lock", "unknown"}:
+                self._autopause(reason, reason, result)
+
+    def _maybe_auto_resume(self) -> None:
+        if (
+            not self.auto_resume_pending
+            or self.state != "paused"
+            or self.opening
+            or self.finalizing
+            or self.close_deadline is not None
+            or self.manual_resume_required
+            or self.session_terminal
+            or not self.pause_reasons
+            or self.pause_reasons != {"lease"}
+            or self.final_status == "failed"
+            or self.clock() - self.last_lease >= 5
+        ):
+            return
+        snapshot = self.session.snapshot()
+        if not snapshot.admissible:
+            return
+        self.auto_resume_pending = False
+        self.selected_tracks = [
+            track
+            for track in ("mic", "far")
+            if track in self.lease_tracks and self.track_states[track] == "paused"
+        ]
+        if self.selected_tracks:
+            self._open(
+                {
+                    "automatic": True,
+                    "blocked_epoch": snapshot.blocked_epoch,
+                    "admission_mono_ms": int(self.clock() * 1000),
+                }
+            )
 
     def _recorded(self) -> int:
         return min(
@@ -444,6 +566,10 @@ class MeetingCaptureState:
                 self.terminate()
             return [failure(message, "req-conflict" if status == "conflict" else "limit")]
         action = message["type"]
+        session_events: list[Message] = []
+        self._session_events(session_events)
+        for event in session_events:
+            self.messages.put({"type": "session-event", "event": event})
         try:
             if self.stopped and action != "meeting.capture.shutdown":
                 raise ValueError("not-prepared")
@@ -507,6 +633,10 @@ class MeetingCaptureState:
                 raise ValueError("admission-stale")
             if action == "meeting.capture.keepalive":
                 self.last_lease = self.clock()
+                self.auto_resume_pending = self.state == "paused" and self.pause_reasons == {
+                    "lease"
+                }
+                self._maybe_auto_resume()
                 return self._remember(
                     message, [self._reply("meeting.ack", message, **self._base())]
                 )
@@ -536,7 +666,7 @@ class MeetingCaptureState:
                     raise ValueError("io")
                 if not self.far_available:
                     raise ValueError("limit")
-                if message.get("blocked_epoch") != 0:
+                if not self._admitted(message):
                     raise ValueError("admission-stale")
                 self.selected_tracks = (
                     message.get(
@@ -564,13 +694,41 @@ class MeetingCaptureState:
                     or self.track_states["mic"] != "paused"
                     or self.opening
                     or self.close_deadline is not None
-                    or message["blocked_epoch"] != 0
+                    or not self._admitted(message)
                 ):
                     raise ValueError("not-prepared")
                 self._resume_microphone(message)
             elif action in {"meeting.capture.stop", "meeting.capture.pause"}:
+                if action == "meeting.capture.pause":
+                    reason = message["reason"]
+                    if (
+                        reason in {"lock", "unknown"}
+                        and not self.session.snapshot().lock_signal_unavailable
+                    ):
+                        if reason != "lock" or not self.session.snapshot().locked:
+                            self.session.signal("Lock" if reason == "lock" else "unknown")
+                    if (
+                        reason in {"lock", "unknown"}
+                        and self.session.snapshot().lock_signal_unavailable
+                    ):
+                        return self._remember(
+                            message, [self._reply("meeting.ack", message, **self._base())]
+                        )
+                    self._add_reason(reason)
                 if self.finalizing or self.close_deadline is not None:
-                    raise ValueError("not-prepared")
+                    if action == "meeting.capture.stop":
+                        self.state = "stopped"
+                        self.auto_resume_pending = False
+                    replies = [self._reply("meeting.ack", message, **self._base())]
+                    if self.close_deadline is None:
+                        replies.append(
+                            self._reply(
+                                "meeting.capture.closed", message, **self._base(), tracks=[]
+                            )
+                        )
+                    self.close_waiters.append(message)
+                    self.pending[message["req"]] = list(replies)
+                    return self._remember(message, replies)
                 if self.state != "recording" and not self.opening:
                     return self._remember(message, self._already_closed(message))
                 self._close(message, message.get("reason", "stop"))
@@ -701,6 +859,13 @@ class MeetingCaptureState:
             )
         return replies
 
+    def _complete_waiters(self, result: list[Message]) -> None:
+        """One physical close, independent correlated durable outcomes for all requests."""
+        waiters, self.close_waiters = self.close_waiters, []
+        for waiter in waiters:
+            for reply in self._already_closed(waiter)[1:]:
+                result.append(self._outcome(waiter, reply))
+
     def _sample_disk(self) -> None:
         if self.disk_sampling:
             return
@@ -715,6 +880,17 @@ class MeetingCaptureState:
 
         threading.Thread(target=sample, name="meeting-disk", daemon=True).start()
 
+    def _guard_source(self, source: Source, request: Message, stop: threading.Event) -> None:
+        # Meeting-only adapters consult this again at native stream_new/connect;
+        # context selection may have blocked after the outer admission check.
+        guarded: Any = source
+        guarded.admission_guard = lambda: self.session.lock
+        guarded.admission_check = lambda: (
+            not stop.is_set()
+            and not self.session_terminal
+            and self.session.allowed(request["blocked_epoch"])
+        )
+
     def _open(self, request: Message) -> None:
         assert self.directory is not None
         if self.archive is None:
@@ -723,7 +899,8 @@ class MeetingCaptureState:
             )
         self.audio_stop = threading.Event()
         self.opening = True
-        self.pause_reasons = []
+        self.pause_reasons.clear()
+        self.manual_resume_required = False
         self.open_request = request
         stop = self.audio_stop
         self.used_meetings.add(self.identity["meeting_id"])
@@ -735,25 +912,31 @@ class MeetingCaptureState:
                 self.messages.put({"type": "disk-space", "free": free})
                 if free < 600:
                     raise ValueError("limit")
-                sources: dict[str, Source] = {}
-                if "mic" in self.selected_tracks:
-                    sources["mic"] = self.mic_factory()
-                if "far" in self.selected_tracks:
-                    sources["far"] = backend.source(self.far)
-                self.sources = sources
-                for source in sources.values():
-                    if stop.is_set():
-                        raise ValueError("capture-cancelled")
-                    if not 0 <= self.clock() * 1000 - request["admission_mono_ms"] <= 1000:
+                self.sources = {}
+                for track in self.selected_tracks:
+                    if stop.is_set() or not self._admitted(request):
                         raise ValueError("admission-stale")
-                    source.open(self.mic_device if source is sources.get("mic") else None)
-                    if stop.is_set():
+                    source = self.mic_factory() if track == "mic" else backend.source(self.far)
+                    self.sources[track] = source
+                    self._guard_source(source, request, stop)
+                    if stop.is_set() or not self._admitted(request):
+                        raise ValueError("admission-stale")
+                    source.open(self.mic_device if track == "mic" else None)
+                    if stop.is_set() or not self._admitted(request):
                         source.shutdown()
-                        raise ValueError("capture-cancelled")
+                        raise ValueError("admission-stale")
                 self.messages.put({"type": "opened", "request": request})
                 # Control activates the disk/reader edge after observing open completion.
-            except Exception:
-                self.messages.put({"type": "open-failed", "request": request})
+            except Exception as exc:
+                self.messages.put(
+                    {
+                        "type": "open-failed",
+                        "request": request,
+                        "code": "admission-stale"
+                        if str(exc) == "admission-stale"
+                        else "audio-failed",
+                    }
+                )
 
         self.open_thread = threading.Thread(target=start, name="meeting-open", daemon=True)
         self.open_thread.start()
@@ -767,19 +950,28 @@ class MeetingCaptureState:
                 old = self.readers.get("mic")
                 if old:
                     old.join()
-                if stop.is_set():
-                    return
+                if stop.is_set() or not self._admitted(request):
+                    raise ValueError("admission-stale")
                 source = self.mic_factory()
                 self.sources["mic"] = source
-                if not 0 <= self.clock() * 1000 - request["admission_mono_ms"] <= 1000:
+                self._guard_source(source, request, stop)
+                if stop.is_set() or not self._admitted(request):
                     raise ValueError("admission-stale")
                 source.open(request["mic_device"])
-                if stop.is_set():
+                if stop.is_set() or not self._admitted(request):
                     source.shutdown()
-                    return
+                    raise ValueError("admission-stale")
                 self.messages.put({"type": "mic-opened", "request": request})
-            except Exception:
-                self.messages.put({"type": "open-failed", "request": request})
+            except Exception as exc:
+                self.messages.put(
+                    {
+                        "type": "open-failed",
+                        "request": request,
+                        "code": "admission-stale"
+                        if str(exc) == "admission-stale"
+                        else "audio-failed",
+                    }
+                )
 
         self.open_thread = threading.Thread(target=start, name="meeting-mic-open", daemon=True)
         self.open_thread.start()
@@ -836,30 +1028,28 @@ class MeetingCaptureState:
             self.messages.put({"type": "audio-failed"})
 
     def _close(self, request: Message | None, reason: str) -> None:
+        if reason == "lease" and self.close_deadline is None:
+            self.lease_tracks = {
+                track for track, state in self.track_states.items() if state == "live"
+            }
+        self._add_reason(reason)
+        if reason in {"stop", "limit", "sleep", "session"}:
+            self.state = "stopped"
+            self.auto_resume_pending = False
         if self.close_deadline is not None:
             return
         self.recorded_ms = self._recorded()
         self.active_at = None
         self.audio_stop.set()
         self.identity["state_rev"] += 1
-        self.pause_reasons = (
-            [reason]
-            if reason
-            in {
-                "user",
-                "lock",
-                "unknown",
-                "lease",
-                "indicators",
-                "mic_change",
-                "audio_failed",
-                "disk",
-            }
-            else []
-        )
         self.state = "stopped" if reason in {"stop", "limit", "sleep", "session"} else "paused"
-        self.close_deadline = self.clock() + CLOSE_SECONDS
-        self.close_wall = time.monotonic() + CLOSE_SECONDS
+        # Poll(.5s) + three bounded reads(.225s) + role tick(.05s)
+        # reserve .2s for physical close on lock/unknown; timeout escalates.
+        budget = 0.2 if reason in {"lock", "unknown"} else CLOSE_SECONDS
+        self.close_deadline = self.clock() + budget
+        if reason == "lease":
+            self.close_deadline = min(self.close_deadline, self.last_lease + 5.0)
+        self.close_wall = time.monotonic() + budget
         self.closing_request = request
         self.close_reason = reason
         self.close_mono_ms = int(self.clock() * 1000)
@@ -914,13 +1104,16 @@ class MeetingCaptureState:
 
     def poll(self) -> list[Message]:
         result: list[Message] = []
+        self._session_events(result)
         while True:
             try:
                 event = self.messages.get_nowait()
             except queue.Empty:
                 break
             kind = event["type"]
-            if kind == "detector-result":
+            if kind == "session-event":
+                result.append(event["event"])
+            elif kind == "detector-result":
                 self.control_busy = False
                 result.append(self._outcome(event["request"], event["reply"]))
             elif kind in {"prepared", "prepare-failed"}:
@@ -945,7 +1138,10 @@ class MeetingCaptureState:
                 self.track_states = {"mic": "ended", "far": "ended"}
                 self.index = request["segment_index_from"]
                 self.state, self.recorded_ms = "prepared", 0
-                self.pause_reasons = []
+                self.pause_reasons.clear()
+                self.manual_resume_required = False
+                self.session_terminal = False
+                self.auto_resume_pending = False
                 self.far_available = event["info"]["far_available"]
                 result.append(
                     self._outcome(
@@ -967,8 +1163,14 @@ class MeetingCaptureState:
                     self._autopause("disk", "disk-write", result)
             elif kind == "opened":
                 self.opening = False
-                if self.close_deadline is not None or self.stopped:
-                    self._close(None, "stop")
+                self._session_events(result)
+                if (
+                    self.close_deadline is not None
+                    or self.stopped
+                    or not self._admitted(event["request"])
+                ):
+                    if self.close_deadline is None:
+                        self._close(None, self.session.snapshot().reason or "stop")
                     continue
                 self.identity["state_rev"] += 1
                 self.state = "recording"
@@ -990,6 +1192,9 @@ class MeetingCaptureState:
                         "track_start", (track, source.sample_clock(), self.recorded_ms)
                     )
                     self._start_reader(track, source)
+                if event["request"].get("automatic"):
+                    self.last_alive = 0
+                    continue
                 result.append(
                     self._outcome(
                         event["request"],
@@ -1004,7 +1209,14 @@ class MeetingCaptureState:
                 )
             elif kind == "mic-opened":
                 self.opening = False
-                if self.close_deadline is not None or self.terminating:
+                self._session_events(result)
+                if (
+                    self.close_deadline is not None
+                    or self.terminating
+                    or not self._admitted(event["request"])
+                ):
+                    if self.close_deadline is None:
+                        self._close(None, self.session.snapshot().reason or "unknown")
                     continue
                 self.identity["state_rev"] += 1
                 assert self.archive is not None
@@ -1028,9 +1240,13 @@ class MeetingCaptureState:
                 self.opening = False
                 if self.close_deadline is None:
                     self._close(None, "audio_failed")
-                result.append(
-                    self._outcome(event["request"], failure(event["request"], "audio-failed"))
-                )
+                if not event["request"].get("automatic"):
+                    result.append(
+                        self._outcome(
+                            event["request"],
+                            failure(event["request"], event.get("code", "audio-failed")),
+                        )
+                    )
             elif kind == "closed":
                 if (
                     self.close_wall is None
@@ -1054,6 +1270,17 @@ class MeetingCaptureState:
                         },
                     )
                 )
+                for waiter in self.close_waiters:
+                    result.append(
+                        self._outcome(
+                            waiter,
+                            {
+                                "type": "meeting.capture.closed",
+                                **self._base(),
+                                "tracks": event["tracks"],
+                            },
+                        )
+                    )
                 for track in event["tracks"]:
                     if self.track_states[track] == "live":
                         self.track_states[track] = "paused" if self.state == "paused" else "ended"
@@ -1067,6 +1294,11 @@ class MeetingCaptureState:
                             "t_mono_ms": self.close_mono_ms,
                             "recorded_ms": self.recorded_ms,
                             "request": request,
+                            **{
+                                key: value
+                                for key, value in self._pause().items()
+                                if key != "lock_signal_unavailable"
+                            },
                         },
                     ):
                         self.finalizing = False
@@ -1083,6 +1315,7 @@ class MeetingCaptureState:
                                 },
                             )
                         )
+                        self._complete_waiters(result)
                 else:
                     self.finalizing = False
             elif kind == "finalized":
@@ -1113,7 +1346,7 @@ class MeetingCaptureState:
                             "at_recorded_ms": self.recorded_ms,
                             "segments_closed": sum(event["segments"].values()),
                         }
-                        if self.state == "paused"
+                        if request["type"] == "meeting.capture.pause"
                         else {
                             "type": "meeting.capture.stopped",
                             **self._base(),
@@ -1123,6 +1356,7 @@ class MeetingCaptureState:
                         }
                     )
                     result.append(self._outcome(request, response))
+                self._complete_waiters(result)
             elif kind == "segment":
                 segment = event["sidecar"]
                 fields = (
@@ -1148,6 +1382,7 @@ class MeetingCaptureState:
                 )
             elif kind == "track-ended":
                 track, reason = event["track"], event["reason"]
+                self.lease_tracks.discard(track)
                 if reason == "audio_failed":
                     self._autopause("audio_failed", "audio-failed", result)
                 else:
@@ -1190,11 +1425,14 @@ class MeetingCaptureState:
                             },
                         )
                     )
+                    self._complete_waiters(result)
                 self._autopause(
                     "disk" if kind == "disk-failed" else "audio_failed",
                     "disk-write" if kind == "disk-failed" else "audio-failed",
                     result,
                 )
+        self._session_events(result)
+        self._maybe_auto_resume()
         now = self.clock()
         if self.close_deadline is not None and (
             now >= self.close_deadline or time.monotonic() >= (self.close_wall or 0)
@@ -1214,7 +1452,7 @@ class MeetingCaptureState:
             if now - self.last_disk >= 10:
                 self.last_disk = now
                 self._sample_disk()
-            if self.state == "recording" and now - self.last_lease >= 5:
+            if self.state == "recording" and now - self.last_lease >= 3.95:
                 self._autopause("lease", "lease", result)
             if self.state == "recording" and self._recorded() >= self.limit_ms:
                 self._close(None, "limit")
@@ -1260,9 +1498,15 @@ class MeetingCaptureState:
         return result
 
     def _autopause(self, reason: str, wire_reason: str, result: list[Message]) -> None:
-        if self.state != "recording":
+        if self.state in {"stopped", "closing-unknown"}:
             return
-        self._close(None, reason)
+        added = self._add_reason(reason)
+        if self.state == "recording" or self.opening:
+            self._close(None, reason)
+        elif self.state == "prepared":
+            self.state = "paused"
+        if not added:
+            return
         result.append(
             {
                 "type": "meeting.capture.autopaused",
@@ -1289,7 +1533,9 @@ class MeetingCaptureState:
 
     def cleanup(self) -> None:
         """Transport loss/signal: bounded physical cleanup, storage may be abandoned."""
-        self.terminate()
+        self.terminate()  # Start physical close before bounded helper reaping.
+        if self.session_monitor is not None:
+            self.session_monitor.close()
         deadline = time.monotonic() + 1.0
         while not self.stopped and time.monotonic() < deadline:
             self.poll()

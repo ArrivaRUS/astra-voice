@@ -257,3 +257,58 @@ def test_native_prepare_and_detector_context_never_create_pcm(
         pulse.lib.pa_stream_new_with_proplist.assert_not_called()
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("kind", ["app_stream", "sink_monitor"])
+def test_session_guard_refuses_far_reopen_after_resolution(kind: str) -> None:
+    pulse = Pulse()
+    source = make(pulse, kind)
+    allowed = [True]
+    source.admission_check = lambda: allowed[0]
+    source.open()
+    if kind == "app_stream":
+
+        def resolve(index: int) -> Target | None:
+            allowed[0] = False
+            return Target(7, 11, 123, 99, "sink-b.monitor")
+
+        pulse.resolve = resolve  # type: ignore[method-assign]
+        pulse.events.append(("changed", 7))
+    else:
+
+        def default() -> str:
+            allowed[0] = False
+            return "sink-b.monitor"
+
+        pulse.default_monitor = default  # type: ignore[method-assign]
+        pulse.events.append(("server", 0))
+    assert source.read_chunk() is None
+    assert len([call for call in pulse.calls if len(call) == 3]) == 1
+    assert not source.opened
+
+
+@pytest.mark.parametrize("boundary", ["create", "connect"])
+def test_native_meeting_admission_rechecked_at_pcm_boundary(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    from unittest.mock import Mock
+
+    from astra_voice.worker import pulse_stream
+    from astra_voice.worker.monitor_stream import _meeting_pulse_type
+
+    lib = Mock()
+    lib.pa_proplist_new.return_value = 10
+    lib.pa_proplist_sets.return_value = 0
+    lib.pa_stream_new_with_proplist.return_value = 22
+    monkeypatch.setattr(
+        pulse_stream._PulseAsync, "__init__", lambda self: setattr(self, "lib", lib)
+    )
+    native = _meeting_pulse_type()()
+    native.admission_check = lambda: False
+    with pytest.raises(ValueError, match="admission-stale"):
+        if boundary == "create":
+            native.stream_new(1, b"meeting", None, None)
+        else:
+            native.stream_connect_record(22, b"source", None, 0)
+    lib.pa_stream_new_with_proplist.assert_not_called()
+    lib.pa_stream_connect_record.assert_not_called()

@@ -290,7 +290,14 @@ OPTIONAL.update(
             "app_class": choices("dion", "browser", "other"),
             "target": TARGET,
         },
-        "meeting.capture.prepared": {"far_reason": text_schema(120)},
+        "meeting.capture.prepared": {
+            "far_reason": text_schema(120),
+            "lock_signal_unavailable": BOOL,
+        },
+        "meeting.capture.started": {"lock_signal_unavailable": BOOL},
+        "meeting.capture.paused": {"lock_signal_unavailable": BOOL},
+        "meeting.capture.alive": {"lock_signal_unavailable": BOOL},
+        "meeting.capture.autopaused": {"lock_signal_unavailable": BOOL},
         "measured": {"sessions": UINT},
     }
 )
@@ -330,7 +337,7 @@ EVENT_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
         "meeting.capture.autopaused": {
             **CAPTURE,
             **PAUSE,
-            "reason": choices("lease", "audio-failed", "disk-write"),
+            "reason": choices("lease", "audio-failed", "disk-write", "lock", "unknown"),
             "at_recorded_ms": MILLISECONDS,
         },
         "meeting.capture.segment": {
@@ -420,7 +427,10 @@ for _event in ("meeting.capture.closed", "meeting.capture.finalized"):
 OPTIONAL.update(
     {
         "meeting.capture.track": {"label": text_schema(120)},
-        "meeting.capture.alive": {"reason": choices("lease", "indicators")},
+        "meeting.capture.alive": {
+            "reason": choices("lease", "indicators"),
+            "lock_signal_unavailable": BOOL,
+        },
         "meeting.job.progress": {"block": UINT, "blocks": UINT},
     }
 )

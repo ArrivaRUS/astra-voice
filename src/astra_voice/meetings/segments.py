@@ -151,12 +151,23 @@ class CaptureJournal(JsonModel):
                 obj(
                     {
                         "kind": choices(
-                            "open", "close", "mic_gap_start", "mic_gap_end", "far_ended"
+                            "open",
+                            "close",
+                            "mic_gap_start",
+                            "mic_gap_end",
+                            "far_ended",
+                            "pause_state",
                         ),
                         "t_mono_ms": UINT,
                         "recorded_ms": MILLISECONDS,
                         "reason": nullable(choices(*CLOSE_REASONS)),
-                    }
+                        "pause_reasons": array(
+                            choices(*PauseReason), len(PauseReason), unique=True
+                        ),
+                        "manual_resume_required": BOOL,
+                        "blocked_epoch": UINT,
+                    },
+                    required=["kind", "t_mono_ms", "recorded_ms", "reason"],
                 ),
                 18000,
             ),

@@ -143,7 +143,8 @@ def test_capture_import_gate_and_v4_meeting_fields() -> None:
 import sys
 sys.path.insert(0,{source!r})
 from astra_voice.worker.meeting_capture import MeetingCaptureState
-state=MeetingCaptureState()
+from astra_voice.worker.meeting_session import SessionAdmission
+state=MeetingCaptureState(session=SessionAdmission(kind="KDE"))
 for name in ('PyQt5','PySide6','onnxruntime','numpy','astra_voice.worker.pulse_stream',
              'astra_voice.worker.audio','astra_voice.worker.state'):
     assert name not in sys.modules,name
