@@ -371,6 +371,12 @@ def nonroot_euid(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
 
 
+@pytest.fixture
+def filesystem_euid(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
+    """Opt-in for real private files: restore ownership identity after root guards."""
+    monkeypatch.setattr(os, "geteuid", REAL_GETEUID)
+
+
 @pytest.fixture(autouse=True)
 def restore_root_logger() -> Iterator[None]:
     """Тест, вызвавший setup_logging (напрямую или через bootstrap), не меняет журнал соседям.

@@ -412,6 +412,11 @@ EVENT_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
         }
     },
 }
+# Self-pauses/parent death have no initiating request. These are the same facts
+# as correlated close/finalize replies, with capture identity retained.
+for _event in ("meeting.capture.closed", "meeting.capture.finalized"):
+    EVENT_FIELDS["meeting-capture"][_event] = REPLY_FIELDS[_event]
+
 OPTIONAL.update(
     {
         "meeting.capture.track": {"label": text_schema(120)},

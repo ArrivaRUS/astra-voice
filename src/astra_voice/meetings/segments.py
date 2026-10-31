@@ -1,4 +1,4 @@
-"""Durable capture boundaries and sample clocks; WAV capture is a later milestone.
+"""Durable capture boundaries and sample clocks; WAV I/O belongs to meeting_capture.
 
 Samples are absolute offsets within one epoch. Timeline knots use server-derived
 CLOCK_MONOTONIC milliseconds, never Python buffer-arrival times. A discontinuous
@@ -130,3 +130,35 @@ class SegmentSidecar(JsonModel):
 
 
 SEGMENT_SCHEMA = SegmentSidecar.SCHEMA
+
+
+@dataclass
+class CaptureJournal(JsonModel):
+    """Capture-owned durable edges; reconstruct GUI intervals without meeting.json writes."""
+
+    meeting_id: str
+    meeting_generation: int
+    capture_id: str
+    boundaries: list[dict[str, Any]] = field(default_factory=list)
+    schema: int = 1
+    SCHEMA = obj(
+        {
+            "schema": VERSION,
+            "meeting_id": MEETING_ID,
+            "meeting_generation": UINT,
+            "capture_id": IDENTIFIER,
+            "boundaries": array(
+                obj(
+                    {
+                        "kind": choices(
+                            "open", "close", "mic_gap_start", "mic_gap_end", "far_ended"
+                        ),
+                        "t_mono_ms": UINT,
+                        "recorded_ms": MILLISECONDS,
+                        "reason": nullable(choices(*CLOSE_REASONS)),
+                    }
+                ),
+                18000,
+            ),
+        }
+    )

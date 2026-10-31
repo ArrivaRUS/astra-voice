@@ -39,7 +39,7 @@ from astra_voice.meetings.model import (
     SpeakerMap,
     Transcript,
 )
-from astra_voice.meetings.segments import SegmentSidecar
+from astra_voice.meetings.segments import CaptureJournal, SegmentSidecar
 from astra_voice.security.files import (
     check_private_file,
     private_directory,
@@ -54,6 +54,7 @@ _DOCUMENTS: dict[str, type[JsonModel]] = {
     "transcript.json": Transcript,
     "checkpoint.json": Checkpoint,
     "speakers.json": SpeakerMap,
+    "capture.json": CaptureJournal,
 }
 
 
@@ -196,7 +197,7 @@ class MeetingWriter:
             Writer.GUI
             if filename in {"meeting.json", "speakers.json"}
             else Writer.CAPTURE
-            if cls is SegmentSidecar
+            if cls in {SegmentSidecar, CaptureJournal}
             else Writer.TRANSCRIBE
         )
         if self._role != allowed or type(document) is not cls:
@@ -224,7 +225,7 @@ class MeetingWriter:
                 and meeting.meeting_generation == document.meeting_generation
             ):
                 raise MeetingStoreError("Отмена встречи уже сохранена")
-        if isinstance(document, (Transcript, Checkpoint, SegmentSidecar)):
+        if isinstance(document, (Transcript, Checkpoint, SegmentSidecar, CaptureJournal)):
             if (
                 document.meeting_id != self._meeting_id
                 or document.meeting_generation != meeting.meeting_generation

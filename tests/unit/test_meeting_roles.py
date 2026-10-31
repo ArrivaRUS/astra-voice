@@ -25,6 +25,12 @@ def no_parent_stderr_redirection(monkeypatch: pytest.MonkeyPatch) -> None:
     from astra_voice.worker import meeting_roles
 
     monkeypatch.setattr(meeting_roles, "silence_native_stderr", lambda: True)
+    # A real capture role owns its process for life. Tests share pytest's process.
+    import logging
+
+    for name in ("astra_voice.worker.audio", "astra_voice.worker.pulse_stream"):
+        logger = logging.getLogger(name)
+        monkeypatch.setattr(logger, "disabled", logger.disabled)
 
 
 @pytest.mark.parametrize("role", COMMANDS)
@@ -211,9 +217,7 @@ def test_successful_role_start_has_strict_hardening_and_limits(
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.setenv("TMPDIR", "/nonexistent/astra-voice-diar")
     assert worker_main.meeting_main(role, ["12"]) == 0
-    harden.assert_called_once_with(
-        123, strict=True, oom_score=300 if role == "meeting-capture" else 500
-    )
+    harden.assert_called_once_with(123, strict=True, oom_score=500)
     limits.assert_called_once_with(role)
     entry.assert_called_once_with(connection, role, parent_pid=123)
 
@@ -347,3 +351,31 @@ def test_revision_refusal_reserve_exhaustion_terminates_supervisor(
     s.send(command(s.role, "ping", "two"))
     assert s.state == "stopped" and not s.ready and not s._restarts
     assert events[-1]["code"] == "limit"
+
+
+def test_capture_entry_suppresses_reused_dictation_device_logs(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    from astra_voice.worker import meeting_roles
+
+    monkeypatch.setattr(worker_main, "harden_process", lambda *a, **kw: True)
+    monkeypatch.setattr(worker_main, "harden_meeting_limits", lambda role: True)
+    connection = Mock(spec=socket.socket)
+    connection.family, connection.type = socket.AF_UNIX, socket.SOCK_STREAM
+    monkeypatch.setattr(socket, "socket", Mock(return_value=connection))
+
+    def entry(*args: object, **kwargs: object) -> int:
+        logging.getLogger("astra_voice.worker.pulse_stream").warning("PRIVATE_DEVICE_NAME")
+        logging.getLogger("astra_voice.worker.audio").warning("PRIVATE_HOST_OR_DEVICE")
+        return 0
+
+    monkeypatch.setattr(meeting_roles, "run_role", entry)
+    with caplog.at_level(logging.DEBUG):
+        assert worker_main.meeting_main("meeting-capture", ["12"]) == 0
+    assert "PRIVATE_DEVICE" not in caplog.text and "PRIVATE_HOST" not in caplog.text
+    assert logging.getLogger("astra_voice.worker.pulse_stream").disabled
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("astra_voice.worker.pulse_stream").warning("LATE_PRIVATE_DEVICE")
+    assert "LATE_PRIVATE_DEVICE" not in caplog.text

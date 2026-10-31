@@ -48,3 +48,11 @@ class SegmentTimeline:
 def sample_to_monotonic(segment: SegmentSidecar, sample: int) -> int:
     """Convenience for mutable sidecars; repeated queries should reuse a snapshot."""
     return SegmentTimeline.from_segment(segment).sample_to_monotonic(sample)
+
+
+def monotonic_to_recorded(intervals: list[dict[str, int]], mono_ms: int) -> int:
+    """Map paired open/close boundaries, rejecting time inside a pause or gap."""
+    for left, right in zip(intervals[::2], intervals[1::2], strict=False):
+        if left["t_mono_ms"] <= mono_ms <= right["t_mono_ms"]:
+            return left["recorded_ms"] + mono_ms - left["t_mono_ms"]
+    raise MeetingValidationError("meeting-timeline-gap")

@@ -16,16 +16,9 @@ from astra_voice.meetings import events, model, segments, store
 from astra_voice.security.files import check_private_file
 from conftest import REAL_GETEUID
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 ID = "2026-10-29_120000-ab12"
 STAMP = "2026-10-29T12:00:00+00:00"
-
-
-@pytest.fixture(autouse=True)
-def filesystem_euid(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
-    # Ownership checks need the real UID, including root in CI; the shared
-    # fixture's UID 1000 is only suitable for application root-guard tests.
-    monkeypatch.setattr(os, "geteuid", REAL_GETEUID)
 
 
 @pytest.fixture
