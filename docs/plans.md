@@ -827,7 +827,7 @@ M9 вынесен в январь/v1.1.1; odt/docx (+1 день Could вне 38)
 | Имя | Тип | Кто пишет → кто читает | С какой вехи |
 |---|---|---|---|
 | `hello.family`, `hello.protocol` | literal `astra-voice.meetings`, int literal 1 | Супервизор ↔ роли встреч; схемы по роли, несовместимость терминальна | M1 (Д1) |
-| `req`, `request_type` | string 1…64 `[A-Za-z0-9_-]`, enum типа команды | Инициатор → роль; ACK → инициатор; включая `model.*`, keepalive/credit | M1 (Д1/Д2) |
+| `req`, `request_type` | string 1…64 `[A-Za-z0-9_-]`, enum типа команды | Инициатор → роль; ACK → инициатор; включая `model.*`, keepalive/credit. M2: capture.keepalive — только корреляция, без журнала; capture.stop/pause/shutdown принимаются и при полном/exhausted журнале как повторяемое управление состоянием без кэша (один текущий ожидающий req на действие, исходный дедлайн не продлевается); известные сохранённые req всегда проверяются на конфликт и повторяют исход | M1 (Д1/Д2), уточнение M2 шаг 3а |
 | `meeting_generation` | uint, меняется при новом задании/отмене/удалении; при аварийном рестарте стабилен | GUI → роли, файлы, события и ACK; роли → GUI | M1, M2/M4/M5 |
 | `capture_id`, `state_rev` | непрозрачный id сессии захвата; монотонный uint ревизии | Capture → GUI; GUI возвращает ожидаемую идентичность в управлении | M2 (Д2/Д9) |
 | `pause_reasons` | set enum user/lock/unknown/lease/indicators/mic_change/audio_failed/disk | Capture → GUI, устойчивые границы захвата → восстановитель | M2 (Д9) |

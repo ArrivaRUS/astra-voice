@@ -376,7 +376,12 @@ class WorkerSupervisor:
                 )
 
     def _send_meeting(self, message: Message, *, timeout: float | None) -> Message:
-        from astra_voice.worker.meeting_contract import COMMAND_FIELDS, operation_timeout
+        from astra_voice.worker.meeting_contract import (
+            CAPTURE_CLOSING,
+            COMMAND_FIELDS,
+            MAX_KEEPALIVE_PENDING,
+            operation_timeout,
+        )
         from astra_voice.worker.meeting_roles import failure
 
         if not self._hello_accepted:
@@ -399,6 +404,14 @@ class WorkerSupervisor:
             < self.meeting_generations.get(request["meeting_id"], 0)
         ):
             raise ValueError("meeting-generation-stale")
+        if request["req"] not in self._meeting_ledger.requests:
+            # Correlation-only traffic still has exact req/content matching
+            # while in flight; completed heartbeats leave no lifetime entry.
+            for pending_request in self._meeting_requests.values():
+                if pending_request["req"] == request["req"]:
+                    if pending_request != request:
+                        self._emit(failure(request, "req-conflict"))
+                    return {**request, "generation": self.generation}
         state, cached = self._meeting_ledger.begin(request)
         if state == "same":
             for reply in cached or []:
@@ -412,11 +425,22 @@ class WorkerSupervisor:
             return {**request, "generation": self.generation}
         if state == "exhausted":
             generation = self.generation
-            self._restart(report=False, failure_code="limit", relaunch=False)
+            if self.role != "meeting-capture":
+                self._restart(report=False, failure_code="limit", relaunch=False)
             self._emit(failure(request, "limit"), generation=generation)
             return {**request, "generation": generation}
         if state in {"conflict", "limit"}:
             self._emit(failure(request, "req-conflict" if state == "conflict" else "limit"))
+            return {**request, "generation": self.generation}
+        if (
+            request["type"] == "meeting.capture.keepalive"
+            and sum(
+                pending_request["type"] == "meeting.capture.keepalive"
+                for pending_request in self._meeting_requests.values()
+            )
+            >= MAX_KEEPALIVE_PENDING
+        ):
+            self._emit(failure(request, "limit"))
             return {**request, "generation": self.generation}
         if "meeting_id" in request:
             self.set_meeting_generation(request["meeting_id"], request["meeting_generation"])
@@ -426,19 +450,37 @@ class WorkerSupervisor:
             self._meeting_ledger.finish(request["req"], [failure(request, "limit")])
             self._emit(failure(request, "limit"))
             return {**request, "generation": self.generation}
+        close_deadline = self._clock() + 1.0
+        end_deadline = self._clock() + (
+            operation_timeout(request)
+            if timeout is None
+            else min(timeout, operation_timeout(request))
+        )
+        if state == "uncached" and request["type"] in CAPTURE_CLOSING:
+            # Overflow closes are state-idempotent: keep only the current
+            # correlation per action without extending the first deadline.
+            for old_key, old_request in tuple(self._meeting_requests.items()):
+                if (
+                    old_request["type"] == request["type"]
+                    and old_request["req"] not in self._meeting_ledger.requests
+                ):
+                    self._meeting_requests.pop(old_key)
+                    self._pending.pop(old_key)
+                    close_deadline = min(
+                        close_deadline, self._meeting_close_deadlines.pop(old_key, close_deadline)
+                    )
+                    end_deadline = min(
+                        end_deadline, self._meeting_end_deadlines.pop(old_key, end_deadline)
+                    )
         key = _correlation(request)
         ack_timeout = 1.0 if timeout is None else min(timeout, 1.0)
         self._pending[key] = _Pending(
             self._clock() + ack_timeout, self._activity, request["type"], ack_timeout
         )
         self._meeting_requests[key] = request
-        self._meeting_end_deadlines[key] = self._clock() + (
-            operation_timeout(request)
-            if timeout is None
-            else min(timeout, operation_timeout(request))
-        )
+        self._meeting_end_deadlines[key] = end_deadline
         if request["type"] in {"meeting.capture.stop", "meeting.capture.pause"}:
-            self._meeting_close_deadlines[key] = self._clock() + 1.0
+            self._meeting_close_deadlines[key] = close_deadline
             self.close_state = "closing"
         self._outgoing.extend(frame)
         self._flush()
@@ -789,7 +831,8 @@ class WorkerSupervisor:
             }
             event: Message = {**message, **identity}
             self._meeting_ledger.finish(key[1], [event])
-            self._finished.add(key)
+            if key[1] in self._meeting_ledger.requests:
+                self._finished.add(key)
             return event
         self._finished.add(key[:2])
         event = dict(message)

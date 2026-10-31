@@ -542,9 +542,10 @@ class MeetingCaptureState:
         if request is None:
             return event
         event = {**event, "req": request["req"], "request_type": request["request_type"]}
-        previous = self.pending.setdefault(request["req"], [])
-        previous.append(event)
-        self.ledger.finish(request["req"], previous)
+        if request["req"] in self.ledger.requests:
+            previous = self.pending.setdefault(request["req"], [])
+            previous.append(event)
+            self.ledger.finish(request["req"], previous)
         return event
 
     def _get_backend(self) -> Backend:
@@ -562,8 +563,8 @@ class MeetingCaptureState:
         if status == "same":
             return deepcopy(cached or [])
         if status in {"conflict", "limit", "exhausted"}:
-            if status == "exhausted":
-                self.terminate()
+            # Exhaustion refuses new work, never the ability to close. The
+            # bounded ledger still admits keepalive and closing controls.
             return [failure(message, "req-conflict" if status == "conflict" else "limit")]
         action = message["type"]
         session_events: list[Message] = []
@@ -580,7 +581,8 @@ class MeetingCaptureState:
                     raise ValueError("not-prepared")
                 self._detector(message)
                 reply = self._reply("meeting.ack", message)
-                self.pending[message["req"]] = [reply]
+                if message["req"] in self.ledger.requests:
+                    self.pending[message["req"]] = [reply]
                 return self._remember(message, [reply])
             if action == "meeting.call.query":
                 return self._remember(
@@ -596,7 +598,8 @@ class MeetingCaptureState:
                 self.shutdown_request = message
                 self.terminate()
                 reply = self._reply("meeting.ack", message)
-                self.pending[message["req"]] = [reply]
+                if message["req"] in self.ledger.requests:
+                    self.pending[message["req"]] = [reply]
                 return self._remember(message, [reply])
             if action == "meeting.capture.prepare":
                 if (
@@ -613,7 +616,8 @@ class MeetingCaptureState:
                     raise ValueError("not-prepared")
                 self._prepare(message)
                 reply = self._reply("meeting.ack", message)
-                self.pending[message["req"]] = [reply]
+                if message["req"] in self.ledger.requests:
+                    self.pending[message["req"]] = [reply]
                 return self._remember(message, [reply])
             if self.stopped or self.terminating or self.preparing:
                 raise ValueError("not-prepared")
@@ -726,8 +730,17 @@ class MeetingCaptureState:
                                 "meeting.capture.closed", message, **self._base(), tracks=[]
                             )
                         )
+                    if message["req"] not in self.ledger.requests:
+                        # Overflow control has one current waiter per action,
+                        # not an unbounded second request journal.
+                        self.close_waiters = [
+                            waiter
+                            for waiter in self.close_waiters
+                            if waiter["req"] in self.ledger.requests or waiter["type"] != action
+                        ]
                     self.close_waiters.append(message)
-                    self.pending[message["req"]] = list(replies)
+                    if message["req"] in self.ledger.requests:
+                        self.pending[message["req"]] = list(replies)
                     return self._remember(message, replies)
                 if self.state != "recording" and not self.opening:
                     return self._remember(message, self._already_closed(message))
@@ -735,7 +748,8 @@ class MeetingCaptureState:
             else:
                 raise ValueError("not-prepared")
             reply = self._reply("meeting.ack", message, **self._base())
-            self.pending[message["req"]] = [reply]
+            if message["req"] in self.ledger.requests:
+                self.pending[message["req"]] = [reply]
             return self._remember(message, [reply])
         except Exception as exc:
             code = (
