@@ -142,8 +142,12 @@ def _fields(value: dict[str, Any], schema: _Schema) -> dict[str, Any]:
     return result
 
 
-def _validate(msg: dict[str, Any]) -> dict[str, Any]:
+def _validate(msg: dict[str, Any], *, role: str = "worker") -> dict[str, Any]:
     """Проверяет схему, формат идентификатора и размер текста в UTF-8."""
+    if role != "worker":
+        from astra_voice.worker.meeting_contract import validate_message
+
+        return validate_message(msg, role)
     if not isinstance(msg, dict):
         raise FrameError(BAD_FRAME, "Сообщение должно быть JSON-объектом.")
     if "type" not in msg or not isinstance(msg["type"], str):
@@ -183,15 +187,17 @@ def _validate(msg: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def encode(msg: dict[str, Any]) -> bytes:
+def encode(msg: dict[str, Any], *, role: str = "worker") -> bytes:
     """Проверяет сообщение и добавляет к компактному JSON префикс длины тела."""
-    validated = _validate(msg)
+    validated = _validate(msg, role=role)
     try:
         payload = json.dumps(validated, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     except (ValueError, UnicodeEncodeError) as exc:
         raise FrameError(BAD_FIELD, "Поля сообщения не представимы в JSON UTF-8.") from exc
     if len(payload) > MAX_FRAME_BYTES:
-        raise FrameError(FRAME_TOO_LARGE, "Тело кадра превышает 64 КиБ.")
+        raise FrameError(
+            FRAME_TOO_LARGE if role == "worker" else BAD_FIELD, "Тело кадра превышает 64 КиБ."
+        )
     return _HEADER.pack(len(payload)) + payload
 
 
@@ -200,15 +206,17 @@ def _reject_constant(value: str) -> None:
     raise ValueError("Недопустимая числовая константа JSON.")
 
 
-def decode(payload: bytes) -> dict[str, Any]:
+def decode(payload: bytes, *, role: str = "worker") -> dict[str, Any]:
     """Разбирает одно тело кадра без префикса и проверяет схему сообщения."""
     if len(payload) > MAX_FRAME_BYTES:
-        raise FrameError(FRAME_TOO_LARGE, "Тело кадра превышает 64 КиБ.")
+        raise FrameError(
+            FRAME_TOO_LARGE if role == "worker" else BAD_FIELD, "Тело кадра превышает 64 КиБ."
+        )
     try:
         msg = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise FrameError(BAD_FRAME, "Тело кадра должно быть JSON в UTF-8.") from exc
-    return _validate(msg)
+    return _validate(msg, role=role)
 
 
 class FrameReader:
@@ -220,7 +228,8 @@ class FrameReader:
     Ошибочное тело пропускается. После ``frame-too-large`` больше ничего не выдаётся.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, role: str = "worker") -> None:
+        self.role = role
         self.broken: bool = False
         self._buffer = bytearray()
         self._length: int | None = None
@@ -248,7 +257,10 @@ class FrameReader:
                     self.broken = True
                     self._pending.clear()
                     self._ready.clear()
-                    raise FrameError(FRAME_TOO_LARGE, "Объявленная длина превышает 64 КиБ.")
+                    raise FrameError(
+                        FRAME_TOO_LARGE if self.role == "worker" else BAD_FIELD,
+                        "Объявленная длина превышает 64 КиБ.",
+                    )
                 self._length = length
             if self._length is not None and len(self._buffer) == self._length:
                 frames.append(bytes(self._buffer))
@@ -260,13 +272,25 @@ class FrameReader:
         """Возвращает сообщения; первая ошибка выбрасывается без потери успешных."""
         self._pending.extend(self.feed_frames(data))
         while self._pending:
-            self._ready.append(decode(self._pending.popleft()))
+            self._ready.append(decode(self._pending.popleft(), role=self.role))
         messages, self._ready = self._ready, []
         return messages
 
 
-def make_hello() -> dict[str, Any]:
+def make_hello(*, role: str = "worker") -> dict[str, Any]:
     """Создаёт приветствие без загрузки ORT; отсутствие пакета допустимо."""
+    if role != "worker":
+        from astra_voice.worker.meeting_contract import FAMILY, PROTOCOL, ROLES
+
+        if role not in ROLES:
+            raise FrameError(PROTOCOL_MISMATCH, "meeting-role-invalid")
+        return {
+            "type": "hello",
+            "family": FAMILY,
+            "protocol": PROTOCOL,
+            "build": __version__,
+            "runtime": {"python": platform.python_version(), "onnxruntime": None},
+        }
     ort_version: str | None = None
     try:
         ort_version = version("onnxruntime")

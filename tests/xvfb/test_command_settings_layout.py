@@ -34,6 +34,13 @@ def tree(item: QQuickItem) -> Iterator[QQuickItem]:
         yield from tree(child)
 
 
+def section_index(sidebar: QQuickItem, key: str) -> int:
+    sections = sidebar.property("sections").toVariant()
+    indices = [index for index, section in enumerate(sections) if section["key"] == key]
+    assert len(indices) == 1, f"Expected exactly one sidebar section {key!r}: {sections!r}"
+    return indices[0]
+
+
 def box(item: QQuickItem, relative: QQuickItem) -> QRectF:
     return QRectF(item.mapToItem(relative, QPointF()), QSizeF(item.width(), item.height()))
 
@@ -116,7 +123,7 @@ def render(width: int, state: str, wizard: bool) -> Iterator[tuple[Any, ...]]:
                 for item in tree(window.contentItem())
                 if item.metaObject().indexOfProperty("sections") >= 0
             )
-            sidebar.setProperty("currentIndex", 4)  # existing Advanced navigation entry
+            assert sidebar.setProperty("currentIndex", section_index(sidebar, "advanced"))
             QTest.qWait(40)
             editor = next(
                 item

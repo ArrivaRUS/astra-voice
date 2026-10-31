@@ -80,7 +80,7 @@ def test_icon_name(state: TrayState, expected: str) -> None:
 
 def test_names_do_not_fall_back_to_astra() -> None:
     provider = TrayIconProvider(SessionKind.KDE)
-    assert len(TrayState) == 6
+    assert len(TrayState) == 8
     assert all(not provider.icon_name(state).startswith("astra-") for state in TrayState)
 
 

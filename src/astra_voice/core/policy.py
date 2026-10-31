@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from astra_voice.core.settings import MODEL_UNLOAD_MINUTES, Settings, is_valid_combo
@@ -33,6 +34,17 @@ APPIMAGE_DENIED_MESSAGE = (
 )
 SECTION = "astra-voice"
 LOCKED_KEY = "locked"
+MEETING_POLICY_KEYS = frozenset(
+    {
+        "meeting_record",
+        "meeting_diarization",
+        "meeting_ai_endpoint",
+        "meeting_ai_allow_external",
+        "meeting_audio_retention_days",
+        "meeting_notice_text",
+        "meeting_ai_allow_plaintext",
+    }
+)
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 
@@ -50,12 +62,19 @@ class Policy:
     status: PolicyStatus = PolicyStatus.ABSENT
     # Только диагностика раскладки: не меняет статус, значения и блокировки.
     permissions_warning: str = ""
+    # Parsed section snapshot, including locked, before legacy coercion.
+    raw: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     def is_locked(self, key: str) -> bool:
         return key in self.locked_keys
 
 
-_SETTINGS_TYPES = {f.name: f.type for f in fields(Settings) if f.name != "extra"}
+# Meeting keys must remain raw until their separate fail-closed parser (E13 M1).
+_SETTINGS_TYPES = {
+    f.name: f.type
+    for f in fields(Settings)
+    if f.name != "extra" and not f.name.startswith(("meeting_", "meetings_"))
+}
 
 
 def _coerce(key: str, raw: str) -> Any:
@@ -135,9 +154,18 @@ def load(path: Path | None = None) -> Policy:
         log.warning("политика %s без секции [%s], считаю её отсутствующей", target, SECTION)
         return Policy(status=PolicyStatus.INVALID, permissions_warning=permissions_warning)
 
+    snapshot = MappingProxyType(dict(raw))
     explicit = {k.strip() for k in raw.pop(LOCKED_KEY, "").replace(",", " ").split() if k.strip()}
     values: dict[str, Any] = {}
     for key, value in raw.items():
+        if key in MEETING_POLICY_KEYS:
+            # Their typed, per-key parser consumes raw; never legacy _coerce.
+            values[key] = value
+            continue
+        if key.startswith("meeting_"):
+            # Quarantine unknown meeting keys in raw. The meeting parser closes
+            # its entire scope; unrelated legacy policy remains valid.
+            continue
         if key == OFFLINE_KEY:
             if _offline_value(value, target):
                 values[key] = True
@@ -149,12 +177,15 @@ def load(path: Path | None = None) -> Policy:
             values[key] = _coerce(key, value)
         except ValueError as exc:
             log.warning("политика %s: %s, считаю её невалидной", target, exc)
-            return Policy(status=PolicyStatus.INVALID, permissions_warning=permissions_warning)
+            return Policy(
+                status=PolicyStatus.INVALID, permissions_warning=permissions_warning, raw=snapshot
+            )
     return Policy(
         values=values,
         locked_keys=frozenset(values) | explicit,
         status=PolicyStatus.OK,
         permissions_warning=permissions_warning,
+        raw=snapshot,
     )
 
 

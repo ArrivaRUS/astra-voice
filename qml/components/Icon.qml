@@ -9,6 +9,7 @@ Item {
     property real size: 16
     property color color: "#000000"
     property real strokeWidth: 1.5
+    property bool fill: false
 
     implicitWidth: size
     implicitHeight: size
@@ -27,7 +28,7 @@ Item {
         source: root.name === "" ? "" : "image://avicon/" + root.name + "?c="
                 + root.hex(root.color.r) + root.hex(root.color.g)
                 + root.hex(root.color.b) + root.hex(root.color.a)
-                + "&w=" + root.strokeWidth
+                + "&w=" + root.strokeWidth + (root.fill ? "&f=1" : "")
         sourceSize: Qt.size(Math.ceil(root.size * Screen.devicePixelRatio),
                             Math.ceil(root.size * Screen.devicePixelRatio))
         smooth: true

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -60,6 +62,8 @@ class _Pending:
 def _correlation(message: Message) -> RequestKey:
     """Нормализует запрос, ответ и коррелированную ошибку в один ключ."""
     kind = str(message.get("request_type", message["type"]))
+    if "req" in message:
+        return ("req", str(message["req"]), kind)
     if "utterance_id" in message:
         return ("utterance", str(message["utterance_id"]), kind)
     return _CORRELATION.get(kind, ("reply", kind))
@@ -75,9 +79,13 @@ def launcher_path() -> Path:
     return dev_launcher
 
 
-def worker_command(fd: int) -> list[str]:
+def worker_command(fd: int, *, role: str = "worker") -> list[str]:
     """Составляет команду запуска воркера через лаунчер в изолированном Python."""
-    return [sys.executable, "-I", str(launcher_path()), "worker", str(fd)]
+    from astra_voice.worker.meeting_contract import ROLES
+
+    if role not in ROLES | {"worker"}:
+        raise ValueError("worker-role-invalid")
+    return [sys.executable, "-I", str(launcher_path()), role, str(fd)]
 
 
 class WorkerSupervisor:
@@ -122,22 +130,47 @@ class WorkerSupervisor:
         on_event: Callable[[Message], None],
         *,
         clock: Callable[[], float] = time.monotonic,
-        command_factory: Callable[[int], list[str]] = worker_command,
+        command_factory: Callable[[int], list[str]] | None = None,
         use_qt: bool = True,
         launch_allowed: Callable[[], bool] = lambda: True,
+        role: str = "worker",
+        auto_restart: bool | None = None,
+        on_exit: Callable[[int], None] = lambda code: None,
     ) -> None:
+        from astra_voice.worker.meeting_contract import ROLES, RequestLedger
+
+        if role not in ROLES | {"worker"}:
+            raise ValueError("worker-role-invalid")
+        self.role = role
+        self.auto_restart = (
+            role in {"worker", "meeting-transcribe"} if auto_restart is None else auto_restart
+        )
+        self._on_exit = on_exit
+        # Legacy dictation clocks may depend on a runtime still being built.
+        # Meeting hello deadlines are reset again at the actual launch below.
+        self._hello_deadline = clock() + 3.0 if role != "worker" else 0.0
+        self._process_group = False
+        self.close_state = "idle"
+        self.meeting_generations: dict[str, int] = {}
+        self._meeting_ledger = RequestLedger()
+        self._meeting_requests: dict[RequestKey, Message] = {}
+        self._meeting_end_deadlines: dict[RequestKey, float] = {}
+        self._meeting_close_deadlines: dict[RequestKey, float] = {}
+        self._meeting_exit_deadline: float | None = None
+        self._exit_notifying = False
+        self._stop_revision = 0
         self.generation = 1
         self.dropped_late = 0
         self.state: Literal["new", "running", "stopped"] = "new"
         self.process: subprocess.Popen[bytes] | None = None
         self._on_event = on_event
         self._clock = clock
-        self._command_factory = command_factory
+        self._command_factory = command_factory or (lambda fd: worker_command(fd, role=role))
         self._use_qt = use_qt
         self._launch_allowed = launch_allowed
         self._hello_accepted = False
         self._socket: socket.socket | None = None
-        self._reader = ipc.FrameReader()
+        self._reader = ipc.FrameReader(role=role)
         self._outgoing = bytearray()
         self._pending: dict[RequestKey, _Pending] = {}
         self._finished: set[RequestKey] = set()
@@ -165,10 +198,18 @@ class WorkerSupervisor:
     @property
     def ready(self) -> bool:
         """Текущий воркер подтвердил совместимость протокола через hello."""
-        return self.state == "running" and not self.restarting and self._hello_accepted
+        return (
+            self.state == "running"
+            and not self.restarting
+            and self._hello_accepted
+            and self._meeting_exit_deadline is None
+            and not self._exit_notifying
+        )
 
     def start(self) -> None:
         """Запускает воркер один раз; повторный вызов при работе безопасен."""
+        if self._exit_notifying:
+            raise RuntimeError("meeting-exit-notifying")
         if self.state == "stopped":
             raise RuntimeError("Супервизор остановлен.")
         if self.state == "running":
@@ -187,20 +228,29 @@ class WorkerSupervisor:
     def _launch(self) -> None:
         """Передаёт только дочерний fd и закрывает его копию в родителе."""
         self._hello_accepted = False
+        self._hello_deadline = self._clock() + 3.0
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             parent.setblocking(False)
-            process = subprocess.Popen(
-                self._command_factory(child.fileno()), pass_fds=[child.fileno()]
-            )
+            options: dict[str, Any] = {"pass_fds": [child.fileno()]}
+            if self.role != "worker":
+                options["start_new_session"] = True
+                options["stderr"] = subprocess.DEVNULL
+                environment = dict(os.environ)
+                if self.role == "meeting-diar":
+                    environment.pop("HOME", None)
+                    environment["TMPDIR"] = "/nonexistent/astra-voice-diar"
+                options["env"] = environment
+            process = subprocess.Popen(self._command_factory(child.fileno()), **options)
         except BaseException:
             parent.close()
             raise
         finally:
             child.close()
         self.process = process
+        self._process_group = self.role != "worker"
         self._socket = parent
-        self._reader = ipc.FrameReader()
+        self._reader = ipc.FrameReader(role=self.role)
         self.state = "running"
         if self._use_qt:
             self._attach_qt()
@@ -233,10 +283,12 @@ class WorkerSupervisor:
         наследует срок последнего соседнего ожидания с таймаутом того же id.
         Это исходный абсолютный срок, а не новый интервал от момента отмены.
         """
-        if self.state != "running" or self._restart_pending is not None:
+        if self.state != "running" or self._restart_pending is not None or self._exit_notifying:
             raise RuntimeError("Воркер не запущен.")
         if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
             raise ValueError("Таймаут должен быть конечным и неотрицательным.")
+        if self.role != "worker":
+            return self._send_meeting(message, timeout=timeout)
         frame = ipc.encode(message)
         request = {**ipc.decode(frame[4:]), "generation": self.generation}
         uid = request.get("utterance_id")
@@ -284,6 +336,261 @@ class WorkerSupervisor:
         self._flush()
         return request
 
+    def set_meeting_generation(self, meeting_id: str, generation: int) -> None:
+        """Controller-owned generation; process restarts never advance it.
+
+        Cancellation/deletion must call this before allowing late events. No
+        open/resume/extend (or any other command) is replayed by _launch.
+        """
+        from astra_voice.meetings.model import MEETING_ID, UINT
+        from astra_voice.models.schema import validate
+
+        validate(meeting_id, MEETING_ID)
+        validate(generation, UINT)
+        if generation < self.meeting_generations.get(meeting_id, 0):
+            raise ValueError("meeting-generation-stale")
+        self.meeting_generations[meeting_id] = generation
+        if any(
+            request.get("meeting_id") == meeting_id
+            and request["meeting_generation"] != generation
+            and key in self._meeting_close_deadlines
+            for key, request in self._meeting_requests.items()
+        ):
+            # A cancellation generation cannot erase the physical-close duty.
+            self._restart(report=False, failure_code="timeout")
+            return
+        # Retire old waits as well as results; they cannot time out and kill the
+        # new job later. A new generation also requires fresh req identifiers.
+        for key, request in list(self._meeting_requests.items()):
+            if (
+                request.get("meeting_id") == meeting_id
+                and request["meeting_generation"] != generation
+            ):
+                self._finish(
+                    key,
+                    {
+                        "type": "error",
+                        "code": "cancelled-by-delete",
+                        "message": "meeting-generation-retired",
+                    },
+                )
+
+    def _send_meeting(self, message: Message, *, timeout: float | None) -> Message:
+        from astra_voice.worker.meeting_contract import COMMAND_FIELDS, operation_timeout
+        from astra_voice.worker.meeting_roles import failure
+
+        if not self._hello_accepted:
+            raise RuntimeError("meeting-role-not-ready")
+        frame = ipc.encode(message, role=self.role)
+        request = ipc.decode(frame[4:], role=self.role)
+        if request["type"] not in COMMAND_FIELDS[self.role]:
+            raise ValueError("meeting-command-invalid")
+        if (
+            self._meeting_exit_deadline is not None
+            and request["req"] not in self._meeting_ledger.requests
+        ):
+            # Existing outcomes/conflicts remain queryable; never reserve new
+            # work while waiting for process exit after bye.
+            raise RuntimeError("meeting-role-exiting")
+        if (
+            ("req" not in request or request["req"] not in self._meeting_ledger.requests)
+            and "meeting_id" in request
+            and request["meeting_generation"]
+            < self.meeting_generations.get(request["meeting_id"], 0)
+        ):
+            raise ValueError("meeting-generation-stale")
+        state, cached = self._meeting_ledger.begin(request)
+        if state == "same":
+            for reply in cached or []:
+                mid = reply.get("meeting_id")
+                if mid is not None and self.meeting_generations.get(mid) != reply.get(
+                    "meeting_generation"
+                ):
+                    self.dropped_late += 1
+                    continue
+                self._emit(reply)
+            return {**request, "generation": self.generation}
+        if state == "exhausted":
+            generation = self.generation
+            self._restart(report=False, failure_code="limit", relaunch=False)
+            self._emit(failure(request, "limit"), generation=generation)
+            return {**request, "generation": generation}
+        if state in {"conflict", "limit"}:
+            self._emit(failure(request, "req-conflict" if state == "conflict" else "limit"))
+            return {**request, "generation": self.generation}
+        if "meeting_id" in request:
+            self.set_meeting_generation(request["meeting_id"], request["meeting_generation"])
+            if self.state != "running" or self.restarting:
+                raise RuntimeError("meeting-closing-unknown")
+        if len(self._outgoing) + len(frame) > 4 * ipc.MAX_FRAME_BYTES:
+            self._meeting_ledger.finish(request["req"], [failure(request, "limit")])
+            self._emit(failure(request, "limit"))
+            return {**request, "generation": self.generation}
+        key = _correlation(request)
+        ack_timeout = 1.0 if timeout is None else min(timeout, 1.0)
+        self._pending[key] = _Pending(
+            self._clock() + ack_timeout, self._activity, request["type"], ack_timeout
+        )
+        self._meeting_requests[key] = request
+        self._meeting_end_deadlines[key] = self._clock() + (
+            operation_timeout(request)
+            if timeout is None
+            else min(timeout, operation_timeout(request))
+        )
+        if request["type"] in {"meeting.capture.stop", "meeting.capture.pause"}:
+            self._meeting_close_deadlines[key] = self._clock() + 1.0
+            self.close_state = "closing"
+        self._outgoing.extend(frame)
+        self._flush()
+        return {**request, "generation": self.generation}
+
+    def _accept_meeting(self, message: Message, generation: int) -> None:
+        from astra_voice.worker.meeting_contract import COMMAND_FIELDS
+
+        if generation != self.generation:
+            self.dropped_late += 1
+            return
+        kind = message["type"]
+        if kind in COMMAND_FIELDS[self.role]:
+            self.dropped_late += 1
+            return
+        if kind == "hello":
+            self._hello_accepted = True
+            self._emit(message)
+            return
+        mid = message.get("meeting_id")
+        if mid is not None and self.meeting_generations.get(mid) != message.get(
+            "meeting_generation"
+        ):
+            self.dropped_late += 1
+            return
+        if "req" not in message:
+            self._activity += 1
+            self._emit(message)
+            return
+        key = _correlation(message)
+        if key not in self._pending:
+            self.dropped_late += 1
+            return
+        request = self._meeting_requests[key]
+        if any(
+            request.get(field) != message.get(field)
+            for field in ("meeting_id", "meeting_generation")
+            + (() if kind == "error" else ("capture_id",))
+            if field in request
+        ):
+            self.dropped_late += 1
+            return
+        self._activity += 1
+        if kind == "error" and key in self._meeting_close_deadlines:
+            self._restart(report=False, failure_code="timeout")
+            return
+        if kind == "meeting.capture.closed":
+            self.close_state = "closed"
+            self._meeting_close_deadlines.pop(key, None)
+            self._pending[key].deadline = self._meeting_end_deadlines[key]
+        elif kind == "meeting.capture.finalized":
+            if key in self._meeting_close_deadlines:
+                self.dropped_late += 1
+                return
+            self.close_state = "finalized"
+            message = self._finish(key, message)
+        elif kind in {"meeting.capture.paused", "meeting.capture.stopped"}:
+            # Legacy aggregate notifications never substitute closed/finalized.
+            self._pending[key].deadline = self._meeting_end_deadlines[key]
+        elif kind == "meeting.ack":
+            if request["type"] in {
+                "meeting.capture.keepalive",
+                "meeting.job.credit",
+                "meeting.job.applied",
+            }:
+                message = self._finish(key, message)
+            else:
+                self._pending[key].deadline = self._meeting_end_deadlines[key]
+        elif kind == "meeting.capture.bye":
+            # Receipt never proves exit. Keep the original shutdown ceiling,
+            # independently of the command wait removed by _finish.
+            self._meeting_exit_deadline = self._meeting_end_deadlines[key]
+            if not self.exited:
+                self.close_state = "closing-unknown"
+            self._update_capture_closed(terminal=True)
+            message = self._finish(key, message)
+        else:
+            message = self._finish(key, message)
+        self._emit(message)
+
+    def _expire_meeting(self) -> None:
+        if self.state != "running" or self.restarting:
+            return
+        now = self._clock()
+        if self._meeting_exit_deadline is not None:
+            if self.exited:
+                code = int(self.process.poll() or 0) if self.process is not None else None
+                self.state = "stopped"
+                self.process = None
+                self._close_connection()
+                self._update_capture_closed(terminal=True)
+                if code is not None:
+                    self._notify_exit(code)
+            elif now >= self._meeting_exit_deadline:
+                self._restart(report=False, failure_code="timeout", relaunch=False)
+            return
+        if not self._hello_accepted and now >= self._hello_deadline:
+            self._restart(report=False, failure_code="hello-timeout", relaunch=False)
+            return
+        if any(deadline <= now for deadline in self._meeting_close_deadlines.values()):
+            self.close_state = "closing-unknown"
+            self._restart(report=False, failure_code="timeout")
+            return
+        expired = [
+            key
+            for key, pending in self._pending.items()
+            if pending.deadline is not None and pending.deadline <= now
+        ]
+        if any(
+            self._pending[key].activity == self._activity
+            or self._pending[key].request_type in {"meeting.job.cancel", "diar.cancel"}
+            for key in expired
+        ):
+            self._restart(report=False, failure_code="timeout")
+            return
+        generation = self.generation
+        events = [
+            self._finish(key, ipc.error("timeout", "meeting-command-timeout")) for key in expired
+        ]
+        for event in events:
+            self._emit(event, generation=generation)
+
+    def _update_capture_closed(self, *, terminal: bool = False) -> None:
+        if (
+            self.role == "meeting-capture"
+            and self.exited
+            and (
+                self.close_state == "closing-unknown"
+                or terminal
+                and self.close_state != "finalized"
+            )
+        ):
+            self.close_state = "closed"
+
+    def _notify_exit(self, code: int) -> None:
+        """Exit state is committed before a user callback can reenter control."""
+        self._exit_notifying = True
+        try:
+            self._on_exit(code)
+        finally:
+            self._exit_notifying = False
+
+    def _kill_current(self) -> None:
+        """Only launcher-created meeting processes have a private process group."""
+        if self.process is None:
+            return
+        if self._process_group:
+            with suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGKILL)
+        else:
+            self.process.kill()
+
     def _flush(self) -> None:
         """Отправляет доступную порцию; остаток дописывается следующим pump."""
         if self._socket is None or not self._outgoing:
@@ -301,7 +608,10 @@ class WorkerSupervisor:
         """Читает порцию IPC через select; ожидание ограничено 50 мс и дедлайном."""
         if not math.isfinite(timeout) or timeout < 0:
             raise ValueError("Таймаут pump должен быть конечным и неотрицательным.")
+        if self._exit_notifying:
+            return
         self._retired = [process for process in self._retired if process.poll() is None]
+        self._update_capture_closed()
         if self._restart_pending is not None:
             self._poll_restart()
             return
@@ -326,6 +636,9 @@ class WorkerSupervisor:
             if readable and self._socket is connection:
                 data = connection.recv(ipc.MAX_FRAME_BYTES)
                 if not data:
+                    if self.role != "worker" and self._meeting_exit_deadline is not None:
+                        self._expire_meeting()
+                        return
                     self._restart()
                     return
                 self._receive(data, generation)
@@ -335,10 +648,16 @@ class WorkerSupervisor:
             if self._socket is connection:
                 self._restart()
         if self.state == "running" and self.process is not None and self.process.poll() is not None:
-            self._restart()
+            if self.role != "worker" and self._meeting_exit_deadline is not None:
+                self._expire_meeting()
+            else:
+                self._restart()
 
     def _receive(self, data: bytes, generation: int) -> None:
         """Разбирает каждое тело отдельно, сохраняя кадры после безопасной ошибки."""
+        if generation != self.generation:
+            self.dropped_late += 1
+            return
         try:
             frames = self._reader.feed_frames(data)
         except ipc.FrameError as exc:
@@ -350,7 +669,7 @@ class WorkerSupervisor:
             if self.state != "running" or self.generation != generation:
                 return
             try:
-                message = ipc.decode(frame)
+                message = ipc.decode(frame, role=self.role)
             except ipc.FrameError as exc:
                 if exc.code == ipc.PROTOCOL_MISMATCH:
                     self._restart(report=False, failure_code=exc.code, relaunch=False)
@@ -361,6 +680,9 @@ class WorkerSupervisor:
 
     def _accept(self, message: Message, generation: int) -> None:
         """Снимает ожидания до callback, отбрасывая повторные завершения (У35)."""
+        if self.role != "worker":
+            self._accept_meeting(message, generation)
+            return
         kind = message["type"]
         if generation != self.generation:
             if kind in ("result", "cancelled", "error"):
@@ -456,6 +778,19 @@ class WorkerSupervisor:
     def _finish(self, key: RequestKey, message: Message) -> Message:
         """Завершает ожидание и дополняет ошибку корреляцией для потребителя."""
         pending = self._pending.pop(key)
+        if key[0] == "req":
+            request = self._meeting_requests.pop(key)
+            self._meeting_close_deadlines.pop(key, None)
+            self._meeting_end_deadlines.pop(key, None)
+            identity: dict[str, Any] = {
+                field: request[field]
+                for field in ("req", "request_type", "meeting_id", "meeting_generation")
+                if field in request
+            }
+            event: Message = {**message, **identity}
+            self._meeting_ledger.finish(key[1], [event])
+            self._finished.add(key)
+            return event
         self._finished.add(key[:2])
         event = dict(message)
         if message["type"] == "error":
@@ -468,6 +803,9 @@ class WorkerSupervisor:
 
     def _expire(self) -> None:
         """Снимает истёкшие ожидания до вызова callback, без ожидания воркера."""
+        if self.role != "worker":
+            self._expire_meeting()
+            return
         now = self._clock()
         generation = self.generation
         expired = [
@@ -504,6 +842,14 @@ class WorkerSupervisor:
         self._pending.clear()
         self._finished.clear()
         self._outgoing.clear()
+        if self.role != "worker":
+            from astra_voice.worker.meeting_contract import RequestLedger
+
+            self._meeting_ledger = RequestLedger()
+            self._meeting_requests.clear()
+            self._meeting_end_deadlines.clear()
+            self._meeting_close_deadlines.clear()
+            self._meeting_exit_deadline = None
 
     def _restart(
         self,
@@ -513,8 +859,12 @@ class WorkerSupervisor:
         relaunch: bool = True,
     ) -> None:
         """Убивает воркер; смена поколения и события ждут подтверждения выхода."""
-        if self._restart_pending is not None:
+        if self._restart_pending is not None or self._exit_notifying:
             return
+        if self.role != "worker":
+            relaunch = relaunch and self.auto_restart
+            if self.role == "meeting-capture" and not self.exited:
+                self.close_state = "closing-unknown"
         generation = self.generation
         failure = ipc.error(
             failure_code,
@@ -531,7 +881,7 @@ class WorkerSupervisor:
         self._close_connection()
         self._restart_pending = (generation, events, report, relaunch)
         if self.process is not None and self.process.poll() is None:
-            self.process.kill()
+            self._kill_current()
             self._restart_kill_deadline = self._clock() + _KILL_RETRY_INTERVAL_S
             with suppress(Exception):
                 self.process.wait(timeout=0.2)
@@ -557,12 +907,25 @@ class WorkerSupervisor:
                     # Повторяем сигнал с ограниченной частотой; это не ACK выхода.
                     self._restart_kill_deadline = now + _KILL_RETRY_INTERVAL_S
                     with suppress(Exception):
-                        self.process.kill()
+                        self._kill_current()
                 return
+        exit_code = (
+            int(self.process.poll() or 0)
+            if self.role != "worker" and self.process is not None
+            else None
+        )
         generation, events, _report, relaunch = self._restart_pending
         self._restart_pending = None
         self._restart_kill_deadline = None
         self._close_connection()
+        if self.role != "worker":
+            self.process = None
+            self._update_capture_closed(terminal=True)
+            stop_revision = self._stop_revision
+            if exit_code is not None:
+                self._notify_exit(exit_code)
+            if self._stop_revision != stop_revision:
+                return
         if not relaunch or not self._launch_allowed():
             self.state = "stopped"
             for event in events:
@@ -606,6 +969,9 @@ class WorkerSupervisor:
 
     def stop(self) -> None:
         """Закрывает IPC, посылает SIGTERM; через две секунды применяет SIGKILL."""
+        self._stop_revision += 1
+        if self.role == "meeting-capture" and not self.exited:
+            self.close_state = "closing-unknown"
         self.state = "stopped"
         self._restart_pending = None
         self._restart_kill_deadline = None
@@ -619,9 +985,16 @@ class WorkerSupervisor:
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                process.kill()
+                if process is self.process:
+                    self._kill_current()
+                else:
+                    process.kill()
                 process.wait(timeout=2)
-        self._retired.clear()
+        if self.role == "worker":
+            self._retired.clear()
+        else:
+            self._retired = [process for process in processes if process.poll() is None]
+            self._update_capture_closed(terminal=True)
 
     def kill(self) -> None:
         """Закрывает IPC и убивает процессы, ожидая каждый до 0,2 с, без callback.
@@ -630,6 +1003,9 @@ class WorkerSupervisor:
         не подтверждает выход — процессы остаются в ``_retired``, ``exited`` сообщает,
         завершились ли они; менять поколение до этого вызывающий не вправе.
         """
+        self._stop_revision += 1
+        if self.role == "meeting-capture" and not self.exited:
+            self.close_state = "closing-unknown"
         self.state = "stopped"
         self._restart_pending = None
         self._restart_kill_deadline = None
@@ -658,6 +1034,10 @@ class WorkerSupervisor:
         for process in self._retired:
             with suppress(OSError):
                 if process.poll() is None:
-                    process.kill()
+                    if process is self.process:
+                        self._kill_current()
+                    else:
+                        process.kill()
             with suppress(Exception):
                 process.wait(timeout=0.2)
+        self._update_capture_closed(terminal=True)

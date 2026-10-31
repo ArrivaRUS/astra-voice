@@ -16,9 +16,16 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from astra_voice.meetings.settings_ext import (
+    MEETING_DEFAULTS,
+    MeetingSettings,
+    migrate_v2,
+    validate_setting,
+)
+
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 HOTKEY_MODES = ("ptt", "toggle")
 # Выгрузка модели после простоя, минуты; 0 — держать в памяти всегда (заказчик 2026-09-07).
 MODEL_UNLOAD_MINUTES = (0, 5, 15, 60)
@@ -45,7 +52,7 @@ def is_valid_command_mouse_button(button: object) -> bool:
 
 
 @dataclass
-class Settings:
+class Settings(MeetingSettings):
     """Значения настроек. Незнакомые ключи сохраняются в ``extra``."""
 
     hotkey: str = "Ctrl+Space"
@@ -80,7 +87,10 @@ class Settings:
         data.update(self.extra)
         for f in fields(self):
             if f.name != "extra":
-                data[f.name] = getattr(self, f.name)
+                value = getattr(self, f.name)
+                data[f.name] = (
+                    validate_setting(f.name, value) if f.name in MEETING_DEFAULTS else value
+                )
         return data
 
 
@@ -122,6 +132,7 @@ def _enable_update_checks(
 MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: dict,
     1: dict,
+    2: migrate_v2,
 }
 
 
@@ -167,7 +178,9 @@ def from_dict(
     settings = defaults(appimage=appimage, locked=locked)
     settings.extra = extra
     for name, value in values.items():
-        if _type_ok(name, value, getattr(settings, name)):
+        if name in MEETING_DEFAULTS:
+            setattr(settings, name, validate_setting(name, value))
+        elif _type_ok(name, value, getattr(settings, name)):
             setattr(settings, name, value)
         else:
             log.warning("настройка %r негодного типа, беру значение по умолчанию", name)

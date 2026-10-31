@@ -19,6 +19,7 @@ ApplicationWindow {
     // ── контекст из app.py (может отсутствовать при запуске через qmlscene) ──
     readonly property var info: (typeof appInfo !== "undefined" && appInfo !== null) ? appInfo : null
     readonly property var bridge: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
+    readonly property var meetings: (typeof meetingBridge !== "undefined" && meetingBridge !== null) ? meetingBridge : null
     readonly property var updates: (typeof updatesBridge !== "undefined" && updatesBridge !== null) ? updatesBridge : null
     readonly property string appVersion: (info && info.version) ? info.version : "0.1.0"
     readonly property string sessionKind: (info && info.sessionKind) ? info.sessionKind : "OTHER"
@@ -39,6 +40,7 @@ ApplicationWindow {
         "general": "sections/General.qml",
         "models": "sections/Models.qml",
         "output": "sections/Output.qml",
+        "meetings": "sections/Meetings.qml",
         "network": "sections/Network.qml",
         "advanced": "sections/Advanced.qml",
         "about": "sections/About.qml",
@@ -144,6 +146,7 @@ ApplicationWindow {
         anchors.bottom: downloadStrip.visible ? downloadStrip.top : statusBar.top
         width: Theme.sidebarW
         debugVisible: window.debugVisible
+        freezeAnimations: window.freezeAnimations
     }
 
     Item {
@@ -194,6 +197,30 @@ ApplicationWindow {
                     font.pixelSize: Theme.fontSmallSize
                     lineHeight: Theme.fontSmallSize * Theme.fontSmallLineHeight
                     lineHeightMode: Text.FixedHeight
+                    renderType: Text.NativeRendering
+                }
+            }
+
+            Column {
+                visible: window.currentSection.key === "meetings" && window.meetings !== null && window.meetings.enabled
+                spacing: Theme.meetingSectionRecCaptionGap
+                AvButton {
+                    objectName: "meetingRecord"
+                    text: window.meetings && window.meetings.texts.record ? window.meetings.texts.record : qsTr("Записать встречу")
+                    iconName: "rec"
+                    iconFill: true
+                    variant: "primary"
+                    enabled: window.meetings !== null && !window.meetings.recording
+                    onClicked: if (window.meetings) window.meetings.requestRecording()
+                }
+                Text {
+                    anchors.right: parent.right
+                    visible: window.meetings ? window.meetings.recording : false
+                    text: window.meetings && window.meetings.texts.recordingCaption ? window.meetings.texts.recordingCaption : qsTr("Уже идёт запись встречи")
+                    textFormat: Text.PlainText
+                    color: Theme.fgMuted
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.meetingSectionRecCaptionSize
                     renderType: Text.NativeRendering
                 }
             }

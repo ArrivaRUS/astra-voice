@@ -12,6 +12,8 @@ FocusScope {
     property string iconName: ""
     property string counter: ""
     property bool current: false
+    // Test stand only; regular navigation retains its normal crossfade.
+    property bool freezeAnimations: false
     // «Отладка»: вес 400, размер 13, цвет fg-muted (§1.3).
     property bool muted: false
 
@@ -54,6 +56,7 @@ FocusScope {
         visible: opacity > 0
 
         Behavior on opacity {
+            enabled: !root.freezeAnimations
             NumberAnimation {
                 duration: Theme.durationHover
                 easing.type: Easing.Bezier

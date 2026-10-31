@@ -17,7 +17,7 @@ from PyQt5.QtGui import QCursor, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlEngine, QQmlExpression
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
 from PyQt5.QtTest import QTest
-from test_command_settings_layout import render, tree
+from test_command_settings_layout import render, section_index, tree
 from test_onboarding import ensure_control_in_viewport
 
 from astra_voice.core.settings import Settings
@@ -85,7 +85,7 @@ def mouse_window(width: int, button: int = 2, runtime: Any = None) -> Iterator[t
             for item in tree(window.contentItem())
             if item.metaObject().indexOfProperty("sections") >= 0
         )
-        sidebar.setProperty("currentIndex", 4)
+        assert sidebar.setProperty("currentIndex", section_index(sidebar, "advanced"))
         window.show()
         QTest.qWait(80)
         bridge.attach_window(window)

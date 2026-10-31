@@ -28,6 +28,8 @@ class TrayState(Enum):
     DONE = "done"
     ERROR = "error"
     NOKEY = "nokey"
+    MEETING_REC = "meeting-rec"
+    MEETING_PAUSED = "meeting-paused"
 
 
 _TOOLTIPS = {
@@ -37,6 +39,8 @@ _TOOLTIPS = {
     TrayState.DONE: "Готово",
     TrayState.ERROR: "Микрофон недоступен — открыть",
     TrayState.NOKEY: "Горячая клавиша не захвачена — выбрать другую",
+    TrayState.MEETING_REC: "Идёт запись встречи · {elapsed}",
+    TrayState.MEETING_PAUSED: "Запись встречи на паузе · {elapsed}",
 }
 
 
@@ -343,8 +347,12 @@ class TrayIconProvider:
         """Есть ли непустой значок; неудачная загрузка тоже кэшируется до refresh()."""
         return not self.icon(state).isNull()
 
-    def tooltip(self, state: TrayState, *, hotkey: str = "Ctrl+Space") -> str:
-        return _TOOLTIPS[state].format(hotkey=hotkey)
+    def tooltip(
+        self, state: TrayState, *, hotkey: str = "Ctrl+Space", elapsed_seconds: int = 0
+    ) -> str:
+        elapsed = max(0, int(elapsed_seconds))
+        clock = f"{elapsed // 3600}:{elapsed // 60 % 60:02}:{elapsed % 60:02}"
+        return _TOOLTIPS[state].format(hotkey=hotkey, elapsed=clock)
 
     def refresh(self) -> None:
         """Сбросить иконки, чтобы следующий запрос учитывал новую тему панели."""

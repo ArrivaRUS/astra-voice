@@ -8,7 +8,7 @@ import pytest
 from PyQt5.QtCore import QObject
 from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtTest import QTest
-from test_command_settings_layout import render, tree
+from test_command_settings_layout import render, section_index, tree
 
 pytestmark = pytest.mark.xvfb
 
@@ -42,7 +42,8 @@ def test_command_details_signal_shows_advanced_and_original_dialog(width: int) -
         QTest.qWait(80)
 
         assert window.isVisible()
-        assert sidebar.property("currentIndex") == 4
+        assert sidebar.property("currentIndex") == section_index(sidebar, "advanced")
+        assert window.property("currentSection").toVariant()["key"] == "advanced"
         assert dialog.property("visible")
         assert dialog.property("message") == detail
         assert any(

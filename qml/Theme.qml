@@ -1,4 +1,4 @@
-// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.3.1 — НЕ ПРАВИТЬ РУКАМИ.
+// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.4.0 — НЕ ПРАВИТЬ РУКАМИ.
 // Перегенерация: python3 scripts/gen_theme.py · проверка: python3 scripts/gen_theme.py --check
 
 pragma Singleton
@@ -174,6 +174,8 @@ QtObject {
     readonly property real sizeBodyH: 552
     readonly property real sizeContentColMax: 796
     readonly property real sizeContentColW: 672
+    readonly property real sizeMeetingSplitContentW: 760
+    readonly property real sizeMeetingSplitWindowW: 988
     readonly property real sizeSheetMaxW: 900
     readonly property real sizeSidebarW: 184
     readonly property real sizeStatusbarH: 36
@@ -220,6 +222,12 @@ QtObject {
     readonly property int durationHover: 120
     readonly property int durationListeningPulse: 1200
     readonly property int durationLoadingModelMax: 10000
+    readonly property int durationMeetingBarNote: 8000
+    readonly property int durationMeetingListSkeletonDelay: 300
+    readonly property int durationMeetingOfferGuard: 500
+    readonly property int durationMeetingOfferTimeout: 60000
+    readonly property int durationMeetingStoppingMax: 1000
+    readonly property int durationMeetingToast: 4000
     readonly property int durationMicRetry: 300
     readonly property int durationPillAppear: 100
     readonly property int durationPillCancelled: 800
@@ -266,6 +274,16 @@ QtObject {
     readonly property real cardRowMinH: 38
     readonly property real cardRowPaddingY: 7
     readonly property real cardRowPaddingX: 14
+    readonly property color checkboxBg: bgSurface
+    readonly property real checkboxBorder: 1.5
+    readonly property color checkboxBorderColor: fgFaint
+    readonly property color checkboxDisabledBg: bgSurface2
+    readonly property real checkboxIcon: 12
+    readonly property real checkboxLabelGap: 10
+    readonly property color checkboxOnBg: primary
+    readonly property color checkboxOnFg: primaryFg
+    readonly property real checkboxRadius: 4
+    readonly property real checkboxSize: 16
     readonly property real chipGap: 6
     readonly property real chipPaddingY: 4
     readonly property real chipPaddingX: 11
@@ -301,6 +319,129 @@ QtObject {
     readonly property real lockBadgePaddingY: 2
     readonly property real lockBadgePaddingX: 6
     readonly property real lockBadgeRadius: 5
+    readonly property real meetingDialogIcon: 22
+    readonly property real meetingDialogRenameW: 380
+    readonly property real meetingDialogSaveFootSize: 12
+    readonly property real meetingDialogSaveItemDescSize: 11.5
+    readonly property real meetingDialogSaveItemPaddingY: 8
+    readonly property real meetingDialogSaveItemPaddingX: 10
+    readonly property real meetingDialogSaveItemRadius: 7
+    readonly property real meetingDialogSaveItemTitleSize: 13.5
+    readonly property real meetingDialogSaveListW: 250
+    readonly property real meetingDialogSavePaneGap: 10
+    readonly property real meetingDialogSavePanePaddingY: 14
+    readonly property real meetingDialogSavePanePaddingX: 16
+    readonly property real meetingDialogSaveW: 760
+    readonly property real meetingDialogSendW: 460
+    readonly property real meetingEntryColGap: 10
+    readonly property real meetingEntryErrorSize: 12.5
+    readonly property real meetingEntryFootSize: 12
+    readonly property real meetingEntryGap: 16
+    readonly property real meetingEntryIcon: 22
+    readonly property color meetingEntryIconFg: primary
+    readonly property real meetingEntryIconTile: 40
+    readonly property color meetingEntryIconTileBg: primaryBg
+    readonly property real meetingEntryIconTileRadius: 10
+    readonly property real meetingEntryPaddingY: 18
+    readonly property real meetingEntryPaddingX: 20
+    readonly property real meetingEntryPolicyGap: 5
+    readonly property real meetingEntryPolicyIcon: 13
+    readonly property real meetingEntryPolicySize: 13
+    readonly property real meetingEntryTextLineHeight: 1.5
+    readonly property real meetingEntryTextMaxW: 560
+    readonly property real meetingEntryTextSize: 13
+    readonly property real meetingHeadActionsGap: 8
+    readonly property real meetingHeadBackGap: 4
+    readonly property real meetingHeadBackIcon: 13
+    readonly property real meetingHeadBackMarginBottom: 6
+    readonly property real meetingHeadBackSize: 13
+    readonly property real meetingHeadEditIcon: 14
+    readonly property real meetingHeadIconButton: 34
+    readonly property real meetingHeadMarksGap: 6
+    readonly property real meetingHeadMarksMarginTop: 6
+    readonly property real meetingHeadMarksMarginX: 0
+    readonly property real meetingHeadMarksMarginBottom: 10
+    readonly property real meetingHeadTitleGap: 8
+    readonly property real meetingListEmptyMinH: 64
+    readonly property real meetingListEmptySize: 13
+    readonly property real meetingListFootGap: 8
+    readonly property real meetingListFootH: 35
+    readonly property color meetingListFootNumFg: fgSecondary
+    readonly property real meetingListFootPaddingY: 8
+    readonly property real meetingListFootPaddingX: 14
+    readonly property real meetingListFootSize: 12
+    readonly property real meetingListSkeletonBarH: 12
+    readonly property real meetingListSkeletonBar2H: 10
+    readonly property color meetingListSkeletonBg: bgSurface2
+    readonly property real meetingListSkeletonGap: 7
+    readonly property real meetingListSkeletonRadius: 4
+    readonly property real meetingPlayerButton: 34
+    readonly property real meetingPlayerGap: 10
+    readonly property real meetingPlayerPaddingY: 8
+    readonly property real meetingPlayerPaddingX: 12
+    readonly property real meetingPlayerTimeSize: 12
+    readonly property real meetingRowGap: 10
+    readonly property color meetingRowLiveBg: primaryBg
+    readonly property real meetingRowMetaSize: 12
+    readonly property real meetingRowMinH: 56
+    readonly property real meetingRowMoreButton: 28
+    readonly property real meetingRowNameSize: 14
+    readonly property real meetingRowPaddingTop: 8
+    readonly property real meetingRowPaddingRight: 10
+    readonly property real meetingRowPaddingBottom: 8
+    readonly property real meetingRowPaddingLeft: 14
+    readonly property color meetingRowProgressBg: bgSurface2
+    readonly property color meetingRowProgressFill: primary
+    readonly property real meetingSectionAdminRowPaddingY: 6
+    readonly property real meetingSectionAdminRowPaddingX: 14
+    readonly property real meetingSectionAiClassIcon: 12
+    readonly property real meetingSectionAiClassMarginTop: 5
+    readonly property real meetingSectionAiClassSize: 12
+    readonly property real meetingSectionFieldAiW: 260
+    readonly property real meetingSectionFieldMeW: 200
+    readonly property real meetingSectionOffBlockGap: 12
+    readonly property real meetingSectionOffBlockMarginTop: 16
+    readonly property real meetingSectionPolicyNoteMarginTop: 2
+    readonly property real meetingSectionPolicyNoteMarginX: 0
+    readonly property real meetingSectionPolicyNoteMarginBottom: 4
+    readonly property real meetingSectionRecCaptionGap: 3
+    readonly property real meetingSectionRecCaptionSize: 11.5
+    readonly property real meetingSectionRowFieldMarginTop: 6
+    readonly property real meetingStartBodyGap: 9
+    readonly property real meetingStartBodyPaddingTop: 14
+    readonly property real meetingStartBodyPaddingX: 16
+    readonly property real meetingStartBodyPaddingBottom: 0
+    readonly property real meetingStartFooterPaddingTop: 12
+    readonly property real meetingStartFooterPaddingX: 16
+    readonly property real meetingStartFooterPaddingBottom: 14
+    readonly property real meetingStartMaxH: 600
+    readonly property real meetingStartMicRowGap: 10
+    readonly property color meetingStartOptionBg: bgSurface
+    readonly property real meetingStartOptionBorder: 1
+    readonly property real meetingStartOptionBorderSelected: 1.5
+    readonly property real meetingStartOptionGap: 11
+    readonly property real meetingStartOptionIcon: 16
+    readonly property real meetingStartOptionPaddingY: 10
+    readonly property real meetingStartOptionPaddingX: 12
+    readonly property real meetingStartOptionRadius: 8
+    readonly property color meetingStartOptionSelectedBg: primaryBg
+    readonly property color meetingStartOptionSelectedBorder: primary
+    readonly property real meetingStartOptionSubLineHeight: 1.45
+    readonly property real meetingStartOptionSubSize: 12
+    readonly property real meetingStartOptionTitleSize: 14
+    readonly property real meetingStartOptionWarnIcon: 12
+    readonly property real meetingStartOptionWarnSize: 12
+    readonly property real meetingStartReminderSize: 12
+    readonly property real meetingStartW: 460
+    readonly property real meetingStatePanelActionsGap: 8
+    readonly property real meetingStatePanelActionsMarginTop: 4
+    readonly property real meetingStatePanelColGap: 6
+    readonly property real meetingStatePanelGap: 14
+    readonly property real meetingStatePanelIcon: 22
+    readonly property real meetingStatePanelPaddingY: 16
+    readonly property real meetingStatePanelPaddingX: 18
+    readonly property real meetingStatePanelTextSize: 13
+    readonly property real meetingStatePanelTitleSize: 15
     readonly property color menuDisabledFg: fgDisabled
     readonly property real menuHeaderSize: 12
     readonly property real menuItemGap: 9
@@ -310,6 +451,13 @@ QtObject {
     readonly property real menuPadding: 5
     readonly property real menuRadius: 8
     readonly property real menuW: 262
+    readonly property real mergePopoverGap: 8
+    readonly property real mergePopoverPadding: 12
+    readonly property real mergePopoverTextSize: 12.5
+    readonly property real mergePopoverTitleSize: 14
+    readonly property real mergePopoverW: 300
+    readonly property real mergePopoverWarnIcon: 12
+    readonly property real mergePopoverWarnSize: 12
     readonly property real micLevelMeterBarGap: 3
     readonly property real micLevelMeterBarRadius: 3
     readonly property real micLevelMeterBarW: 7
@@ -419,6 +567,42 @@ QtObject {
     readonly property real onboardingSummaryLineFreeSize: 12
     readonly property real onboardingSummaryLineMarginTop: 10
     readonly property real onboardingSummaryLineSize: 13
+    readonly property real participantsCaptionPaddingTop: 0
+    readonly property real participantsCaptionPaddingX: 12
+    readonly property real participantsCaptionPaddingBottom: 10
+    readonly property real participantsCaptionSize: 11.5
+    readonly property real participantsFieldPaddingY: 4
+    readonly property real participantsFieldPaddingX: 8
+    readonly property real participantsFieldSize: 12.5
+    readonly property real participantsFootPaddingY: 8
+    readonly property real participantsFootPaddingX: 12
+    readonly property real participantsHeadIcon: 16
+    readonly property real participantsHeadPaddingY: 9
+    readonly property real participantsHeadPaddingX: 12
+    readonly property color participantsHighlightBg: primaryBg
+    readonly property real participantsItemGap: 5
+    readonly property real participantsItemPaddingY: 9
+    readonly property real participantsItemPaddingX: 12
+    readonly property real participantsMinutesSize: 11.5
+    readonly property real participantsNameSize: 14
+    readonly property real participantsPanelGap: 12
+    readonly property real participantsPanelW: 232
+    readonly property real participantsQuoteLineHeight: 1.4
+    readonly property real participantsQuoteSize: 11.5
+    readonly property real participantsTitleSize: 14
+    readonly property color participantsDrawerBg: bgApp
+    readonly property real participantsDrawerBorderLeft: 1
+    readonly property real participantsDrawerPadding: 0
+    readonly property real participantsDrawerW: 300
+    readonly property real participantsStripChipSize: 12.5
+    readonly property real participantsStripGap: 12
+    readonly property real participantsStripH: 44.8
+    readonly property real participantsStripLabelSize: 12
+    readonly property real participantsStripMarginBottom: 10
+    readonly property real participantsStripPaddingTop: 7
+    readonly property real participantsStripPaddingRight: 10
+    readonly property real participantsStripPaddingBottom: 7
+    readonly property real participantsStripPaddingLeft: 12
     readonly property real popoverItemDescSize: 11.5
     readonly property real popoverItemGap: 8
     readonly property real popoverItemH: 38
@@ -434,8 +618,30 @@ QtObject {
     readonly property color progressBg: bgSurface2
     readonly property color progressFill: primary
     readonly property real progressH: 6
+    readonly property real progressHThin: 4
     readonly property real progressRadius: 3
     readonly property real progressStatusbarW: 120
+    readonly property real radioBorder: 1.5
+    readonly property color radioBorderColor: fgFaint
+    readonly property color radioDot: primary
+    readonly property real radioDotInset: 3
+    readonly property color radioOnBorder: primary
+    readonly property real radioSize: 16
+    readonly property real responsibilityDialogBodyGap: 12
+    readonly property real responsibilityDialogCheckLabelSize: 13.5
+    readonly property real responsibilityDialogCheckPaddingTop: 12
+    readonly property real responsibilityDialogCheckSubSize: 12
+    readonly property real responsibilityDialogIcon: 16
+    readonly property real responsibilityDialogIconOffsetTop: 2
+    readonly property real responsibilityDialogItemGap: 11
+    readonly property real responsibilityDialogItemTextSize: 13
+    readonly property real responsibilityDialogItemTitleSize: 14
+    readonly property real responsibilityDialogMaxHInset: 48
+    readonly property real responsibilityDialogW: 520
+    readonly property real responsibilityDialogWarnBleed: 10
+    readonly property real responsibilityDialogWarnPaddingY: 9
+    readonly property real responsibilityDialogWarnPaddingX: 10
+    readonly property real responsibilityDialogWarnRadius: 8
     readonly property color scrollbarColor: fgFaint
     readonly property real scrollbarOpacity: 0.45
     readonly property bool scrollbarOverlay: true
@@ -477,6 +683,18 @@ QtObject {
     readonly property real sidebarW: 184
     readonly property bool soundDefault: false
     readonly property int soundDurationMax: 120
+    readonly property color speakerNumBg: bgSurface2
+    readonly property real speakerNumBorder: 1
+    readonly property color speakerNumBorderColor: border
+    readonly property color speakerNumFg: fgSecondary
+    readonly property real speakerNumGap: 6
+    readonly property real speakerNumH: 17
+    readonly property real speakerNumMinW: 17
+    readonly property real speakerNumPaddingY: 0
+    readonly property real speakerNumPaddingX: 4
+    readonly property real speakerNumRadius: 9
+    readonly property real speakerNumSize: 10.5
+    readonly property int speakerNumWeight: 700
     readonly property color statusbarAccentFg: primary
     readonly property color statusbarBg: bgApp
     readonly property color statusbarFg: fgMuted
@@ -488,6 +706,17 @@ QtObject {
     readonly property real titlebarGap: 8
     readonly property real titlebarH: 32
     readonly property real titlebarMarkW: 16
+    readonly property real toastBottom: 14
+    readonly property real toastGap: 10
+    readonly property real toastH: 32.8
+    readonly property real toastIcon: 16
+    readonly property real toastMaxWInset: 44
+    readonly property real toastPaddingTop: 7
+    readonly property real toastPaddingRight: 8
+    readonly property real toastPaddingBottom: 7
+    readonly property real toastPaddingLeft: 12
+    readonly property real toastRadius: 8
+    readonly property real toastSize: 12.5
     readonly property real toggleH: 21
     readonly property real toggleKnob: 17
     readonly property color toggleKnobBg: "#FFFFFF"
@@ -500,6 +729,35 @@ QtObject {
     readonly property color toggleOnBg: primary
     readonly property real toggleRadius: 11
     readonly property real toggleW: 38
+    readonly property real transcribeProgressGap: 12
+    readonly property real transcribeProgressIcon: 16
+    readonly property real transcribeProgressMarginBottom: 10
+    readonly property real transcribeProgressPaddingY: 10
+    readonly property real transcribeProgressPaddingX: 12
+    readonly property real transcribeProgressSubSize: 12
+    readonly property real transcribeProgressTextSize: 13.5
+    readonly property real transcribeProgressTrackMarginTop: 6
+    readonly property real transcriptColGap: 10
+    readonly property real transcriptColTimeW: 76
+    readonly property real transcriptColWhoW: 124
+    readonly property color transcriptMarkBg: bgSurface2
+    readonly property color transcriptMarkFg: fgMuted
+    readonly property real transcriptMarkIcon: 12
+    readonly property real transcriptMarkSize: 12
+    readonly property color transcriptMeFg: accentInk
+    readonly property real transcriptRowDivider: 1
+    readonly property real transcriptRowH: 35.5
+    readonly property real transcriptRowPaddingY: 7
+    readonly property real transcriptRowPaddingX: 14
+    readonly property real transcriptTailSize: 12.5
+    readonly property real transcriptTextLineHeight: 1.5
+    readonly property real transcriptTextSize: 13.5
+    readonly property color transcriptTimeFg: fgMuted
+    readonly property real transcriptTimeOffsetTop: 2
+    readonly property real transcriptTimeSize: 12
+    readonly property real transcriptWhoOffsetTop: 1
+    readonly property real transcriptWhoSize: 13
+    readonly property int transcriptWhoWeight: 500
     readonly property real updatePanelListLineHeight: 1.6
     readonly property real updatePanelListSize: 12.5
     readonly property real updatePanelPaddingY: 14

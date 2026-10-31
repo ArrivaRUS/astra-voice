@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Встречи — состояния карточки</title><style>
+@font-face{font-family:'PT Root UI';font-weight:400;src:url('../../../tests/fixtures/fonts/pt-root-ui/PTRootUI-Regular.ttf')}
+@font-face{font-family:'PT Root UI';font-weight:500;src:url('../../../tests/fixtures/fonts/pt-root-ui/PTRootUI-Medium.ttf')}
+@font-face{font-family:'PT Root UI';font-weight:700;src:url('../../../tests/fixtures/fonts/pt-root-ui/PTRootUI-Bold.ttf')}
+:root{--font-ui:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;
+ --font-mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+ --bg-app:#F7F9FC;--bg-surface:#FFFFFF;--bg-sunk:#EDF1F7;--bg-tbar:#E7ECF4;
+ --border:#D7DEEA;--border-soft:#EDF1F7;--hover:#EDF1F7;
+ --fg1:#0E1729;--fg2:#243350;--fg3:#5A6884;--fg4:#AAB4C7;--fgdis:#616D83;
+ --primary:#1B3A73;--primary-fg:#FFFFFF;--primary-bg:#E8EDF7;
+ --accent:#12B3A0;--accent-ink:#0A776A;--accent-bg:#E3F7F4;
+ --ok-ink:#1F7D50;--ok-bg:#E7F5EE;--warn-ink:#8F5E12;--warn-bg:#FAF0DC;--err-ink:#C0322F;--err-bg:#FBECEB;
+ --canvas:#DDE3EE;--canvas-fg:#3A4761;--shadow:rgba(14,23,41,.18);
+ --desk1:#C9D6EA;--desk2:#9FB4D6;
+ /* fixed — поверх чужого рабочего стола, с темой не меняются */
+ --pill-bg:rgba(14,23,41,.94);--pill-fg:#F2F5FA;--pill-muted:#C4CDDC;--pill-neutral:#8C97AC;
+ --pill-live:#12B3A0;--pill-warn:#F2B559;--pill-err:#F0645F;
+ --nt-bg:#1B2331;--nt-border:rgba(255,255,255,.12);--nt-btn:rgba(255,255,255,.10);
+ --nt-pri:#6C93E8;--nt-pri-fg:#0B1220;--nt-muted:#8C97AC;--pill-close-bg:rgba(255,255,255,.12);
+ /* спикеры — только направление B (новые токены, контраст проверять) */
+ --sp1:#2F6FD0;--sp2:#B5487A;--sp3:#7A5BC4;--sp4:#B36A12;
+}
+body.dark{
+ --bg-app:#0B1220;--bg-surface:#151E30;--bg-sunk:#080D18;--bg-tbar:#101A2B;
+ --border:rgba(255,255,255,.10);--border-soft:rgba(255,255,255,.06);--hover:#232C3C;
+ --fg1:#F2F5FA;--fg2:#C4CDDC;--fg3:#8C97AC;--fg4:#5A6884;--fgdis:#7E889B;
+ --primary:#6C93E8;--primary-fg:#0B1220;--primary-bg:rgba(108,147,232,.12);
+ --accent:#2FD9C4;--accent-ink:#2FD9C4;--accent-bg:rgba(47,217,196,.13);
+ --ok-ink:#4FBF88;--ok-bg:rgba(79,191,136,.13);--warn-ink:#F2B559;--warn-bg:rgba(242,181,89,.13);
+ --err-ink:#F0645F;--err-bg:rgba(240,100,95,.13);
+ --canvas:#05080F;--canvas-fg:#8C97AC;--shadow:rgba(0,0,0,.55);
+ --desk1:#16233B;--desk2:#0A1222;
+ --sp1:#7FA8F0;--sp2:#E58AB4;--sp3:#B29BF0;--sp4:#E8B060;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:58px 20px 40px;background:var(--canvas);color:var(--canvas-fg);
+ font-family:var(--font-ui);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.page{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:16px;align-items:center}
+.stand{position:fixed;top:0;left:0;right:0;z-index:50;display:flex;align-items:center;gap:12px;
+ padding:10px 20px;background:var(--canvas);border-bottom:1px solid var(--border);font-size:12.5px}
+.stand a{color:var(--canvas-fg)} .stand .sp{flex:1}
+.stand button{font:inherit;font-size:12.5px;padding:3px 10px;border-radius:6px;border:1px solid var(--border);
+ background:var(--bg-surface);color:var(--fg1);cursor:pointer}
+.stand button.on{background:var(--primary);color:var(--primary-fg);border-color:var(--primary)}
+h1.ptitle{font-size:20px;margin:0 0 2px;color:var(--fg1);align-self:stretch}
+.lead{align-self:stretch;font-size:13px;max-width:none}
+.sec{align-self:stretch;font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;
+ color:var(--canvas-fg);margin:18px 0 -4px}
+.cap{align-self:stretch;font-size:13px}
+.cap b{color:var(--fg1)}
+.legend{align-self:stretch;font-size:12.5px;line-height:1.55}
+.legend b{color:var(--fg1)}
+.grid2{align-self:stretch;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid3{align-self:stretch;display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.tile{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;
+ display:flex;flex-direction:column;gap:10px;color:var(--fg1)}
+.tile .tl{font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3)}
+.tile .tl code{font-family:var(--font-mono);text-transform:none;letter-spacing:0;color:var(--fg4);margin-left:6px}
+.tile .tn{font-size:12px;color:var(--fg3);line-height:1.45}
+.mono{font-family:var(--font-mono);letter-spacing:.02em}
+code{font-family:var(--font-mono);font-size:.92em}
+.ico{width:16px;height:16px;flex:none;display:inline-block;vertical-align:middle}
+.ico svg{width:100%;height:100%;display:block}
+
+/* окно */
+.win{background:var(--bg-app);color:var(--fg1);border-radius:8px;overflow:hidden;box-shadow:0 14px 44px var(--shadow);
+ display:flex;flex-direction:column;flex:none}
+.tbar{height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 10px;background:var(--bg-tbar);
+ border-bottom:1px solid var(--border)}
+.tbar .t{font-size:12.5px;color:var(--fg2);font-weight:500}
+.tbar .sp{flex:1}
+.wbtn{width:14px;height:14px;border-radius:3px;background:var(--border);display:inline-block}
+.wbtn.c{background:#D96B62} body.dark .wbtn.c{background:#8C3B36}
+.body{display:flex;flex:1;min-height:0}
+.side{width:184px;flex:none;border-right:1px solid var(--border);padding:12px 10px;display:flex;flex-direction:column;gap:2px;background:var(--bg-app)}
+.brand{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:500;padding:4px 6px 12px;
+ border-bottom:1px solid var(--border);margin-bottom:8px}
+.nav{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;font-size:13.5px;font-weight:500;color:var(--fg2)}
+.nav.on{background:var(--primary);color:var(--primary-fg)}
+.nav.new:not(.on){box-shadow:inset 0 0 0 1.5px var(--accent)}
+.nav .cnt{margin-left:auto;font-size:11.5px;font-weight:400;opacity:.8}
+.side .grow{flex:1}
+.side .dbg{font-size:13px;color:var(--fg3);font-weight:400}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.content{flex:1;padding:12px 22px 16px;overflow:hidden;position:relative}
+.content.scrollmark{border-right:6px solid transparent}
+.shead{display:flex;align-items:flex-start;gap:12px;margin-bottom:8px}
+.shead .h{flex:1}
+.h2{font-size:20px;line-height:1.25;font-weight:700;margin:0}
+.h3{font-size:16px;line-height:1.3;font-weight:500;margin:0}
+.ssub{font-size:13px;color:var(--fg3)}
+.sbar{height:36px;flex:none;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:0 14px;
+ font-size:12.5px;color:var(--fg2);background:var(--bg-app)}
+.sbar .sp{flex:1} .sbar .v{font-family:var(--font-mono);font-size:12px;color:var(--fg3)}
+
+.grp{font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3);margin:14px 0 5px 2px}
+.card{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.card>.r+.r,.card>.r+.mrow,.card>.mrow+.mrow,.card>.mrow+.r{border-top:1px solid var(--border-soft)}
+.r{display:flex;align-items:center;gap:10px;padding:7px 14px;min-height:38px}
+.r .left{flex:1;min-width:0}
+.r .lbl{font-size:14px} .r .sub{font-size:12px;color:var(--fg3);line-height:1.5}
+.r.dis .lbl,.r.dis .sub{color:var(--fgdis)}
+.r.col{flex-direction:column;align-items:stretch}
+.hint{width:15px;height:15px;flex:none;border-radius:50%;border:1px solid var(--fg4);color:var(--fg3);
+ font-size:10px;line-height:13px;text-align:center;display:inline-block;font-weight:500}
+.lockb{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--fg3);background:var(--bg-sunk);
+ border-radius:5px;padding:2px 6px;white-space:nowrap}
+.lockb .ico{width:11px;height:11px}
+.lockb.err{color:var(--err-ink);background:var(--err-bg)}
+.tgl{width:38px;height:21px;border-radius:11px;background:var(--fg4);position:relative;flex:none}
+.tgl i{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;display:block}
+.tgl.on{background:var(--primary)} .tgl.on i{left:19px}
+.btn{font-family:var(--font-ui);font-size:13px;font-weight:500;color:var(--fg1);background:var(--bg-surface);
+ border:1px solid var(--border);border-radius:7px;padding:6px 12px;display:inline-flex;align-items:center;gap:6px;
+ white-space:nowrap;line-height:1.5}
+.btn .ico{width:13px;height:13px}
+.btn.pri{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+.btn.gh{background:transparent;border-color:transparent;color:var(--primary);padding:6px 8px}
+.btn.dan{background:var(--bg-surface);border-color:var(--border);color:var(--err-ink)}
+.btn.dis{color:var(--fgdis);background:var(--bg-sunk);border-color:var(--border)}
+.btn.sm{font-size:12.5px;padding:4px 9px}
+.btn.icon{width:34px;height:34px;padding:0;justify-content:center}
+.btn.icon.sm{width:28px;height:28px}
+.btn.focus{box-shadow:0 0 0 2px var(--bg-app),0 0 0 4px var(--accent-ink)}
+.sel{font-size:13px;color:var(--fg1);background:var(--bg-surface);border:1px solid var(--border);border-radius:7px;
+ padding:6px 10px;display:inline-flex;align-items:center;gap:8px;white-space:nowrap;min-width:150px;justify-content:space-between}
+.sel.dis{color:var(--fgdis);background:var(--bg-sunk)}
+.field{font-size:13px;color:var(--fg1);background:var(--bg-surface);border:1px solid var(--border);border-radius:7px;
+ padding:7px 11px;display:flex;align-items:center;gap:8px;min-width:0}
+.field.ph{color:var(--fg3)} .field.dis{color:var(--fgdis);background:var(--bg-sunk)}
+.field.area{align-items:flex-start;line-height:1.45}
+.field.foc{box-shadow:0 0 0 2px var(--bg-app),0 0 0 4px var(--accent-ink)}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:500;border-radius:5px;padding:2px 7px;
+ white-space:nowrap;line-height:1.5}
+.b-pri{background:var(--primary-bg);color:var(--primary)}
+.b-n{background:var(--bg-sunk);color:var(--fg2)}
+.b-ok{background:var(--ok-bg);color:var(--ok-ink)}
+.b-warn{background:var(--warn-bg);color:var(--warn-ink)}
+.b-err{background:var(--err-bg);color:var(--err-ink)}
+.b-acc{background:var(--accent-bg);color:var(--accent-ink)}
+.badge .ico{width:11px;height:11px}
+.note{display:flex;gap:9px;padding:10px 12px;border-radius:9px;font-size:12.5px;line-height:1.45;background:var(--bg-sunk);color:var(--fg2)}
+.note .ico{width:15px;height:15px;margin-top:1px;color:var(--fg3)}
+.note.warn{background:var(--warn-bg);color:var(--fg1)} .note.warn .ico{color:var(--warn-ink)}
+.note.err{background:var(--err-bg);color:var(--fg1)} .note.err .ico{color:var(--err-ink)}
+.note.ok{background:var(--ok-bg);color:var(--fg1)} .note.ok .ico{color:var(--ok-ink)}
+.note.info{background:var(--primary-bg);color:var(--fg1)} .note.info .ico{color:var(--primary)}
+.ok-t{color:var(--ok-ink)} .warn-t{color:var(--warn-ink)} .err-t{color:var(--err-ink)} .mut{color:var(--fg3)}
+.prog{height:4px;background:var(--bg-sunk);border-radius:3px;overflow:hidden}
+.prog i{display:block;height:100%;background:var(--primary)}
+.chk{width:16px;height:16px;border-radius:4px;border:1.5px solid var(--fg4);flex:none;display:inline-flex;align-items:center;justify-content:center;background:var(--bg-surface)}
+.chk.on{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+.chk.on .ico{width:12px;height:12px}
+.chk.dis{background:var(--bg-sunk)}
+.radio{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--fg4);flex:none;position:relative;background:var(--bg-surface)}
+.radio.on{border-color:var(--primary)} .radio.on::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--primary)}
+
+/* строка встречи */
+.mrow{display:flex;align-items:center;gap:10px;padding:8px 10px 8px 14px;min-height:56px;position:relative}
+.mrow .left{flex:1;min-width:0}
+.mrow .nm{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mrow .meta{font-size:12px;color:var(--fg3);font-family:var(--font-mono);letter-spacing:.01em}
+.mrow .meta .t{font-family:var(--font-ui)}
+.mrow .pbar{position:absolute;left:0;right:0;bottom:0;height:4px;background:var(--bg-sunk)}
+.mrow .pbar i{display:block;height:100%;background:var(--primary)}
+.mrow.live{background:var(--primary-bg)}
+.cfoot{display:flex;align-items:center;gap:8px;padding:8px 14px;border-top:1px solid var(--border-soft);font-size:12px;color:var(--fg3);background:var(--bg-surface)}
+.cfoot .mono{color:var(--fg2)}
+
+/* диалог */
+.dlg{background:var(--bg-app);border:1px solid var(--border);border-radius:9px;box-shadow:0 16px 44px var(--shadow);
+ overflow:hidden;color:var(--fg1);flex:none}
+.dlg .dh{height:30px;background:var(--bg-tbar);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:7px;
+ padding:0 10px;font-size:12.5px;color:var(--fg2)}
+.dlg .db{padding:16px 18px 6px;display:flex;flex-direction:column;gap:12px;font-size:13.5px}
+.dlg .df{padding:12px 18px 14px;display:flex;gap:8px;align-items:center}
+.dlg .df .sp{flex:1}
+.scrim{position:relative;background:rgba(14,23,41,.35);display:flex;align-items:center;justify-content:center;padding:30px}
+body.dark .scrim{background:rgba(0,0,0,.5)}
+
+/* рабочий стол и окна поверх */
+.desk{position:relative;border-radius:10px;overflow:hidden;background:linear-gradient(160deg,var(--desk1),var(--desk2));
+ align-self:stretch}
+.desk .panel{position:absolute;left:0;right:0;bottom:0;height:34px;background:rgba(10,16,28,.82);display:flex;align-items:center;
+ gap:8px;padding:0 10px;color:#C4CDDC;font-size:12px}
+.desk .panel .sp{flex:1}
+.desk .panel .task{background:rgba(255,255,255,.08);border-radius:4px;padding:2px 9px}
+.desk .panel .clock{font-family:var(--font-mono);background:rgba(255,255,255,.08);border-radius:4px;padding:2px 8px}
+.vks{position:absolute;background:#1A1F27;border-radius:8px;box-shadow:0 12px 36px rgba(0,0,0,.45);overflow:hidden;color:#DCE2EC}
+.vks .vt{height:26px;background:#232A35;display:flex;align-items:center;padding:0 10px;font-size:11.5px;color:#AEB7C6;gap:8px}
+.vks .tiles{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px}
+.vks .tiles div{background:#2B3340;border-radius:6px;height:96px;display:flex;align-items:flex-end;padding:6px 8px;font-size:11px;color:#C9D1DE}
+.vks .ctl{display:flex;justify-content:center;gap:10px;padding:8px 0 10px}
+.vks .ctl i{width:30px;height:30px;border-radius:50%;background:#3A4352;display:block}
+.vks .ctl i.end{background:#C8483F;width:44px;border-radius:15px}
+.ov{position:absolute;color:var(--pill-fg)}
+.ntf{width:380px;background:var(--nt-bg);border:1px solid var(--nt-border);border-radius:10px;padding:12px 14px 12px;
+ box-shadow:0 14px 36px rgba(0,0,0,.5);color:#F2F5FA;font-size:12.5px;line-height:1.45;position:relative;overflow:hidden}
+.ntf .nh{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--nt-muted);margin-bottom:6px}
+.ntf .nh .x{margin-left:auto;width:18px;height:18px;border-radius:50%;background:rgba(255,255,255,.1);display:inline-flex;align-items:center;justify-content:center;color:#C4CDDC}
+.ntf .nh .x .ico{width:10px;height:10px}
+.ntf .nt{font-size:13.5px;font-weight:500;margin-bottom:3px}
+.ntf .nb{display:flex;gap:7px;margin-top:10px;align-items:center;flex-wrap:wrap}
+.nbtn{font-family:var(--font-ui);font-size:12.5px;padding:5px 10px;border-radius:6px;background:var(--nt-btn);color:#F2F5FA;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
+.nbtn.p{background:var(--nt-pri);color:var(--nt-pri-fg);font-weight:500}
+.nbtn .ico{width:12px;height:12px}
+.ntf .cnt{margin-left:auto;font-size:11.5px;color:var(--nt-muted)}
+.ntf .timer{position:absolute;left:0;bottom:0;height:2px;background:var(--nt-pri)}
+.ntf.native{width:340px;border-radius:8px;padding:11px 12px}
+.ntf .txtbox{border:1px solid var(--nt-border);border-radius:7px;padding:8px 10px;margin:8px 0 2px;font-size:13px;color:#F2F5FA}
+.ntf .muted{color:var(--nt-muted)}
+
+/* плашка записи */
+.rbar{height:36px;border-radius:18px;background:var(--pill-bg);box-shadow:0 6px 18px rgba(0,0,0,.4);display:inline-flex;align-items:center;
+ gap:8px;padding:0 5px 0 8px;color:var(--pill-fg);font-size:12.5px;white-space:nowrap}
+.rbar .grip{width:8px;height:16px;opacity:.55;background:radial-gradient(circle,#C4CDDC 1px,transparent 1.3px) 0 0/4px 5px}
+.rbar .lab{font-weight:700}
+.rbar .tm{font-family:var(--font-mono);font-size:13px;letter-spacing:.02em;font-variant-numeric:tabular-nums}
+.rbar .dim{color:var(--pill-neutral)}
+.rbar .wn{color:var(--pill-warn)}
+.rbar .sep{width:1px;height:18px;background:var(--pill-close-bg)}
+.rb{height:26px;border-radius:13px;background:rgba(255,255,255,.10);color:var(--pill-fg);display:inline-flex;align-items:center;gap:5px;
+ padding:0 10px;font-size:12.5px}
+.rb .ico{width:12px;height:12px}
+.rb.i{width:26px;padding:0;justify-content:center}
+.rb.p{background:var(--nt-pri);color:var(--nt-pri-fg);font-weight:500}
+.rbar .sym{width:14px;height:14px;flex:none}
+.rbar .sym svg{width:100%;height:100%;display:block}
+.tip{position:absolute;background:#0E1729;color:#F2F5FA;font-size:12px;padding:5px 9px;border-radius:6px;box-shadow:0 6px 18px rgba(0,0,0,.35);white-space:nowrap}
+
+/* трей-меню */
+.tmenu{width:262px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:5px;box-shadow:0 12px 34px var(--shadow);font-size:13px;color:var(--fg1)}
+.tmenu .mi{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:6px}
+.tmenu .mi .k{margin-left:auto;font-family:var(--font-mono);font-size:11.5px;color:var(--fg3)}
+.tmenu .mi.st{font-size:12px;color:var(--fg3);padding:3px 9px}
+.tmenu .mi.st.live{color:var(--fg3)}
+.tmenu .mi.dis{color:var(--fgdis)}
+.tmenu .mi.hl{background:var(--primary);color:var(--primary-fg)}
+.tmenu .mi.new{}
+.tmenu .sepm{height:1px;background:var(--border-soft);margin:4px 6px}
+.trayicon{display:inline-flex;align-items:center;justify-content:center;width:44px;height:30px;border-radius:6px;background:rgba(10,16,28,.82);color:#E7ECF4}
+body:not(.dark) .trayicon.light{background:#E7ECF4;color:#243350}
+
+/* расшифровка */
+.tr{display:grid;grid-template-columns:76px 124px 1fr;gap:0 10px;padding:7px 14px;font-size:13.5px;line-height:1.5;border-top:1px solid var(--border-soft)}
+.tr:first-child{border-top:0}
+.tr .tc{font-family:var(--font-mono);font-size:12px;color:var(--fg3);padding-top:2px}
+.tr .who{font-weight:500;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-top:1px}
+.tr .who.me{color:var(--accent-ink)}
+.sn{display:inline-flex;align-items:center;justify-content:center;min-width:17px;height:17px;border-radius:9px;padding:0 4px;
+ background:var(--bg-sunk);border:1px solid var(--border);color:var(--fg2);font-family:var(--font-mono);font-size:10.5px;font-weight:700;margin-right:6px;vertical-align:1px}
+.drawer{position:absolute;top:0;right:0;bottom:0;width:300px;background:var(--bg-app);border-left:1px solid var(--border);box-shadow:-12px 0 34px var(--shadow);padding:12px 14px;display:flex;flex-direction:column;gap:10px;z-index:4}
+.toast{display:inline-flex;align-items:center;gap:10px;white-space:nowrap;max-width:var(--toast-max,708px);background:#0E1729;color:#F2F5FA;font-size:12.5px;border-radius:8px;padding:7px 8px 7px 12px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
+.toast .btn{background:var(--pill-close-bg);border-color:transparent;color:#F2F5FA}
+.hist{align-self:stretch;background:var(--warn-bg);color:var(--fg1);border-radius:9px;padding:10px 14px;font-size:13px}
+.tr.mark{grid-template-columns:76px 1fr;background:var(--bg-sunk);font-size:12px;color:var(--fg3)}
+.spk{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:500;border-radius:10px;padding:1px 8px 1px 2px;white-space:nowrap}
+.spk .n{width:16px;height:16px;border-radius:50%;color:#fff;font-size:10px;display:inline-flex;align-items:center;justify-content:center;font-weight:700}
+body.dark .spk .n{color:#0B1220}
+.bub{max-width:76%;padding:7px 11px;border-radius:12px;font-size:13.5px;line-height:1.5;background:var(--bg-surface);border:1px solid var(--border)}
+.bub.me{background:var(--primary-bg);border-color:transparent}
+.msg{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.msg.me{align-items:flex-end}
+.msg .mh{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--fg3)}
+</style><script>
+function setTheme(d){document.body.classList.toggle('dark',d);
+ document.getElementById('tl').classList.toggle('on',!d);document.getElementById('td').classList.toggle('on',d);
+ if(location.hash.indexOf('measure')<0)history.replaceState(null,'',d?'#dark':'#');}
+window.addEventListener('DOMContentLoaded',function(){setTheme(location.hash.indexOf('dark')>=0);});
+/* стенд: #measure — замер ширин после загрузки шрифтов (в продукт не входит) */
+var MEASURE=location.hash.indexOf('measure')>=0;
+window.addEventListener('load',function(){if(!MEASURE)return;
+ document.fonts.ready.then(function(){var r=[];document.querySelectorAll('.rbar,.dlg,.toast,.win,.ntf').forEach(function(e){var b=e.getBoundingClientRect();
+ r.push([e.className.split(' ')[0],Math.round(b.width*10)/10,Math.round(b.height*10)/10,(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,48)]);});
+ var p=document.createElement('pre');p.id='measure';p.setAttribute('data-font',document.fonts.check('13px "PT Root UI"')?'PT Root UI':'fallback');p.textContent=JSON.stringify(r);document.body.appendChild(p);});});
+</script></head>
+<body><div class="stand"><b>Astra Voice · Встречи (E13)</b><span><a href="index.html">Оглавление</a> · <a href="01-section.html">01 Раздел</a> · <a href="02-responsibility.html">02 Ответственность</a> · <a href="03-offer.html">03 Предложение</a> · <a href="04-recording.html">04 Запись</a> · <a href="05-meeting-A.html">05 Карточка</a> · <a href="06-meeting-states.html">06 Состояния</a> · <a href="07-templates.html">07 Шаблоны</a></span><span class="sp"></span>
+<span>Тема:</span><button id="tl" onclick="setTheme(false)">светлая</button><button id="td" onclick="setTheme(true)">тёмная</button></div>
+<div class="page"><h1 class="ptitle">06 · Состояния карточки встречи</h1><div class="lead legend">US-13.7, 13.8, 13.11. Тексты — spec.md §4.7. Состояния — §3.7.</div>
+<div class="sec">Состояния карточки встречи — общие для направлений A / B / C (нарисованы в рамке A)</div><div class="grid2" style="align-items:start"><div class="tile" style="background:var(--bg-app)"><div class="tl">Расшифровка идёт <code>transcribing</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-warn"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.2 1.6"/></svg></span>Расшифровка · <span class="mono">40 %</span></span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="card" style="padding:16px 18px;display:flex;gap:14px;align-items:flex-start"><span style="color:var(--primary)"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.2 1.6"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="font-size:15px;font-weight:500">Расшифровываю встречу · <span class="mono">40 %</span></div><div style="font-size:13px;color:var(--fg2)">Можно закрыть окно — расшифровка продолжится в фоне, диктовка работает. Текст появляется по ходу — вид в <a href=05-meeting-A.html>05</a>, §3.</div><div class="prog" style="margin-top:4px"><i style="width:40%"></i></div><div style=display:flex;gap:8px;margin-top:4px><span class="btn ">Отменить</span></div></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Отменено <code>cancelled</code> = «Записана»</div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-n">Записана</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="card" style="padding:16px 18px;display:flex;gap:14px;align-items:flex-start"><span style="color:var(--fg3)"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M8 7.2v4M8 4.9v.1"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="font-size:15px;font-weight:500">Расшифровка отменена</div><div style="font-size:13px;color:var(--fg2)">Запись сохранена — можно начать снова.</div><div style=display:flex;gap:8px;margin-top:4px><span class="btn pri">Расшифровать</span><span class="btn ">Удалить встречу…</span></div></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Нет модели <code>no-model</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-warn"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span>Нужна модель</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="card" style="padding:16px 18px;display:flex;gap:14px;align-items:flex-start"><span style="color:var(--warn-ink)"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="8" height="8" rx="1.5"/><path d="M6 1.8V4M10 1.8V4M6 12v2.2M10 12v2.2M1.8 6H4M1.8 10H4M12 6h2.2M12 10h2.2"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="font-size:15px;font-weight:500">Для расшифровки встреч нужна модель GigaAM v3</div><div style="font-size:13px;color:var(--fg2)">Запись сохранена. После установки расшифровка начнётся сама.</div><div style=display:flex;gap:8px;margin-top:4px><span class="btn pri">Установить</span><span class="btn ">Установить из файла…</span></div></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Мало памяти <code>wait-memory</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-warn"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.2 1.6"/></svg></span>Ждёт памяти</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="card" style="padding:16px 18px;display:flex;gap:14px;align-items:flex-start"><span style="color:var(--warn-ink)"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.2 1.6"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="font-size:15px;font-weight:500">Расшифровка подождёт: сейчас мало свободной памяти</div><div style="font-size:13px;color:var(--fg2)">Начнётся сама, когда памяти станет достаточно. Можно закрыть другие программы.</div><div style=display:flex;gap:8px;margin-top:4px><span class="btn ">Отменить</span></div></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Самопроверка модели <code>error</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-err"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span>Ошибка расшифровки</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="card" style="padding:16px 18px;display:flex;gap:14px;align-items:flex-start"><span style="color:var(--err-ink)"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="font-size:15px;font-weight:500">Распознавание на этом компьютере не работает</div><div style="font-size:13px;color:var(--fg2)">Запись сохранена и не удалится, пока вы её не удалите. Подробности — в разделе «Модели».</div><div style=display:flex;gap:8px;margin-top:4px><span class="btn pri">Повторить</span><span class="btn ">Подробнее</span></div></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Прервана при записи <code>interrupted</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-warn"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span>Прервана</span></div><div class="ssub" style="margin-bottom:12px">07.10.2026 · 09:00 · сохранено <span class="mono">0:37:02</span></div><div class="card" style="padding:16px 18px;display:flex;gap:14px;align-items:flex-start"><span style="color:var(--warn-ink)"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="font-size:15px;font-weight:500">Запись встречи прервалась. Сохранено <span class="mono">0:37:02</span></div><div style="font-size:13px;color:var(--fg2)">Программа закрылась во время записи. Последние секунды могли потеряться.</div><div style=display:flex;gap:8px;margin-top:4px><span class="btn pri">Расшифровать</span><span class="btn ">Удалить…</span></div></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Речи нет <code>empty</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-ok"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"/></svg></span>Готово</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="card" style="padding:16px 18px;display:flex;gap:14px;align-items:flex-start"><span style="color:var(--fg3)"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2" width="4" height="7.5" rx="2"/><path d="M3.8 7.8a4.2 4.2 0 0 0 8.4 0M8 12v2.2"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="font-size:15px;font-weight:500">В записи не нашлось речи</div><div style="font-size:13px;color:var(--fg2)">Проверьте, что выбран нужный микрофон, и что звук программы видеосвязи был слышен.</div><div style=display:flex;gap:8px;margin-top:4px><span class="btn ">Удалить встречу…</span></div></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Политика <code>off</code> <code>read-only</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-ok"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"/></svg></span>Готово</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="note"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg></span><div>Запись встреч отключена администратором. Встречу можно прочитать, сохранить как файл и удалить.</div></div><div style="height:8px"></div><div class="card" style=""><div class="tr"><span class="tc">[0:00:04]</span><span class="who me">Я</span><span>Коллеги, добрый день. Я веду запись и расшифровку этой встречи для протокола.</span></div><div class="tr"><span class="tc">[0:00:12]</span><span class="who"><span class="sn">1</span>Спикер 1</span><span>Добрый день. Тогда начнём с бюджета на четвёртый квартал.</span></div><div class="tr"><span class="tc">[0:00:21]</span><span class="who"><span class="sn">2</span>Спикер 2</span><span>По подрядчикам у нас перерасход около двенадцати процентов, в основном из-за сдвига сроков.</span></div></div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Встреча в комнате <code>room</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-ok"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"/></svg></span>Готово</span></div><div class="ssub" style="margin-bottom:12px">10.10.2026 · 14:00 · <span class="mono">0:41:12</span> · Встреча в комнате</div><div class="card" style=""><div class="tr"><span class="tc">[0:00:03]</span><span class="who"><span class="sn">1</span>Спикер 1</span><span>Начнём? Сегодня три вопроса.</span></div><div class="tr"><span class="tc">[0:00:09]</span><span class="who"><span class="sn">2</span>Спикер 2</span><span>Да, у меня первый — по отпускам.</span></div><div class="tr"><span class="tc">[0:00:15]</span><span class="who"><span class="sn">3</span>Спикер 3</span><span>Я тоже по графику.</span></div></div><div class="tn mut" style="font-size:12px;margin-top:6px">Одна дорожка: «Я» определить нельзя — все «Спикер N».</div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Разделение выключено <code>no-diarization</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-ok"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"/></svg></span>Готово</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div class="card" style=""><div class="tr"><span class="tc">[0:00:04]</span><span class="who me">Я</span><span>Коллеги, добрый день. Я веду запись и расшифровку этой встречи для протокола.</span></div><div class="tr"><span class="tc">[0:00:12]</span><span class="who">Собеседники</span><span>Добрый день. Тогда начнём с бюджета на четвёртый квартал.</span></div><div class="tr"><span class="tc">[0:00:21]</span><span class="who">Собеседники</span><span>По подрядчикам у нас перерасход около двенадцати процентов, в основном из-за сдвига сроков.</span></div><div class="tr"><span class="tc">[0:00:35]</span><span class="who me">Я</span><span>Олег, это уже с учётом договора на поддержку?</span></div><div class="tr"><span class="tc">[0:00:39]</span><span class="who">Собеседники</span><span>Да, договор включён. Без него было бы около семи.</span></div></div><div class="mut" style="font-size:12px;margin-top:6px">Настройкой или <code>meeting_diarization=off</code>. В комнате — «Участники». Поля имён нет.</div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Записано с предупреждением <code>warn-marks</code></div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-ok"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"/></svg></span>Готово</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION</div><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"><span class="badge b-warn"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span>Хранится на сетевом диске</span><span class="badge b-warn"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 14.3 13.3H1.7z"/><path d="M8 6.5v3.3M8 11.4v.1"/></svg></span>Звук шёл через другой компьютер</span></div><div class="mut" style="font-size:12px">Отметки ставятся, если при старте было предупреждение (решение владельца 12.10); они же — в шапке файла расшифровки.</div></div></div></div><div class="tile" style="background:var(--bg-app)"><div class="tl">Звук хранится <code>audio-kept</code> · Could</div><div class="win" style="width:100%;"><div class="content" style="padding:14px 18px"><div style="font-size:13px;color:var(--primary);display:flex;align-items:center;gap:4px;margin-bottom:6px"><span class="ico" style="width:13px;height:13px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4L6 8l4 4"/></svg></span>Все встречи</div><div style="display:flex;align-items:center;gap:8px"><div class="h2">Планёрка по бюджету</div><span class="badge b-ok"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"/></svg></span>Готово</span></div><div class="ssub" style="margin-bottom:12px">09.10.2026 · 10:00 · <span class="mono">1:12:40</span> · Звонок в DION · <span class="t">звук хранится до 19.10</span></div><div style="display:flex;gap:8px;align-items:center"><span class="btn "><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.3v9.4L12.8 8z" fill="currentColor" stroke="none"/></svg></span>Прослушать</span><span class="mut" style="font-size:12px">Звук удалится 19.10.2026 — так задано в «Хранении»</span></div></div></div></div></div><div class="sec">Диалоги: удалить (D2) и переименовать (D3) — из «⋯» и по значку карандаша у названия</div><div class="grid3" style="align-items:start"><div class="tile"><div class="dlg" style="width:420px"><div class="dh"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg>Удалить встречу</div><div class="db"><div style="display:flex;gap:13px"><span class="err-t"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 4.3h10.4M6.3 4.3V2.8h3.4v1.5M4.2 4.3l.7 9.2h6.2l.7-9.2"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:8px"><div style="font-weight:500">Удалить встречу «Планёрка по бюджету»?</div><div style="font-size:13px;color:var(--fg2)">Удалятся запись звука, расшифровка и все её файлы в программе. Файлы, которые вы сохранили в другие папки, останутся — удалите их сами.</div></div></div></div><div class="df"><span class="sp"></span><span class="btn focus">Отмена</span><span class="btn dan">Удалить встречу</span></div></div></div><div class="tile"><div class="dlg" style="width:420px"><div class="dh"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg>Удалить встречу</div><div class="db"><div style="display:flex;gap:13px"><span class="err-t"><span class="ico" style="width:22px;height:22px"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 4.3h10.4M6.3 4.3V2.8h3.4v1.5M4.2 4.3l.7 9.2h6.2l.7-9.2"/></svg></span></span><div style="flex:1;display:flex;flex-direction:column;gap:8px"><div style="font-weight:500">Удалить встречу «Планёрка по бюджету»?</div><div style="font-size:13px;color:var(--fg2)">Удалятся запись звука, расшифровка и все её файлы в программе. Файлы, которые вы сохранили в другие папки, останутся — удалите их сами.</div><div class="note warn" style="margin-top:2px"><span class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M2.2 8h11.6M8 2.2c1.7 1.6 2.5 3.5 2.5 5.8S9.7 12.2 8 13.8C6.3 12.2 5.5 10.3 5.5 8S6.3 3.8 8 2.2z"/></svg></span><div>Текст встречи отправлялся в сервис ИИ (<span class="mono">api.example.ru</span>) — копия могла остаться у владельца сервиса.</div></div></div></div></div><div class="df"><span class="sp"></span><span class="btn focus">Отмена</span><span class="btn dan">Удалить встречу</span></div></div><div class="tn">Если была хотя бы одна попытка отправки в ИИ (отметка ставится с начала передачи — MJ-13).</div></div><div class="tile"><div class="dlg" style="width:380px"><div class="dh"><svg width="22" height="22" viewBox="0 0 22 22"><g fill="currentColor"><circle cx="4" cy="8.5" r="1.2"/><circle cx="8.3" cy="8.5" r="1.7"/><circle cx="13.6" cy="8.5" r="2.3" fill="#12B3A0"/><rect x="2" y="12" width="18" height="4" rx="2"/></g></svg>Переименовать встречу</div><div class="db"><div style="display:flex;gap:13px"><div style="flex:1;display:flex;flex-direction:column;gap:8px"><div style="font-size:13px">Название встречи</div><div class="field foc">Планёрка по бюджету</div></div></div></div><div class="df"><span class="sp"></span><span class="btn ">Отмена</span><span class="btn pri">Сохранить</span></div></div></div></div>
+</div></body></html>

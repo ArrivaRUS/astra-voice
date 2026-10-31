@@ -30,6 +30,7 @@ from PyQt5.QtDBus import (
     QDBusMessage,
     QDBusVariant,
 )
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QAction, QActionGroup, QMenu, QSystemTrayIcon
 
 from astra_voice.platform.session import SessionKind, detect
@@ -374,6 +375,21 @@ class Tray(QObject):
         self.on_about: Callable[[], None] | None = None
         self.on_quit: Callable[[], None] | None = None
         self.on_model_selected: Callable[[str], None] | None = None
+        # M1: callbacks describe available actions; no capture is started here.
+        self.on_meeting_record: Callable[[], None] | None = None
+        self.on_meeting_open: Callable[[], None] | None = None
+        self.on_meeting_pause: Callable[[], None] | None = None
+        self.on_meeting_stop: Callable[[], None] | None = None
+        self.on_meeting_notice: Callable[[], None] | None = None
+        self.on_meeting_extend: Callable[[], None] | None = None
+        self.on_meeting_resume_mic: Callable[[], None] | None = None
+        self._meetings_enabled = False
+        self._meeting_state: TrayState | None = None
+        self._meeting_elapsed = 0
+        self._meeting_limit_soon = False
+        self._meeting_can_extend = False
+        self._meeting_limit_remaining: int | None = None
+        self._meeting_mic_name = ""
         self._provider = provider
         self._hotkey = hotkey
         factory = tray_factory if tray_factory is not None else lambda: QSystemTrayIcon()
@@ -465,6 +481,42 @@ class Tray(QObject):
         self._menu.addSeparator()
         settings = self._add_action("Настройки…", lambda: self._invoke(self.on_settings))
         settings.setShortcut("Ctrl+,")
+        self._settings_action = settings
+        self._meeting_status_action = QAction(self._menu)
+        self._meeting_status_action.setEnabled(False)
+        self._meeting_record_action = QAction("Записать встречу", self._menu)
+        self._meeting_open_action = QAction("Встречи…", self._menu)
+        self._meeting_pause_action = QAction("Пауза", self._menu)
+        self._meeting_stop_action = QAction("Остановить запись встречи", self._menu)
+        self._meeting_notice_action = QAction("Текст для участников…", self._menu)
+        self._meeting_extend_action = QAction("Продлить на час", self._menu)
+        self._meeting_resume_mic_action = QAction(self._menu)
+        for action, callback in (
+            (self._meeting_record_action, lambda: self._invoke(self.on_meeting_record)),
+            (self._meeting_open_action, lambda: self._invoke(self.on_meeting_open)),
+            (self._meeting_pause_action, lambda: self._invoke(self.on_meeting_pause)),
+            (self._meeting_stop_action, lambda: self._invoke(self.on_meeting_stop)),
+            (self._meeting_notice_action, lambda: self._invoke(self.on_meeting_notice)),
+            (self._meeting_extend_action, lambda: self._invoke(self.on_meeting_extend)),
+            (self._meeting_resume_mic_action, lambda: self._invoke(self.on_meeting_resume_mic)),
+        ):
+            action.triggered.connect(callback)
+        self._meeting_separator = QAction(self._menu)
+        self._meeting_separator.setSeparator(True)
+        self._meeting_idle_separator = QAction(self._menu)
+        self._meeting_idle_separator.setSeparator(True)
+        self._meeting_actions = (
+            self._meeting_status_action,
+            self._meeting_record_action,
+            self._meeting_open_action,
+            self._meeting_pause_action,
+            self._meeting_stop_action,
+            self._meeting_notice_action,
+            self._meeting_extend_action,
+            self._meeting_resume_mic_action,
+            self._meeting_separator,
+            self._meeting_idle_separator,
+        )
         self._updates_action = self._add_action(
             "Проверить обновления", lambda: self._invoke(self.on_check_updates)
         )
@@ -527,6 +579,8 @@ class Tray(QObject):
 
     def set_state(self, state: TrayState, tooltip: str | None = None) -> None:
         self._done_timer.stop()
+        if state == TrayState.IDLE and self._meeting_state is not None:
+            state = self._meeting_state
         self._state = state
         self._command_status = (
             tooltip
@@ -550,7 +604,10 @@ class Tray(QObject):
                 self._try_register()
 
     def _display_icon(self) -> Any:
-        if self._command_mode:
+        if self._command_mode and self._state not in (
+            TrayState.MEETING_REC,
+            TrayState.MEETING_PAUSED,
+        ):
             return self._provider.command_icon(self._state)
         return self._provider.icon(self._state)
 
@@ -600,7 +657,15 @@ class Tray(QObject):
         if self._download_action.isVisible():
             tooltip = "Astra Voice — загружается модель"
         elif tooltip is None:
-            tooltip = self._provider.tooltip(self._state, hotkey=self._hotkey)
+            if self._meeting_state is not None and self._state in (
+                TrayState.MEETING_REC,
+                TrayState.MEETING_PAUSED,
+            ):
+                tooltip = self._provider.tooltip(
+                    self._state, hotkey=self._hotkey, elapsed_seconds=self._meeting_elapsed
+                )
+            else:
+                tooltip = self._provider.tooltip(self._state, hotkey=self._hotkey)
         self._tray.setToolTip(clean_display_name(tooltip))
 
     def _done_expired(self) -> None:
@@ -622,6 +687,87 @@ class Tray(QObject):
         self._updates_action.setEnabled(self._updates_enabled)
         self._model_recheck_action.setEnabled(self._model_recheck_enabled)
         self._model_recheck_action.setVisible(self._model_recheck_enabled)
+        self._update_meeting_menu()
+
+    def set_meetings_enabled(self, enabled: bool) -> None:
+        """Visibility follows human opt-in; this never enables meeting capture."""
+        self._meetings_enabled = bool(enabled)
+        self._update_meeting_menu()
+
+    def set_meeting_state(
+        self,
+        state: TrayState | None,
+        *,
+        elapsed_seconds: int = 0,
+        limit_soon: bool = False,
+        can_extend: bool = False,
+        mic_name: str = "",
+        limit_remaining_seconds: int | None = None,
+    ) -> None:
+        """Install a test/controller-owned baseline below dictation states.
+
+        M1 contains no timer, recorder or microphone switching. Dictation's
+        normal state updates overlay this baseline; IDLE/DONE expiry restores it.
+        """
+        if state not in (None, TrayState.MEETING_REC, TrayState.MEETING_PAUSED):
+            raise ValueError("Недопустимое состояние встречи")
+        self._meeting_state = state
+        self._meeting_elapsed = max(0, int(elapsed_seconds))
+        self._meeting_limit_soon = bool(limit_soon)
+        self._meeting_can_extend = bool(can_extend) and self._meeting_elapsed < 4 * 3600
+        self._meeting_limit_remaining = (
+            None if limit_remaining_seconds is None else max(0, int(limit_remaining_seconds))
+        )
+        self._meeting_mic_name = clean_display_name(mic_name, for_menu=True) if mic_name else ""
+        if self._state in (TrayState.IDLE, TrayState.MEETING_REC, TrayState.MEETING_PAUSED):
+            self.set_state(state if state is not None else TrayState.IDLE)
+        else:
+            self._update_meeting_menu()
+
+    def _update_meeting_menu(self) -> None:
+        for action in self._meeting_actions:
+            self._menu.removeAction(action)
+        active = self._meeting_state is not None
+        if self._meeting_state is not None:
+            clock = self._meeting_elapsed
+            elapsed = f"{clock // 3600}:{clock // 60 % 60:02}:{clock % 60:02}"
+            status = (
+                "Запись встречи на паузе"
+                if self._meeting_state == TrayState.MEETING_PAUSED
+                else "Идёт запись встречи"
+            )
+            if self._meeting_limit_soon and self._meeting_limit_remaining is not None:
+                remaining = self._meeting_limit_remaining
+                elapsed += f" · остановится через {remaining // 60}:{remaining % 60:02}"
+            self._meeting_status_action.setText(f"● {status} · {elapsed}")
+            icon = self._provider.icon(self._meeting_state)
+            if isinstance(icon, QIcon):
+                self._meeting_status_action.setIcon(icon)
+            self._meeting_pause_action.setText(
+                "Продолжить" if self._meeting_state == TrayState.MEETING_PAUSED else "Пауза"
+            )
+            block = [self._meeting_status_action]
+            if self._meeting_limit_soon and self._meeting_can_extend:
+                block.append(self._meeting_extend_action)
+            if self._meeting_mic_name:
+                self._meeting_resume_mic_action.setText(f"Продолжить с «{self._meeting_mic_name}»")
+                block.append(self._meeting_resume_mic_action)
+            block.extend(
+                (
+                    self._meeting_pause_action,
+                    self._meeting_stop_action,
+                    self._meeting_notice_action,
+                    self._meeting_separator,
+                )
+            )
+            anchor = self._menu.actions()[0]
+            for action in block:
+                self._menu.insertAction(anchor, action)
+        if self._meetings_enabled or active:
+            if not active:
+                self._menu.insertAction(self._settings_action, self._meeting_record_action)
+            self._menu.insertAction(self._settings_action, self._meeting_open_action)
+            self._menu.insertAction(self._settings_action, self._meeting_idle_separator)
 
     def set_models(
         self,
