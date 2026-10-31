@@ -13,6 +13,7 @@ import pytest
 from PyQt5.QtCore import QObject, QPointF
 from PyQt5.QtTest import QTest
 from test_meetings_section import grab
+from test_meetings_section import meetings_app as meetings_app
 from test_meetings_section import rendered as rendered
 
 pytestmark = pytest.mark.xvfb
