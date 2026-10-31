@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from pathlib import Path
 from unittest.mock import Mock
@@ -11,9 +12,16 @@ import pytest
 
 from astra_voice.core.diagnostics import collect_diagnostics, endpoint_class
 from astra_voice.core.settings import Settings
+from conftest import REAL_GETEUID
 
 pytestmark = pytest.mark.unit
 MARKER = "PRIVATE_DIAGNOSTICS_MARKER"
+
+
+@pytest.fixture(autouse=True)
+def filesystem_euid(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
+    # Stats are private files owned by the real process UID, including root CI.
+    monkeypatch.setattr(os, "geteuid", REAL_GETEUID)
 
 
 @pytest.mark.parametrize(

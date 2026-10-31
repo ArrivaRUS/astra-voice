@@ -152,14 +152,53 @@ def test_incompatible_hello_terminal_without_retry(field: str, value: object) ->
     assert events[-1]["code"] == ipc.PROTOCOL_MISMATCH and not s._restarts
 
 
-def test_missing_hello_terminal_at_three_seconds() -> None:
+def test_dictation_constructor_does_not_consume_deferred_clock() -> None:
+    clock = Mock(side_effect=AssertionError("The runtime clock is not ready before start"))
+    supervisor = WorkerSupervisor(lambda event: None, clock=clock, use_qt=False)
+    assert supervisor.role == "worker" and supervisor.state == "new"
+    clock.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["meeting-capture", "meeting-transcribe", "meeting-diar"])
+def test_missing_hello_terminal_at_three_seconds(role: str) -> None:
     clock = Clock()
     events: list[dict[str, Any]] = []
-    s = WorkerSupervisor(events.append, role="meeting-transcribe", clock=clock, use_qt=False)
+    s = WorkerSupervisor(events.append, role=role, clock=clock, use_qt=False)
     s.state = "running"
-    clock.now += 3
+    clock.now = 12.999
+    s._expire()
+    assert s.state == "running" and not events
+    clock.now = 13.0
     s._expire()
     assert str(s.state) == "stopped" and events[-1]["code"] == "hello-timeout"
+
+
+@pytest.mark.parametrize("role", ["meeting-capture", "meeting-transcribe", "meeting-diar"])
+def test_hello_deadline_starts_again_at_actual_launch(
+    monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    clock = Clock()
+    s = WorkerSupervisor(lambda event: None, role=role, clock=clock, use_qt=False)
+    parent, child = Mock(), Mock()
+    monkeypatch.setattr(
+        "astra_voice.worker.supervisor.socket.socketpair", lambda *args: (parent, child)
+    )
+    monkeypatch.setattr(subprocess, "Popen", Mock())
+    restart = Mock()
+    monkeypatch.setattr(s, "_restart", restart)
+    clock.now = 40.0
+    try:
+        s.start()
+        clock.now = 42.999
+        s._expire()
+        restart.assert_not_called()
+        clock.now = 43.0
+        s._expire()
+        restart.assert_called_once_with(report=False, failure_code="hello-timeout", relaunch=False)
+    finally:
+        s.stop()
+    child.close.assert_called_once_with()
+    parent.close.assert_called_once_with()
 
 
 def test_long_operation_ack_has_independent_absolute_timeout() -> None:

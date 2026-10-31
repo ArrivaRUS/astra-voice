@@ -146,7 +146,9 @@ class WorkerSupervisor:
             role in {"worker", "meeting-transcribe"} if auto_restart is None else auto_restart
         )
         self._on_exit = on_exit
-        self._hello_deadline = clock() + 3.0
+        # Legacy dictation clocks may depend on a runtime still being built.
+        # Meeting hello deadlines are reset again at the actual launch below.
+        self._hello_deadline = clock() + 3.0 if role != "worker" else 0.0
         self._process_group = False
         self.close_state = "idle"
         self.meeting_generations: dict[str, int] = {}

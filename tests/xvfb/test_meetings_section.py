@@ -18,6 +18,7 @@ from PyQt5.QtCore import (
     pyqtSlot,
     qInstallMessageHandler,
 )
+from PyQt5.QtGui import QFontDatabase
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtTest import QTest
 
@@ -223,9 +224,22 @@ class Bridge(QObject):
         pass
 
 
-@pytest.fixture
-def rendered() -> Iterator[Any]:
+@pytest.fixture(scope="module")
+def meetings_app() -> Any:
     app = get_qapplication()
+    # Resolve the real UI font before Main.qml can cache a missing-family fallback
+    # for this process, including later onboarding renders in a different engine.
+    paths = sorted((REPO / "tests/fixtures/fonts/pt-root-ui").glob("*.ttf"))
+    assert paths
+    for path in paths:
+        assert QFontDatabase.addApplicationFont(str(path)) >= 0, path
+    # Keep fonts registered: live Qt text caches can retain them after engine teardown.
+    return app
+
+
+@pytest.fixture
+def rendered(meetings_app: Any) -> Iterator[Any]:
+    app = meetings_app
     messages: list[str] = []
     previous = qInstallMessageHandler(lambda _m, _c, message: messages.append(message))
     active: list[tuple[Any, Any, Any, list[str]]] = []
@@ -310,21 +324,19 @@ def grab(window: Any) -> Any:
 
 def snapshots() -> Path:
     # Always outside design; this task never replaces owner-approved references.
-    default = REPO / "tests/snapshots/meetings"
-    selected = os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_MEETINGS") or os.environ.get(
-        "ASTRA_VOICE_SNAPSHOT_DIR"
+    env_var = (
+        "ASTRA_VOICE_SNAPSHOT_DIR_MEETINGS"
+        if os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_MEETINGS")
+        else "ASTRA_VOICE_SNAPSHOT_DIR"
     )
-    if selected:
-        default = Path(selected)
     # This test deliberately never opts into design reference updates.
     from unittest.mock import patch
 
     with patch.dict(os.environ, {"ASTRA_VOICE_UPDATE_REFS": "0"}):
         return snapshot_dir(
-            "ASTRA_VOICE_SNAPSHOT_DIR_MEETINGS",
+            env_var,
             "meetings",
             "design/refs/impl/meetings",
-            default=default,
         )
 
 
@@ -623,6 +635,7 @@ def test_responsibility_titles_use_medium_weight_without_trailing_periods(render
     for item in titles:
         font = item.property("font")
         assert font.pixelSize() == 14 and font.weight() == QFont.Medium
+        assert QFontInfo(font).family() == "PT Root UI"
         assert QFontInfo(font).weight() == QFont.Medium
 
 

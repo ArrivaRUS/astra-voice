@@ -2492,6 +2492,7 @@ def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: b
             "general",
             "models",
             "output",
+            "meetings",
             "network",
             "advanced",
             "about",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -9,10 +10,17 @@ import pytest
 from astra_voice.meetings.events import MeetingState
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError
+from conftest import REAL_GETEUID
 
 pytestmark = pytest.mark.unit
 STAMP = "2026-10-30T12:00:00+00:00"
 ID = "2026-10-30_120000-ab12"
+
+
+@pytest.fixture(autouse=True)
+def filesystem_euid(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
+    # The catalogue checks ownership of real files, also when CI runs as root.
+    monkeypatch.setattr(os, "geteuid", REAL_GETEUID)
 
 
 def test_list_missing_root_is_empty_without_creating_directory(tmp_path: Path) -> None:

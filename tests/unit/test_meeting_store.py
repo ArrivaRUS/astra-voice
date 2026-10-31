@@ -13,10 +13,19 @@ from unittest.mock import Mock
 import pytest
 
 from astra_voice.meetings import events, model, segments, store
+from astra_voice.security.files import check_private_file
+from conftest import REAL_GETEUID
 
 pytestmark = pytest.mark.unit
 ID = "2026-10-29_120000-ab12"
 STAMP = "2026-10-29T12:00:00+00:00"
+
+
+@pytest.fixture(autouse=True)
+def filesystem_euid(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
+    # Ownership checks need the real UID, including root in CI; the shared
+    # fixture's UID 1000 is only suitable for application root-guard tests.
+    monkeypatch.setattr(os, "geteuid", REAL_GETEUID)
 
 
 @pytest.fixture
@@ -427,7 +436,10 @@ def test_every_disk_document_is_private_and_roundtrips(disk: store.MeetingStore)
     assert stat.S_IMODE((disk.root / ID / "speakers.json").stat().st_mode) == 0o600
 
 
-@pytest.mark.parametrize("location,mode", [("root", 0o755), ("meeting", 0o770), ("audio", 0o755)])
+@pytest.mark.parametrize(
+    "location,mode",
+    [("root", 0o755), ("meeting", 0o770), ("audio", 0o755), ("root", 0o777)],
+)
 def test_existing_unsafe_directory_permissions_refused(
     disk: store.MeetingStore, location: str, mode: int
 ) -> None:
@@ -500,16 +512,17 @@ def test_create_refuses_existing_tombstone(disk: store.MeetingStore) -> None:
     assert tombstone.is_dir() and not (disk.root / new_id).exists()
 
 
-def test_default_store_hardens_owned_data_directory_0755(
+def test_default_store_preserves_shared_data_directory_0755(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     data = tmp_path / "astra-voice"
     data.mkdir(mode=0o755)
+    data.chmod(0o755)
     disk = store.MeetingStore()
     disk.create(model.Meeting(id=ID, started_at=STAMP))
-    # Свой каталог данных не отвергается, а ужесточается до 0700, как в core/paths.py.
-    assert stat.S_IMODE(data.stat().st_mode) == 0o700
+    # Only meetings/ is private; other features share the parent data directory.
+    assert stat.S_IMODE(data.stat().st_mode) == 0o755
     assert stat.S_IMODE(disk.root.stat().st_mode) == 0o700
 
 
@@ -630,3 +643,69 @@ def test_create_restores_private_mode_under_restrictive_umask(tmp_path: Path) ->
         os.umask(previous)
     assert stat.S_IMODE((disk.root / ID).stat().st_mode) == 0o700
     assert disk.read(ID, "meeting.json").id == ID
+
+
+@pytest.mark.parametrize("euid", [0, 1000])
+@pytest.mark.parametrize("damage", [None, "owner", "mode", "hardlink", "symlink"])
+def test_private_file_checks_include_root_without_bypassing_guards(
+    monkeypatch: pytest.MonkeyPatch, euid: int, damage: str | None
+) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: euid)
+    info = os.stat_result(
+        (
+            (stat.S_IFLNK if damage == "symlink" else stat.S_IFREG)
+            | (0o777 if damage == "mode" else 0o600),
+            1,
+            1,
+            2 if damage == "hardlink" else 1,
+            euid + 1 if damage == "owner" else euid,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    )
+    if damage is None:
+        check_private_file(info)
+    else:
+        with pytest.raises(ValueError, match="Небезопасный файл данных"):
+            check_private_file(info)
+
+
+@pytest.mark.parametrize("location", ["root", "meeting", "audio", "file", "lock"])
+def test_foreign_owner_is_refused(
+    disk: store.MeetingStore, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    sidecar = segments.SegmentSidecar(meeting_id=ID, epoch_id="e1")
+    disk.write(ID, "audio/mic-0000.json", sidecar, writer=store.Writer.CAPTURE)
+    if location == "lock":
+        with disk.writer(ID, store.Writer.GUI):
+            pass
+    target = {
+        "root": disk.root,
+        "meeting": disk.root / ID,
+        "audio": disk.root / ID / "audio",
+        "file": disk.root / ID / "meeting.json",
+        "lock": disk.root / ID / ".writer-gui.lock",
+    }[location]
+    before = target.stat()
+    real_fstat = os.fstat
+
+    def foreign_fstat(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        if (info.st_dev, info.st_ino) == (before.st_dev, before.st_ino):
+            fields = list(info)
+            fields[4] = REAL_GETEUID() + 1
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(os, "fstat", foreign_fstat)
+    with pytest.raises(store.MeetingStoreError) as caught:
+        if location == "lock":
+            with disk.writer(ID, store.Writer.GUI):
+                pytest.fail("A foreign-owned writer lock must be refused")
+        else:
+            disk.read(ID, "audio/mic-0000.json" if location == "audio" else "meeting.json")
+    assert str(caught.value) and str(target) not in str(caught.value)
+    assert target.stat() == before
