@@ -733,6 +733,37 @@ def test_capture_commands_use_real_wire_schema(
     assert (directory / "audio").is_dir()
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_profile_shutdown_uses_unscoped_real_wire_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prepared: bool
+) -> None:
+    from astra_voice.worker import ipc
+
+    capture = stand.Capture(Mock(spec=stand.ProcessOwner), tmp_path, profile=tmp_path / "p.json")
+    if prepared:
+        capture.identity.update(capture_id="capture-1", state_rev=3)
+    messages: list[dict[str, Any]] = []
+
+    def send(message: dict[str, Any]) -> None:
+        messages.append(
+            ipc.decode(ipc.encode(message, role="meeting-capture")[4:], role="meeting-capture")
+        )
+
+    monkeypatch.setattr(capture.supervisor, "send", send)
+    req = capture.send("meeting.capture.shutdown")
+    assert messages == [
+        {"type": "meeting.capture.shutdown", "request_type": "meeting.capture.shutdown", "req": req}
+    ]
+
+
+def test_profile_section_names_are_available_to_json_consumers() -> None:
+    from tools.meeting_stand_profile import Sections
+
+    rows = Sections().snapshot()
+    assert rows
+    assert all(row.get("name") == row["label"] for row in rows)
+
+
 def test_train_has_silent_startup_and_termination_margin(tmp_path: Path) -> None:
     import wave
 

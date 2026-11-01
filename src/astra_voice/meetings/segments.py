@@ -1,8 +1,8 @@
 """Durable capture boundaries and sample clocks; WAV I/O belongs to meeting_capture.
 
 Samples are absolute offsets within one epoch. Timeline knots use server-derived
-CLOCK_MONOTONIC milliseconds, never Python buffer-arrival times. A discontinuous
-sidecar is conservatively unusable for interpolation; capture splits at gaps.
+CLOCK_MONOTONIC milliseconds, never Python buffer-arrival times. Discontinuity
+marks the boundary after observed samples; capture splits at gaps (D11).
 """
 
 from __future__ import annotations

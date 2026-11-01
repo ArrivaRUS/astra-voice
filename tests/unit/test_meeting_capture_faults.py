@@ -486,8 +486,9 @@ def test_forward_clock_jump_splits_epoch_without_gap_interpolation(
         assert first.epoch_id != second.epoch_id and second.sample_start == 0
         assert second.opened_t_mono_ms == end_mono - 1000
         assert not second.discontinuity
+        assert SegmentTimeline.from_segment(first).sample_to_monotonic(8000) == 100500
         with pytest.raises(MeetingValidationError):
-            SegmentTimeline.from_segment(first).sample_to_monotonic(8000)
+            SegmentTimeline.from_segment(first).sample_to_monotonic(first.sample_end + 1)
     finally:
         rig.cleanup()
 

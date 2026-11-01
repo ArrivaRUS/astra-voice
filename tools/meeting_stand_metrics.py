@@ -29,6 +29,7 @@ from astra_voice.meetings.timeline import EpochTimeline, SegmentTimeline
 
 MIB = 1024**2
 JSON = dict[str, Any]
+_CAPTURE_TEMP = re.compile(r"\.(?:capture|meeting|(?:mic|far)-[0-9]{4,})-[0-9a-f]{32}\.tmp\Z")
 
 
 def _finite(value: object) -> bool:
@@ -122,10 +123,26 @@ def _disk_bytes(root: Path) -> int | None:
 
         for parent, directories, files in os.walk(root, onerror=on_error, followlinks=False):
             for name in (*directories, *files):
-                metadata = (Path(parent) / name).lstat()
+                temporary = bool(_CAPTURE_TEMP.fullmatch(name))
+                try:
+                    metadata = (Path(parent) / name).lstat()
+                except FileNotFoundError:
+                    if temporary:
+                        continue  # Atomic writer removed its transient publication file.
+                    raise
                 if stat.S_ISLNK(metadata.st_mode):
                     return None
+                if temporary and not stat.S_ISREG(metadata.st_mode):
+                    return None
                 if stat.S_ISREG(metadata.st_mode):
+                    if temporary:
+                        if (
+                            metadata.st_uid != os.geteuid()
+                            or stat.S_IMODE(metadata.st_mode) != 0o600
+                            or metadata.st_nlink != 1
+                        ):
+                            return None
+                        continue
                     total += metadata.st_size
         return total
     except OSError:
@@ -262,6 +279,15 @@ def summarize_resources(samples: Sequence[JSON]) -> JSON:
         )
     ):
         disk = None  # deletion would hide bytes written
+    disk_problem = (
+        "insufficient-resource-duration"
+        if duration <= 0
+        else "missing-disk-samples"
+        if any(row["disk_bytes"] is None for row in samples)
+        else "decreasing-committed-disk-bytes"
+        if disk is None
+        else "committed-file-byte-growth"
+    )
     limits: float | None = 0.0 if captures and all(captures) else None
     for procs in captures:
         for process in procs:
@@ -291,7 +317,14 @@ def summarize_resources(samples: Sequence[JSON]) -> JSON:
         criterion("capture_rss", rss, 60.0, "MiB"),
         *([growth_criterion] if growth_criterion["status"] != "provisional" else []),
         criterion(
-            "disk", disk, 230.0, "MiB/h", detail="logical file-byte growth, including sidecars"
+            "disk",
+            disk,
+            230.0,
+            "MiB/h",
+            detail=(
+                f"{disk_problem}; logical file-byte growth including sidecars, "
+                "excluding private atomic publication temporaries"
+            ),
         ),
         criterion(
             "capture_role_limits",
@@ -320,6 +353,16 @@ def summarize_resources(samples: Sequence[JSON]) -> JSON:
         "growth_mib_per_hour": growth,
         "growth_criterion": growth_criterion,
         "disk_mib_per_hour": disk,
+        "disk_diagnostics": {
+            "sample_count": len(samples),
+            "missing_samples": sum(row["disk_bytes"] is None for row in samples),
+            "decreasing_steps": sum(
+                a["disk_bytes"] is not None
+                and b["disk_bytes"] is not None
+                and b["disk_bytes"] < a["disk_bytes"]
+                for a, b in zip(samples, samples[1:], strict=False)
+            ),
+        },
         "criteria": criteria,
     }
 
@@ -391,11 +434,7 @@ def sample_to_monotonic(side: JSON, sample: int) -> int:
 def _raw_sample_to_monotonic(side: JSON, sample: int) -> float:
     """Legacy piecewise diagnostic only; no extrapolation or gap crossing."""
     _validate_sidecar(side)
-    if (
-        type(sample) is not int
-        or side["discontinuity"]
-        or not side["sample_start"] <= sample <= side["sample_end"]
-    ):
+    if type(sample) is not int or not side["sample_start"] <= sample <= side["sample_end"]:
         raise ValueError("unmapped-sample")
     for offset, mono in side["timeline"]:
         if sample == offset:
@@ -468,7 +507,11 @@ def _read_segment(path: Path, *, crash: bool) -> tuple[JSON, list[int]]:
             for index, value in enumerate(block):
                 if abs(value) >= 4000:
                     absolute = position + index
-                    if absolute - last_loud > 640:
+                    # write_signal emits a 150ms marker every five seconds.
+                    # A short dropout inside that known pulse is not a second
+                    # marker; never merge separate scheduled pulses or invent
+                    # an onset when an entire marker is missing.
+                    if absolute - last_loud > 640 and (not beeps or absolute - beeps[-1] >= 2400):
                         beeps.append(absolute)
                     last_loud = absolute
             position += len(block)
@@ -480,8 +523,8 @@ def _read_segment(path: Path, *, crash: bool) -> tuple[JSON, list[int]]:
 def _startup_placeholder(side: JSON) -> bool:
     """Only the proven empty monotonic-to-server startup transition is skippable.
 
-    Call after PCM and sidecar validation. A nonempty discontinuous epoch still
-    has no usable clock; an all-placeholder capture still has no positive PCM.
+    Call after PCM and sidecar validation. A terminal discontinuity does not
+    invalidate observed knots; an all-placeholder capture has no positive PCM.
     """
     return bool(
         side["index"] == 0
@@ -493,6 +536,64 @@ def _startup_placeholder(side: JSON) -> bool:
         and side.get("close_reason") == "clock_change"
         and len(side["timeline"]) == 1
     )
+
+
+@dataclass(frozen=True)
+class _MarkerEdge:
+    side: JSON
+    age_frames: int | None
+    tail_gap_frames: int | None
+
+
+def _continue_marker(
+    path: Path, side: JSON, beeps: list[int], previous: _MarkerEdge | None
+) -> tuple[list[int], _MarkerEdge, bool]:
+    """Carry detector state, never a clock fit, across an observed adjacent edge.
+
+    Epoch counters can restart at zero. Require consecutive files of the same
+    capture, observed clock edges equal to 1ms quantisation, and PCM consistent
+    with the same known 150ms pulse. Pauses and nonadjacent clocks never merge.
+    """
+    continued = bool(
+        previous is not None
+        and previous.age_frames is not None
+        and previous.tail_gap_frames is not None
+        and beeps
+        and 0 <= beeps[0] < side["frames"]
+        and previous.side.get("close_reason", "segment") in {"segment", "clock_change"}
+        and side["index"] == previous.side["index"] + 1
+        and all(
+            side.get(key) == previous.side.get(key)
+            for key in ("meeting_id", "meeting_generation", "capture_id", "track")
+        )
+        and (
+            side["epoch_id"] != previous.side["epoch_id"]
+            or side["sample_start"] == previous.side["sample_end"]
+        )
+        and abs(side["timeline"][0][1] - previous.side["timeline"][-1][1]) <= 1
+        and previous.age_frames + beeps[0] < 2400
+        and previous.tail_gap_frames + beeps[0] <= 640
+    )
+    if continued:
+        beeps = beeps[1:]
+    observed_beeps = [sample for sample in beeps if sample < side["frames"]]
+    age = (
+        side["frames"] - observed_beeps[-1]
+        if observed_beeps
+        else (
+            previous.age_frames + side["frames"]
+            if continued and previous is not None and previous.age_frames is not None
+            else None
+        )
+    )
+    start = max(0, side["frames"] - 640)
+    with wave.open(str(path), "rb") as stream:
+        stream.setpos(start)
+        tail = array.array("h", stream.readframes(side["frames"] - start))
+    if sys.byteorder != "little":
+        tail.byteswap()
+    gap = next((len(tail) - i for i in range(len(tail) - 1, -1, -1) if abs(tail[i]) >= 4000), None)
+    return beeps, _MarkerEdge(side, age, gap), continued
 
 
 def _beep_error_fit(hours: Sequence[float], errors: Sequence[float]) -> JSON:
@@ -637,11 +738,17 @@ def analyze_recording(
     beep_clock_unknown = False
     raw_clock_unknown = False
     prepared: list[tuple[JSON, list[int], JSON]] = []
+    marker_edges: dict[str, _MarkerEdge] = {}
+    mapped_epochs: dict[str, list[str]] = {"mic": [], "far": []}
+    clock_issues: list[JSON] = []
     files = sorted(audio_root.glob("*.wav")) if not audio_root.is_symlink() else []
     for path in files:
         try:
             side, beeps = _read_segment(path, crash=crash_mono_ms is not None)
             track = side["track"]
+            beeps, marker_edges[track], continued = _continue_marker(
+                path, side, beeps, marker_edges.get(track)
+            )
             indexes[track].append(side["index"])
             frames[track] += side["frames"]
             item: JSON = {
@@ -654,6 +761,7 @@ def analyze_recording(
                 "beeps": len(beeps),
                 "beep_local_samples": beeps,
                 "valid": True,
+                "continued_marker_at_boundary": continued,
             }
             if _startup_placeholder(side):
                 item["clock_status"] = "empty-startup-placeholder"
@@ -675,6 +783,7 @@ def analyze_recording(
             epoch_maps[key] = EpochTimeline.from_segments([SegmentSidecar(**s) for s in sides])
         except (ValueError, TypeError, KeyError, OverflowError):
             clock_unknown = True
+            clock_issues.append({"track": key[0], "epoch_id": key[1], "code": "unmapped-epoch"})
     for side, beeps, item in prepared:
         track = side["track"]
         # Preserve the original diagnostic even when a legacy seam prevents
@@ -701,6 +810,13 @@ def analyze_recording(
             if last_sample < side["sample_end"]:
                 item["clock_status"] = "partial"
                 beep_clock_unknown = True
+                clock_issues.append(
+                    {
+                        "track": track,
+                        "epoch_id": side["epoch_id"],
+                        "code": "unmapped-epoch:partial-clock-coverage",
+                    }
+                )
             checkpoint_sample = side["sample_start"] + side["frames_at_checkpoint"]
             durable_sample = min(checkpoint_sample, last_sample)
             if durable_sample > side["sample_start"]:
@@ -711,11 +827,15 @@ def analyze_recording(
                         mapped[track].append(
                             mapper.sample_to_monotonic(side["sample_start"] + sample)
                         )
+                        mapped_epochs[track].append(side["epoch_id"])
                     else:
                         beep_clock_unknown = True
         except ValueError:
             clock_unknown = True
             item["clock_status"] = "unavailable"
+            clock_issues.append(
+                {"track": track, "epoch_id": side["epoch_id"], "code": "unmapped-epoch:sample"}
+            )
     if any(sorted(values) != list(range(len(values))) for values in indexes.values()):
         invalid = True
     if all(indexes.values()) and not all(frames.values()):
@@ -742,6 +862,8 @@ def analyze_recording(
     initial: float | None = None
     drift: float | None = None
     timecodes: float | None = None
+    epoch_pairs: list[JSON] = []
+    epoch_jumps: list[JSON] = []
     # Validate the captured segment/epoch order before the legacy raw metric
     # sorts marker times. Sorting must not manufacture diagnostic provenance.
     diagnostics = (
@@ -760,11 +882,37 @@ def analyze_recording(
         ]
         raw_drift = max(abs(value - raw_offsets[0]) for value in raw_offsets)
     if beep_known:
-        for values in mapped.values():
-            values.sort()
         offsets = [mic - far for mic, far in zip(mapped["mic"], mapped["far"], strict=True)]
         initial = offsets[0]
-        drift = max(abs(value - initial) for value in offsets)
+        # Match scheduled markers in PCM order, never by sorting clocks through
+        # a backward jump. Restart the offset baseline only at an epoch boundary.
+        for index, offset in enumerate(offsets):
+            pair = (mapped_epochs["mic"][index], mapped_epochs["far"][index])
+            if not epoch_pairs or pair != (
+                epoch_pairs[-1]["mic_epoch"],
+                epoch_pairs[-1]["far_epoch"],
+            ):
+                if index:
+                    epoch_jumps.append(
+                        {"beep_index": index, "offset_change_ms": offset - offsets[index - 1]}
+                    )
+                epoch_pairs.append(
+                    {
+                        "mic_epoch": pair[0],
+                        "far_epoch": pair[1],
+                        "first_beep": index,
+                        "beep_count": 0,
+                        "initial_offset_ms": offset,
+                        "drift_ms": 0.0,
+                    }
+                )
+            part = epoch_pairs[-1]
+            part["beep_count"] += 1
+            part["drift_ms"] = max(part["drift_ms"], abs(offset - part["initial_offset_ms"]))
+        for part in epoch_pairs:
+            part["status"] = "measured" if part["beep_count"] >= 2 else "unmeasured"
+        measured = [part["drift_ms"] for part in epoch_pairs if part["beep_count"] >= 2]
+        drift = max(measured, default=None)
         try:
             timecodes = max(
                 abs(_recorded(intervals, actual) - _recorded(intervals, reference))
@@ -773,6 +921,26 @@ def analyze_recording(
             )
         except (ValueError, KeyError, TypeError):
             pass
+    beep_problem = (
+        "invalid-segment-or-sidecar"
+        if invalid
+        else "unmapped-epoch"
+        if clock_unknown or beep_clock_unknown
+        else "missing-or-invalid-beep-schedule"
+        if not expected_known
+        else "beep-count-mismatch"
+        if not beep_known
+        else "insufficient-within-epoch-beeps"
+        if drift is None
+        else "observed-epoch-pairs"
+    )
+    timecode_problem = (
+        beep_problem
+        if not beep_known
+        else "unmapped-recorded-axis"
+        if timecodes is None
+        else "observed"
+    )
     crash_loss: float | None = None
     if (
         crash_mono_ms is not None
@@ -797,14 +965,17 @@ def analyze_recording(
                     drift,
                     50.0,
                     "ms",
-                    detail="product epoch clock: max mic/far offset change from first beep",
+                    detail=(
+                        f"{beep_problem}; product epoch clock: max mic/far offset change "
+                        "within contiguous epoch pairs; cross-epoch jumps are diagnostic"
+                    ),
                 ),
                 criterion(
                     "timecodes",
                     timecodes,
                     1000.0,
                     "ms",
-                    detail="beep recorded axis vs playback schedule",
+                    detail=f"{timecode_problem}; beep recorded axis vs playback schedule",
                 ),
             ]
         )
@@ -823,6 +994,10 @@ def analyze_recording(
         "beeps_mono_ms": mapped,
         "expected_beeps_ms": expected,
         "beep_initial_offset_ms": initial,
+        "beep_epochs": mapped_epochs,
+        "epoch_pairs": epoch_pairs,
+        "epoch_jumps": epoch_jumps,
+        "clock_issues": clock_issues,
         "beep_drift_ms": drift,
         "beep_diagnostics": diagnostics,
         "raw_beeps_mono_ms": raw_mapped,

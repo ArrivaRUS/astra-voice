@@ -73,15 +73,18 @@ def test_balanced_two_mode_jitter_is_not_misclassified_as_outliers() -> None:
     )
 
 
-def test_fitted_clock_still_rejects_unobserved_tail_and_discontinuity() -> None:
+def test_fitted_clock_preserves_observed_prefix_before_boundary() -> None:
     segment = noisy_segment()
     segment.timeline.pop()
     view = SegmentTimeline.from_segment(segment)
     with pytest.raises(MeetingValidationError):
         view.sample_to_monotonic(segment.sample_end)
     segment.discontinuity = True
+    boundary_view = SegmentTimeline.from_segment(segment)
+    assert boundary_view.mapping_method == "robust-linear"
+    assert abs(boundary_view.sample_to_monotonic(segment.timeline[100][0]) - 200000) <= 10
     with pytest.raises(MeetingValidationError):
-        SegmentTimeline.from_segment(segment).sample_to_monotonic(segment.timeline[100][0])
+        boundary_view.sample_to_monotonic(segment.sample_end)
 
 
 @pytest.mark.parametrize(
@@ -146,11 +149,10 @@ def test_shared_epoch_fit_has_one_clock_at_rotation_and_large_origin() -> None:
         ("meeting_generation", 1),
         ("meeting_id", "2026-10-31_120000-cd34"),
         ("clock", "monotonic"),
-        ("discontinuity", True),
         ("index", 2),
     ],
 )
-def test_epoch_rejects_cross_identity_and_discontinuities(field: str, value: object) -> None:
+def test_epoch_rejects_cross_identity(field: str, value: object) -> None:
     from astra_voice.meetings.timeline import EpochTimeline
 
     segments = adjacent_segments()

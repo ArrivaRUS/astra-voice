@@ -21,6 +21,8 @@ class SegmentTimeline:
     sparse outliers, not an arbitrary bounded/adversarial error guarantee.
     Short startup snapshots retain exact piecewise interpolation, explicitly
     exposed by mapping_method. Construct once and reuse after loading.
+    discontinuity marks the boundary after the observed prefix, not invalid
+    samples inside that prefix; no mapping extends beyond the observed knots.
     """
 
     sample_start: int
@@ -55,11 +57,7 @@ class SegmentTimeline:
                 )
             ):
                 raise MeetingValidationError("Недопустимые опорные точки часов")
-        if (
-            not self.discontinuity
-            and len(self.points) >= 61
-            and self.points[-1][1] - self.points[0][1] >= 60_000
-        ):
+        if len(self.points) >= 61 and self.points[-1][1] - self.points[0][1] >= 60_000:
             object.__setattr__(self, "_fit", _robust_fit(self.points))
 
     @property
@@ -81,7 +79,6 @@ class SegmentTimeline:
         """Estimate only inside observed knots; never extrapolate over gaps."""
         if (
             type(sample) is not int
-            or self.discontinuity
             or not self.sample_start <= sample <= self.sample_end
             or not self.points
             or not self.points[0][0] <= sample <= self.points[-1][0]
@@ -110,10 +107,11 @@ class EpochTimeline:
         previous: SegmentSidecar | None = None
         for segment in segments:
             view = SegmentTimeline.from_segment(segment)
-            if view.discontinuity or not view.points:
+            if not view.points:
                 raise MeetingValidationError("Нельзя отобразить отсчёт через разрыв")
             if previous is not None and (
-                any(
+                previous.discontinuity
+                or any(
                     getattr(segment, name) != getattr(previous, name)
                     for name in (
                         "meeting_id",

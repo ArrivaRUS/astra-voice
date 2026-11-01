@@ -291,9 +291,7 @@ def test_timeline_data_does_not_interpolate_through_discontinuity() -> None:
     )
     assert timeline.sample_to_monotonic(sidecar, 8000) == 600
     sidecar.discontinuity = True
-    with pytest.raises(model.MeetingValidationError):
-        timeline.sample_to_monotonic(sidecar, 8000)
-    sidecar.discontinuity = False
+    assert timeline.sample_to_monotonic(sidecar, 8000) == 600
     with pytest.raises(model.MeetingValidationError):
         timeline.sample_to_monotonic(sidecar, 16001)
 

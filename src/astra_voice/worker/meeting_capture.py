@@ -1053,6 +1053,7 @@ class MeetingCaptureState:
     def _read(self, track: str, source: Source, stop: threading.Event) -> None:
         assert self.archive is not None
         archive = self.archive
+        next_read = time.monotonic()
         try:
             while not stop.is_set():
                 data = source.read_chunk()
@@ -1086,8 +1087,18 @@ class MeetingCaptureState:
                         {"type": "disk-failed", "lost_estimate_ms": (len(data) + 31) // 32}
                     )
                     return
-                if not data:
-                    stop.wait(0.01)
+                if getattr(source, "device_change", None) is not None:
+                    # Drain the bounded pre-change tail and publish the already
+                    # observed cutoff without adding another cadence interval.
+                    continue
+                # One native dispatch per 100ms batch, including empty input.
+                # Wait outside source locks; stop wakes this wait immediately.
+                # Sources drain up to 1s of queued PCM to catch up after stalls.
+                next_read += 0.1
+                now = time.monotonic()
+                if next_read < now:
+                    next_read = now
+                stop.wait(min(0.1, max(0.0, next_read - now)))
         except Exception:
             self.messages.put({"type": "audio-failed"})
 

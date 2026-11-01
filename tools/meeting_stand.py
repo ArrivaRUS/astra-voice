@@ -601,8 +601,11 @@ class Capture:
 
     def send(self, action: str, **fields: Any) -> str:
         req = uuid.uuid4().hex
+        # Shutdown is process-scoped, including after a successful capture.
+        # Its M1 schema intentionally carries no meeting/capture identity.
+        identity = {} if action == "meeting.capture.shutdown" else self.identity
         self.supervisor.send(
-            {"type": action, "request_type": action, "req": req, **self.identity, **fields}
+            {"type": action, "request_type": action, "req": req, **identity, **fields}
         )
         return req
 

@@ -519,6 +519,12 @@ class PulseStreamSource:
     в close/_release: вне записи микрофон закрыт (PRD §9.5).
     """
 
+    # Dictation keeps its fixed 20ms contract. Meeting capture overrides only
+    # delivery batching; native event/cutoff handling below remains shared.
+    _chunk_bytes = CHUNK_BYTES
+    _max_chunk_bytes = CHUNK_BYTES
+    _poll_buffered = False
+
     def __init__(
         self,
         *,
@@ -1368,7 +1374,11 @@ class PulseStreamSource:
             try:
                 if not self._check_state():
                     raise _PulseFailure
-                if len(self._buffer) < CHUNK_BYTES:
+                if self._poll_buffered and len(self._buffer) >= self._chunk_bytes:
+                    self._pulse.iterate(0)
+                    if not self._check_state():
+                        raise _PulseFailure
+                if len(self._buffer) < self._chunk_bytes:
                     if self.device_change is None:
                         self._pulse.iterate(POLL_US)
                         if not self._check_state():
@@ -1389,10 +1399,13 @@ class PulseStreamSource:
                 available = len(self._buffer)
                 if self._cutoff is not None:
                     available = min(available, self._cutoff - self._delivered)
-                if available >= CHUNK_BYTES:
-                    chunk = bytes(self._buffer[:CHUNK_BYTES])
-                    del self._buffer[:CHUNK_BYTES]
-                    self._delivered += CHUNK_BYTES
+                minimum = CHUNK_BYTES if self.device_change is not None else self._chunk_bytes
+                if available >= minimum:
+                    size = min(available, self._max_chunk_bytes)
+                    size -= size % minimum
+                    chunk = bytes(self._buffer[:size])
+                    del self._buffer[:size]
+                    self._delivered += size
                     return chunk
                 if self.device_change is not None:
                     self._finish_change()

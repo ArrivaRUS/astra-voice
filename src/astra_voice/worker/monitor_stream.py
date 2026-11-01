@@ -326,6 +326,25 @@ def _meeting_pulse_type() -> Any:
             self.admission_check: Callable[[], bool] = lambda: True
             self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
 
+        def iterate(self, timeout_us: int) -> int:
+            # One libpulse socket dispatch can consume only a packet header or
+            # body. Drain ready work before the reader's 100ms cadence wait, or
+            # PCM and timing replies accumulate behind that wait. Only the
+            # first iteration may block; bound subsequent work by count/time so
+            # close and device handling retain their existing deadlines.
+            dispatched = super().iterate(timeout_us)
+            if not dispatched:
+                return dispatched
+            deadline = time.monotonic_ns() + 5_000_000
+            for _ in range(63):
+                if time.monotonic_ns() >= deadline:
+                    break
+                ready = super().iterate(0)
+                dispatched += ready
+                if not ready:
+                    break
+            return dispatched
+
         def _timing_updated(self, stream: int, userdata: Any) -> None:
             # Pulse computes transport at dispatch, before calling this callback.
             # It includes mainloop delay. Avoid get_time/get_latency: both contain
@@ -722,6 +741,9 @@ def microphone_source() -> Any:
     from astra_voice.worker.pulse_stream import PulseStreamSource
 
     class MeetingMicrophone(PulseStreamSource):
+        _chunk_bytes = 3200
+        _max_chunk_bytes = 32000
+        _poll_buffered = True
         admission_check: Callable[[], bool]
         admission_guard: Callable[[], AbstractContextManager[Any]]
         anchor: tuple[int, int] | None = None

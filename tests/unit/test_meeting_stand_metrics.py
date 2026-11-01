@@ -5,6 +5,8 @@ from __future__ import annotations
 import array
 import json
 import math
+import os
+import struct
 import sys
 import wave
 from pathlib import Path
@@ -85,6 +87,143 @@ def statuses(report: dict[str, Any]) -> dict[str, str]:
     return {row["name"]: row["status"] for row in report["criteria"]}
 
 
+def second_epoch(
+    root: Path, track: str, *, shift_ms: int = 0, beeps: tuple[int, ...] = (100, 1100)
+) -> None:
+    temporary = root / f"{track}-fixture"
+    recording(
+        temporary,
+        track,
+        shift_ms=2000 + shift_ms,
+        beeps=beeps,
+        epoch=f"{track}-second",
+        sample_start=0,
+    )
+    source = temporary / f"{track}-0000.wav"
+    side = json.loads(source.with_suffix(".json").read_text())
+    side["index"] = 1
+    source.replace(root / f"{track}-0001.wav")
+    (root / f"{track}-0001.json").write_text(json.dumps(side))
+
+
+def test_beep_drift_is_within_epoch_pairs_and_reports_boundary_jump(tmp_path: Path) -> None:
+    for track in ("mic", "far"):
+        recording(tmp_path, track)
+        second_epoch(tmp_path, track, shift_ms=200 if track == "mic" else 0)
+    report = module.analyze_recording(
+        tmp_path,
+        expected_beeps_ms=[10100, 11100, 12100, 13100],
+        intervals=[
+            {"t_mono_ms": 10000, "recorded_ms": 0},
+            {"t_mono_ms": 15000, "recorded_ms": 5000},
+        ],
+    )
+    assert report["beep_drift_ms"] == pytest.approx(0, abs=0.1)
+    assert report["epoch_jumps"][0]["offset_change_ms"] == pytest.approx(200, abs=0.1)
+    assert statuses(report)["timecodes"] == "pass"
+
+
+def test_unmapped_epoch_is_unavailable_with_specific_detail(tmp_path: Path) -> None:
+    for track in ("mic", "far"):
+        recording(tmp_path, track)
+        second_epoch(tmp_path, track)
+    path = tmp_path / "mic-0001.json"
+    side = json.loads(path.read_text())
+    side["timeline"] = [side["timeline"][0]]
+    path.write_text(json.dumps(side))
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100, 11100, 12100, 13100])
+    detail = next(c["detail"] for c in report["criteria"] if c["name"] == "beep_drift")
+    assert statuses(report)["beep_drift"] == "unavailable"
+    assert "unmapped-epoch" in detail
+
+
+def test_known_150ms_beep_with_43ms_hole_is_not_two_markers(tmp_path: Path) -> None:
+    for track in ("mic", "far"):
+        recording(tmp_path, track)
+        path = tmp_path / f"{track}-0000.wav"
+        with wave.open(str(path), "rb") as stream:
+            raw = bytearray(stream.readframes(32000))
+        for offset in range(2400):
+            value = (
+                0 if 1280 <= offset < 1968 else round(16000 * math.sin(2 * math.pi * offset / 16))
+            )
+            struct.pack_into("<h", raw, (1600 + offset) * 2, value)
+        with wave.open(str(path), "wb") as stream:
+            stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            stream.writeframes(raw)
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100, 11100])
+    assert all(len(values) == 2 for values in report["beeps_mono_ms"].values())
+    assert statuses(report)["beep_drift"] == "pass"
+
+
+def test_one_beep_in_each_epoch_cannot_prove_drift(tmp_path: Path) -> None:
+    for track in ("mic", "far"):
+        recording(tmp_path, track, beeps=(100,))
+        second_epoch(tmp_path, track, beeps=(100,))
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100, 12100])
+    assert statuses(report)["beep_drift"] == "unavailable"
+    detail = next(c["detail"] for c in report["criteria"] if c["name"] == "beep_drift")
+    assert "insufficient-within-epoch-beeps" in detail
+
+
+@pytest.mark.parametrize("boundary_gap", [0, 1000])
+def test_marker_split_at_epoch_counter_reset_requires_adjacent_clock_edges(
+    tmp_path: Path, boundary_gap: int
+) -> None:
+    for track in ("mic", "far"):
+        recording(tmp_path, track, beeps=(100, 1900))
+        second_epoch(tmp_path, track, shift_ms=boundary_gap, beeps=(0, 1100))
+        path = tmp_path / f"{track}-0001.wav"
+        with wave.open(str(path), "rb") as stream:
+            raw = bytearray(stream.readframes(32000))
+        raw[800 * 2 : 1600 * 2] = bytes(800 * 2)  # Remaining 50ms of one 150ms pulse.
+        with wave.open(str(path), "wb") as stream:
+            stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            stream.writeframes(raw)
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100, 11900, 13100])
+    if boundary_gap:
+        assert statuses(report)["beep_drift"] == "unavailable"
+        assert all(len(values) == 4 for values in report["beeps_mono_ms"].values())
+    else:
+        assert statuses(report)["beep_drift"] == "pass"
+        assert all(len(values) == 3 for values in report["beeps_mono_ms"].values())
+
+
+@pytest.mark.usefixtures("filesystem_euid")
+def test_disk_excludes_only_private_capture_atomic_temporaries(tmp_path: Path) -> None:
+    (tmp_path / "mic-0000.wav").write_bytes(b"x" * 100)
+    temporary = tmp_path / (".mic-0000-" + "a" * 32 + ".tmp")
+    temporary.write_bytes(b"t" * 500)
+    temporary.chmod(0o600)
+    (tmp_path / "other.tmp").write_bytes(b"u" * 7)
+    assert module._disk_bytes(tmp_path) == 107
+
+
+def test_disk_atomic_temporary_disappearing_during_walk_is_not_missing_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "mic-0000.wav").write_bytes(b"x" * 100)
+    monkeypatch.setattr(
+        os,
+        "walk",
+        lambda *a, **k: iter(
+            [(str(tmp_path), [], ["mic-0000.wav", ".mic-0000-" + "a" * 32 + ".tmp"])]
+        ),
+    )
+    assert module._disk_bytes(tmp_path) == 100
+
+
+def test_disk_unavailable_explains_missing_samples(tmp_path: Path) -> None:
+    process(tmp_path)
+    sampler = module.ProcSampler(tmp_path, hz=100)
+    rows = [sampler.sample({"capture": [42]}, now_s=t, disk_root=tmp_path) for t in (0.0, 3600.0)]
+    rows[1]["disk_bytes"] = None
+    report = module.summarize_resources(rows)
+    disk = next(c for c in report["criteria"] if c["name"] == "disk")
+    assert disk["status"] == "unavailable"
+    assert "missing-disk-samples" in disk["detail"]
+
+
 def test_proc_parser_handles_parentheses_and_rejects_short_stat() -> None:
     parsed = module.parse_proc_stat(stat_line())
     assert (parsed.pid, parsed.ticks, parsed.start_ticks) == (42, 10, 100)
@@ -146,8 +285,9 @@ def test_clock_mapping_uses_absolute_samples_and_rejects_gaps(tmp_path: Path) ->
         with pytest.raises(ValueError):
             module.sample_to_monotonic(side, sample)
     side["discontinuity"] = True
+    assert module.sample_to_monotonic(side, 17600) == pytest.approx(10100)
     with pytest.raises(ValueError):
-        module.sample_to_monotonic(side, 17600)
+        module.sample_to_monotonic(side, 48001)
 
 
 def test_beep_drift_uses_timeline_epochs_and_constant_offset(tmp_path: Path) -> None:
@@ -176,8 +316,8 @@ def test_beep_drift_over_50ms_fails(tmp_path: Path) -> None:
     assert statuses(report)["beep_drift"] == "fail"
 
 
-def test_missing_beep_or_discontinuous_epoch_is_unavailable(tmp_path: Path) -> None:
-    recording(tmp_path, "mic", discontinuity=True)
+def test_missing_beep_is_unavailable(tmp_path: Path) -> None:
+    recording(tmp_path, "mic", beeps=(100,))
     recording(tmp_path, "far")
     report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100.0, 11100.0])
     assert statuses(report)["beep_drift"] == "unavailable"
@@ -341,7 +481,11 @@ def test_placeholder_skip_is_restricted_to_safe_startup_headers(
         tmp_path, expected_beeps_ms=[10100.0, 11100.0], crash_mono_ms=13000
     )
     assert module.verdict(report["criteria"]) != 0
-    assert report["crash_loss_ms"] is None
+    if problem == "nonempty-discontinuity":
+        assert report["crash_loss_ms"] == 1000.0
+        assert all(s.get("mapping_method") for s in report["segments"] if s["frames"])
+    else:
+        assert report["crash_loss_ms"] is None
 
 
 def test_integer_clock_tolerance_does_not_admit_larger_boundary_error(tmp_path: Path) -> None:
@@ -511,6 +655,10 @@ def test_exclusivity_requires_mapped_quiet_pcm(tmp_path: Path, problem: str) -> 
         side["clock_anchor"]["t_mono_ms"] += 1
         path.write_text(json.dumps(side))
     report = module.analyze_exclusivity(tmp_path, expected_beeps_ms=expected)
+    if problem == "discontinuity":
+        assert statuses(report)["farforeign_rms_dbfs"] == "pass"
+        assert report["farforeign_rms_dbfs"] <= -60
+        return
     assert statuses(report)["farforeign_rms_dbfs"] == "unavailable"
     assert report["farforeign_rms_dbfs"] is None
     assert module.verdict(report["criteria"]) == 2
@@ -684,9 +832,9 @@ def test_recording_diagnostics_validates_epoch_order_before_legacy_sort(
                 old.rename(new)
                 old.with_suffix(".json").rename(new.with_suffix(".json"))
     report = module.analyze_recording(tmp_path, expected_beeps_ms=[10000.0, 15000.0, 20000.0])
-    # The old gate deliberately remains unchanged in this diagnostics-only fix.
-    assert statuses(report)["beep_drift"] == "pass"
-    assert report["beep_drift_ms"] == 0
+    # Each epoch has only one marker: there is no within-epoch drift evidence.
+    assert statuses(report)["beep_drift"] == "unavailable"
+    assert report["beep_drift_ms"] is None
     assert report["beep_diagnostics"]["status"] == ("diagnostic" if ordered else "unavailable")
 
 

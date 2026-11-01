@@ -65,6 +65,7 @@ class Sections:
             for owner, method in targets:
                 label = f"{owner}.{method}" if owner else method
                 self.rows[label] = {
+                    "name": label,
                     "label": label,
                     "installed": False,
                     "calls": 0,
