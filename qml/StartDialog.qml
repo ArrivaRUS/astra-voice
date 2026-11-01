@@ -32,6 +32,10 @@ ApplicationWindow {
         for (var i = 0; i < devices.length; ++i) names.push(devices[i].label || devices[i].name)
         return names
     }
+    function isLocked(name) {
+        return settings && settings.lockedSettings
+            ? settings.lockedSettings.indexOf(name) >= 0 : false
+    }
     function cancel() { if (meeting) meeting.closeStartDialog() }
     function focusInitialButton() {
         if (!visible || !active || !initialFocusPending) return
@@ -273,7 +277,7 @@ ApplicationWindow {
                         id: microphoneSelector
                         objectName: "meetingStartMicrophone"
                         Layout.maximumWidth: parent.width - microphoneLabel.implicitWidth - Theme.meetingStartMicRowGap
-                        enabled: !root.starting && (!root.settings || !root.settings.isLocked("device"))
+                        enabled: !root.starting && !root.isLocked("device")
                         model: root.deviceNames()
                         itemDetails: root.devices
                         popupMaxWidth: root.width - Theme.meetingStartBodyPaddingX * 2
