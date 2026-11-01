@@ -861,6 +861,7 @@ def analyze_recording(
     )
     initial: float | None = None
     drift: float | None = None
+    unmeasured_pairs = False
     timecodes: float | None = None
     epoch_pairs: list[JSON] = []
     epoch_jumps: list[JSON] = []
@@ -913,6 +914,11 @@ def analyze_recording(
             part["status"] = "measured" if part["beep_count"] >= 2 else "unmeasured"
         measured = [part["drift_ms"] for part in epoch_pairs if part["beep_count"] >= 2]
         drift = max(measured, default=None)
+        unmeasured_pairs = any(part["status"] == "unmeasured" for part in epoch_pairs)
+        # Missing coverage cannot establish a pass, but a measured failure is
+        # already conclusive. Per-pair values remain available for diagnostics.
+        if unmeasured_pairs and (drift is None or drift <= 50.0):
+            drift = None
         try:
             timecodes = max(
                 abs(_recorded(intervals, actual) - _recorded(intervals, reference))
@@ -931,7 +937,7 @@ def analyze_recording(
         else "beep-count-mismatch"
         if not beep_known
         else "insufficient-within-epoch-beeps"
-        if drift is None
+        if drift is None or unmeasured_pairs
         else "observed-epoch-pairs"
     )
     timecode_problem = (

@@ -84,7 +84,7 @@ class SegmentTimeline:
             or not self.points[0][0] <= sample <= self.points[-1][0]
         ):
             raise MeetingValidationError("Нельзя отобразить отсчёт через разрыв")
-        return _map(self.points, self._fit, sample)
+        return _map(self.points, self._fit, sample, discontinuity=self.discontinuity)
 
 
 @dataclass(frozen=True, init=False)
@@ -99,6 +99,7 @@ class EpochTimeline:
 
     points: tuple[tuple[int, int], ...]
     _fit: tuple[float, float] | None = field(repr=False, compare=False)
+    _discontinuity: bool = field(repr=False)
 
     def __init__(self, segments: Sequence[SegmentSidecar]) -> None:
         if not segments:
@@ -134,6 +135,7 @@ class EpochTimeline:
         frozen = tuple(points)
         object.__setattr__(self, "points", frozen)
         object.__setattr__(self, "_fit", _robust_fit(frozen))
+        object.__setattr__(self, "_discontinuity", segments[-1].discontinuity)
 
     @classmethod
     def from_segments(cls, segments: Sequence[SegmentSidecar]) -> Self:
@@ -146,15 +148,25 @@ class EpochTimeline:
     def sample_to_monotonic(self, sample: int) -> int:
         if type(sample) is not int or not self.points[0][0] <= sample <= self.points[-1][0]:
             raise MeetingValidationError("Нет опорных точек часов")
-        return _map(self.points, self._fit, sample)
+        return _map(self.points, self._fit, sample, discontinuity=self._discontinuity)
 
 
-def _map(points: tuple[tuple[int, int], ...], fit: tuple[float, float] | None, sample: int) -> int:
+def _map(
+    points: tuple[tuple[int, int], ...],
+    fit: tuple[float, float] | None,
+    sample: int,
+    *,
+    discontinuity: bool,
+) -> int:
     if fit is not None:
         slope, intercept = fit
         # Subtract integer origins BEFORE float conversion and restore the
         # integer mono origin AFTER rounding, even near uint64 boundaries.
-        return points[0][1] + round(intercept + slope * (sample - points[0][0]))
+        mono = points[0][1] + round(intercept + slope * (sample - points[0][0]))
+        # A fitted edge can lie beyond the observed prefix even for an in-range
+        # sample. Clamp terminal boundaries monotonically; ordinary rotations
+        # retain the shared fitted clock instead of reintroducing knot noise.
+        return min(max(mono, points[0][1]), points[-1][1]) if discontinuity else mono
     for knot_sample, mono in points:
         if sample == knot_sample:
             return mono

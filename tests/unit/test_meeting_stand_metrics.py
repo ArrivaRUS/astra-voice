@@ -166,6 +166,34 @@ def test_one_beep_in_each_epoch_cannot_prove_drift(tmp_path: Path) -> None:
     assert "insufficient-within-epoch-beeps" in detail
 
 
+@pytest.mark.parametrize("measured_drift_ms", [0, 50, 60])
+def test_unmeasured_epoch_pair_prevents_pass_but_preserves_measured_failure(
+    tmp_path: Path, measured_drift_ms: int
+) -> None:
+    for track in ("mic", "far"):
+        recording(tmp_path, track, beeps=(100, 1100 + (measured_drift_ms if track == "mic" else 0)))
+        second_epoch(tmp_path, track, beeps=(100,))
+    report = module.analyze_recording(
+        tmp_path,
+        expected_beeps_ms=[10100, 11100, 12100],
+        intervals=[
+            {"t_mono_ms": 10000, "recorded_ms": 0},
+            {"t_mono_ms": 15000, "recorded_ms": 5000},
+        ],
+    )
+    assert [part["beep_count"] for part in report["epoch_pairs"]] == [2, 1]
+    expected_status = "fail" if measured_drift_ms > 50 else "unavailable"
+    assert statuses(report)["beep_drift"] == expected_status
+    assert statuses(report)["timecodes"] == "pass"
+    assert module.verdict(report["criteria"]) == (1 if expected_status == "fail" else 2)
+    detail = next(c["detail"] for c in report["criteria"] if c["name"] == "beep_drift")
+    assert "insufficient-within-epoch-beeps" in detail
+    if expected_status == "fail":
+        assert report["beep_drift_ms"] == pytest.approx(measured_drift_ms, abs=0.1)
+    else:
+        assert report["beep_drift_ms"] is None
+
+
 @pytest.mark.parametrize("boundary_gap", [0, 1000])
 def test_marker_split_at_epoch_counter_reset_requires_adjacent_clock_edges(
     tmp_path: Path, boundary_gap: int
@@ -185,7 +213,10 @@ def test_marker_split_at_epoch_counter_reset_requires_adjacent_clock_edges(
         assert statuses(report)["beep_drift"] == "unavailable"
         assert all(len(values) == 4 for values in report["beeps_mono_ms"].values())
     else:
-        assert statuses(report)["beep_drift"] == "pass"
+        # The seam-spanning beep belongs to the preceding epoch. The second
+        # pair has only its later beep: correct deduplication cannot prove drift.
+        assert statuses(report)["beep_drift"] == "unavailable"
+        assert [part["beep_count"] for part in report["epoch_pairs"]] == [2, 1]
         assert all(len(values) == 3 for values in report["beeps_mono_ms"].values())
 
 

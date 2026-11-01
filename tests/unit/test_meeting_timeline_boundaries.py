@@ -5,10 +5,38 @@ from __future__ import annotations
 import pytest
 
 from astra_voice.meetings import MeetingValidationError
+from astra_voice.meetings.model import UINT_MAX
 from astra_voice.meetings.segments import ClockAnchor, SegmentSidecar
 from astra_voice.meetings.timeline import EpochTimeline, SegmentTimeline
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("view_type", [SegmentTimeline, EpochTimeline])
+@pytest.mark.parametrize("origin", [100_000, UINT_MAX - 400_000])
+def test_terminal_robust_fit_stays_inside_observed_times(
+    view_type: type[SegmentTimeline] | type[EpochTimeline], origin: int
+) -> None:
+    segment = terminated_epoch("pulse")[0]
+    segment.timeline = [[16000 * second, origin + 1000 * second] for second in range(301)]
+    segment.timeline[-1][1] -= 50
+    segment.discontinuity = True
+    segment.close_reason = "clock_change"
+    view = (
+        SegmentTimeline.from_segment(segment)
+        if view_type is SegmentTimeline
+        else EpochTimeline.from_segments([segment])
+    )
+    lower, upper = segment.timeline[0][1], segment.timeline[-1][1]
+    assert view.sample_to_monotonic(segment.sample_end) == upper
+    # Include both sides of the clamp, not just knots or the exact endpoint.
+    samples = [0, 1, 16000 * 150, *range(segment.sample_end - 1600, segment.sample_end + 1)]
+    times = [view.sample_to_monotonic(sample) for sample in samples]
+    assert all(lower <= mono <= upper for mono in times)
+    assert times == sorted(times)
+    assert view.sample_to_monotonic(16000 * 150) == origin + 150_000
+    with pytest.raises(MeetingValidationError):
+        view.sample_to_monotonic(segment.sample_end + 1)
 
 
 def terminated_epoch(clock: str) -> list[SegmentSidecar]:
