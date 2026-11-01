@@ -84,6 +84,7 @@ def test_new_pcm_files_private_and_existing_symlink_untouched(tmp_path: Path) ->
         victim.write_bytes(b"original")
         (rig.directory / "audio/mic-0000.wav").symlink_to(victim)
         rig.open()
+        rig.mics[-1].chunks.append(b"\0\0" * 1600)
         rig.until("meeting.capture.closed")
         assert rig.until("meeting.capture.finalized")["status"] == "failed"
         assert victim.read_bytes() == b"original"
@@ -423,7 +424,7 @@ def test_pcm_overflow_failure_survives_archive_finalization_and_stop(tmp_path: P
         rig.prepare()
         rig.open()
         assert entered.wait(1)
-        # Four seconds fit in the bounded queue; the fifth second is lost.
+        # Fill one track's bounded queue; a subsequent chunk must be rejected.
         rig.mics[0].chunks.extend([b"\0\0" * 16000 for _ in range(5)])
         rig.until("meeting.capture.autopaused")
         rig.until("meeting.capture.closed")

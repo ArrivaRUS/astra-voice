@@ -42,7 +42,7 @@ from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, new_meeting_id
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.session_state import SessionMonitor
-from astra_voice.ui.meeting_texts import W4_FLY_WARNING, W4_TEXTS
+from astra_voice.ui.meeting_texts import W4_TEXTS
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
@@ -347,8 +347,6 @@ class MeetingRecording(QObject):
             result.append(WARNING_TEXT["storage-network"])
         if self._audio.remote:
             result.append(WARNING_TEXT["audio-remote"])
-        if self.session_kind == SessionKind.FLY:
-            result.append(W4_FLY_WARNING)
         return result
 
     @property

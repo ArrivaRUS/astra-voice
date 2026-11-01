@@ -19,7 +19,6 @@ from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.meeting_bridge import MeetingBridge
 from astra_voice.ui.meeting_recording import AudioHints, MeetingRecording
-from astra_voice.ui.meeting_texts import W4_FLY_WARNING
 from astra_voice.worker import ipc
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
@@ -217,7 +216,9 @@ def test_only_correlated_validated_target_enables_call(rig: Rig, app_class: str)
     assert rig.supervisor.messages[-1]["far"]["sink_input"] == 7
 
 
-def test_w4_preflight_warnings_are_visible_before_prepare(rig: Rig) -> None:
+@pytest.mark.parametrize("kind", [SessionKind.KDE, SessionKind.FLY])
+def test_w4_preflight_warnings_are_visible_before_prepare(rig: Rig, kind: SessionKind) -> None:
+    rig.recording.session_kind = kind
     rig.storage = StorageStatus(1000, True, True)
     rig.audio = AudioHints(remote=True, speakers=True)
     rig.bridge.requestRecording()
@@ -226,13 +227,24 @@ def test_w4_preflight_warnings_are_visible_before_prepare(rig: Rig) -> None:
     assert not any(m["type"].endswith("prepare") for m in rig.supervisor.messages)
 
 
-def test_fly_unknown_lock_shows_warning_and_allows_start(rig: Rig) -> None:
-    rig.recording.session_kind = SessionKind.FLY
-    rig.recording.controller.session_kind = SessionKind.FLY
-    rig.session.value = SessionSnapshot(known=False, supported=False)
-    rig.bridge.requestRecording()
-    assert W4_FLY_WARNING in rig.bridge.startWarnings
-    assert rig.bridge.startCanStart
+def test_fly_unknown_lock_has_no_warning_and_allows_start(tmp_path: Path) -> None:
+    from helpers.qt_app import get_qapplication
+
+    get_qapplication()
+    rig = Rig(tmp_path, kind=SessionKind.FLY)
+    try:
+        rig.session.value = SessionSnapshot(known=False, supported=False)
+        rig.bridge.requestRecording()
+        assert rig.bridge.startWarnings == []
+        assert rig.bridge.startCanStart
+        rig.bridge.on_start_clicked()
+        assert rig.recording.controller.lock_signal_unavailable
+        assert rig.recording.controller.warnings == []
+        assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
+        rig.reply("prepared")
+        assert rig.supervisor.messages[-1]["type"] == "meeting.capture.open"
+    finally:
+        rig.bridge.shutdown()
 
 
 @pytest.mark.parametrize(

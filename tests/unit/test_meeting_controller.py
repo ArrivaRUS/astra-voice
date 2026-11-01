@@ -147,6 +147,7 @@ def test_fly_missing_signal_allows_start(tmp_path: Path) -> None:
     rig.snapshot = SessionSnapshot(known=False, supported=False)
     rig.bridge.on_start_clicked()
     assert rig.controller.lock_signal_unavailable
+    assert rig.controller.warnings == []
     assert rig.supervisor.messages[-1]["type"].endswith("prepare")
 
 

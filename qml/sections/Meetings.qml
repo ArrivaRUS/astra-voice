@@ -58,12 +58,6 @@ Column {
         body: root.bridge && root.bridge.saveError !== undefined ? root.bridge.saveError : ""
     }
 
-    NoteBanner {
-        visible: root.bridge ? root.bridge.flyWarning !== "" : false
-        variant: "warn"
-        iconName: "alert"
-        body: root.bridge ? root.bridge.flyWarning : ""
-    }
 
     Rectangle {
         id: entry

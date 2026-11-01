@@ -283,6 +283,8 @@ def test_resume_creates_new_epochs_and_no_pause_pcm(rig: Rig) -> None:
     first = json.loads((rig.directory / "audio/mic-0000.json").read_text())
     rig.clock.now += 20
     rig.open("resume")
+    rig.mics[-1].chunks.append(b"\0\0" * 1600)
+    rig.frames("mic", 1600)
     rig.stop()
     second = json.loads((rig.directory / "audio/mic-0001.json").read_text())
     assert first["epoch_id"] != second["epoch_id"]

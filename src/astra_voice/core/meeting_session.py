@@ -62,10 +62,6 @@ WARNING_TEXT = {
         "через другой компьютер. Записывайте, только если это разрешено в вашей "
         "организации."
     ),
-    "lock-unavailable": (
-        "В этой сессии запись продолжится при блокировке экрана. Остановите "
-        "запись вручную перед блокировкой."
-    ),
 }
 Message = dict[str, Any]
 
@@ -337,8 +333,6 @@ class MeetingController:
                 assert storage is not None and self.meeting is not None
                 self.meeting.warnings.storage_network = storage.network
                 self.warnings = [WARNING_TEXT["storage-network"]] if storage.network else []
-                if self.lock_signal_unavailable:
-                    self.warnings.append(WARNING_TEXT["lock-unavailable"])
                 self._prepare_if_ready()
 
             return completed

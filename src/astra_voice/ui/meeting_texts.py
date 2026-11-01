@@ -1,15 +1,9 @@
 """Literal E13 interface copy from design/meetings/spec.md §3/§4.
 
-Fly copy follows the owner's 29.10 decision, superseding the older design §6.
 No user data belongs in this vocabulary.
 """
 
 from __future__ import annotations
-
-W4_FLY_WARNING = (
-    "В этой сессии программа не узнаёт о блокировке экрана: если заблокировать экран, "
-    "запись продолжится. Приостановите или остановите запись сами, когда отходите от компьютера."
-)
 
 W4_TEXTS = {
     "title": "Записать встречу",
@@ -128,7 +122,6 @@ TEXTS = {
     "d1ManualCaption": "Недоступно — так настроено администратором вашей организации",
     "cancel": "Отмена",
     "accept": "Понятно, включить",
-    "flyWarning": "Во время записи блокировка экрана не ставит запись на паузу",
 }
 
 RESPONSIBILITY_ITEMS = (

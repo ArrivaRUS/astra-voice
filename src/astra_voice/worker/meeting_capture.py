@@ -27,7 +27,8 @@ from astra_voice.worker.meeting_roles import failure
 from astra_voice.worker.meeting_session import MeetingSession, SessionAdmission
 
 Message = dict[str, Any]
-MAX_PCM_BYTES = 128000  # two tracks, at most two seconds each
+MAX_PCM_BYTES = 128000  # total across the two tracks
+MAX_TRACK_PCM_BYTES = 64000  # two seconds, including the block being written
 CLOSE_SECONDS = 1.0
 FINAL_STATUS_RANK = {"succeeded": 0, "partial": 1, "failed": 2}
 # Two 100ms fragment endpoints may differ by 200ms of jitter; keep 50ms
@@ -80,6 +81,7 @@ class _Archive:
         self.jobs: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=256)
         self.lock = threading.Lock()
         self.pending_bytes = 0
+        self.pending_track_bytes = {"mic": 0, "far": 0}
         self.failed = threading.Event()
         self.counts = {"mic": index, "far": index}
         self.segments: dict[str, tuple[Any, Any, SegmentSidecar]] = {}
@@ -96,13 +98,22 @@ class _Archive:
     def put(self, kind: str, payload: Any) -> bool:
         size = len(payload[1]) if kind == "pcm" else 0
         with self.lock:
-            if self.failed.is_set() or self.pending_bytes + size > MAX_PCM_BYTES:
+            if (
+                self.failed.is_set()
+                or self.pending_bytes + size > MAX_PCM_BYTES
+                or (
+                    kind == "pcm"
+                    and self.pending_track_bytes[payload[0]] + size > MAX_TRACK_PCM_BYTES
+                )
+            ):
                 return False
             try:
                 self.jobs.put_nowait((kind, payload))
             except queue.Full:
                 return False
             self.pending_bytes += size
+            if kind == "pcm":
+                self.pending_track_bytes[payload[0]] += size
         return True
 
     def _edge(self, payload: Message, owner: Any) -> None:
@@ -175,7 +186,6 @@ class _Archive:
             self.last_clock[track] = stamp
             self.last_checkpoint[track] = stamp[2]
             wav.writeframesraw(b"")
-            self._checkpoint(track, owner)
         except BaseException:
             file.close()
             raise
@@ -186,7 +196,17 @@ class _Archive:
         file.flush()
         self.fsync(file.fileno())
         sidecar.frames_at_checkpoint = sidecar.frames
-        owner.write(f"audio/{track}-{sidecar.index:04d}.json", sidecar)
+        # A durable sample range must have an exact mapped endpoint, even when
+        # this checkpoint falls between the one-second timeline knots. Keep the
+        # extra endpoint only in the snapshot (<=302 points for 300 seconds).
+        timeline = sidecar.timeline
+        mono = self.last_clock[track][2]
+        if sidecar.sample_end > timeline[-1][0]:
+            sidecar.timeline = [*timeline, [sidecar.sample_end, mono]]
+        try:
+            owner.write(f"audio/{track}-{sidecar.index:04d}.json", sidecar)
+        finally:
+            sidecar.timeline = timeline
 
     def _finish(self, track: str, reason: str, owner: Any) -> None:
         if track not in self.segments:
@@ -232,12 +252,15 @@ class _Archive:
         tolerance_ms = CLOCK_JITTER_MS + duration_ms * CLOCK_DRIFT_PPM / 1000000
         changed = previous and (
             stamp[0] != previous[0]
-            or stamp[1] < previous[1]
-            or stamp[2] < previous[2]
             or any(
                 abs(stamp[index] - previous[index] - duration_ms) > tolerance_ms for index in (1, 2)
             )
         )
+        if previous and not changed:
+            # Latency refreshes may move a 20ms endpoint backwards by a few ms.
+            # Apply the same jitter budget as forward corrections, and retain a
+            # strictly increasing sample axis without widening that budget.
+            stamp = (stamp[0], stamp[1], max(stamp[2], previous[2] + 1))
         if changed:
             if track in self.segments:
                 self.segments[track][2].discontinuity = True
@@ -250,7 +273,12 @@ class _Archive:
                 max(0, stamp[2] - len(data) // 32),
             )
             self._start(
-                track, start, recorded, audio, owner, new_epoch=not previous or bool(changed)
+                track,
+                start,
+                max(0, recorded - len(data) // 32),
+                audio,
+                owner,
+                new_epoch=not previous or bool(changed),
             )
         while data:
             wav, _, sidecar = self.segments[track]
@@ -259,7 +287,10 @@ class _Archive:
             wav.writeframesraw(block)
             sidecar.frames += len(block) // 2
             sidecar.sample_end += len(block) // 2
-            mono = stamp[2] - len(data) // 32
+            # A buffer can straddle the 300s rotation boundary. Normalize each
+            # delivered sub-block as well: backfilling the remaining duration
+            # after a small latency correction must not reverse its endpoint.
+            mono = max(stamp[2] - len(data) // 32, self.last_clock[track][2] + 1)
             self.last_clock[track] = (stamp[0], stamp[1] - len(data) // 32, mono)
             if mono - sidecar.timeline[-1][1] >= 1000:
                 sidecar.timeline.append([sidecar.sample_end, mono])
@@ -269,10 +300,17 @@ class _Archive:
                     self._start(
                         track, self.last_clock[track], recorded, audio, owner, new_epoch=False
                     )
-            # Two seconds of PCM queueing fit inside the ten-second crash-loss budget.
-            elif mono - self.last_checkpoint[track] >= 8000:
+            # Two seconds of PCM queueing fit inside the ten-second crash-loss
+            # budget. Bound frames as well as time: latency corrections must not
+            # postpone durability when server-derived time progresses slowly.
+            elif (
+                sidecar.frames == len(block) // 2
+                or mono - self.last_checkpoint[track] >= 8000
+                or sidecar.frames - sidecar.frames_at_checkpoint >= 128000
+            ):
                 self._checkpoint(track, owner)
-                self.last_checkpoint[track] = mono
+                if mono - self.last_checkpoint[track] >= 8000:
+                    self.last_checkpoint[track] = mono
 
     def _run(self) -> None:
         self.last_epoch: dict[str, str] = {}
@@ -288,8 +326,12 @@ class _Archive:
                                 self.source_kind = payload.pop("source_kind")
                                 self._edge(payload, owner)
                             elif kind == "track_start":
-                                track, stamp, recorded = payload
-                                self._start(track, stamp, recorded, audio, owner)
+                                track, _, _ = payload
+                                # The journal owns open/close boundaries. A PCM
+                                # epoch starts with actual data, not the timing
+                                # fallback sampled before Pulse is ready.
+                                self.last_clock.pop(track, None)
+                                self.fsync(audio)
                             elif kind == "pcm":
                                 self._pcm(payload, audio, owner)
                             elif kind == "track_close":
@@ -323,6 +365,7 @@ class _Archive:
                             if kind == "pcm":
                                 with self.lock:
                                     self.pending_bytes -= len(payload[1])
+                                    self.pending_track_bytes[payload[0]] -= len(payload[1])
         except Exception:
             self.failed.set()
             self.emit_event({"type": "disk-failed"})

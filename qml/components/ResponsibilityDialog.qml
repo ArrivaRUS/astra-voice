@@ -119,12 +119,6 @@ AvDialog {
                 color: Theme.fgSecondary
                 renderType: Text.NativeRendering
             }
-            NoteBanner {
-                visible: root.bridge ? root.bridge.flyWarning !== "" : false
-                variant: "warn"
-                iconName: "alert"
-                body: root.bridge ? root.bridge.flyWarning : ""
-            }
             Item {
                 width: parent.width
                 visible: root.bridge ? root.bridge.detectorVisible : false

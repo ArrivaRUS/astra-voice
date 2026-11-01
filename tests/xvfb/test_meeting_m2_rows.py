@@ -14,6 +14,7 @@ from test_start_dialog import SHOTS, texts
 from astra_voice.core.settings import Settings
 from astra_voice.meetings.events import MeetingState
 from astra_voice.meetings.model import Mark, Meeting
+from astra_voice.platform.session import SessionKind
 from astra_voice.ui.meeting_bridge import MeetingBridge
 from helpers.snapshots import write_snapshot
 
@@ -89,6 +90,38 @@ def test_m2_section_recording_row_snapshot(rendered: Any, dark: bool) -> None:
         write_snapshot(
             SHOTS, f"meetings-recording-{'dark' if dark else 'light'}-1280.png", grab(window)
         )
+        assert not messages
+    finally:
+        bridge.shutdown()
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("screen", ["section", "responsibility"])
+def test_fly_section_and_responsibility_have_no_lock_banner(
+    rendered: Any, dark: bool, screen: str
+) -> None:
+    from PyQt5.QtCore import QObject
+    from PyQt5.QtTest import QTest
+
+    bridge = MeetingBridge(
+        Settings(),
+        session=SessionKind.FLY,
+        known_apps=(),
+        store=Mock(list=Mock(return_value=[])),
+        save=Mock(),
+        submit=lambda work: work(),
+    )
+    try:
+        window, _bridge, messages = rendered("off", dark, bridge)
+        if screen == "responsibility":
+            bridge.openResponsibility()
+            QTest.qWait(30)
+            assert bridge.responsibilityOpen
+            content = window.findChild(QObject, "meetingResponsibility").property("contentItem")
+        else:
+            content = window.contentItem()
+        assert not any("блокировка экрана" in value for value in texts(content))
+        write_snapshot(SHOTS, f"fly-{screen}-{'dark' if dark else 'light'}.png", grab(window))
         assert not messages
     finally:
         bridge.shutdown()

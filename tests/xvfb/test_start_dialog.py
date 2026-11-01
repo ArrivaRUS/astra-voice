@@ -30,11 +30,7 @@ from helpers.snapshots import write_snapshot
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SHOTS = Path("/tmp/e13-m2-s3b-shots")
-FLY = (
-    "В этой сессии программа не узнаёт о блокировке экрана: если заблокировать экран, "
-    "запись продолжится. Приостановите или остановите запись сами, когда отходите от компьютера."
-)
+SHOTS = Path("/tmp/e13-m2-s4-new-shots")
 COPY = {
     "title": "Записать встречу",
     "heading": "Что записывать",
@@ -74,9 +70,18 @@ WARNINGS = {
         "Звуковая служба работает не на этом компьютере — звук встречи пройдёт через другой "
         "компьютер. Записывайте, только если это разрешено в вашей организации."
     ),
-    "fly": FLY,
 }
-STATES = ["default", "call", "browser", "no-app-split", "speakers", "starting", *ERRORS, *WARNINGS]
+STATES = [
+    "default",
+    "call",
+    "browser",
+    "no-app-split",
+    "speakers",
+    "starting",
+    "fly",
+    *ERRORS,
+    *WARNINGS,
+]
 
 
 class RecordingBridge(Bridge):
@@ -300,6 +305,9 @@ def test_w4_state_composition_and_literal_copy(start_window: Any, state: str) ->
         assert banner.property("variant") == "error" and ERRORS[state] in content
     if state in WARNINGS:
         assert WARNINGS[state] in content and start.property("enabled")
+    if state == "fly":
+        assert not bridge.startWarnings and start.property("enabled")
+        assert not any("блокировк" in value for value in content)
     headset = window.findChild(QObject, "meetingStartSpeakers")
     assert headset is not None and headset.property("visible") == (state == "speakers")
     assert bridge.starts == 0 and not messages
@@ -404,13 +412,12 @@ def test_w4_starting_ignores_pointer_return_and_space(start_window: Any, dark: b
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_w4_combined_fly_network_remote_warnings_keep_controls_visible(
+def test_w4_combined_network_remote_warnings_keep_controls_visible(
     start_window: Any, dark: bool
 ) -> None:
-    # A validated call target plus Fly, network storage and remote audio is the
-    # largest real preview: three options and three independent warnings.
+    # Network storage and remote audio remain independent warnings.
     window, bridge, messages = start_window("call", dark)
-    bridge._extra_warnings = [FLY, WARNINGS["warn-nfs"], WARNINGS["warn-remote-audio"]]
+    bridge._extra_warnings = [WARNINGS["warn-nfs"], WARNINGS["warn-remote-audio"]]
     bridge.changed.emit()
     QTest.qWait(30)
     assert window.height() <= 600
@@ -421,7 +428,10 @@ def test_w4_combined_fly_network_remote_warnings_keep_controls_visible(
     footer = start.parentItem()
     assert footer.mapToScene(QPointF(0, footer.height())).y() <= window.height()
     options = window.findChild(QObject, "meetingStartOptionsScroll")
-    assert options is not None and options.property("contentHeight") > options.property("height")
+    assert options is not None and options.property("height") > 0
+    assert (
+        options.mapToScene(QPointF(0, options.height())).y() <= footer.mapToScene(QPointF(0, 0)).y()
+    )
     for warning in bridge._extra_warnings:
         assert warning in texts(window.contentItem())
     image = grab(window)
@@ -434,7 +444,7 @@ def test_w4_arrow_selection_reveals_whole_option_without_moving_start_focus(
     start_window: Any, dark: bool
 ) -> None:
     window, bridge, messages = start_window("call", dark)
-    bridge._extra_warnings = [FLY, WARNINGS["warn-nfs"], WARNINGS["warn-remote-audio"]]
+    bridge._extra_warnings = [WARNINGS["warn-nfs"], WARNINGS["warn-remote-audio"]]
     bridge.changed.emit()
     QTest.qWait(30)
     start = window.findChild(QObject, "meetingStartConfirm")

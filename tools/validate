@@ -47,6 +47,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import astra_voice.security.verify as verify_module  # noqa: E402
@@ -2994,6 +2995,19 @@ def cowork_check(args: argparse.Namespace) -> int:
     return network_report(args, checks, notes)
 
 
+def meetings_stand(args: argparse.Namespace) -> int:
+    """Run only the explicitly requested private audio stand, never host audio."""
+    from tools.meeting_stand import run_stand
+
+    code, report = run_stand(minutes=args.minutes, server=args.server, keep=args.keep)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+    else:
+        print("meetings: " + str(report.get("verdict", "unavailable")))
+        print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
@@ -3002,6 +3016,14 @@ def main(argv: list[str] | None = None) -> int:
         "cowork", help="контракт Command1 на приватных тестовых шинах"
     )
     cowork_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    meetings_parser = commands.add_parser("meetings", help="изолированный стенд захвата встреч")
+    meetings_parser.add_argument("--stand", action="store_true", required=True)
+    meetings_parser.add_argument("--minutes", type=positive_finite, default=60.0)
+    meetings_parser.add_argument("--server", choices=("pipewire", "pulseaudio"), default="pipewire")
+    meetings_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    meetings_parser.add_argument(
+        "--keep", action="store_true", help="оставить только артефакты стенда"
+    )
     summary = commands.add_parser(
         "stats", help="проверить p95 полного времени t_total_ms по прогретым диктовкам"
     )
@@ -3101,6 +3123,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "catalog" and args.all and (args.from_ref or args.to_ref):
         parser.error("--from/--to применимы только с --switch")
     handlers = {
+        "meetings": meetings_stand,
         "cowork": cowork_check,
         "worker-cancel": worker_cancel,
         "dictation": dictation,

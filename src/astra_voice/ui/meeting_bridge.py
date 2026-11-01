@@ -124,7 +124,6 @@ class MeetingBridge(QObject):
         self._stored, self._mirror, self._save = stored, mirror, save
         self._policy = policy or Policy()
         self._parsed = parse_policy(self._policy)
-        self._session = session
         self._store: MeetingListing = MeetingStore() if store is None else store
         self._apps = known_apps
         self._submit, self._clock = submit, clock
@@ -220,10 +219,6 @@ class MeetingBridge(QObject):
             PolicyCode.UNKNOWN_KEY,
         }
         return TEXTS["policyInvalid"] if invalid else ""
-
-    @pyqtProperty(str, notify=changed)
-    def flyWarning(self) -> str:
-        return TEXTS["flyWarning"] if self._session == SessionKind.FLY else ""
 
     @pyqtProperty("QVariantMap", constant=True)
     def texts(self) -> dict[str, str]:
