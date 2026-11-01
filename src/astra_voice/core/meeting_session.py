@@ -162,6 +162,7 @@ class MeetingController:
         id_factory: Callable[[], str] = lambda: new_meeting_id(datetime.now(UTC)),
         metadata_submit: Callable[[Callable[[], None]], None] | None = None,
         filesystem_submit: Callable[[Callable[[], None]], None] | None = None,
+        mic_device: Callable[[], str | None] = lambda: None,
     ) -> None:
         self.store, self.supervisor = store, supervisor
         self.session, self.session_kind, self.clock = session, session_kind, clock
@@ -171,6 +172,8 @@ class MeetingController:
             policy_allowed,
         )
         self.id_factory = id_factory
+        self._mic_device = mic_device
+        self._selected_mic: str | None = None
         writer = MetadataWriter()
         self._metadata_submit = metadata_submit or writer.submit
         self._filesystem_submit = filesystem_submit or writer.submit
@@ -272,6 +275,7 @@ class MeetingController:
         if not self._allowed(click_snapshot):
             return self._error("session-blocked")
         self._click_epoch = click_snapshot.blocked_epoch
+        self._selected_mic = self._mic_device()
         self.error_code = ""
         self._far = far or {"kind": "none"}
         self.far_available = self.mic_only_available = False
@@ -371,6 +375,7 @@ class MeetingController:
             segment_s=300,
             fsync_s=10,
             segment_index_from=0,
+            **({"mic_device": self._selected_mic} if self._selected_mic else {}),
         )
 
     def _freeze(self) -> None:

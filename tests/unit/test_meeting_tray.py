@@ -40,6 +40,13 @@ def test_meeting_actions_appear_only_when_user_enabled(harness: Harness) -> None
     assert labels(h) == before
 
 
+def test_m2_hides_record_entry_but_keeps_meetings_navigation(harness: Harness) -> None:
+    harness.tray.set_meeting_record_entry_enabled(False)
+    harness.tray.set_meetings_enabled(True)
+    assert "Записать встречу" not in labels(harness)
+    assert "Встречи…" in labels(harness)
+
+
 @pytest.mark.parametrize("paused", [False, True])
 def test_recording_menu_is_first_block_with_pause_stop_and_notice(
     harness: Harness, paused: bool

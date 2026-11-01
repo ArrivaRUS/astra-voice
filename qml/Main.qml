@@ -202,7 +202,8 @@ ApplicationWindow {
             }
 
             Column {
-                visible: window.currentSection.key === "meetings" && window.meetings !== null && window.meetings.enabled
+                visible: window.currentSection.key === "meetings" && window.meetings !== null
+                    && window.meetings.enabled && window.meetings.recordingDevEnabled === true
                 spacing: Theme.meetingSectionRecCaptionGap
                 AvButton {
                     objectName: "meetingRecord"
@@ -403,6 +404,56 @@ ApplicationWindow {
         onOpened: if (window.bridge) window.bridge.commandPreviewShown()
         onConfirmed: if (window.bridge) window.bridge.confirmCommand()
         onCancelled: if (window.bridge) window.bridge.rejectCommand()
+    }
+
+    StartDialog {
+        meeting: window.meetings
+        settings: window.bridge
+    }
+
+    AvDialog {
+        id: meetingInterruptedDialog
+        objectName: "meetingInterruptedDialog"
+        heading: window.meetings && window.meetings.startTexts !== undefined ? window.meetings.startTexts.interruptedTitle : ""
+        message: window.meetings && window.meetings.interruptedText !== undefined ? window.meetings.interruptedText : ""
+        confirmText: window.meetings && window.meetings.startTexts !== undefined ? window.meetings.startTexts.openMeetings : ""
+        cancelText: window.meetings && window.meetings.startTexts !== undefined ? window.meetings.startTexts.close : ""
+        safeConfirmation: true
+        iconName: "alert"
+        onConfirmed: {
+            if (window.meetings) window.meetings.openInterruptedMeetings()
+            sidebar.currentIndex = window.sectionIndices.meetings
+            recoveryShown = false
+            Qt.callLater(reconcile)
+        }
+        onCancelled: {
+            if (window.meetings) window.meetings.closeInterrupted()
+            recoveryShown = false
+            Qt.callLater(reconcile)
+        }
+        property bool recoveryShown: false
+        function reconcile() {
+            if (window.meetings && window.meetings.interruptedOpen === true) {
+                if (!recoveryShown) {
+                    recoveryShown = true
+                    if (!window.visible) {
+                        window.show()
+                        window.raise()
+                        window.requestActivate()
+                    }
+                    open()
+                }
+            } else {
+                recoveryShown = false
+                close()
+            }
+        }
+        Component.onCompleted: reconcile()
+    }
+
+    Connections {
+        target: window.meetings
+        function onChanged() { meetingInterruptedDialog.reconcile() }
     }
 
     AvDialog {

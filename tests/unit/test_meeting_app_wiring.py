@@ -17,7 +17,6 @@ from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.platform import userinstall
 from astra_voice.platform.session import SessionKind
-from astra_voice.ui.tray_icons import TrayState
 
 pytestmark = pytest.mark.unit
 
@@ -61,8 +60,9 @@ def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
     bridge.enabled, bridge.recording = True, True
     refresh()
     tray.set_meetings_enabled.assert_called_with(True)
-    tray.set_meeting_state.assert_called_with(TrayState.MEETING_REC)
-    assert tray.on_meeting_record == bridge.requestRecording
+    tray.set_meeting_state.assert_called_with(None)
+    tray.set_meeting_record_entry_enabled.assert_called_once_with(False)
+    assert tray.on_meeting_record == show
     tray.on_meeting_open()
     show.assert_called_once_with()
     assert not bridge.requestRecording.called

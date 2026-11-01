@@ -5,11 +5,12 @@ from __future__ import annotations
 import importlib
 import itertools
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
-from test_meeting_capture import Rig, wait_until
+from test_meeting_capture import Rig, Source, wait_until
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
@@ -207,13 +208,28 @@ def test_pause_reason_union_never_auto_resumes_over_lock(rig: Rig, order: tuple[
     rig.until("meeting.capture.started")
 
 
-def test_lease_keepalive_resumes_only_same_capture_without_other_reasons(rig: Rig) -> None:
+def test_lease_keepalive_resumes_only_same_capture_without_other_reasons(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shutdown = Source.shutdown
+
+    def delayed_shutdown(source: Source) -> None:
+        time.sleep(0.025)
+        shutdown(source)
+
+    monkeypatch.setattr(Source, "shutdown", delayed_shutdown)
     rig.prepare()
     rig.open()
     capture = rig.identity["capture_id"]
-    rig.clock.now += 5
+    last_lease = rig.state.last_lease
+    # Let the control loop observe lease expiry before its absolute close
+    # deadline; jumping directly to +5 incorrectly skips the whole budget.
+    rig.clock.now += 4
+    rig.poll()
     rig.until("meeting.capture.closed")
+    assert rig.state.close_mono_ms <= (last_lease + 5) * 1000
     rig.until("meeting.capture.finalized")
+    rig.clock.now += 1
     assert set(rig.state.pause_reasons) == {"lease"}
     assert not rig.state.manual_resume_required
     assert rig.send("keepalive", seq=1, capture_id="foreign")[0]["type"] == "error"
