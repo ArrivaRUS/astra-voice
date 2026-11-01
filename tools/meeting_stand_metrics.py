@@ -1,9 +1,11 @@
-"""Read-only, stdlib-only evidence for the E13.M2 isolated recording stand.
+"""Read-only evidence for the E13.M2 isolated recording stand.
 
 Architecture §5.7 inherits SP1 S1.5c's mean CPU budget (one core). Peak is
 reported separately. Hourly rates from short samples are projections; they do
 not satisfy the sixty-minute soak. Missing evidence always remains unavailable.
 No imports of production capture code or experimental spikes are permitted here.
+The pure product timeline is shared with M4/M7 so the beep gate measures the
+actual timestamp contract. Raw piecewise errors remain separately visible.
 """
 
 from __future__ import annotations
@@ -14,12 +16,16 @@ import math
 import os
 import re
 import stat
+import statistics
 import sys
 import wave
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from astra_voice.meetings.segments import SegmentSidecar
+from astra_voice.meetings.timeline import EpochTimeline, SegmentTimeline
 
 MIB = 1024**2
 JSON = dict[str, Any]
@@ -371,8 +377,19 @@ def _validate_sidecar(side: JSON) -> None:
         raise ValueError("invalid-clock-anchor")
 
 
-def sample_to_monotonic(side: JSON, sample: int) -> float:
-    """Map one epoch's absolute sample, with no extrapolation or gap crossing."""
+def sample_to_monotonic(side: JSON, sample: int) -> int:
+    """Single-segment product mapping; complete recordings reuse an epoch fit."""
+    _validate_sidecar(side)
+    return SegmentTimeline(
+        side["sample_start"],
+        side["sample_end"],
+        side["discontinuity"],
+        tuple((s, m) for s, m in side["timeline"]),
+    ).sample_to_monotonic(sample)
+
+
+def _raw_sample_to_monotonic(side: JSON, sample: int) -> float:
+    """Legacy piecewise diagnostic only; no extrapolation or gap crossing."""
     _validate_sidecar(side)
     if (
         type(sample) is not int
@@ -478,6 +495,123 @@ def _startup_placeholder(side: JSON) -> bool:
     )
 
 
+def _beep_error_fit(hours: Sequence[float], errors: Sequence[float]) -> JSON:
+    """OLS diagnostics, never an acceptance estimator or detector calibration.
+
+    x is hours since the first scheduled marker; y is a timestamp error in ms.
+    Sigma uses N (population RMS after fitting); the separate regression sigma
+    uses N-2. The slope SE assumes independent, homoscedastic residuals and is
+    NOT a confidence interval for the generally correlated timeline errors.
+    """
+    mean_x, mean_y = statistics.mean(hours), statistics.mean(errors)
+    sxx = sum((x - mean_x) ** 2 for x in hours)
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(hours, errors, strict=True)) / sxx
+    intercept = mean_y - slope * mean_x
+    residuals = [y - (intercept + slope * x) for x, y in zip(hours, errors, strict=True)]
+    squared = sum(r * r for r in residuals)
+    regression_sigma = math.sqrt(squared / (len(errors) - 2))
+    return {
+        "intercept_ms": intercept,
+        "slope_ms_per_hour": slope,
+        "span_change_ms": slope * (hours[-1] - hours[0]),
+        "residual_sigma_ms": math.sqrt(squared / len(errors)),
+        "residual_sigma_dof_ms": regression_sigma,
+        "residual_max_abs_ms": max(abs(r) for r in residuals),
+        "iid_slope_se_ms_per_hour": regression_sigma / math.sqrt(sxx),
+    }
+
+
+def _beep_minute_windows(elapsed_ms: Sequence[float], offsets: Sequence[float]) -> JSON:
+    """Fixed half-open 60s windows from first marker, without discarding startup.
+
+    A full window ends no later than the last observed marker and has >=3
+    expected/observed paired markers. All partial windows remain visible but
+    cannot contribute to full-window excursion statistics. A complete train is
+    validated by the caller; no unmatched or missing beep is filled in here.
+    """
+    groups: dict[int, list[float]] = {}
+    for elapsed, offset in zip(elapsed_ms, offsets, strict=True):
+        groups.setdefault(int(elapsed // 60000), []).append(offset)
+    items: list[JSON] = [
+        {
+            "start_s": index * 60,
+            "beep_count": len(values),
+            "complete": (index + 1) * 60000 <= elapsed_ms[-1] and len(values) >= 3,
+            "median_offset_ms": statistics.median(values),
+        }
+        for index, values in groups.items()
+    ]
+    full = [row["median_offset_ms"] for row in items if row["complete"]]
+    # Never silently move the baseline past an insufficient first window.
+    known = len(full) >= 2 and items[0]["complete"]
+    return {
+        "items": items,
+        "full_window_count": len(full),
+        "max_change_from_first_ms": max(abs(v - full[0]) for v in full) if known else None,
+        "range_ms": max(full) - min(full) if known else None,
+    }
+
+
+def beep_diagnostics(expected_ms: Sequence[float], mapped: Mapping[str, Sequence[float]]) -> JSON:
+    """Explain raw errors without subtracting a fitted trend from the raw gate.
+
+    Residuals combine playback/capture clock/timeline/detector effects. They are
+    NOT detector noise: onset accuracy requires a separate PCM experiment.
+    Ordered complete trains and a <half-spacing association are required here.
+    Even a long, small-slope fit cannot prove the <=50ms maximum-error contract.
+    """
+    unavailable: JSON = {"status": "unavailable", "fits": {}}
+    if (
+        len(expected_ms) < 3
+        or not all(_finite(v) for v in expected_ms)
+        or any(b <= a for a, b in zip(expected_ms, expected_ms[1:], strict=False))
+    ):
+        return unavailable
+    half_spacing = min(b - a for a, b in zip(expected_ms, expected_ms[1:], strict=False)) / 2
+    for track in ("mic", "far"):
+        values = mapped.get(track, ())
+        if (
+            len(values) != len(expected_ms)
+            or not all(_finite(v) for v in values)
+            or any(b <= a for a, b in zip(values, values[1:], strict=False))
+            or any(abs(v - e) >= half_spacing for v, e in zip(values, expected_ms, strict=True))
+        ):
+            return unavailable
+    elapsed = [v - expected_ms[0] for v in expected_ms]
+    hours = [v / 3600000 for v in elapsed]
+    errors = {
+        track: [v - e for v, e in zip(mapped[track], expected_ms, strict=True)]
+        for track in ("mic", "far")
+    }
+    errors["mic_minus_far"] = [a - b for a, b in zip(mapped["mic"], mapped["far"], strict=True)]
+    fits = {track: _beep_error_fit(hours, values) for track, values in errors.items()}
+    offsets = errors["mic_minus_far"]
+    worst = max(range(len(offsets)), key=lambda i: abs(offsets[i] - offsets[0]))
+    change = offsets[worst] - offsets[0]
+    trend = fits["mic_minus_far"]["slope_ms_per_hour"] * hours[worst]
+    return {
+        "status": "diagnostic",
+        "basis": (
+            "OLS; residual combines playback/capture clock/timeline/detector; not detector noise"
+        ),
+        "uncertainty": "iid slope SE is conditional; correlated errors invalidate an iid CI",
+        "beep_count": len(expected_ms),
+        "observed_span_s": elapsed[-1] / 1000,
+        "hourly_projection": elapsed[-1] < 3600000,
+        "fits": fits,
+        "raw_max_change_ms": abs(change),
+        "worst_change": {
+            "index": worst,
+            "elapsed_s": elapsed[worst] / 1000,
+            "initial_offset_ms": offsets[0],
+            "offset_ms": offsets[worst],
+            "trend_contribution_ms": trend,
+            "residual_change_ms": change - trend,
+        },
+        "minute_windows": _beep_minute_windows(elapsed, offsets),
+    }
+
+
 def analyze_recording(
     audio_root: Path,
     *,
@@ -493,6 +627,7 @@ def analyze_recording(
     """
     items: list[JSON] = []
     mapped: dict[str, list[float]] = {"mic": [], "far": []}
+    raw_mapped: dict[str, list[float]] = {"mic": [], "far": []}
     ends: dict[str, list[float]] = {"mic": [], "far": []}
     durable: dict[str, list[float]] = {"mic": [], "far": []}
     indexes: dict[str, list[int]] = {"mic": [], "far": []}
@@ -500,6 +635,8 @@ def analyze_recording(
     invalid = False
     clock_unknown = False
     beep_clock_unknown = False
+    raw_clock_unknown = False
+    prepared: list[tuple[JSON, list[int], JSON]] = []
     files = sorted(audio_root.glob("*.wav")) if not audio_root.is_symlink() else []
     for path in files:
         try:
@@ -515,58 +652,113 @@ def analyze_recording(
                 "frames_at_checkpoint": side["frames_at_checkpoint"],
                 "closed": side["closed"],
                 "beeps": len(beeps),
+                "beep_local_samples": beeps,
                 "valid": True,
             }
             if _startup_placeholder(side):
                 item["clock_status"] = "empty-startup-placeholder"
                 items.append(item)
                 continue
-            try:
-                # Legacy checkpoints could be written after the last clock
-                # knot. Bound loss by observed durable PCM, without inventing
-                # a clock for the remaining tail or joining different epochs.
-                last_sample = min(side["sample_end"], side["timeline"][-1][0])
-                ends[track].append(sample_to_monotonic(side, last_sample))
-                if last_sample < side["sample_end"]:
-                    item["clock_status"] = "partial"
-                    beep_clock_unknown = True
-                checkpoint_sample = side["sample_start"] + side["frames_at_checkpoint"]
-                durable_sample = min(checkpoint_sample, last_sample)
-                if durable_sample > side["sample_start"]:
-                    durable[track].append(sample_to_monotonic(side, durable_sample))
-                for sample in beeps:
-                    if sample < side["frames"]:
-                        if side["sample_start"] + sample <= last_sample:
-                            mapped[track].append(
-                                sample_to_monotonic(side, side["sample_start"] + sample)
-                            )
-                        else:
-                            beep_clock_unknown = True
-            except ValueError:
-                clock_unknown = True
-                item["clock_status"] = "unavailable"
+            prepared.append((side, beeps, item))
             items.append(item)
         except (OSError, ValueError, TypeError, KeyError, OverflowError, wave.Error, EOFError):
             invalid = True
             items.append({"file": path.name, "valid": False, "error": "invalid-segment-or-sidecar"})
+    # One product estimate for each continuous track/epoch. In particular,
+    # querying the sample shared by two files must use the SAME fitted clock.
+    groups: dict[tuple[str, str], list[JSON]] = {}
+    for side, _, _ in prepared:
+        groups.setdefault((side["track"], side["epoch_id"]), []).append(side)
+    epoch_maps: dict[tuple[str, str], EpochTimeline] = {}
+    for key, sides in groups.items():
+        try:
+            epoch_maps[key] = EpochTimeline.from_segments([SegmentSidecar(**s) for s in sides])
+        except (ValueError, TypeError, KeyError, OverflowError):
+            clock_unknown = True
+    for side, beeps, item in prepared:
+        track = side["track"]
+        # Preserve the original diagnostic even when a legacy seam prevents
+        # construction of a shared product clock. Never repair that seam.
+        try:
+            raw_mapped[track].extend(
+                _raw_sample_to_monotonic(side, side["sample_start"] + sample)
+                for sample in beeps
+                if sample < side["frames"]
+            )
+        except ValueError:
+            raw_clock_unknown = True
+        mapper = epoch_maps.get((track, side["epoch_id"]))
+        if mapper is None:
+            item["clock_status"] = "unavailable"
+            continue
+        item["mapping_method"] = mapper.mapping_method
+        try:
+            # Legacy checkpoints could be written after the last clock
+            # knot. Bound loss by observed durable PCM, without inventing
+            # a clock for the remaining tail or joining different epochs.
+            last_sample = min(side["sample_end"], side["timeline"][-1][0])
+            ends[track].append(mapper.sample_to_monotonic(last_sample))
+            if last_sample < side["sample_end"]:
+                item["clock_status"] = "partial"
+                beep_clock_unknown = True
+            checkpoint_sample = side["sample_start"] + side["frames_at_checkpoint"]
+            durable_sample = min(checkpoint_sample, last_sample)
+            if durable_sample > side["sample_start"]:
+                durable[track].append(mapper.sample_to_monotonic(durable_sample))
+            for sample in beeps:
+                if sample < side["frames"]:
+                    if side["sample_start"] + sample <= last_sample:
+                        mapped[track].append(
+                            mapper.sample_to_monotonic(side["sample_start"] + sample)
+                        )
+                    else:
+                        beep_clock_unknown = True
+        except ValueError:
+            clock_unknown = True
+            item["clock_status"] = "unavailable"
     if any(sorted(values) != list(range(len(values))) for values in indexes.values()):
         invalid = True
     if all(indexes.values()) and not all(frames.values()):
         invalid = True  # an empty WAV header does not prove recording survived
     segments = 1.0 if invalid else (0.0 if all(indexes.values()) else None)
     expected = list(expected_beeps_ms)
-    beep_known = (
+    expected_known = (
         not invalid
-        and not clock_unknown
-        and not beep_clock_unknown
         and len(expected) >= 2
         and all(_finite(value) for value in expected)
         and all(b > a for a, b in zip(expected, expected[1:], strict=False))
+    )
+    beep_known = (
+        expected_known
+        and not clock_unknown
+        and not beep_clock_unknown
         and all(len(mapped[track]) == len(expected) for track in mapped)
+    )
+    raw_known = (
+        expected_known
+        and not raw_clock_unknown
+        and all(len(raw_mapped[track]) == len(expected) for track in raw_mapped)
     )
     initial: float | None = None
     drift: float | None = None
     timecodes: float | None = None
+    # Validate the captured segment/epoch order before the legacy raw metric
+    # sorts marker times. Sorting must not manufacture diagnostic provenance.
+    diagnostics = (
+        beep_diagnostics(expected, mapped) if beep_known else {"status": "unavailable", "fits": {}}
+    )
+    raw_diagnostics = (
+        beep_diagnostics(expected, raw_mapped)
+        if raw_known
+        else {"status": "unavailable", "fits": {}}
+    )
+    raw_drift: float | None = None
+    if raw_known:
+        raw_offsets = [
+            mic - far
+            for mic, far in zip(sorted(raw_mapped["mic"]), sorted(raw_mapped["far"]), strict=True)
+        ]
+        raw_drift = max(abs(value - raw_offsets[0]) for value in raw_offsets)
     if beep_known:
         for values in mapped.values():
             values.sort()
@@ -605,7 +797,7 @@ def analyze_recording(
                     drift,
                     50.0,
                     "ms",
-                    detail="max mic/far clock offset change from first beep",
+                    detail="product epoch clock: max mic/far offset change from first beep",
                 ),
                 criterion(
                     "timecodes",
@@ -632,6 +824,17 @@ def analyze_recording(
         "expected_beeps_ms": expected,
         "beep_initial_offset_ms": initial,
         "beep_drift_ms": drift,
+        "beep_diagnostics": diagnostics,
+        "raw_beeps_mono_ms": raw_mapped,
+        "raw_beep_drift_ms": raw_drift,
+        "raw_beep_diagnostics": raw_diagnostics,
+        "raw_beep_drift_criterion": criterion(
+            "raw_beep_drift",
+            raw_drift,
+            50.0,
+            "ms",
+            detail="legacy piecewise diagnostic; historical failures remain visible",
+        ),
         "timecode_error_ms": timecodes,
         "crash_loss_ms": crash_loss,
         "crash_mono_ms": crash_mono_ms,

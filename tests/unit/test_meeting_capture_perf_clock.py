@@ -359,3 +359,38 @@ def test_two_track_queue_credits_are_independent_and_close_bypasses_pcm_budget(
     finally:
         release.set()
         rig.cleanup()
+
+
+@pytest.mark.parametrize("correction_ms", [-14, 11])
+def test_exact_rotation_preserves_shared_sample_clock(tmp_path: Path, correction_ms: int) -> None:
+    """T-453: a segment boundary is one sample, not a new clock observation.
+
+    Replay corrections seen at mic-0000/0001 and mic-0007/0008 in the
+    60-minute stand. The next read may adjust its endpoint, but must not
+    retroactively move the previous segment's final sample in the same epoch.
+    """
+    rig = Rig(tmp_path)
+    try:
+        rig.prepare("none")
+        rig.open()
+        archive = rig.state.archive
+        assert archive is not None
+        for end in range(1000, 300001, 1000):
+            assert archive.put("pcm", ("mic", b"\0" * 32000, ("pulse", end, 100000 + end), 0))
+            wait_until(lambda: archive.pending_bytes == 0)
+        assert archive.put(
+            "pcm", ("mic", b"\0" * 640, ("pulse", 300020, 400020 + correction_ms), 0)
+        )
+        wait_until(lambda: archive.pending_bytes == 0)
+        rig.stop()
+        first, second = [
+            json.loads(path.read_text())
+            for path in sorted((rig.directory / "audio").glob("mic-*.json"))
+        ]
+        assert first["epoch_id"] == second["epoch_id"]
+        assert first["sample_end"] == second["sample_start"] == 4800000
+        assert first["timeline"][-1] == second["timeline"][0]
+        assert second["clock_anchor"] == {"server_ms": 300000, "t_mono_ms": 400000}
+        assert second["timeline"][-1] == [4800320, 400020 + correction_ms]
+    finally:
+        rig.cleanup()

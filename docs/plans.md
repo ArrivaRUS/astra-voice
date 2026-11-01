@@ -846,6 +846,7 @@ M9 вынесен в январь/v1.1.1; odt/docx (+1 день Could вне 38)
 | `job.applied` | `{seq, revision}` + корреляция/идентичность | GUI → transcribe: применённая замена, кредит один раз; устойчивую ревизию пишет transcribe | M7 (Д5) |
 | `epoch_id` | уникальный id на открытие потока/смену часов | Capture → sidecar → timeline/transcribe/GUI-восстановитель | M2/M4 (Д11) |
 | `clock`, `clock_anchor` | enum источника; пара server timestamp ↔ CLOCK_MONOTONIC | Capture → sidecar → timeline; не время прихода Python-буфера | M2/M4 (Д11) |
+| `timeline` | прежние сырые пары отсчёт/моно, schema 1 без изменений | Capture → sidecar; читатели используют общий робастный линейный fit непрерывной эпохи при достаточной истории, иначе интерполяцию наблюдаемых узлов; эпохи и разрывы не объединяются | M2/M4/M7 (§5.3, Д11) |
 | Диапазон отсчётов (`sample_start`, `sample_end`) | uint полуинтервал в пределах epoch | Capture → sidecar → timeline | M2/M4 (Д11) |
 | `discontinuity`, `close_reason` | bool/диапазон разрыва; enum причины | Capture → sidecar/устойчивые границы → GUI `intervals/marks`; через разрыв не интерполировать | M2/M4 (Д11) |
 | `processing_status`, `cancelled` | enum pending/running/partial/succeeded/failed/cancelled; bool устойчивой отмены | GUI → meeting.json/очередь; transcribe сообщает исход → GUI | M4/M5 (Д6/Д12) |

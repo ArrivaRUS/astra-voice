@@ -59,6 +59,22 @@ def test_meetings_default_is_sixty_minutes_without_retained_processes(
     capsys.readouterr()
 
 
+def test_meetings_profile_reaches_only_explicit_stand_runner(
+    cli: tuple[Callable[[list[str]], int], list[dict[str, Any]]],
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    main, calls = cli
+    profile = tmp_path / "capture.pstats"
+    assert main(["meetings", "--stand", "--profile", str(profile), "--json"]) == 0
+    assert calls == [{"minutes": 60.0, "server": "pipewire", "keep": False, "profile": profile}]
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as error:
+        main(["meetings", "--profile", str(profile)])
+    assert error.value.code == 2
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("code", [0, 1, 2])
 def test_meetings_preserves_runner_verdict_and_return_code(
     cli: tuple[Callable[[list[str]], int], list[dict[str, Any]]],
@@ -102,3 +118,16 @@ def test_meetings_text_mode_reports_verdict(
     main, _calls = cli
     assert main(["meetings", "--stand"]) == 0
     assert "pass" in capsys.readouterr().out
+
+
+def test_profile_help_identifies_json_not_pstats(
+    cli: tuple[Callable[[list[str]], int], list[dict[str, Any]]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    main, _ = cli
+    with pytest.raises(SystemExit) as result:
+        main(["meetings", "--help"])
+    assert result.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "JSON capture-worker" in help_text
+    assert "pstats" not in help_text

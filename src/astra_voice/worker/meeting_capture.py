@@ -267,10 +267,17 @@ class _Archive:
             self._finish(track, "clock_change", owner)
         if track not in self.segments:
             # First sample precedes this end-of-buffer timestamp.
+            # Exact rotations share one sample with the completed segment.
+            # Reusing its clock preserves a single mapping in this epoch; the
+            # next read's latency correction belongs to its new endpoint only.
             start = (
-                stamp[0],
-                max(0, stamp[1] - len(data) // 32),
-                max(0, stamp[2] - len(data) // 32),
+                previous
+                if previous and not changed
+                else (
+                    stamp[0],
+                    max(0, stamp[1] - len(data) // 32),
+                    max(0, stamp[2] - len(data) // 32),
+                )
             )
             self._start(
                 track,

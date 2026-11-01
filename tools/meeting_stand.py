@@ -80,13 +80,37 @@ def private_environment(root: Path) -> dict[str, str]:
     return env
 
 
-def capture_command(fd: int, env: dict[str, str]) -> list[str]:
+def capture_profile_paths(profile: Path) -> dict[str, Path]:
+    return {
+        name: profile if name == "normal" else Path(f"{profile}.{name}")
+        for name in ("normal", "target-gone", "fallback", "crash")
+    }
+
+
+def capture_command(
+    fd: int,
+    env: dict[str, str],
+    *,
+    profile: Path | None = None,
+    profile_gate: Path | None = None,
+) -> list[str]:
     # exec env retains the supervisor's PID, new process group, and passed IPC FD.
+    command = worker_command(fd, role="meeting-capture")
+    if profile is not None:
+        if profile_gate is None:
+            raise ValueError("capture-profile-gate-required")
+        command = [
+            *command[:2],
+            str(Path(__file__).with_name("meeting_stand_profile.py").resolve()),
+            str(profile),
+            str(profile_gate),
+            *command[2:],
+        ]
     return [
         "/usr/bin/env",
         "-i",
         *(f"{key}={value}" for key, value in sorted(env.items())),
-        *worker_command(fd, role="meeting-capture"),
+        *command,
     ]
 
 
@@ -543,15 +567,22 @@ def write_signal(
 
 
 class Capture:
-    def __init__(self, owner: ProcessOwner, directory: Path) -> None:
+    def __init__(
+        self, owner: ProcessOwner, directory: Path, *, profile: Path | None = None
+    ) -> None:
         self.owner, self.directory = owner, directory
+        self.profile = profile
+        self.profile_gate = directory / ".profile-start"
+        self.profile_activated = False
         self.events: list[dict[str, Any]] = []
         self.identity: dict[str, Any] = {"meeting_id": directory.name, "meeting_generation": 1}
         self.supervisor = WorkerSupervisor(
             self.events.append,
             role="meeting-capture",
             use_qt=False,
-            command_factory=lambda fd: capture_command(fd, owner.env),
+            command_factory=lambda fd: capture_command(
+                fd, owner.env, profile=self.profile, profile_gate=self.profile_gate
+            ),
         )
         self.sequence = 0
         self.keepalive_at = 0.0
@@ -575,14 +606,41 @@ class Capture:
         )
         return req
 
-    def wait(self, kind: str, req: str | None = None, timeout: float = 6) -> dict[str, Any]:
+    def wait(
+        self, kind: str, req: str | None = None, timeout: float = 6, *, since: int = 0
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.owner.check_interrupt()
             self.supervisor.pump(0.05)
-            for event in self.events:
+            for event in self.events[since:]:
                 if event["type"] == "error":
-                    raise StandUnavailable("capture-operation-failed")
+                    phase = {
+                        "meeting.capture.prepared": "prepare",
+                        "meeting.capture.started": "open",
+                        "meeting.capture.finalized": "stop",
+                        "meeting.capture.bye": "shutdown",
+                        "meeting.capture.track": "track",
+                    }.get(kind, "wait")
+                    code = event.get("code")
+                    safe_codes = {
+                        "admission-stale",
+                        "audio-failed",
+                        "dir-unwritable",
+                        "limit",
+                        "io",
+                        "target-mismatch",
+                        "target-gone",
+                        "not-prepared",
+                        "timeout",
+                        "hello-timeout",
+                        "worker-crashed",
+                        "protocol",
+                        "worker-start",
+                    }
+                    if not isinstance(code, str) or code not in safe_codes:
+                        code = "unknown"
+                    raise StandUnavailable(f"capture-operation-failed:{phase}:{code}")
                 if event["type"] == kind and (req is None or event.get("req") == req):
                     for key in ("capture_id", "state_rev"):
                         if key in event:
@@ -608,7 +666,64 @@ class Capture:
         req = self.send(
             "meeting.capture.open", blocked_epoch=0, admission_mono_ms=int(time.monotonic() * 1000)
         )
-        self.wait("meeting.capture.started", req)
+        try:
+            self.wait("meeting.capture.started", req)
+        except StandUnavailable as exc:
+            if self.profile is not None:
+                self.finish_failed_profile(str(exc))
+            raise
+        if self.profile is not None:
+            self.activate_profile()
+
+    def activate_profile(self) -> None:
+        process = self.supervisor.process
+        if process is None or not self.owner._owned_group(process) or process.poll() is not None:
+            raise StandUnavailable("capture-profile-worker-unavailable")
+        fd = os.open(self.profile_gate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(f"start:{process.pid}")
+        os.kill(process.pid, signal.SIGUSR1)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            self.owner.check_interrupt()
+            self.tick()
+            try:
+                assert self.profile is not None
+                data = json.loads(self.profile.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("process_id") != process.pid:
+                continue
+            if data.get("status") == "running" and data.get("activated") is True:
+                self.profile_activated = True
+                return
+            if data.get("status") in {"activation-failed", "partial", "not-started"}:
+                raise StandUnavailable("capture-profile-activation-failed")
+        raise StandUnavailable("capture-profile-activation-timeout")
+
+    def finish_failed_profile(self, diagnostic: str) -> None:
+        # Retain the original safe open failure even if bounded shutdown fails.
+        # Earlier errors must not hide the new correlated shutdown reply.
+        process = self.supervisor.process
+        if process is None:
+            return
+        try:
+            since = len(self.events)
+            req = self.send("meeting.capture.shutdown")
+            self.wait("meeting.capture.bye", req, timeout=5, since=since)
+            process.wait(timeout=2)
+            self.supervisor.stop()
+            self.owner.terminate(process)
+            if self.profile is not None:
+                from tools.meeting_stand_profile import atomic_dump
+
+                data = json.loads(self.profile.read_text())
+                data["capture_error"] = diagnostic
+                atomic_dump(self.profile, data)
+        except (OSError, ValueError, StandUnavailable, subprocess.TimeoutExpired):
+            # run_stand's ProcessOwner still owns bounded cleanup; the previous
+            # atomic checkpoint remains useful even when shutdown is unavailable.
+            pass
 
     def tick(self) -> None:
         self.owner.check_interrupt()
@@ -626,11 +741,36 @@ class Capture:
         result = self.wait("meeting.capture.finalized", req, timeout=5)
         if result["status"] != "succeeded":
             raise StandFailure("capture-finalization-failed")
-        if self.supervisor.process is not None:
-            self.owner._owned_group(self.supervisor.process)
+        process = self.supervisor.process
+        if process is not None:
+            self.owner._owned_group(process)
+            if self.profile is not None:
+                # EOF -> restoring the default SIGTERM handler -> profile dump
+                # must finish before supervisor.stop can send another signal.
+                # Keep the handle: pump may reap it while receiving bye.
+                req = self.send("meeting.capture.shutdown")
+                self.wait("meeting.capture.bye", req, timeout=5)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    raise StandUnavailable("capture-profile-exit-timeout") from None
         self.supervisor.stop()
-        if self.supervisor.process is not None:
-            self.owner.terminate(self.supervisor.process)
+        if process is not None:
+            self.owner.terminate(process)
+            if self.profile is not None:
+                if process.returncode != 0:
+                    raise StandUnavailable("capture-profile-write-failed")
+                try:
+                    data = json.loads(self.profile.read_text())
+                except (OSError, ValueError):
+                    raise StandUnavailable("capture-profile-write-failed") from None
+                if (
+                    not isinstance(data, dict)
+                    or data.get("format") != "astra-capture-sampling-v1"
+                    or data.get("status")
+                    != ("complete" if self.profile_activated else "not-started")
+                ):
+                    raise StandUnavailable("capture-profile-incomplete")
 
     def intervals(self) -> list[dict[str, int]]:
         journal = json.loads((self.directory / "capture.json").read_text())
@@ -667,7 +807,9 @@ def _has_signal(directory: Path) -> bool:
     return True
 
 
-def exercise(owner: ProcessOwner, root: Path, minutes: float, server: str) -> dict[str, Any]:
+def exercise(
+    owner: ProcessOwner, root: Path, minutes: float, server: str, profile: Path | None = None
+) -> dict[str, Any]:
     from tools.meeting_stand_metrics import (
         ProcSampler,
         analyze_exclusivity,
@@ -691,8 +833,10 @@ def exercise(owner: ProcessOwner, root: Path, minutes: float, server: str) -> di
     criteria: list[dict[str, Any]] = []
     reports: dict[str, Any] = {}
 
-    def new_capture() -> Capture:
-        capture = Capture(owner, meeting_directory(root))
+    profiles = capture_profile_paths(profile) if profile is not None else {}
+
+    def new_capture(scenario: str) -> Capture:
+        capture = Capture(owner, meeting_directory(root), profile=profiles.get(scenario))
         capture.start()
         return capture
 
@@ -744,7 +888,7 @@ def exercise(owner: ProcessOwner, root: Path, minutes: float, server: str) -> di
     target = audio.target(far)
     audio.target(mic)
     normal_routes = audio.snapshot()
-    capture = new_capture()
+    capture = new_capture("normal")
     prepare(capture, target)
     capture.open()
     if time.monotonic() * 1000 >= started_ms + 9000:
@@ -767,7 +911,7 @@ def exercise(owner: ProcessOwner, root: Path, minutes: float, server: str) -> di
 
     # Target disappearance is separate from normal stop. The competing stream
     # has already been playing on the same sink and remains alive for >=10s.
-    lost = new_capture()
+    lost = new_capture("target-gone")
     prepare(lost, target, "target_loss_")
     lost.open()
     observe(lost, 0.5)
@@ -798,7 +942,7 @@ def exercise(owner: ProcessOwner, root: Path, minutes: float, server: str) -> di
     audio.target(a_far)
     audio.target(a_mic)
     fallback_routes = audio.snapshot()
-    fallback = new_capture()
+    fallback = new_capture("fallback")
     prepare(fallback, {"kind": "sink_monitor"}, "fallback_")
     fallback.open()
     observe(fallback, 6)
@@ -814,7 +958,7 @@ def exercise(owner: ProcessOwner, root: Path, minutes: float, server: str) -> di
     crash_target = audio.target(crash_far)
     audio.target(crash_mic)
     crash_routes = audio.snapshot()
-    crash = new_capture()
+    crash = new_capture("crash")
     prepare(crash, crash_target, "crash_")
     crash.open()
     observe(crash, 35)
@@ -895,7 +1039,10 @@ def _unavailable_criteria() -> list[dict[str, Any]]:
 
 
 def run_stand(
-    minutes: float = 60, server: str = "pipewire", keep: bool = False
+    minutes: float = 60,
+    server: str = "pipewire",
+    keep: bool = False,
+    profile: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     report: dict[str, Any] = {
         "server": server,
@@ -906,6 +1053,25 @@ def run_stand(
         "exit_code": 2,
         "verdict": "unavailable",
     }
+    if profile is not None:
+        profile = profile.absolute()
+        report["profiling"] = {
+            "paths": {name: str(path) for name, path in capture_profile_paths(profile).items()},
+            "format": "astra-capture-sampling-v1",
+            "timer": "proc-thread-cpu-ticks",
+            "backend": "stdlib-sampling",
+            "thread_start_fallback": "sections-only-final-counters",
+            "activation": "after-meeting.capture.started",
+            "startup_profiled": False,
+            "sections_timing": "inclusive-do-not-sum-nested-sections",
+            "section_timer": "time.thread_time",
+            "threads": "live-threads-excluding-sampler",
+            "interval_seconds": 0.1,
+            "cpu_attribution": "approximate-running-stack-only",
+            "checkpoint_interval_seconds": 1.0,
+            "resource_measurements_include_profiler_overhead": True,
+            "sigkill_dump_guaranteed": False,
+        }
     if not math.isfinite(minutes) or minutes <= 0 or server not in {"pipewire", "pulseaudio"}:
         report["diagnostics"] = ["invalid-arguments"]
         return 2, report
@@ -923,7 +1089,7 @@ def run_stand(
                 owner.env = private_environment(root)
             except OSError:
                 raise StandUnavailable("environment-create-failed") from None
-            report.update(exercise(owner, root, minutes, server))
+            report.update(exercise(owner, root, minutes, server, profile))
             owner.check_interrupt()
             rc = int(report.pop("rc"))
         except KeyboardInterrupt:

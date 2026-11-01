@@ -2999,7 +2999,8 @@ def meetings_stand(args: argparse.Namespace) -> int:
     """Run only the explicitly requested private audio stand, never host audio."""
     from tools.meeting_stand import run_stand
 
-    code, report = run_stand(minutes=args.minutes, server=args.server, keep=args.keep)
+    profiling = {"profile": args.profile} if args.profile is not None else {}
+    code, report = run_stand(minutes=args.minutes, server=args.server, keep=args.keep, **profiling)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, allow_nan=False))
     else:
@@ -3021,6 +3022,19 @@ def main(argv: list[str] | None = None) -> int:
     meetings_parser.add_argument("--minutes", type=positive_finite, default=60.0)
     meetings_parser.add_argument("--server", choices=("pipewire", "pulseaudio"), default="pipewire")
     meetings_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    meetings_parser.add_argument(
+        "--profile",
+        type=Path,
+        metavar="FILE",
+        help=(
+            "JSON capture-worker после meeting.capture.started "
+            "(точные inclusive CPU sections + sampling100ms; "
+            "если поток недоступен — только sections при завершении): "
+            "normal → FILE; дополнительные → "
+            "FILE.target-gone/.fallback/.crash (SIGKILL: последний checkpoint); "
+            "CPU включает накладные расходы профилировщика"
+        ),
+    )
     meetings_parser.add_argument(
         "--keep", action="store_true", help="оставить только артефакты стенда"
     )

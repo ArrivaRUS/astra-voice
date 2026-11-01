@@ -19,6 +19,42 @@ from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 
+class _Timeval(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long)]
+
+
+class _TimingInfo(ctypes.Structure):
+    # Public pa_timing_info ABI from pulse/def.h (including its complete tail).
+    _fields_ = [
+        ("timestamp", _Timeval),
+        ("synchronized_clocks", ctypes.c_int),
+        ("sink_usec", ctypes.c_uint64),
+        ("source_usec", ctypes.c_uint64),
+        ("transport_usec", ctypes.c_uint64),
+        ("playing", ctypes.c_int),
+        ("write_index_corrupt", ctypes.c_int),
+        ("write_index", ctypes.c_int64),
+        ("read_index_corrupt", ctypes.c_int),
+        ("read_index", ctypes.c_int64),
+        ("configured_sink_usec", ctypes.c_uint64),
+        ("configured_source_usec", ctypes.c_uint64),
+        ("since_underrun", ctypes.c_int64),
+    ]
+
+
+_TimingCallback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+_CLOCK_MAX_AGE_US = 3000000  # AUTO_TIMING_UPDATE's maximum interval is 1.5s.
+_CLOCK_JITTER_US = 50000
+
+
+@dataclass(frozen=True)
+class _ClockObservation:
+    observed_us: int
+    sample_us: int
+    write_index: int
+    wall_offset_us: int
+
+
 @dataclass(frozen=True)
 class Target:
     index: int
@@ -250,6 +286,11 @@ def _meeting_pulse_type() -> Any:
                 "pa_proplist_gets": (ctypes.c_char_p, [ctypes.c_void_p, ctypes.c_char_p]),
                 "pa_proplist_free": (None, [ctypes.c_void_p]),
                 "pa_stream_get_time": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_void_p]),
+                "pa_stream_get_timing_info": (ctypes.POINTER(_TimingInfo), [ctypes.c_void_p]),
+                "pa_stream_set_latency_update_callback": (
+                    None,
+                    [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p],
+                ),
                 "pa_context_get_server_info": (
                     ctypes.c_void_p,
                     [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p],
@@ -276,9 +317,83 @@ def _meeting_pulse_type() -> Any:
             if self.monitor_supported:
                 lib.pa_stream_set_monitor_stream.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
                 lib.pa_stream_set_monitor_stream.restype = ctypes.c_int
+            self.clock_observations: dict[int, _ClockObservation] = {}
+            self.clock_wall_offset_us = (time.time_ns() - time.monotonic_ns()) // 1000
+            self.clock_valid_after_us = 0
+            # Hold the ctypes callback until every stream has been unregistered.
+            self.timing_callback = _TimingCallback(self._timing_updated)
             self.token = uuid.uuid4().hex
             self.admission_check: Callable[[], bool] = lambda: True
             self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
+
+        def _timing_updated(self, stream: int, userdata: Any) -> None:
+            # Pulse computes transport at dispatch, before calling this callback.
+            # It includes mainloop delay. Avoid get_time/get_latency: both contain
+            # the same per-stream smoother, whose error would enter our timeline.
+            self.clock_observations.pop(stream, None)
+            now = time.monotonic_ns() // 1000
+            wall = time.time_ns() // 1000
+            offset = wall - now
+            shifted = abs(offset - self.clock_wall_offset_us) > _CLOCK_JITTER_US
+            self.clock_wall_offset_us = offset
+            if shifted:
+                self.clock_valid_after_us = now
+            pointer = self.lib.pa_stream_get_timing_info(stream)
+            if not pointer or shifted:
+                return
+            info = pointer.contents
+            # 'playing' describes playback underruns, not recording validity.
+            timestamp = info.timestamp.tv_sec * 1000000 + info.timestamp.tv_usec
+            if (
+                not info.synchronized_clocks
+                or info.write_index_corrupt
+                or info.read_index_corrupt
+                or info.write_index < 0
+                or info.read_index < 0
+                or info.transport_usec > _CLOCK_MAX_AGE_US
+                or abs(wall - timestamp - info.transport_usec) > _CLOCK_JITTER_US
+            ):
+                return
+            observed = now - info.transport_usec
+            # More than one timing request may predate a wall-clock jump. The
+            # next delayed reply must not restore a pre-jump observation merely
+            # because the current wall/mono offset has already been updated.
+            if observed < self.clock_valid_after_us:
+                return
+            self.clock_observations[stream] = _ClockObservation(
+                observed,
+                observed - info.source_usec + info.sink_usec,
+                info.write_index,
+                offset,
+            )
+
+        def capture_clock(self, stream: int, buffered: int) -> tuple[int, int] | None:
+            observation = self.clock_observations.get(stream)
+            now = time.monotonic_ns() // 1000
+            wall_offset = time.time_ns() // 1000 - now
+            if (
+                observation is None
+                or not 0 <= now - observation.observed_us <= _CLOCK_MAX_AGE_US
+                or abs(wall_offset - observation.wall_offset_us) > _CLOCK_JITTER_US
+            ):
+                return None
+            pointer = self.lib.pa_stream_get_timing_info(stream)
+            if (
+                not pointer
+                or pointer.contents.read_index_corrupt
+                or pointer.contents.write_index_corrupt
+            ):
+                return None
+            delivered = pointer.contents.read_index - buffered
+            if delivered < 0:
+                return None
+            mono = observation.sample_us + (delivered - observation.write_index) * 1000000 // 32000
+            return delivered * 1000 // 32000, max(0, mono // 1000)
+
+        def stream_unref(self, stream: int) -> None:
+            self.lib.pa_stream_set_latency_update_callback(stream, None, None)
+            self.clock_observations.pop(stream, None)
+            super().stream_unref(stream)
 
         def peek(self, stream: int) -> bytes | int | None:
             fragment = super().peek(stream)
@@ -303,10 +418,15 @@ def _meeting_pulse_type() -> Any:
                 with self.admission_guard():
                     if not self.admission_check():
                         raise ValueError("admission-stale")
-                    return cast(
+                    stream = cast(
                         int | None,
                         self.lib.pa_stream_new_with_proplist(ctx, b"meeting", spec, None, prop),
                     )
+                    if stream:
+                        self.lib.pa_stream_set_latency_update_callback(
+                            stream, self.timing_callback, None
+                        )
+                    return stream
             finally:
                 self.lib.pa_proplist_free(prop)
 
@@ -577,15 +697,16 @@ class NativePulse:
 
 
 def _sample_clock(pulse: Any, stream: int, buffered: int, owner: Any) -> tuple[str, int, int]:
-    """Map the delivered sample end using current server time and signed latency.
-
-    Pulse time is in the card clock domain (not monotonic seconds). Re-anchor
-    each observation rather than assuming this domain ticks at exactly 1 MHz.
-    get_latency includes native queued data; only our Python queue is extra.
-    """
+    """Use fresh unsmoothed server observations; missing timing is explicit local time."""
+    observed = pulse.capture_clock(stream, buffered)
+    if observed is not None:
+        server, mono = observed
+        owner.anchor = (server, mono)
+        return "pulse", server, mono
+    # Local fallback cannot claim server accuracy. Native readable bytes are in
+    # get_latency already; the undelivered Python queue is the only extra delay.
     now = time.monotonic_ns() // 1000000
-    usec, latency, negative = ctypes.c_uint64(), ctypes.c_uint64(), ctypes.c_int()
-    server_ok = pulse.lib.pa_stream_get_time(stream, ctypes.byref(usec)) >= 0
+    latency, negative = ctypes.c_uint64(), ctypes.c_int()
     latency_ok = (
         pulse.stream_get_latency(stream, ctypes.byref(latency), ctypes.byref(negative)) >= 0
     )
@@ -593,11 +714,7 @@ def _sample_clock(pulse: Any, stream: int, buffered: int, owner: Any) -> tuple[s
         (-(latency.value // 1000) if negative.value else latency.value // 1000) if latency_ok else 0
     )
     mono = max(0, now - delay - buffered * 1000 // 32000)
-    if not server_ok or not latency_ok:
-        return "monotonic", mono, mono
-    server = max(0, usec.value // 1000 - delay - buffered * 1000 // 32000)
-    owner.anchor = (server, mono)
-    return "pulse", server, mono
+    return "monotonic", mono, mono
 
 
 def microphone_source() -> Any:

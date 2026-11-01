@@ -59,6 +59,7 @@ def recording(
         stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
         stream.writeframes(samples.tobytes())
     side: dict[str, Any] = {
+        "meeting_id": "2026-10-31_120000-ab12",
         "schema": 1,
         "track": track,
         "rate": 16000,
@@ -181,6 +182,7 @@ def test_missing_beep_or_discontinuous_epoch_is_unavailable(tmp_path: Path) -> N
     report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100.0, 11100.0])
     assert statuses(report)["beep_drift"] == "unavailable"
     assert statuses(report)["timecodes"] == "unavailable"
+    assert report["beep_diagnostics"]["status"] == "unavailable"
 
 
 def test_no_files_and_no_crash_time_never_pass(tmp_path: Path) -> None:
@@ -512,3 +514,253 @@ def test_exclusivity_requires_mapped_quiet_pcm(tmp_path: Path, problem: str) -> 
     assert statuses(report)["farforeign_rms_dbfs"] == "unavailable"
     assert report["farforeign_rms_dbfs"] is None
     assert module.verdict(report["criteria"]) == 2
+
+
+def test_beep_diagnostics_separates_known_hourly_drift_from_residual() -> None:
+    expected = [float(i * 60000) for i in range(61)]
+    mapped = {"mic": [t + 120 + i for i, t in enumerate(expected)], "far": expected}
+    report = module.beep_diagnostics(expected, mapped)
+    fit = report["fits"]["mic_minus_far"]
+    assert fit["slope_ms_per_hour"] == pytest.approx(60)
+    assert fit["span_change_ms"] == pytest.approx(60)
+    assert fit["residual_sigma_ms"] == pytest.approx(0, abs=1e-9)
+    assert report["raw_max_change_ms"] == pytest.approx(60)
+    assert report["hourly_projection"] is False
+    assert report["status"] == "diagnostic"
+    assert "criteria" not in report  # a fitted slope must never replace the raw gate
+
+
+def test_beep_diagnostics_symmetric_25ms_noise_has_no_trend() -> None:
+    expected = [float(i * 60000) for i in range(61)]
+    noise = [25.0 if i % 2 else -25.0 for i in range(61)]
+    mapped = {"mic": [t + n for t, n in zip(expected, noise, strict=True)], "far": expected}
+    report = module.beep_diagnostics(expected, mapped)
+    fit = report["fits"]["mic_minus_far"]
+    assert fit["slope_ms_per_hour"] == pytest.approx(0, abs=1e-9)
+    assert fit["residual_sigma_ms"] == pytest.approx(25, abs=0.01)
+    assert report["raw_max_change_ms"] == 50
+    assert report["status"] == "diagnostic"
+
+
+@pytest.mark.parametrize("case", ["early-step", "first-outlier", "last-outlier"])
+def test_beep_diagnostics_never_hides_steps_or_endpoint_outliers(case: str) -> None:
+    expected = [float(i * 60000) for i in range(61)]
+    offsets = [0.0] * 61
+    if case == "early-step":
+        offsets[1:] = [70.0] * 60
+    else:
+        offsets[0 if case == "first-outlier" else -1] = 70.0
+    report = module.beep_diagnostics(
+        expected,
+        {"mic": [t + n for t, n in zip(expected, offsets, strict=True)], "far": expected},
+    )
+    assert report["raw_max_change_ms"] == 70
+    assert report["fits"]["mic_minus_far"]["residual_max_abs_ms"] > 50
+    worst = report["worst_change"]
+    assert worst["trend_contribution_ms"] + worst["residual_change_ms"] == pytest.approx(
+        worst["offset_ms"] - worst["initial_offset_ms"]
+    )
+
+
+def test_beep_diagnostics_short_span_labels_hourly_projection() -> None:
+    expected = [10000.0 + i * 5000 for i in range(21)]
+    report = module.beep_diagnostics(
+        expected, {"mic": [t + i / 12 for i, t in enumerate(expected)], "far": expected}
+    )
+    assert report["hourly_projection"] is True
+    assert report["observed_span_s"] == 100
+    assert report["fits"]["mic_minus_far"]["slope_ms_per_hour"] == pytest.approx(60)
+    assert report["status"] == "diagnostic"
+
+
+@pytest.mark.parametrize("problem", ["few", "missing", "unordered", "nonfinite", "ambiguous"])
+def test_beep_diagnostics_missing_or_ambiguous_evidence_is_unavailable(problem: str) -> None:
+    expected = [10000.0, 15000.0, 20000.0]
+    mapped = {"mic": expected.copy(), "far": expected.copy()}
+    if problem == "few":
+        expected = expected[:2]
+        mapped = {t: v[:2] for t, v in mapped.items()}
+    elif problem == "missing":
+        mapped["mic"].pop()
+    elif problem == "unordered":
+        mapped["mic"].reverse()
+    elif problem == "nonfinite":
+        mapped["mic"][0] = float("nan")
+    else:
+        mapped["mic"] = [t + 2500 for t in expected]  # half spacing: identity ambiguous
+    report = module.beep_diagnostics(expected, mapped)
+    assert report["status"] == "unavailable"
+    assert not report["fits"]
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize("phase", range(16))
+def test_pcm_detector_sample_resolution_is_not_20ms_window_jitter(
+    tmp_path: Path, phase: int
+) -> None:
+    recording(tmp_path, "mic")
+    onsets = [1600 + phase, 17600 + phase]
+    samples = array.array("h", [0] * 32000)
+    for onset in onsets:
+        for i in range(1600):
+            samples[onset + i] = round(12000 * math.sin(2 * math.pi * (i + phase) / 16))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    path = tmp_path / "mic-0000.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(samples.tobytes())
+    _, detected = module._read_segment(path, crash=False)
+    assert len(detected) == 2
+    assert all(0 <= d - onset <= 1 for d, onset in zip(detected, onsets, strict=True))
+    assert detected[1] - detected[0] == 16000
+
+
+def test_beep_diagnostics_minute_windows_preserve_nonlinear_error() -> None:
+    expected = [float(i * 5000) for i in range(37)]
+    offsets = [0.0] * 12 + [75.0] * 12 + [0.0] * 13
+    report = module.beep_diagnostics(
+        expected,
+        {"mic": [t + n for t, n in zip(expected, offsets, strict=True)], "far": expected},
+    )
+    windows = report["minute_windows"]
+    assert windows["full_window_count"] == 3
+    assert [row["beep_count"] for row in windows["items"]] == [12, 12, 12, 1]
+    assert [row["complete"] for row in windows["items"]] == [True, True, True, False]
+    assert windows["max_change_from_first_ms"] == 75
+    assert windows["range_ms"] == 75
+    assert windows["items"][0]["median_offset_ms"] == 0
+
+
+def test_beep_diagnostics_partial_minute_is_not_full_window_evidence() -> None:
+    expected = [float(i * 5000) for i in range(21)]
+    offsets = [0.0] * 12 + [80.0] * 9
+    report = module.beep_diagnostics(
+        expected,
+        {"mic": [t + n for t, n in zip(expected, offsets, strict=True)], "far": expected},
+    )
+    windows = report["minute_windows"]
+    assert windows["full_window_count"] == 1
+    assert windows["max_change_from_first_ms"] is None
+    assert windows["range_ms"] is None
+    assert windows["items"][-1]["median_offset_ms"] == 80
+    assert report["raw_max_change_ms"] == 80
+
+
+def test_recording_adds_diagnostics_without_replacing_raw_failure(tmp_path: Path) -> None:
+    recording(tmp_path, "mic", beeps=(100, 670, 1100))
+    recording(tmp_path, "far", beeps=(100, 600, 1100))
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100.0, 10600.0, 11100.0])
+    assert report["beep_drift_ms"] == pytest.approx(70)
+    assert statuses(report)["beep_drift"] == "fail"
+    fit = report["beep_diagnostics"]["fits"]["mic_minus_far"]
+    assert fit["slope_ms_per_hour"] == pytest.approx(0, abs=1e-7)
+    assert report["beep_diagnostics"]["hourly_projection"] is True
+    assert all(len(s["beep_local_samples"]) == 3 for s in report["segments"])
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+def test_recording_diagnostics_validates_epoch_order_before_legacy_sort(
+    tmp_path: Path, ordered: bool
+) -> None:
+    starts = [10000, 15000, 20000] if ordered else [20000, 10000, 15000]
+    for track in ("mic", "far"):
+        # Descending file creation preserves the helper's fixed 0000 filename.
+        for index in reversed(range(3)):
+            recording(
+                tmp_path,
+                track,
+                shift_ms=starts[index] - 10000,
+                beeps=(0,),
+                epoch=f"{track}-epoch-{index}",
+                sample_start=0,
+            )
+            old = tmp_path / f"{track}-0000.wav"
+            side = json.loads(old.with_suffix(".json").read_text())
+            side["index"] = index
+            old.with_suffix(".json").write_text(json.dumps(side))
+            if index:
+                new = tmp_path / f"{track}-{index:04d}.wav"
+                old.rename(new)
+                old.with_suffix(".json").rename(new.with_suffix(".json"))
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=[10000.0, 15000.0, 20000.0])
+    # The old gate deliberately remains unchanged in this diagnostics-only fix.
+    assert statuses(report)["beep_drift"] == "pass"
+    assert report["beep_drift_ms"] == 0
+    assert report["beep_diagnostics"]["status"] == ("diagnostic" if ordered else "unavailable")
+
+
+def test_beep_gate_uses_shared_product_epoch_clock_and_keeps_raw_failure(tmp_path: Path) -> None:
+    from astra_voice.meetings.segments import ClockAnchor, SegmentSidecar
+    from astra_voice.meetings.timeline import EpochTimeline
+
+    expected = [105000.0, 135000.0, 165000.0, 195000.0]
+    epochs: dict[str, EpochTimeline] = {}
+    for track, sign in (("mic", 1), ("far", -1)):
+        sides = []
+        for index in range(2):
+            samples = array.array("h", [0]) * 960000
+            for second in (5, 35):
+                samples[second * 16000] = 16000
+            if sys.byteorder != "little":
+                samples.byteswap()
+            path = tmp_path / f"{track}-{index:04d}.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                stream.writeframes(samples.tobytes())
+            points = [
+                [t * 16000, 100000 + t * 1000 + sign * (40 if t % 4 < 2 else -40)]
+                for t in range(index * 60, (index + 1) * 60 + 1)
+            ]
+            side = SegmentSidecar(
+                meeting_id="2026-10-31_120000-ab12",
+                epoch_id=f"{track}-epoch",
+                track=track,
+                index=index,
+                frames=960000,
+                frames_at_checkpoint=960000,
+                sample_start=index * 960000,
+                sample_end=(index + 1) * 960000,
+                timeline=points,
+                closed=True,
+                opened_t_mono_ms=points[0][1],
+                clock_anchor=ClockAnchor(0, points[0][1]),
+            )
+            sides.append(side)
+            path.with_suffix(".json").write_text(json.dumps(side.to_dict()))
+        epochs[track] = EpochTimeline.from_segments(sides)
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=expected)
+    assert report["raw_beep_drift_ms"] == 160
+    assert report["raw_beep_drift_criterion"]["status"] == "fail"
+    assert statuses(report)["beep_drift"] == "pass"
+    for track in ("mic", "far"):
+        assert report["beeps_mono_ms"][track] == [
+            epochs[track].sample_to_monotonic(int((v - 100000) * 16)) for v in expected
+        ]
+    assert all(row["mapping_method"] == "robust-linear" for row in report["segments"])
+
+
+def test_rejected_epoch_keeps_historical_raw_diagnostics(tmp_path: Path) -> None:
+    for track in ("mic", "far"):
+        for index in reversed(range(2)):
+            recording(
+                tmp_path,
+                track,
+                shift_ms=index * 2000 + (80 if track == "mic" and index else 0),
+                sample_start=index * 32000,
+                beeps=(100,),
+            )
+            path = tmp_path / f"{track}-0000.wav"
+            side = json.loads(path.with_suffix(".json").read_text())
+            side["index"] = index
+            path.with_suffix(".json").write_text(json.dumps(side))
+            if index:
+                destination = tmp_path / f"{track}-{index:04d}.wav"
+                path.rename(destination)
+                path.with_suffix(".json").rename(destination.with_suffix(".json"))
+    report = module.analyze_recording(tmp_path, expected_beeps_ms=[10100, 12100])
+    assert statuses(report)["beep_drift"] == "unavailable"
+    assert report["beep_drift_ms"] is None
+    assert report["raw_beep_drift_ms"] == pytest.approx(80)
+    assert report["raw_beep_drift_criterion"]["status"] == "fail"
+    assert all(len(values) == 2 for values in report["raw_beeps_mono_ms"].values())
