@@ -282,7 +282,7 @@ def test_recording_flag_gates_disable_and_emits_only_stub(
     assert len(spy) == 1 and bridge.enabled and bridge.sectionState == "recording"
 
 
-def test_d1_organization_and_fly_warning(
+def test_d1_organization_and_fly_has_no_lock_warning(
     bridge_factory: Callable[..., MeetingBridge],
 ) -> None:
     personal = bridge_factory()
@@ -291,8 +291,9 @@ def test_d1_organization_and_fly_warning(
     )
     assert personal.responsibilityParagraph == TEXTS["d1Personal"]
     assert organization.responsibilityParagraph == TEXTS["d1Organization"]
-    assert not personal.flyWarning
-    assert organization.flyWarning == "Во время записи блокировка экрана не ставит запись на паузу"
+    assert personal.metaObject().indexOfProperty("flyWarning") == -1
+    assert organization.metaObject().indexOfProperty("flyWarning") == -1
+    assert "flyWarning" not in organization.texts
 
 
 def test_literal_strings_match_design_spec() -> None:
@@ -300,8 +301,6 @@ def test_literal_strings_match_design_spec() -> None:
     # The spec nests „…“ inside quoted UI text; the UI uses standalone «…».
     flat = re.sub(r"\s+", " ", spec).replace("„", "«").replace("“", "»")
     for key, text in TEXTS.items():
-        if key == "flyWarning":
-            continue  # Owner's 29.10 decision supersedes the earlier Fly table.
         assert re.sub(r"\s+", " ", text) in flat, key
     for item in RESPONSIBILITY_ITEMS:
         item_title, item_text = item["title"], item["text"]

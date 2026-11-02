@@ -142,10 +142,6 @@ class Bridge(QObject):
             else ""
         )
 
-    @pyqtProperty(str, notify=changed)
-    def flyWarning(self) -> str:
-        return ""
-
     @pyqtProperty(bool, notify=changed)
     def responsibilityOpen(self) -> bool:
         return self.dialog

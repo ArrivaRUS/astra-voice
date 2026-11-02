@@ -783,18 +783,46 @@ def _make_meeting_bridge(
         return None
 
 
+def _bind_meeting_recording(
+    bridge: Any, settings_bridge: Any, session_kind: SessionKind, runtime: Any | None = None
+) -> None:
+    """M2 GUI adapter; recovery is inert and capture requires the explicit dev click."""
+    from astra_voice.ui.meeting_recording import MeetingRecording
+
+    options: dict[str, Any] = {}
+    if runtime is not None:
+
+        def monitor() -> Any:
+            runtime._ensure_session_monitor()
+            return runtime._command_session
+
+        options.update(session_factory=monitor, owns_session=False)
+    recording = MeetingRecording(
+        bridge._store,
+        enabled=lambda: bridge.enabled,
+        policy_allowed=lambda: bridge.canEnable,
+        session_kind=session_kind,
+        microphone=lambda: settings_bridge.device or None,
+        parent=bridge,
+        **options,
+    )
+    bridge.bindRecording(recording)
+    recording.initialize()
+
+
 def _wire_tray_meetings(
     tray: Any, bridge: Any, show_meetings: Callable[[], None]
 ) -> Callable[[], None]:
     """Publish effective visibility and test-only recording flags, without IPC."""
-    from astra_voice.ui.tray_icons import TrayState
 
     def refresh() -> None:
         tray.set_meetings_enabled(bridge.enabled)
-        tray.set_meeting_state(TrayState.MEETING_REC if bridge.recording else None)
+        # The public recording controls and indicator guard ship together in M3.
+        tray.set_meeting_state(None)
 
     bridge.changed.connect(refresh)
-    tray.on_meeting_record = bridge.requestRecording
+    tray.set_meeting_record_entry_enabled(False)
+    tray.on_meeting_record = show_meetings
     tray.on_meeting_open = show_meetings
     refresh()
 
@@ -1961,12 +1989,19 @@ def main(argv: list[str] | None = None) -> int:
             QQmlEngine.setObjectOwnership(meeting_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "meetingBridge", meeting_bridge)
             settings_bridge.offlineChanged.connect(meeting_bridge.changed.emit)
+            _bind_meeting_recording(
+                meeting_bridge,
+                settings_bridge,
+                session_kind,
+                runtime if runtime_ready else None,
+            )
+
+            def show_meetings() -> None:
+                focuser.focus_shell()
+                app_info.show_section(SECTION_MEETINGS)
+
+            meeting_bridge.openMeetingsRequested.connect(show_meetings)
             if runtime_ready and runtime is not None:
-
-                def show_meetings() -> None:
-                    focuser.focus_shell()
-                    app_info.show_section(SECTION_MEETINGS)
-
                 meeting_tray_disconnect = _wire_tray_meetings(
                     runtime.tray, meeting_bridge, show_meetings
                 )

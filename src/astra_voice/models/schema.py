@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import NoReturn
+from functools import lru_cache
+from typing import Any, NoReturn
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +39,17 @@ def require_available() -> None:
         raise SchemaUnavailable("Несовместимая версия jsonschema.") from None
 
 
+@lru_cache(maxsize=128)
+def _check_schema(validator_class: Any, encoded: str) -> None:
+    """Cache only successful meta-validation of an exact schema snapshot.
+
+    Keys include the validator class and JSON content, never mutable identity.
+    Resolvers and validators remain per-call because their state is not shared
+    safely across the capture/control/storage threads.
+    """
+    validator_class.check_schema(json.loads(encoded))
+
+
 def validate(document: object, schema: object) -> None:
     """Проверяет документ по схеме; удалённые ссылки в схеме запрещены."""
     try:
@@ -62,16 +75,24 @@ def validate(document: object, schema: object) -> None:
                     raise ref_resolution_error("Удалённые ссылки в схеме каталога запрещены.")
 
             cls = jsonschema.Draft202012Validator
-            cls.check_schema(schema)
-            resolver = _LocalRefResolver.from_schema(schema)
+            # Snapshot before checking/using it: later in-place edits must not
+            # reuse a successful check for different content.
+            encoded = json.dumps(schema, ensure_ascii=True, allow_nan=False, sort_keys=True)
+            snapshot = json.loads(encoded)
+            if snapshot != schema:
+                # Do not make invalid Python schemas valid by JSON coercion
+                # (for example required=("id",) becoming required=["id"]).
+                raise SchemaInvalid("Каталог не соответствует схеме.")
+            _check_schema(cls, encoded)
+            resolver = _LocalRefResolver.from_schema(snapshot)
             resolver.handlers.update(
                 dict.fromkeys(("http", "https", "ftp", "file", "data"), resolver.resolve_remote)
             )
-            validator = cls(schema, resolver=resolver, format_checker=cls.FORMAT_CHECKER)
+            validator = cls(snapshot, resolver=resolver, format_checker=cls.FORMAT_CHECKER)
         except (AttributeError, TypeError):
             raise SchemaUnavailable("Несовместимая версия jsonschema.") from None
         validator.validate(document)
-    except (AttributeError, TypeError):
+    except (AttributeError, TypeError, ValueError):
         raise SchemaInvalid("Каталог не соответствует схеме.") from None
     except (
         jsonschema.ValidationError,

@@ -58,12 +58,6 @@ Column {
         body: root.bridge && root.bridge.saveError !== undefined ? root.bridge.saveError : ""
     }
 
-    NoteBanner {
-        visible: root.bridge ? root.bridge.flyWarning !== "" : false
-        variant: "warn"
-        iconName: "alert"
-        body: root.bridge ? root.bridge.flyWarning : ""
-    }
 
     Rectangle {
         id: entry
@@ -286,26 +280,58 @@ Column {
                     Rectangle {
                         objectName: "meetingBadge"
                         readonly property string kind: meetingRow.row.badgeKind
+                        readonly property string symbol: meetingRow.row.badge.indexOf("● ") === 0 ? "rec" : meetingRow.row.badge.indexOf("‖ ") === 0 ? "pause" : ""
+                        readonly property string label: symbol !== "" ? meetingRow.row.badge.slice(2) : meetingRow.row.badge
+                        readonly property int timerAt: symbol !== "" ? label.indexOf(" · ") : -1
                         color: kind === "success" ? Theme.successBg : (kind === "danger" || kind === "error") ? Theme.dangerBg : kind === "warning" ? Theme.warningBg : kind === "primary" ? Theme.primaryBg : Theme.bgSurface2
                         radius: Theme.badgeRadius
                         implicitWidth: badgeLabel.implicitWidth + Theme.badgePaddingX * 2
                         implicitHeight: badgeLabel.implicitHeight + Theme.badgePaddingY * 2
-                        Text {
+                        Row {
                             id: badgeLabel
                             anchors.centerIn: parent
-                            text: meetingRow.row.badge
-                            textFormat: Text.PlainText
-                            color: parent.kind === "success" ? Theme.successInk : (parent.kind === "danger" || parent.kind === "error") ? Theme.dangerInk : parent.kind === "warning" ? Theme.warningInk : parent.kind === "primary" ? Theme.primary : Theme.fgSecondary
-                            font.family: Theme.fontUi
-                            font.pixelSize: Theme.fontBadgeSize
-                            font.weight: Font.Medium
-                            renderType: Text.NativeRendering
+                            readonly property var badge: parent
+                            readonly property color ink: badge.kind === "success" ? Theme.successInk : (badge.kind === "danger" || badge.kind === "error") ? Theme.dangerInk : badge.kind === "warning" ? Theme.warningInk : badge.kind === "primary" ? Theme.primary : Theme.fgSecondary
+                            spacing: Theme.badgeGap
+                            Accessible.name: meetingRow.row.badge
+                            Icon {
+                                objectName: "meetingBadgeSymbol"
+                                name: badgeLabel.badge.symbol
+                                size: 11 // design/meetings/tokens.md §8.2: badge glyph.
+                                strokeWidth: name === "pause" ? 2.2 : 1.5
+                                fill: name === "rec"
+                                color: badgeLabel.ink
+                                visible: name !== ""
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Text {
+                                text: badgeLabel.badge.timerAt >= 0 ? badgeLabel.badge.label.slice(0, badgeLabel.badge.timerAt) : badgeLabel.badge.label
+                                textFormat: Text.PlainText
+                                color: badgeLabel.ink
+                                font.family: Theme.fontUi
+                                font.pixelSize: Theme.fontBadgeSize
+                                font.weight: Font.Medium
+                                renderType: Text.NativeRendering
+                            }
+                            Text {
+                                visible: badgeLabel.badge.timerAt >= 0
+                                text: visible ? badgeLabel.badge.label.slice(badgeLabel.badge.timerAt + 1) : ""
+                                textFormat: Text.PlainText
+                                color: badgeLabel.ink
+                                font.family: Theme.fontMono
+                                font.pixelSize: Theme.fontBadgeSize
+                                renderType: Text.NativeRendering
+                            }
                         }
                     }
                     AvButton {
+                        objectName: "meetingRowAction"
                         small: true
                         text: meetingRow.row.action
                         visible: text !== ""
+                        enabled: meetingRow.row.actionEnabled !== false
+                        iconName: text === "Остановить" ? "stop" : text === "Продолжить" ? "play" : ""
+                        iconFill: iconName !== ""
                         onClicked: if (root.bridge) root.bridge.requestMeetingAction(meetingRow.row.id, text)
                     }
                     AvButton {

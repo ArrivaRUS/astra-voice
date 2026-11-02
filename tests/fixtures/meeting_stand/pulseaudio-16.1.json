@@ -1,0 +1,108 @@
+{
+  "_origin": "Source-derived, reduced synthetic example; NOT captured from a running server. Module fields follow PulseAudio v16.1/v17.0 src/utils/pactl.c get_module_info_callback; backend properties are representative.",
+  "_source": "https://github.com/pulseaudio/pulseaudio/blob/v16.1/src/utils/pactl.c",
+  "rows": {
+    "modules": [
+      {
+        "name": "module-null-sink",
+        "argument": "sink_name=stand_far rate=16000 channels=1",
+        "usage_counter": "n/a",
+        "properties": {}
+      },
+      {
+        "name": "module-null-sink",
+        "argument": "sink_name=stand_mic rate=16000 channels=1",
+        "usage_counter": "n/a",
+        "properties": {}
+      }
+    ],
+    "sinks": [
+      {
+        "index": 1,
+        "name": "stand_far",
+        "driver": "module-null-sink.c"
+      },
+      {
+        "index": 2,
+        "name": "stand_mic",
+        "driver": "module-null-sink.c"
+      }
+    ],
+    "sources": [
+      {
+        "index": 1,
+        "name": "stand_far.monitor",
+        "driver": "module-null-sink.c"
+      },
+      {
+        "index": 2,
+        "name": "stand_mic.monitor",
+        "driver": "module-null-sink.c"
+      }
+    ],
+    "sink-inputs": [
+      {
+        "index": 10,
+        "driver": "protocol-native.c",
+        "sink": 1,
+        "mute": false,
+        "volume": {
+          "mono": {
+            "value": 65536
+          }
+        },
+        "properties": {
+          "application.name": "DION",
+          "application.process.id": "42"
+        }
+      },
+      {
+        "index": 11,
+        "driver": "protocol-native.c",
+        "sink": 2,
+        "mute": false,
+        "volume": {
+          "mono": {
+            "value": 65536
+          }
+        },
+        "properties": {
+          "application.name": "DION",
+          "application.process.id": "43"
+        }
+      }
+    ],
+    "source-outputs": [
+      {
+        "index": 20,
+        "driver": "protocol-native.c",
+        "source": 1,
+        "mute": false,
+        "volume": {
+          "mono": {
+            "value": 65536
+          }
+        },
+        "properties": {
+          "application.name": "AstraVoice",
+          "application.process.id": "52"
+        }
+      },
+      {
+        "index": 21,
+        "driver": "protocol-native.c",
+        "source": 2,
+        "mute": false,
+        "volume": {
+          "mono": {
+            "value": 65536
+          }
+        },
+        "properties": {
+          "application.name": "AstraVoice",
+          "application.process.id": "53"
+        }
+      }
+    ]
+  }
+}

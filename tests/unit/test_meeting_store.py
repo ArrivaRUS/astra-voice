@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -16,16 +17,113 @@ from astra_voice.meetings import events, model, segments, store
 from astra_voice.security.files import check_private_file
 from conftest import REAL_GETEUID
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 ID = "2026-10-29_120000-ab12"
 STAMP = "2026-10-29T12:00:00+00:00"
 
 
-@pytest.fixture(autouse=True)
-def filesystem_euid(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
-    # Ownership checks need the real UID, including root in CI; the shared
-    # fixture's UID 1000 is only suitable for application root-guard tests.
-    monkeypatch.setattr(os, "geteuid", REAL_GETEUID)
+@pytest.mark.parametrize("crash_after", ["audio", "exports", "ai", "temporary"])
+def test_sigkill_during_reserved_commit_keeps_catalogue_recoverable(
+    disk: store.MeetingStore, crash_after: str
+) -> None:
+    reserved_id = "2026-10-29_130000-ab12"
+    disk.reserve(reserved_id)
+    script = """
+import os
+import signal
+import sys
+from pathlib import Path
+from astra_voice.meetings.model import Meeting
+from astra_voice.meetings.store import MeetingStore
+original = os.mkdir
+def crash_mkdir(path, *args, **kwargs):
+    original(path, *args, **kwargs)
+    if path == sys.argv[3]:
+        os.kill(os.getpid(), signal.SIGKILL)
+os.mkdir = crash_mkdir
+if sys.argv[3] == "temporary":
+    def crash_link(*args, **kwargs):
+        os.kill(os.getpid(), signal.SIGKILL)
+    os.link = crash_link
+MeetingStore(Path(sys.argv[1])).commit_reserved(
+    Meeting(id=sys.argv[2], started_at="2026-10-29T13:00:00+00:00")
+)
+"""
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")}
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(disk.root), reserved_id, crash_after],
+        env=env,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == -signal.SIGKILL, result.stderr.decode()
+    reserved = disk.root / reserved_id
+    assert not (reserved / "meeting.json").exists()
+    # Listing never removes an orphan: capture exit may still be unknown.
+    assert [meeting.id for meeting in disk.list()] == [ID]
+    if crash_after == "temporary":
+        assert len(list(reserved.glob(".meeting-*.tmp"))) == 1
+    else:
+        assert (reserved / crash_after).is_dir()
+    # This explicit API is called only after confirmed capture exit.
+    disk.discard_reserved(reserved_id)
+    assert not reserved.exists()
+
+
+@pytest.mark.parametrize("unsafe", ["data", "symlink", "foreign", "mode"])
+def test_partial_reservation_never_hides_or_discards_unknown_data(
+    disk: store.MeetingStore, unsafe: str, tmp_path: Path
+) -> None:
+    reserved_id = "2026-10-29_130000-ab12"
+    disk.reserve(reserved_id)
+    reserved = disk.root / reserved_id
+    audio = reserved / "audio"
+    if unsafe == "symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        audio.symlink_to(target, target_is_directory=True)
+    else:
+        audio.mkdir(mode=0o700)
+        if unsafe == "data":
+            (audio / "retain.wav").write_bytes(b"retain")
+        elif unsafe == "foreign":
+            (reserved / "foreign").mkdir(mode=0o700)
+        else:
+            audio.chmod(0o755)
+    with pytest.raises(store.MeetingStoreError):
+        disk.list()
+    with pytest.raises(store.MeetingStoreError):
+        disk.discard_reserved(reserved_id)
+    assert audio.exists()
+    assert (reserved / ".preparing").exists()
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "mode", "hardlink", "fifo"])
+def test_reservation_temporary_file_must_be_private_regular_owned(
+    disk: store.MeetingStore, unsafe: str, tmp_path: Path
+) -> None:
+    reserved_id = "2026-10-29_130000-ab12"
+    disk.reserve(reserved_id)
+    reserved = disk.root / reserved_id
+    temporary = reserved / (".meeting-" + "a" * 32 + ".tmp")
+    if unsafe == "symlink":
+        target = tmp_path / "private-target"
+        target.write_bytes(b"retain")
+        target.chmod(0o600)
+        temporary.symlink_to(target)
+    elif unsafe == "fifo":
+        os.mkfifo(temporary, mode=0o600)
+    else:
+        temporary.write_bytes(b"retain")
+        temporary.chmod(0o600 if unsafe == "hardlink" else 0o644)
+        if unsafe == "hardlink":
+            os.link(temporary, tmp_path / "retain-alias")
+    with pytest.raises(store.MeetingStoreError):
+        disk.list()
+    with pytest.raises(store.MeetingStoreError):
+        disk.discard_reserved(reserved_id)
+    assert temporary.lstat()
 
 
 @pytest.fixture

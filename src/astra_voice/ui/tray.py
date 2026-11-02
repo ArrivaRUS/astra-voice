@@ -384,6 +384,7 @@ class Tray(QObject):
         self.on_meeting_extend: Callable[[], None] | None = None
         self.on_meeting_resume_mic: Callable[[], None] | None = None
         self._meetings_enabled = False
+        self._meeting_record_entry_enabled = True
         self._meeting_state: TrayState | None = None
         self._meeting_elapsed = 0
         self._meeting_limit_soon = False
@@ -694,6 +695,11 @@ class Tray(QObject):
         self._meetings_enabled = bool(enabled)
         self._update_meeting_menu()
 
+    def set_meeting_record_entry_enabled(self, enabled: bool) -> None:
+        """M2 keeps only meeting navigation; M3 owns the public recording entry."""
+        self._meeting_record_entry_enabled = bool(enabled)
+        self._update_meeting_menu()
+
     def set_meeting_state(
         self,
         state: TrayState | None,
@@ -764,7 +770,7 @@ class Tray(QObject):
             for action in block:
                 self._menu.insertAction(anchor, action)
         if self._meetings_enabled or active:
-            if not active:
+            if not active and self._meeting_record_entry_enabled:
                 self._menu.insertAction(self._settings_action, self._meeting_record_action)
             self._menu.insertAction(self._settings_action, self._meeting_open_action)
             self._menu.insertAction(self._settings_action, self._meeting_idle_separator)

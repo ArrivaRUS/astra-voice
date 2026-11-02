@@ -37,7 +37,12 @@ from astra_voice.models.schema import SchemaInvalid, SchemaUnavailable, validate
 FAMILY = "astra-voice.meetings"
 PROTOCOL = 1
 ROLES = frozenset({"meeting-capture", "meeting-transcribe", "meeting-diar"})
-MAX_REQUESTS = 16384  # Never evict a req within a process generation.
+MAX_REQUESTS = 16384  # Never evict a retained req within a process generation.
+CAPTURE_CLOSING = frozenset(
+    {"meeting.capture.pause", "meeting.capture.stop", "meeting.capture.shutdown"}
+)
+CAPTURE_UNCACHED = CAPTURE_CLOSING | {"meeting.capture.keepalive"}
+MAX_KEEPALIVE_PENDING = 16  # Wire waits only, not lifetime idempotency entries.
 MAX_CACHE_BYTES = 16 * 1024 * 1024
 MAX_REJECTIONS = 256  # Separate bounded reserve; never forget a refused req.
 _REPLY_RESERVATION = 65536 + 1024
@@ -290,7 +295,14 @@ OPTIONAL.update(
             "app_class": choices("dion", "browser", "other"),
             "target": TARGET,
         },
-        "meeting.capture.prepared": {"far_reason": text_schema(120)},
+        "meeting.capture.prepared": {
+            "far_reason": text_schema(120),
+            "lock_signal_unavailable": BOOL,
+        },
+        "meeting.capture.started": {"lock_signal_unavailable": BOOL},
+        "meeting.capture.paused": {"lock_signal_unavailable": BOOL},
+        "meeting.capture.alive": {"lock_signal_unavailable": BOOL},
+        "meeting.capture.autopaused": {"lock_signal_unavailable": BOOL},
         "measured": {"sessions": UINT},
     }
 )
@@ -330,7 +342,7 @@ EVENT_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
         "meeting.capture.autopaused": {
             **CAPTURE,
             **PAUSE,
-            "reason": choices("lease", "audio-failed", "disk-write"),
+            "reason": choices("lease", "audio-failed", "disk-write", "lock", "unknown"),
             "at_recorded_ms": MILLISECONDS,
         },
         "meeting.capture.segment": {
@@ -412,10 +424,18 @@ EVENT_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
         }
     },
 }
+# Self-pauses/parent death have no initiating request. These are the same facts
+# as correlated close/finalize replies, with capture identity retained.
+for _event in ("meeting.capture.closed", "meeting.capture.finalized"):
+    EVENT_FIELDS["meeting-capture"][_event] = REPLY_FIELDS[_event]
+
 OPTIONAL.update(
     {
         "meeting.capture.track": {"label": text_schema(120)},
-        "meeting.capture.alive": {"reason": choices("lease", "indicators")},
+        "meeting.capture.alive": {
+            "reason": choices("lease", "indicators"),
+            "lock_signal_unavailable": BOOL,
+        },
         "meeting.job.progress": {"block": UINT, "blocks": UINT},
     }
 )
@@ -581,19 +601,21 @@ def operation_timeout(message: dict[str, Any]) -> float:
 
 
 class RequestLedger:
-    """No eviction within a generation; refuse new work at the memory bound."""
+    """Retain ordinary outcomes; lease/overflow close remain available without cache.
+
+    Uncached requests retain wire req/request_type correlation. Their retry runs
+    current-state idempotent control, not replay of a previous cached outcome.
+    Known retained reqs always keep fingerprint/replay semantics, even exhausted.
+    """
 
     def __init__(self) -> None:
         self.requests: dict[str, tuple[bytes, list[dict[str, Any]] | None]] = {}
         self.used_bytes = 0
         self.reserved_bytes = 0
-        self._terminal_admitted = False
         self._rejected: set[str] = set()
         self.exhausted = False
 
     def begin(self, message: dict[str, Any]) -> tuple[str, list[dict[str, Any]] | None]:
-        if self.exhausted:
-            return "exhausted", None
         req = str(message["req"])
         fingerprint = hashlib.sha256(
             json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -605,11 +627,17 @@ class RequestLedger:
                 if previous[0] == fingerprint
                 else ("conflict", None)
             )
-        terminal = message["type"] == "meeting.capture.shutdown" and not self._terminal_admitted
-        if (
+        full = (
             len(self.requests) - len(self._rejected) >= MAX_REQUESTS
             or self.used_bytes + self.reserved_bytes + _REPLY_RESERVATION > MAX_CACHE_BYTES
-        ) and not terminal:
+        )
+        if message["type"] == "meeting.capture.keepalive" or (
+            message["type"] in CAPTURE_CLOSING and (full or self.exhausted)
+        ):
+            return "uncached", None
+        if self.exhausted:
+            return "exhausted", None
+        if full:
             if len(self._rejected) >= MAX_REJECTIONS:
                 self.exhausted = True
                 return "exhausted", None
@@ -629,13 +657,18 @@ class RequestLedger:
             self.requests[req] = fingerprint, [refusal]
             self._rejected.add(req)
             return "limit", deepcopy([refusal])
-        if message["type"] == "meeting.capture.shutdown":
-            self._terminal_admitted = True
         self.reserved_bytes += _REPLY_RESERVATION
         self.requests[req] = fingerprint, None
         return "new", None
 
     def finish(self, req: str, replies: list[dict[str, Any]]) -> None:
+        if req not in self.requests:
+            if replies and all(
+                reply.get("req") == req and reply.get("request_type") in CAPTURE_UNCACHED
+                for reply in replies
+            ):
+                return
+            raise KeyError(req)
         if req in self._rejected:
             raise ValueError("meeting-request-rejected")
         fingerprint, previous = self.requests[req]

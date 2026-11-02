@@ -39,7 +39,7 @@ from astra_voice.meetings.model import (
     SpeakerMap,
     Transcript,
 )
-from astra_voice.meetings.segments import SegmentSidecar
+from astra_voice.meetings.segments import CaptureJournal, SegmentSidecar
 from astra_voice.security.files import (
     check_private_file,
     private_directory,
@@ -54,6 +54,7 @@ _DOCUMENTS: dict[str, type[JsonModel]] = {
     "transcript.json": Transcript,
     "checkpoint.json": Checkpoint,
     "speakers.json": SpeakerMap,
+    "capture.json": CaptureJournal,
 }
 
 
@@ -196,7 +197,7 @@ class MeetingWriter:
             Writer.GUI
             if filename in {"meeting.json", "speakers.json"}
             else Writer.CAPTURE
-            if cls is SegmentSidecar
+            if cls in {SegmentSidecar, CaptureJournal}
             else Writer.TRANSCRIBE
         )
         if self._role != allowed or type(document) is not cls:
@@ -224,7 +225,7 @@ class MeetingWriter:
                 and meeting.meeting_generation == document.meeting_generation
             ):
                 raise MeetingStoreError("Отмена встречи уже сохранена")
-        if isinstance(document, (Transcript, Checkpoint, SegmentSidecar)):
+        if isinstance(document, (Transcript, Checkpoint, SegmentSidecar, CaptureJournal)):
             if (
                 document.meeting_id != self._meeting_id
                 or document.meeting_generation != meeting.meeting_generation
@@ -295,6 +296,129 @@ class MeetingStore:
             raise
         with resources:
             yield directory
+
+    def reserve(self, meeting_id: str) -> None:
+        """Prepare-only directory: no meeting metadata and no capture writer yet."""
+        try:
+            _id(meeting_id)
+            with private_directory(self.root, create=True) as root, _lock(root, ".store.lock"):
+                if f".deleting-{meeting_id}" in os.listdir(root):
+                    raise MeetingStoreError("Встреча удаляется")
+                os.mkdir(meeting_id, mode=0o700, dir_fd=root)
+                try:
+                    os.chmod(meeting_id, 0o700, dir_fd=root, follow_symlinks=False)
+                    os.fsync(root)
+                    with _child(root, meeting_id) as directory:
+                        write_private(
+                            Path(".preparing"),
+                            b"1\n",
+                            directory_fd=directory,
+                            create_only=True,
+                            private=True,
+                        )
+                except BaseException:
+                    # mkdir succeeded exclusively: remove only our marker/empty dir.
+                    with _child(root, meeting_id) as directory:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(".preparing", dir_fd=directory)
+                    os.rmdir(meeting_id, dir_fd=root)
+                    raise
+        except (OSError, ValueError, TypeError):
+            raise MeetingStoreError("Не удалось подготовить встречу") from None
+
+    @staticmethod
+    def _reservation(directory: int) -> bool:
+        try:
+            marker = read_private(Path(".preparing"), 2, directory_fd=directory, private=True)
+        except FileNotFoundError:
+            return False
+        if marker != b"1\n":
+            raise MeetingStoreError("Недопустимая подготовка встречи")
+        return True
+
+    @staticmethod
+    def _reservation_children(directory: int) -> tuple[set[str], set[str]]:
+        """Validate an interrupted pre-publication commit, without removing it."""
+        entries = set(os.listdir(directory)) - {".preparing"}
+        temporaries = {
+            name for name in entries if re.fullmatch(r"\.meeting-[0-9a-f]{32}\.tmp", name)
+        }
+        children = entries - temporaries
+        if len(temporaries) > 1:
+            raise MeetingStoreError("Подготовка встречи непуста")
+        if not children <= {"audio", "exports", "ai"}:
+            raise MeetingStoreError("Подготовка встречи непуста")
+        for name in children:
+            with _child(directory, name) as child:
+                if os.listdir(child):
+                    raise MeetingStoreError("Подготовка встречи непуста")
+        for name in temporaries:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
+            try:
+                info = os.fstat(descriptor)
+                check_private_file(info)
+                if info.st_size > MAX_DOCUMENT_BYTES:
+                    raise MeetingStoreError("Подготовка встречи непуста")
+            finally:
+                os.close(descriptor)
+        return children, temporaries
+
+    def commit_reserved(self, meeting: Meeting) -> None:
+        """Publish metadata before granting open; reservations never overwrite data."""
+        try:
+            raw = (json.dumps(meeting.to_dict(), ensure_ascii=False) + "\n").encode()
+            with private_directory(self.root) as root, _lock(root, ".store.lock"):
+                with _child(root, meeting.id) as directory:
+                    if not self._reservation(directory) or set(os.listdir(directory)) != {
+                        ".preparing"
+                    }:
+                        raise MeetingStoreError("Подготовка встречи недоступна")
+                    try:
+                        for name in ("audio", "exports", "ai"):
+                            with _child(directory, name, create=True):
+                                pass
+                        write_private(
+                            Path("meeting.json"),
+                            raw,
+                            directory_fd=directory,
+                            create_only=True,
+                            private=True,
+                        )
+                    except BaseException:
+                        # Only empty, known directories created by this transaction.
+                        # Published metadata is retained if directory fsync failed.
+                        if "meeting.json" not in os.listdir(directory):
+                            for name in ("audio", "exports", "ai"):
+                                with contextlib.suppress(FileNotFoundError):
+                                    os.rmdir(name, dir_fd=directory)
+                        raise
+                    os.unlink(".preparing", dir_fd=directory)
+                    os.fsync(directory)
+        except (OSError, ValueError, TypeError):
+            raise MeetingStoreError("Не удалось создать встречу") from None
+
+    def discard_reserved(self, meeting_id: str) -> None:
+        """Caller confirms capture exit first. Refuse any data, links or active metadata."""
+        try:
+            _id(meeting_id)
+            with private_directory(self.root) as root, _lock(root, ".store.lock"):
+                with _child(root, meeting_id) as directory:
+                    if not self._reservation(directory):
+                        raise MeetingStoreError("Подготовка встречи непуста")
+                    children, temporaries = self._reservation_children(directory)
+                    for name in children:
+                        os.rmdir(name, dir_fd=directory)
+                    for name in temporaries:
+                        os.unlink(name, dir_fd=directory)
+                    os.unlink(".preparing", dir_fd=directory)
+                os.rmdir(meeting_id, dir_fd=root)
+                os.fsync(root)
+        except (OSError, ValueError, TypeError):
+            raise MeetingStoreError("Не удалось отменить подготовку") from None
 
     def create(self, meeting: Meeting) -> None:
         """Reserve a new ID exclusively; never overwrite or resurrect a tombstone."""
@@ -379,6 +503,11 @@ class MeetingStore:
                     else:
                         continue
                     with _child(root, name) as directory:
+                        if self._reservation(directory) and "meeting.json" not in os.listdir(
+                            directory
+                        ):
+                            self._reservation_children(directory)
+                            continue
                         meeting = _metadata(directory, name)
                     if meeting.state != MeetingState.DELETING:
                         result.append(meeting)

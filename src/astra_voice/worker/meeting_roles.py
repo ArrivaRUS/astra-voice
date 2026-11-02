@@ -1,7 +1,7 @@
-"""Meetings v1 role skeletons. No audio, inference, threads or media file I/O.
+"""Meetings v1 control transport and role dispatch.
 
-A not-prepared outcome never claims physical close, durable finalization or
-publication. M2 implements capture; M4/M7 implement transcribe/diar and fd rights.
+Capture uses MeetingCaptureState after entry-point hardening. Compute roles
+remain M1 skeletons until M4/M7; not-prepared never claims durable publication.
 """
 
 from __future__ import annotations
@@ -107,10 +107,16 @@ class MeetingRole:
 def run_role(connection: socket.socket, role: str, *, parent_pid: int) -> int:
     """Single bounded control loop, including shutdown -> bye -> exit 0.
 
-    SIGTERM/PDEATHSIG only sets a flag; there are no media resources in M1.
-    The loop checks parent identity every 50 ms, never logs peer payloads.
+    SIGTERM/PDEATHSIG sets a flag; capture cleanup physically revokes streams
+    within a bounded wait independent of storage. Parent identity is checked
+    every 50 ms. Peer payloads are never logged.
     """
-    handler = MeetingRole(role)
+    if role == "meeting-capture":
+        from astra_voice.worker.meeting_capture import MeetingCaptureState
+
+        handler: Any = MeetingCaptureState()
+    else:
+        handler = MeetingRole(role)
     reader = ipc.FrameReader(role=role)
     outgoing = bytearray(ipc.encode(ipc.make_hello(role=role), role=role))
     terminated = False
@@ -124,8 +130,15 @@ def run_role(connection: socket.socket, role: str, *, parent_pid: int) -> int:
         previous = signal.signal(signal.SIGTERM, terminate)
         connection.setblocking(False)
         while not terminated and os.getppid() == parent_pid:
+            if role == "meeting-capture":
+                for event in handler.poll():
+                    outgoing.extend(ipc.encode(event, role=role))
+                if len(outgoing) > MAX_SEND_BUFFER:
+                    return 2
+                if handler.exit_code:
+                    return int(handler.exit_code)
             if handler.stopped and not outgoing:
-                return handler.exit_code
+                return int(handler.exit_code)
             readable, writable, _ = select.select(
                 [] if handler.stopped else [connection], [connection] if outgoing else [], [], 0.05
             )
@@ -149,6 +162,9 @@ def run_role(connection: socket.socket, role: str, *, parent_pid: int) -> int:
                 for frame in frames:
                     try:
                         message = ipc.decode(frame, role=role)
+                        if role == "meeting-capture":
+                            for event in handler.poll():
+                                outgoing.extend(ipc.encode(event, role=role))
                         replies = handler.handle(message)
                     except ipc.FrameError as exc:
                         if exc.code == ipc.PROTOCOL_MISMATCH:
@@ -170,6 +186,8 @@ def run_role(connection: socket.socket, role: str, *, parent_pid: int) -> int:
     except (OSError, ValueError):
         return 2
     finally:
+        if role == "meeting-capture":
+            handler.cleanup()
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
         connection.close()

@@ -195,9 +195,7 @@ def meeting_main(role: str, argv: list[str]) -> int:
     parent_pid = os.getppid()
     if not silence_native_stderr():
         return 3
-    if not harden_process(
-        parent_pid, strict=True, oom_score=300 if role == "meeting-capture" else 500
-    ):
+    if not harden_process(parent_pid, strict=True, oom_score=500):
         return 3
     if not harden_meeting_limits(role):
         return 3
@@ -208,6 +206,20 @@ def meeting_main(role: str, argv: list[str]) -> int:
     if connection.family != socket.AF_UNIX or connection.type != socket.SOCK_STREAM:
         connection.close()
         return 2
+    # Reused dictation sources log device labels. Their diagnostics must not
+    # enter meeting logs; capture publishes only finite IPC error/event codes.
+    audio_logs = (
+        [
+            logging.getLogger(name)
+            for name in ("astra_voice.worker.audio", "astra_voice.worker.pulse_stream")
+        ]
+        if role == "meeting-capture"
+        else []
+    )
+    # Keep suppressed through process exit: a timed-out daemon can still emit
+    # diagnostics after run_role returns. Dictation lives in a different role.
+    for logger in audio_logs:
+        logger.disabled = True
     return run_role(connection, role, parent_pid=parent_pid)
 
 

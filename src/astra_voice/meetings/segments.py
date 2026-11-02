@@ -1,8 +1,8 @@
-"""Durable capture boundaries and sample clocks; WAV capture is a later milestone.
+"""Durable capture boundaries and sample clocks; WAV I/O belongs to meeting_capture.
 
 Samples are absolute offsets within one epoch. Timeline knots use server-derived
-CLOCK_MONOTONIC milliseconds, never Python buffer-arrival times. A discontinuous
-sidecar is conservatively unusable for interpolation; capture splits at gaps.
+CLOCK_MONOTONIC milliseconds, never Python buffer-arrival times. Discontinuity
+marks the boundary after observed samples; capture splits at gaps (D11).
 """
 
 from __future__ import annotations
@@ -130,3 +130,46 @@ class SegmentSidecar(JsonModel):
 
 
 SEGMENT_SCHEMA = SegmentSidecar.SCHEMA
+
+
+@dataclass
+class CaptureJournal(JsonModel):
+    """Capture-owned durable edges; reconstruct GUI intervals without meeting.json writes."""
+
+    meeting_id: str
+    meeting_generation: int
+    capture_id: str
+    boundaries: list[dict[str, Any]] = field(default_factory=list)
+    schema: int = 1
+    SCHEMA = obj(
+        {
+            "schema": VERSION,
+            "meeting_id": MEETING_ID,
+            "meeting_generation": UINT,
+            "capture_id": IDENTIFIER,
+            "boundaries": array(
+                obj(
+                    {
+                        "kind": choices(
+                            "open",
+                            "close",
+                            "mic_gap_start",
+                            "mic_gap_end",
+                            "far_ended",
+                            "pause_state",
+                        ),
+                        "t_mono_ms": UINT,
+                        "recorded_ms": MILLISECONDS,
+                        "reason": nullable(choices(*CLOSE_REASONS)),
+                        "pause_reasons": array(
+                            choices(*PauseReason), len(PauseReason), unique=True
+                        ),
+                        "manual_resume_required": BOOL,
+                        "blocked_epoch": UINT,
+                    },
+                    required=["kind", "t_mono_ms", "recorded_ms", "reason"],
+                ),
+                18000,
+            ),
+        }
+    )

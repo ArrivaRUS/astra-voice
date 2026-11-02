@@ -12,16 +12,9 @@ import pytest
 
 from astra_voice.core.diagnostics import collect_diagnostics, endpoint_class
 from astra_voice.core.settings import Settings
-from conftest import REAL_GETEUID
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 MARKER = "PRIVATE_DIAGNOSTICS_MARKER"
-
-
-@pytest.fixture(autouse=True)
-def filesystem_euid(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
-    # Stats are private files owned by the real process UID, including root CI.
-    monkeypatch.setattr(os, "geteuid", REAL_GETEUID)
 
 
 @pytest.mark.parametrize(
@@ -209,7 +202,6 @@ def test_stats_source_cannot_be_meeting_subtree(
 def test_stats_hardlink_to_excluded_valid_document_produces_empty_snapshot(
     tmp_path: Path, source: str
 ) -> None:
-    import os
 
     data, state = tmp_path / "data", tmp_path / "state"
     data.mkdir(mode=0o700)

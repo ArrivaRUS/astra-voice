@@ -129,15 +129,15 @@ def test_old_process_and_meeting_generation_cannot_touch_pending() -> None:
 
 def test_idempotent_requests_conflict_and_cached_outcome() -> None:
     s, events, clock = detached()
-    request = command(s.role, "meeting.capture.keepalive")
+    request = command(s.role, "ping")
     s.send(request)
     original = next(iter(s._pending.values())).deadline
     clock.now += 0.1
     s.send(request)
     assert next(iter(s._pending.values())).deadline == original
-    s.send({**request, "seq": 2})
+    s.send({**request, "type": "meeting.call.query", "request_type": "meeting.call.query"})
     assert events[-1]["code"] == "req-conflict" and len(s._pending) == 1
-    response = ack("meeting.ack", "meeting.capture.keepalive", **CAPTURE)
+    response = ack("pong", "ping")
     receive(s, response)
     s.send(request)
     assert events[-1] == {**response, "generation": 1} and not s._pending

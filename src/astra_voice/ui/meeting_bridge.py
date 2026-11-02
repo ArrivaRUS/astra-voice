@@ -32,7 +32,8 @@ from astra_voice.meetings.settings_ext import (
 )
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.platform.session import SessionKind
-from astra_voice.ui.meeting_texts import RESPONSIBILITY_ITEMS, TEXTS
+from astra_voice.ui.meeting_recording import MeetingRecording
+from astra_voice.ui.meeting_texts import RESPONSIBILITY_ITEMS, TEXTS, W4_TEXTS
 
 SAVE_ERROR = "Не удалось сохранить настройки. Попробуйте ещё раз."
 
@@ -103,6 +104,7 @@ class MeetingBridge(QObject):
     enabledChanged = pyqtSignal(bool)
     recordingRequested = pyqtSignal()
     meetingActionRequested = pyqtSignal(str, str)
+    openMeetingsRequested = pyqtSignal()
 
     def __init__(
         self,
@@ -122,7 +124,6 @@ class MeetingBridge(QObject):
         self._stored, self._mirror, self._save = stored, mirror, save
         self._policy = policy or Policy()
         self._parsed = parse_policy(self._policy)
-        self._session = session
         self._store: MeetingListing = MeetingStore() if store is None else store
         self._apps = known_apps
         self._submit, self._clock = submit, clock
@@ -132,6 +133,7 @@ class MeetingBridge(QObject):
         self._save_error = ""
         self._started = 0.0
         self._responsibility_open = self._recording = self._closed = False
+        self._capture: MeetingRecording | None = None
         self._timer = QTimer(self)
         self._timer.setInterval(20)
         self._timer.timeout.connect(self._poll)
@@ -217,10 +219,6 @@ class MeetingBridge(QObject):
             PolicyCode.UNKNOWN_KEY,
         }
         return TEXTS["policyInvalid"] if invalid else ""
-
-    @pyqtProperty(str, notify=changed)
-    def flyWarning(self) -> str:
-        return TEXTS["flyWarning"] if self._session == SessionKind.FLY else ""
 
     @pyqtProperty("QVariantMap", constant=True)
     def texts(self) -> dict[str, str]:
@@ -404,6 +402,15 @@ class MeetingBridge(QObject):
         if not self.enabled:
             action = "Открыть" if state == MeetingState.DONE else ""
             actions = ["Сохранить как…", "Удалить"] if state == MeetingState.DONE else ["Удалить"]
+        saving = bool(
+            self._capture is not None
+            and self._capture.controller.meeting is not None
+            and self._capture.controller.meeting.id == meeting.id
+            and self._capture.controller.state == "stopped"
+            and state in {MeetingState.RECORDING, MeetingState.PAUSED}
+        )
+        if saving:
+            badge, kind, action, actions = "Сохраняю запись…", "neutral", "", []
         return {
             "id": meeting.id,
             "title": meeting.title,
@@ -411,9 +418,20 @@ class MeetingBridge(QObject):
             "badge": badge,
             "badgeKind": kind,
             "action": action,
+            "actionEnabled": bool(
+                action
+                and state not in {MeetingState.RECORDED, MeetingState.INTERRUPTED}
+                and (
+                    state not in {MeetingState.RECORDING, MeetingState.PAUSED}
+                    or self._capture is not None
+                    and self._capture.current_meeting is not None
+                    and self._capture.current_meeting.id == meeting.id
+                    and self._capture.busy
+                )
+            ),
             "actions": actions,
             "progress": 0,
-            "active": state in {MeetingState.RECORDING, MeetingState.PAUSED},
+            "active": not saving and state in {MeetingState.RECORDING, MeetingState.PAUSED},
             "transcribing": state == MeetingState.TRANSCRIBING,
         }
 
@@ -465,10 +483,13 @@ class MeetingBridge(QObject):
         self._read_error = documents is None
         if documents is not None:
             self._documents = documents
+            self._overlay_capture()
         self._timer.stop()
         self.changed.emit()
 
     def shutdown(self) -> None:
+        if self._capture is not None:
+            self._capture.shutdown()
         self._closed = True
         self._timer.stop()
         self._loading = self._loading_visible = False
@@ -477,6 +498,8 @@ class MeetingBridge(QObject):
     def refreshPolicy(self, policy: Policy) -> None:
         old_enabled = self.enabled
         self._policy, self._parsed = policy, parse_policy(policy)
+        if self._capture is not None:
+            self._capture.policy_changed()
         if not self.canEnable:
             self._responsibility_open = False
         self.changed.emit()
@@ -555,14 +578,123 @@ class MeetingBridge(QObject):
     @pyqtSlot()
     def requestRecording(self) -> None:
         if self.enabled and not self._recording and not self._closed:
+            if self._capture is not None:
+                self._capture.open_dialog()
             self.recordingRequested.emit()
 
     @pyqtSlot(str, str)
     def requestMeetingAction(self, meeting_id: str, action: str) -> None:
         for row in self.meetings:
             if row["id"] == meeting_id and action and action in [row["action"], *row["actions"]]:
+                if action == row["action"] and not row["actionEnabled"]:
+                    return
+                if self._capture is not None and action in {"Остановить", "Продолжить"}:
+                    self._capture.action(meeting_id, action)
+                    return
                 self.meetingActionRequested.emit(meeting_id, action)
                 return
+
+    def bindRecording(self, capture: MeetingRecording) -> None:
+        """Bind the existing section to the inert M2 adapter; no launch here."""
+        self._capture = capture
+        capture.changed.connect(self._capture_changed)
+        capture.openMeetingsRequested.connect(self.openMeetingsRequested)
+        self._capture_changed()
+
+    def _capture_changed(self) -> None:
+        self._overlay_capture()
+        if not self._closed:
+            self.changed.emit()
+
+    def _overlay_capture(self) -> None:
+        if self._closed or self._capture is None:
+            return
+        self._recording = self._capture.busy
+        updates = dict(self._capture.recovered)
+        current = self._capture.current_meeting
+        if current is not None:
+            updates[current.id] = current
+        if updates:
+            self._documents = [row for row in self._documents if row.id not in updates]
+            self._documents.extend(updates.values())
+
+    @pyqtProperty(bool, notify=changed)
+    def recordingDevEnabled(self) -> bool:
+        return self._capture is not None and self._capture.dev_enabled
+
+    @pyqtProperty(bool, notify=changed)
+    def startDialogOpen(self) -> bool:
+        return self._capture is not None and self._capture.dialog_open
+
+    @pyqtProperty(str, notify=changed)
+    def startState(self) -> str:
+        return self._capture.state if self._capture else "default"
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def startTexts(self) -> dict[str, str]:
+        return dict(W4_TEXTS)
+
+    @pyqtProperty("QVariantList", notify=changed)
+    def startOptions(self) -> list[dict[str, Any]]:
+        return self._capture.options if self._capture else []
+
+    @pyqtProperty(str, notify=changed)
+    def selectedSource(self) -> str:
+        return self._capture.selected_source if self._capture else "room"
+
+    @pyqtProperty(str, notify=changed)
+    def startError(self) -> str:
+        return self._capture.error if self._capture else ""
+
+    @pyqtProperty("QStringList", notify=changed)
+    def startWarnings(self) -> list[str]:
+        return self._capture.warnings if self._capture else []
+
+    @pyqtProperty(bool, notify=changed)
+    def startCanStart(self) -> bool:
+        return self._capture is not None and self._capture.can_start
+
+    @pyqtProperty(bool, notify=changed)
+    def startSpeakers(self) -> bool:
+        return self._capture is not None and self._capture._audio.speakers
+
+    @pyqtProperty(bool, notify=changed)
+    def interruptedOpen(self) -> bool:
+        return bool(self._capture and self._capture.interrupted_text)
+
+    @pyqtProperty(str, notify=changed)
+    def interruptedText(self) -> str:
+        return self._capture.interrupted_text if self._capture else ""
+
+    @pyqtSlot()
+    def on_start_clicked(self) -> None:
+        if self._capture is not None:
+            self._capture.begin_clicked()
+
+    @pyqtSlot()
+    def closeStartDialog(self) -> None:
+        if self._capture is not None:
+            self._capture.close_dialog()
+
+    @pyqtSlot(str)
+    def selectRecordingSource(self, source: str) -> None:
+        if self._capture is not None:
+            self._capture.select(source)
+
+    @pyqtSlot()
+    def retryStart(self) -> None:
+        if self._capture is not None:
+            self._capture.retry()
+
+    @pyqtSlot()
+    def closeInterrupted(self) -> None:
+        if self._capture is not None:
+            self._capture.close_interrupted()
+
+    @pyqtSlot()
+    def openInterruptedMeetings(self) -> None:
+        if self._capture is not None:
+            self._capture.close_interrupted(open_meetings=True)
 
     @pyqtSlot(result=bool)
     def copyInviteText(self) -> bool:
