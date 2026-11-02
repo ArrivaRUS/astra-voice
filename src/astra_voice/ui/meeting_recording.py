@@ -43,7 +43,7 @@ from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, new_meeting_id
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.session_state import SessionMonitor
-from astra_voice.ui.meeting_texts import W4_TEXTS
+from astra_voice.ui.meeting_texts import W2_TEXTS, W4_TEXTS
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
@@ -118,6 +118,7 @@ def _supervisor(event: Callable[[Message], None], exited: Callable[[int], None])
 class MeetingRecording(QObject):
     changed = pyqtSignal()
     openMeetingsRequested = pyqtSignal()
+    participantsRequested = pyqtSignal()
 
     def __init__(
         self,
@@ -172,6 +173,11 @@ class MeetingRecording(QObject):
         self._recovery_seen: set[str] = set()
         self.recovered: dict[str, Meeting] = {}
         self._signature = ""
+        self._overlay_identity = ""
+        self._overlay_far_state = ""
+        self._overlay_far_deadline = 0.0
+        self._overlay_error_deadline = 0.0
+        self._overlay_error_seen = False
         role = self._new_supervisor()
         self.controller = MeetingController(
             store,
@@ -501,6 +507,111 @@ class MeetingRecording(QObject):
             self.clicks.on_resume_clicked()
         self._publish()
 
+    @staticmethod
+    def _duration(milliseconds: int) -> str:
+        seconds = max(0, milliseconds // 1000)
+        return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+    @property
+    def overlay(self) -> Message:
+        """Presentation of controller-published values, never a capture authority."""
+        controller = self.controller
+        meeting = controller.meeting
+        state = controller.state
+        visible = bool(
+            self.dev_enabled
+            and controller._committed
+            and meeting is not None
+            and (
+                state in {"recording", "paused", "stopping", "closing-unknown"}
+                or state == "opening"
+                and bool(controller.pause_reasons)
+            )
+        )
+        secondary = ""
+        action = ""
+        remaining_ms = max(0, meeting.limit_ms - controller.recorded_ms) if meeting else 0
+        can_extend = bool(
+            meeting and meeting.limit_ms < 14400000 and state in {"recording", "paused"}
+        )
+        can_resume = bool(
+            state == "paused"
+            and not controller._finalizing
+            and controller._close_deadline is None
+            and not controller._epoch_pending
+            and controller._allowed()
+            and self.enabled()
+            and self.policy_allowed()
+        )
+        active = visible
+        if state == "opening" and controller.pause_reasons:
+            state = "paused"
+        if state in {"stopping", "closing-unknown"}:
+            state = "stopping"
+        elif state == "paused":
+            if "lock" in controller.pause_reasons:
+                state, secondary = "paused-lock", W2_TEXTS["pausedLock"]
+            elif "unknown" in controller.pause_reasons:
+                secondary = W2_TEXTS["pausedUnknown"]
+            elif "indicators" in controller.pause_reasons:
+                state, secondary = "paused-indicator", W2_TEXTS["pausedIndicator"]
+            elif "lease" in controller.pause_reasons:
+                state, secondary = "paused-hang", W2_TEXTS["pausedHang"]
+        elif state == "recording":
+            if controller.tracks.get("mic") in {"lost", "paused"}:
+                state, secondary = "mic-paused", W2_TEXTS["micPaused"]
+            elif controller.limit_warning:
+                seconds = remaining_ms // 1000
+                state = "limit-soon"
+                secondary = W2_TEXTS["limitSoon"].format(
+                    remaining=f"{seconds // 60}:{seconds % 60:02d}"
+                )
+                action = "extend" if can_extend else ""
+            elif self.clock() < self._overlay_far_deadline:
+                state, secondary = "app-closed", W2_TEXTS["farEnded"]
+        if self.dev_enabled and self.clock() < self._overlay_error_deadline:
+            visible, state, secondary = True, "error", W2_TEXTS["audioError"]
+        pause_minutes = (
+            max(0, int((self.clock() - controller._pause_at) // 60))
+            if controller._pause_at is not None
+            else 0
+        )
+        return {
+            "visible": visible,
+            "active": active,
+            "state": state if visible else "hidden",
+            "elapsed": self._duration(controller.recorded_ms),
+            "elapsedSeconds": controller.recorded_ms // 1000,
+            "secondary": secondary,
+            "secondaryAction": action,
+            "canExtend": can_extend,
+            "canResume": can_resume,
+            "microphoneName": "",  # M2 publishes no replacement candidate or acceptance command.
+            "pausedMinutes": pause_minutes,
+            "timerTooltip": W2_TEXTS["pausedTimer"].format(minutes=pause_minutes),
+            "limitSoon": controller.limit_warning,
+            "limitRemainingSeconds": remaining_ms // 1000,
+            "paused": controller.state == "paused"
+            or controller.state == "opening"
+            and bool(controller.pause_reasons),
+        }
+
+    def overlay_action(self, action: str) -> None:
+        if self._closed or not self.dev_enabled or not self.overlay["visible"]:
+            return
+        if action == "stop":
+            self.clicks.on_stop_clicked()
+        elif action == "participants":
+            self.participantsRequested.emit()
+        elif self.enabled() and self.policy_allowed():
+            if action == "pause":
+                self.clicks.on_pause_clicked()
+            elif action == "resume" and self.overlay["canResume"]:
+                self.clicks.on_resume_clicked()
+            elif action == "extend":
+                self.clicks.on_extend_clicked()
+        self._publish()
+
     def _session_changed(self, snapshot: object = None) -> None:
         if not self._closed:
             self.controller.on_session_changed()
@@ -659,8 +770,32 @@ class MeetingRecording(QObject):
         self._publish()
 
     def _publish(self) -> None:
+        identity = self.controller.meeting.id if self.controller.meeting else ""
+        if identity != self._overlay_identity:
+            self._overlay_identity = identity
+            self._overlay_far_deadline = self._overlay_error_deadline = 0.0
+            self._overlay_far_state = ""
+            self._overlay_error_seen = False
+        far_state = self.controller.tracks.get("far", "")
+        if (
+            far_state == "ended"
+            and self._overlay_far_state == "live"
+            and self.controller.state == "recording"
+        ):
+            self._overlay_far_deadline = self.clock() + 8
+        self._overlay_far_state = far_state
+        audio_error = bool(
+            self.controller._committed
+            and self.controller.state == "stopped"
+            and (self.controller._physically_closed or self.controller._exit_confirmed)
+            and self.controller.error_code == "audio-unavailable"
+        )
+        if audio_error and not self._overlay_error_seen:
+            self._overlay_error_deadline = self.clock() + 3
+        self._overlay_error_seen = audio_error
         signature = repr(
             (
+                self.overlay,
                 self.controller.state,
                 self.controller.recorded_ms // 1000,
                 self.controller.saved,

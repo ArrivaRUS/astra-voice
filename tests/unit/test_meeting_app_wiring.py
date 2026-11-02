@@ -48,24 +48,73 @@ def test_factory_error_does_not_log_raw_exception(
 
 
 def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
+    from astra_voice.ui.tray_icons import TrayState
+
     tray = Mock()
     bridge = SimpleNamespace(
-        changed=Mock(), enabled=False, recording=False, requestRecording=Mock()
+        changed=Mock(),
+        enabled=False,
+        recordingDevEnabled=False,
+        overlay={},
+        requestRecording=Mock(),
+        on_start_clicked=Mock(),
+        on_overlay_pause_clicked=Mock(),
+        on_overlay_resume_clicked=Mock(),
+        on_overlay_stop_clicked=Mock(),
+        on_overlay_participants_clicked=Mock(),
+        on_overlay_extend_clicked=Mock(),
+        activateOverlayKeyboard=Mock(),
     )
     show = Mock()
-    app._wire_tray_meetings(tray, bridge, show)
+    disconnect = app._wire_tray_meetings(tray, bridge, show)
     tray.set_meetings_enabled.assert_called_with(False)
-    tray.set_meeting_state.assert_called_with(None)
+    assert tray.set_meeting_state.call_args.args[0] is None
+    tray.set_meeting_record_entry_enabled.assert_called_with(False)
     refresh = bridge.changed.connect.call_args.args[0]
-    bridge.enabled, bridge.recording = True, True
+    bridge.enabled, bridge.recordingDevEnabled = True, True
+    bridge.overlay = {
+        "visible": True,
+        "active": True,
+        "paused": False,
+        "elapsedSeconds": 2530,
+        "limitSoon": True,
+        "canExtend": True,
+        "canResume": True,
+        "limitRemainingSeconds": 288,
+    }
     refresh()
     tray.set_meetings_enabled.assert_called_with(True)
-    tray.set_meeting_state.assert_called_with(None)
-    tray.set_meeting_record_entry_enabled.assert_called_once_with(False)
-    assert tray.on_meeting_record == show
+    tray.set_meeting_record_entry_enabled.assert_called_with(True)
+    tray.set_meeting_state.assert_called_with(
+        TrayState.MEETING_REC,
+        elapsed_seconds=2530,
+        limit_soon=True,
+        can_extend=True,
+        can_resume=True,
+        mic_name="",
+        limit_remaining_seconds=288,
+    )
+    tray.on_meeting_pause()
+    bridge.on_overlay_pause_clicked.assert_called_once_with()
+    bridge.overlay["paused"] = True
+    refresh()
+    assert tray.set_meeting_state.call_args.args[0] is TrayState.MEETING_PAUSED
+    tray.on_meeting_pause()
+    bridge.on_overlay_resume_clicked.assert_called_once_with()
+    for callback, handler in [
+        (tray.on_meeting_stop, bridge.on_overlay_stop_clicked),
+        (tray.on_meeting_notice, bridge.on_overlay_participants_clicked),
+        (tray.on_meeting_extend, bridge.on_overlay_extend_clicked),
+        (tray.on_meeting_keyboard, bridge.activateOverlayKeyboard),
+    ]:
+        callback()
+        handler.assert_called_once_with()
     tray.on_meeting_open()
     show.assert_called_once_with()
-    assert not bridge.requestRecording.called
+    disconnect()
+    bridge.changed.disconnect.assert_called_once_with(refresh)
+    for name in ("record", "open", "pause", "stop", "notice", "extend", "keyboard"):
+        assert getattr(tray, "on_meeting_" + name) is None
 
 
 @pytest.mark.parametrize(
@@ -161,3 +210,31 @@ def test_finalizer_meeting_cleanup_preserves_resource_and_lock_barriers(
     assert ("meeting-bridge-shutdown-failed" in caplog.text) is failed
     assert "PRIVATE_DISCONNECT_MARKER" not in caplog.text
     assert "PRIVATE_SHUTDOWN_MARKER" not in caplog.text
+
+
+@pytest.mark.parametrize("can_resume", [False, True])
+def test_tray_wiring_forwards_resume_admission(can_resume: bool) -> None:
+    tray = Mock()
+    bridge = Mock(enabled=True, recordingDevEnabled=True)
+    bridge.overlay = {
+        "visible": True,
+        "active": True,
+        "paused": True,
+        "state": "paused-lock",
+        "canResume": can_resume,
+    }
+    disconnect = app._wire_tray_meetings(tray, bridge, Mock())
+    try:
+        assert tray.set_meeting_state.call_args.kwargs["can_resume"] is can_resume
+        tray.on_meeting_pause()
+        if can_resume:
+            bridge.on_overlay_resume_clicked.assert_called_once_with()
+        else:
+            bridge.on_overlay_resume_clicked.assert_not_called()
+        bridge.overlay.update(paused=False, state="recording", canResume=False)
+        refresh = bridge.changed.connect.call_args.args[0]
+        refresh()
+        tray.on_meeting_pause()
+        bridge.on_overlay_pause_clicked.assert_called_once_with()
+    finally:
+        disconnect()

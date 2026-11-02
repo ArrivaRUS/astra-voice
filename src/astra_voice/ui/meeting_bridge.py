@@ -33,7 +33,7 @@ from astra_voice.meetings.settings_ext import (
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.meeting_recording import MeetingRecording
-from astra_voice.ui.meeting_texts import RESPONSIBILITY_ITEMS, TEXTS, W4_TEXTS
+from astra_voice.ui.meeting_texts import RESPONSIBILITY_ITEMS, TEXTS, W2_TEXTS, W4_TEXTS
 
 SAVE_ERROR = "Не удалось сохранить настройки. Попробуйте ещё раз."
 
@@ -105,6 +105,8 @@ class MeetingBridge(QObject):
     recordingRequested = pyqtSignal()
     meetingActionRequested = pyqtSignal(str, str)
     openMeetingsRequested = pyqtSignal()
+    participantsRequested = pyqtSignal()
+    overlayKeyboardRequested = pyqtSignal()
 
     def __init__(
         self,
@@ -488,6 +490,9 @@ class MeetingBridge(QObject):
         self.changed.emit()
 
     def shutdown(self) -> None:
+        overlay = getattr(self, "_meeting_overlay", None)
+        if overlay is not None:
+            overlay.shutdown()
         if self._capture is not None:
             self._capture.shutdown()
         self._closed = True
@@ -599,6 +604,7 @@ class MeetingBridge(QObject):
         self._capture = capture
         capture.changed.connect(self._capture_changed)
         capture.openMeetingsRequested.connect(self.openMeetingsRequested)
+        capture.participantsRequested.connect(self.participantsRequested)
         self._capture_changed()
 
     def _capture_changed(self) -> None:
@@ -617,6 +623,44 @@ class MeetingBridge(QObject):
         if updates:
             self._documents = [row for row in self._documents if row.id not in updates]
             self._documents.extend(updates.values())
+
+    @pyqtProperty("QVariantMap", notify=changed)
+    def overlay(self) -> dict[str, Any]:
+        return self._capture.overlay if self._capture else {"visible": False, "state": "hidden"}
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def overlayTexts(self) -> dict[str, str]:
+        return dict(W2_TEXTS)
+
+    @pyqtSlot()
+    def on_overlay_pause_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("pause")
+
+    @pyqtSlot()
+    def on_overlay_resume_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("resume")
+
+    @pyqtSlot()
+    def on_overlay_stop_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("stop")
+
+    @pyqtSlot()
+    def on_overlay_participants_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("participants")
+
+    @pyqtSlot()
+    def on_overlay_extend_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("extend")
+
+    @pyqtSlot()
+    def activateOverlayKeyboard(self) -> None:
+        if self.overlay.get("visible"):
+            self.overlayKeyboardRequested.emit()
 
     @pyqtProperty(bool, notify=changed)
     def recordingDevEnabled(self) -> bool:

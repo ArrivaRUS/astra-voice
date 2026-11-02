@@ -70,7 +70,7 @@ def test_conditional_actions_are_present_only_when_available(harness: Harness) -
     h.tray.set_meeting_state(
         TrayState.MEETING_REC, limit_soon=True, can_extend=True, mic_name="Встроенный микрофон"
     )
-    assert labels(h)[1:3] == ["Продлить на час", "Продолжить с «Встроенный микрофон»"]
+    assert labels(h)[1:3] == ["Продлить на час", "Продолжить с „Встроенный микрофон“"]
     h.tray.set_meeting_state(TrayState.MEETING_REC, limit_soon=True, can_extend=False)
     assert "Продлить на час" not in labels(h)
     assert not any(label.startswith("Продолжить с") for label in labels(h))
@@ -137,3 +137,29 @@ def test_limit_soon_status_and_four_hour_ceiling(harness: Harness) -> None:
         TrayState.MEETING_REC, elapsed_seconds=14400, limit_soon=True, can_extend=True
     )
     assert "Продлить на час" not in labels(h)
+
+
+@pytest.mark.parametrize(
+    "state,can_resume,enabled",
+    [
+        (TrayState.MEETING_PAUSED, False, False),
+        (TrayState.MEETING_PAUSED, True, True),
+        (TrayState.MEETING_REC, False, True),
+    ],
+)
+def test_pause_resume_menu_respects_published_admission(
+    harness: Harness, state: TrayState, can_resume: bool, enabled: bool
+) -> None:
+    h = harness
+    callback = Mock()
+    h.tray.on_meeting_pause = callback
+    h.tray.set_meeting_state(state, can_resume=can_resume)
+    label = "Продолжить" if state is TrayState.MEETING_PAUSED else "Пауза"
+    action = next(a for a in h.menu.actions() if a.text() == label)
+    assert action.isEnabled() is enabled
+    # QAction.trigger can be invoked from code even on disabled actions.
+    action.trigger()
+    if enabled:
+        callback.assert_called_once_with()
+    else:
+        callback.assert_not_called()
