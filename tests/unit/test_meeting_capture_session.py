@@ -234,7 +234,16 @@ def test_lease_keepalive_resumes_only_same_capture_without_other_reasons(
     assert not rig.state.manual_resume_required
     assert rig.send("keepalive", seq=1, capture_id="foreign")[0]["type"] == "error"
     assert len(rig.mics) == 1
-    assert rig.send("keepalive", seq=2)[0]["type"] == "meeting.ack"
+    assert (
+        rig.send(
+            "keepalive",
+            seq=2,
+            indicators_visible=True,
+            blocked_epoch=rig.state.session.snapshot().blocked_epoch,
+            admission_mono_ms=int(rig.clock() * 1000),
+        )[0]["type"]
+        == "meeting.ack"
+    )
     wait_until(lambda: (rig.poll(), rig.state.state == "recording")[1])
     assert len(rig.mics) == 2
     assert rig.identity["capture_id"] == capture

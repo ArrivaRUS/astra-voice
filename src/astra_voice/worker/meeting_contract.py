@@ -200,6 +200,12 @@ COMMAND_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
 }
 OPTIONAL: dict[str, dict[str, Any]] = {
     "meeting.capture.prepare": {"mic_device": S},
+    # Legacy keepalive still renews the lease, but cannot authorize reopening.
+    "meeting.capture.keepalive": {
+        "indicators_visible": BOOL,
+        "blocked_epoch": UINT,
+        "admission_mono_ms": UINT,
+    },
     "meeting.capture.resume": {"mic_device": S, "tracks": TRACKS},
     "meeting.job.start": {"diar_models": obj({"segmentation_dir": S, "embedder_dir": S})},
 }
@@ -435,6 +441,13 @@ OPTIONAL.update(
         "meeting.capture.alive": {
             "reason": choices("lease", "indicators"),
             "lock_signal_unavailable": BOOL,
+            "recovery": obj(
+                {
+                    "state_rev": UINT,
+                    "reason": choices("lease", "indicators"),
+                    "duration_ms": UINT,
+                }
+            ),
         },
         "meeting.job.progress": {"block": UINT, "blocks": UINT},
     }

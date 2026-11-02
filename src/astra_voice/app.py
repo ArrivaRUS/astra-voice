@@ -812,6 +812,14 @@ def _bind_meeting_recording(
 
         bridge._meeting_overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
         bridge.overlayKeyboardRequested.connect(bridge._meeting_overlay.activate_keyboard)
+        recording.bind_indicators(
+            overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
+            tray_visible=lambda: bool(
+                runtime is not None
+                and runtime.tray is not None
+                and runtime.tray.meeting_indicator_visible
+            ),
+        )
     recording.initialize()
 
 

@@ -43,6 +43,7 @@ from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, new_meeting_id
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.session_state import SessionMonitor
+from astra_voice.ui.meeting_indicator_guard import MeetingIndicatorGuard
 from astra_voice.ui.meeting_texts import W2_TEXTS, W4_TEXTS
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
@@ -178,6 +179,11 @@ class MeetingRecording(QObject):
         self._overlay_far_deadline = 0.0
         self._overlay_error_deadline = 0.0
         self._overlay_error_seen = False
+        self._overlay_recovery_key: tuple[str, int] | None = None
+        self._overlay_recovery_deadline = 0.0
+        self._overlay_recovery_text = ""
+        self._overlay_recovery_reason = ""
+        self._indicator_guard: MeetingIndicatorGuard | None = None
         role = self._new_supervisor()
         self.controller = MeetingController(
             store,
@@ -202,6 +208,31 @@ class MeetingRecording(QObject):
         self._control_timer.setInterval(50)
         self._control_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._control_timer.timeout.connect(self.tick)
+
+    def bind_indicators(
+        self, *, overlay_visible: Callable[[], bool], tray_visible: Callable[[], bool]
+    ) -> None:
+        if self._closed:
+            return
+        if self._indicator_guard is not None:
+            self._indicator_guard.shutdown()
+            self._indicator_guard.deleteLater()
+        self._indicator_guard = MeetingIndicatorGuard(
+            active=lambda: bool(self.overlay["active"]),
+            overlay_visible=overlay_visible,
+            tray_visible=tray_visible,
+            set_visible=self.controller.set_indicators_visible,
+            pause=lambda: self.controller.pause("indicators"),
+            capturing=lambda: self.controller.capturing_without_indicator_pause,
+            identity=lambda: str((self.controller._identity or {}).get("capture_id", "")),
+            clock=self.clock,
+            parent=self,
+        )
+
+    def unbind_indicators(self) -> None:
+        if self._indicator_guard is not None:
+            self._indicator_guard.shutdown()
+            self._indicator_guard = None
 
     def _new_supervisor(self) -> Role:
         self._role_serial += 1
@@ -567,6 +598,9 @@ class MeetingRecording(QObject):
                     remaining=f"{seconds // 60}:{seconds % 60:02d}"
                 )
                 action = "extend" if can_extend else ""
+            elif self.clock() < self._overlay_recovery_deadline:
+                state = self._overlay_recovery_reason
+                secondary = self._overlay_recovery_text
             elif self.clock() < self._overlay_far_deadline:
                 state, secondary = "app-closed", W2_TEXTS["farEnded"]
         if self.dev_enabled and self.clock() < self._overlay_error_deadline:
@@ -717,6 +751,8 @@ class MeetingRecording(QObject):
                     self._interrupted.append(meeting)
         if not self.enabled() or not self.policy_allowed():
             self.policy_changed()
+        if self._indicator_guard is not None:
+            self._indicator_guard.check()
         self.controller.tick()
         self._poll_retirement()
         if (
@@ -776,6 +812,22 @@ class MeetingRecording(QObject):
             self._overlay_far_deadline = self._overlay_error_deadline = 0.0
             self._overlay_far_state = ""
             self._overlay_error_seen = False
+            self._overlay_recovery_key = None
+            self._overlay_recovery_deadline = 0.0
+            self._overlay_recovery_text = self._overlay_recovery_reason = ""
+        recovery = self.controller.indicator_recovery
+        if recovery is not None:
+            key = (recovery["capture_id"], recovery["state_rev"])
+            if key != self._overlay_recovery_key:
+                self._overlay_recovery_key = key
+                reason = recovery["reason"]
+                self._overlay_recovery_reason = (
+                    "reason-indicator" if reason == "indicators" else "reason-hang"
+                )
+                self._overlay_recovery_text = W2_TEXTS[
+                    "restoredIndicator" if reason == "indicators" else "restoredHang"
+                ].format(duration=self._duration(recovery["duration_ms"]))
+                self._overlay_recovery_deadline = self.clock() + 8
         far_state = self.controller.tracks.get("far", "")
         if (
             far_state == "ended"
@@ -822,6 +874,7 @@ class MeetingRecording(QObject):
         self._closed = True
         self._lease_timer.stop()
         self._control_timer.stop()
+        self.unbind_indicators()
         try:
             if self._role_started:
                 self.controller.supervisor.kill()

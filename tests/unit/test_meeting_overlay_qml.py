@@ -539,6 +539,8 @@ class Recording(QObject):
     actions = []
     def overlay_action(self, action):
         self.actions.append(action)
+    def unbind_indicators(self):
+        pass
 
 warnings = []
 

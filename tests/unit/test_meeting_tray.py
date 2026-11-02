@@ -163,3 +163,47 @@ def test_pause_resume_menu_respects_published_admission(
         callback.assert_called_once_with()
     else:
         callback.assert_not_called()
+
+
+@pytest.mark.parametrize("state", [TrayState.MEETING_REC, TrayState.MEETING_PAUSED])
+def test_meeting_indicator_requires_effective_meeting_icon_and_confirmed_registration(
+    harness: Harness, state: TrayState
+) -> None:
+    h = harness
+    h.tray.set_meeting_state(state)
+    h.tray.start()
+    assert h.tray.meeting_indicator_visible
+    calls = len(h.bus.calls)
+    for _ in range(100):
+        assert h.tray.meeting_indicator_visible
+    assert len(h.bus.calls) == calls  # A guard tick must not issue a bus query.
+    h.tray.set_state(TrayState.LISTENING)
+    assert not h.tray.meeting_indicator_visible
+    h.tray.set_state(TrayState.IDLE)
+    assert h.tray.meeting_indicator_visible
+    h.icon.isVisible.return_value = False
+    assert not h.tray.meeting_indicator_visible
+
+
+def test_unconfirmed_native_tray_is_not_meeting_visibility_evidence(harness: Harness) -> None:
+    h = harness
+    h.bus.host_registered = False
+    h.probe.owner.return_value = 42
+    h.tray.set_meeting_state(TrayState.MEETING_REC)
+    h.tray.start()
+    assert not h.tray.registered
+    assert h.tray.xembed_unconfirmed
+    assert not h.tray.meeting_indicator_visible
+
+
+@pytest.mark.parametrize("loss", ["stopped", "null-icon"])
+def test_meeting_indicator_rejects_stopped_or_missing_icon(harness: Harness, loss: str) -> None:
+    h = harness
+    h.tray.set_meeting_state(TrayState.MEETING_REC)
+    h.tray.start()
+    assert h.tray.meeting_indicator_visible
+    if loss == "stopped":
+        h.tray.stop()
+    else:
+        h.provider.has_icon.return_value = False
+    assert not h.tray.meeting_indicator_visible

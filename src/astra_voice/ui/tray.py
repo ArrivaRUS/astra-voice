@@ -887,6 +887,15 @@ class Tray(QObject):
         return self._registered
 
     @property
+    def meeting_indicator_visible(self) -> bool:
+        """Only a confirmed registrar and the effective meeting icon prove BL-4."""
+        return bool(
+            self._running
+            and self._state in (TrayState.MEETING_REC, TrayState.MEETING_PAUSED)
+            and self.registered
+        )
+
+    @property
     def visible_for_close(self) -> bool:
         """Локальный показ достаточен для закрытия окна, но не для О4."""
         if self.registered:

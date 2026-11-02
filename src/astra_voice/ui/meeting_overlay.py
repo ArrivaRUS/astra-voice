@@ -64,6 +64,34 @@ class MeetingOverlay(OverlayWindow):
     def pause(self) -> None:
         self.recording.overlay_action("pause")
 
+    @property
+    def indicator_visible(self) -> bool:
+        """Mapped W2 surface on a screen; overlap with other windows is irrelevant."""
+        if (
+            self._closed
+            or not self._view.isVisible()
+            or self._view.windowState() & Qt.WindowMinimized
+        ):
+            return False
+        surface = self._input_region.boundingRect().translated(self._view.position())
+        if surface.isEmpty() or not any(
+            surface.intersects(screen.geometry()) for screen in QGuiApplication.screens()
+        ):
+            return False
+        if QGuiApplication.platformName() != "xcb":
+            return bool(self._view.isExposed())
+        try:
+            if self._x11.d is None and not self._x11.open():
+                return False
+            from Xlib import X
+
+            window = self._x11.d.create_resource_object("window", int(self._view.winId()))
+            return bool(window.get_attributes().map_state == X.IsViewable)
+        except Exception:
+            log.warning("meeting-overlay-visibility-unavailable")
+            self._x11.close()
+            return False
+
     def resume(self) -> None:
         self.recording.overlay_action("resume")
 
@@ -288,6 +316,7 @@ class MeetingOverlay(OverlayWindow):
     def shutdown(self) -> None:
         if self._closed:
             return
+        self.recording.unbind_indicators()
         self._closed = True
         self.recording.changed.disconnect(self.refresh)
         self._view.hide()
