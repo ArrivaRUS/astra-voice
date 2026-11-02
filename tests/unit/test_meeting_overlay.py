@@ -149,6 +149,18 @@ def test_paused_lock_never_resumes_from_overlay_refresh_or_unlock(rig: Rig) -> N
     assert not any(m["type"] == "meeting.capture.resume" for m in rig.supervisor.messages)
 
 
+@pytest.mark.parametrize("reason", ["indicators", "lease"])
+def test_indicator_or_lease_pause_shows_plain_spec_paused_state(rig: Rig, reason: str) -> None:
+    # spec §3.5 has no own W2 row for these reasons; a visible W2 shows plain «Пауза».
+    start(rig)
+    controller = rig.recording.controller
+    controller.state = "paused"
+    controller.pause_reasons = {reason}
+    view = rig.recording.overlay
+    assert view["state"] == "paused"
+    assert view["secondary"] == ""
+
+
 def test_limit_warning_extend_and_four_hour_ceiling(rig: Rig) -> None:
     start(rig)
     rig.now += 6900

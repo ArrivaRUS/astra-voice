@@ -66,6 +66,7 @@ FocusScope {
         shadowRadius: 36
         shadowColor: Qt.rgba(0, 0, 0, 0.5)
         surfaceColor: PillTheme.notifyBg
+        shadowSourceColor: PillTheme.notifyBg
         borderColor: PillTheme.notifyBorder
         borderWidth: root.borderWidth
     }

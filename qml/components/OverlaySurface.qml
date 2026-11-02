@@ -15,6 +15,10 @@ Item {
     property color surfaceColor: PillTheme.pillBg
     property color borderColor: "transparent"
     property real borderWidth: 0
+    // Colour of the shadow-casting shape. destination-out cannot remove its
+    // antialiased edge completely; W2/W3 pass their surface colour to avoid a
+    // light fringe on the rounded corners.
+    property color shadowSourceColor: PillTheme.pillFg
     Canvas {
         x: -root.shadowRadius
         y: -root.shadowRadius
@@ -48,7 +52,9 @@ Item {
             ctx.shadowOffsetY = root.shadowY;
             ctx.shadowBlur = root.shadowRadius;
             ctx.shadowColor = root.shadowColor;
-            ctx.fillStyle = PillTheme.pillFg;
+            // Opaque: shadow strength and the destination-out cut follow the fill alpha.
+            var source = root.shadowSourceColor;
+            ctx.fillStyle = Qt.rgba(source.r, source.g, source.b, 1);
             ctx.fill();
             // Убираем источник и внутреннюю часть тени, как у внешней CSS box-shadow.
             ctx.shadowColor = "transparent";
@@ -63,7 +69,9 @@ Item {
         radius: root.surfaceRadius
         color: root.surfaceColor
         border.width: root.borderWidth
-        border.color: root.borderColor
+        // Qt leaves no fill beneath a Rectangle border; pre-composite the translucent
+        // border over surfaceColor (CSS border-box), not over the wallpaper/shadow.
+        border.color: Qt.tint(root.surfaceColor, root.borderColor)
         antialiasing: true
     }
 }

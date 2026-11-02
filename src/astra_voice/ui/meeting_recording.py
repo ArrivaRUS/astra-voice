@@ -590,10 +590,7 @@ class MeetingRecording(QObject):
                 state, secondary = "paused-lock", W2_TEXTS["pausedLock"]
             elif "unknown" in controller.pause_reasons:
                 secondary = W2_TEXTS["pausedUnknown"]
-            elif "indicators" in controller.pause_reasons:
-                state, secondary = "paused-indicator", W2_TEXTS["pausedIndicator"]
-            elif "lease" in controller.pause_reasons:
-                state, secondary = "paused-hang", W2_TEXTS["pausedHang"]
+            # spec §3.5: indicators/lease pauses have no own W2 row; plain «Пауза».
         elif state == "recording":
             if controller.tracks.get("mic") in {"lost", "paused"}:
                 state, secondary = "mic-paused", W2_TEXTS["micPaused"]

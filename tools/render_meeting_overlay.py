@@ -106,15 +106,8 @@ def presentations() -> dict[str, dict[str, Any]]:
             "state": "paused-lock",
             "secondary": "Экран был заблокирован — продолжите вручную",
         },
-        "paused-indicator": {
-            "state": "paused-indicator",
-            "secondary": "Индикатор записи не отображается",
-            "canResume": False,
-        },
-        "paused-hang": {
-            "state": "paused-hang",
-            "secondary": "Программа не отвечала",
-        },
+        # Pause by indicators/lease while W2 is visible: plain spec `paused`.
+        "paused-blocked": {"state": "paused", "canResume": False},
         "mic-paused": {
             "state": "mic-paused",
             "elapsed": "0:12:40",

@@ -22,7 +22,7 @@ FocusScope {
     signal releaseKeyboardRequested()
     signal dragRequested(real dx, real dy)
     readonly property string avState: presentation.state || "hidden"
-    readonly property bool paused: avState === "paused" || avState === "paused-lock" || avState === "paused-indicator" || avState === "paused-hang"
+    readonly property bool paused: avState === "paused" || avState === "paused-lock"
     readonly property bool terminal: avState === "stopping" || avState === "error"
     readonly property bool effectiveCompact: compact && !terminal
     readonly property bool hasSecondary: !effectiveCompact && avState !== "error" && !!presentation.secondary
@@ -49,6 +49,7 @@ FocusScope {
         surfaceWidth: root.pillWidth
         surfaceHeight: root.pillHeight
         surfaceRadius: root.hasSecondary ? PillTheme.pillMeetingBarMultilineRadius : PillTheme.pillRadius
+        shadowSourceColor: PillTheme.pillBg
     }
     Row {
         id: row1
@@ -65,8 +66,9 @@ FocusScope {
                 model: PillTheme.pillMeetingBarGripCols * PillTheme.pillMeetingBarGripRows
                 Rectangle {
                     required property int index
-                    x: (index % PillTheme.pillMeetingBarGripCols) * 4
-                    y: Math.floor(index / PillTheme.pillMeetingBarGripCols) * 5 + 2
+                    // Dot pitch 4×5; the 6-dot block is centred in the 8×16 grip field.
+                    x: (grip.width - (PillTheme.pillMeetingBarGripCols - 1) * 4 - width) / 2 + (index % PillTheme.pillMeetingBarGripCols) * 4
+                    y: (grip.height - (PillTheme.pillMeetingBarGripRows - 1) * 5 - height) / 2 + Math.floor(index / PillTheme.pillMeetingBarGripCols) * 5
                     width: PillTheme.pillMeetingBarGripDot
                     height: width
                     radius: width / 2
@@ -100,7 +102,16 @@ FocusScope {
                 border.width: 1
                 border.color: PillTheme.pillBarLive
                 visible: !root.paused && !root.terminal && root.avState !== "mic-paused" && root.avState !== "limit-soon"
-                Rectangle { anchors.centerIn: parent; width: 5; height: 5; radius: 3; color: PillTheme.pillBarLive }
+                // tokens.md §8.2 `rec`: filled circle r2.4 on the 16 grid, scaled to the
+                // 14 symbol (r2.1). Even whole-pixel diameter keeps it centred in the ring.
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: Math.round(PillTheme.pillMeetingBarSymbol * 2.4 / 16) * 2
+                    height: width
+                    radius: width / 2
+                    antialiasing: true
+                    color: PillTheme.pillBarLive
+                }
             }
             Icon {
                 anchors.fill: parent
