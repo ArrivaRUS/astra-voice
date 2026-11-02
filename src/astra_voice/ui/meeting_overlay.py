@@ -1,4 +1,8 @@
-"""W2 view of published capture state; independent from dictation preferences."""
+"""W2 view of published capture state; independent from dictation preferences.
+
+``SurfaceWindow`` is the native plumbing shared by W2 and W3: notification window
+type, X11 input shape over the visible surface only, shadow margins.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ from collections.abc import Callable
 from math import ceil, floor
 from typing import Any
 
-from PyQt5.QtCore import QEvent, QMetaObject, QObject, QPoint, Qt, QUrl
+from PyQt5.QtCore import QEvent, QMetaObject, QObject, QPoint, QRect, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QGuiApplication, QRegion
 
 from astra_voice.core.paths import qml_dir
@@ -20,7 +24,169 @@ from astra_voice.ui.overlay import SHADOW_MARGIN, SHADOW_OFFSET_Y, WINDOW_FLAGS,
 log = logging.getLogger(__name__)
 
 
-class MeetingOverlay(OverlayWindow):
+class SurfaceWindow(OverlayWindow):
+    """Overlay view whose QML root publishes its surface size without shadow."""
+
+    _width_property = "pillWidth"
+    _height_property = "pillHeight"
+    _shadow_margin = SHADOW_MARGIN
+    _shadow_offset_y = SHADOW_OFFSET_Y
+    _closed: bool
+    _input_region: QRegion
+    _input_native_window_id: int | None
+    _x11: X11Display
+
+    def _surface_size(self) -> tuple[int, int]:
+        return (
+            ceil(float(self._root.property(self._width_property))),
+            ceil(float(self._root.property(self._height_property))),
+        )
+
+    def _place(self) -> None:
+        raise NotImplementedError
+
+    def _clamped(self, point: QPoint, area: QRect) -> QPoint:
+        """Clamp the visible surface, allowing its transparent shadow past edges."""
+        margin = self._shadow_margin
+        x = min(
+            max(point.x(), area.left() - margin),
+            max(area.left() - margin, area.right() + 1 - self._view.width() + margin),
+        )
+        y = min(
+            max(point.y(), area.top() - margin),
+            max(
+                area.top() - margin,
+                area.bottom() + 1 - self._view.height() + margin + self._shadow_offset_y,
+            ),
+        )
+        return QPoint(x, y)
+
+    def _prepare_window(self) -> None:
+        try:
+            self._configure_native_window()
+        except Exception:
+            # Window metadata must not turn a capture update into a UI exception.
+            log.warning("meeting-overlay-window-unavailable")
+            self._x11.close()
+
+    def _configure_native_window(self) -> None:
+        if QGuiApplication.platformName() != "xcb":
+            return
+        if self._x11.d is None and not self._x11.open():
+            return
+        from Xlib import Xatom
+
+        connection = self._x11.d
+        window_type = (
+            "_NET_WM_WINDOW_TYPE_UTILITY"
+            if self._root.property("keyboardMode")
+            else "_NET_WM_WINDOW_TYPE_NOTIFICATION"
+        )
+        window = connection.create_resource_object("window", int(self._view.winId()))
+        for name, values, kind in (
+            (
+                "_NET_WM_WINDOW_TYPE",
+                [connection.intern_atom(window_type)],
+                Xatom.ATOM,
+            ),
+            (
+                "_NET_WM_STATE",
+                [
+                    connection.intern_atom("_NET_WM_STATE_ABOVE"),
+                    connection.intern_atom("_NET_WM_STATE_SKIP_TASKBAR"),
+                    connection.intern_atom("_NET_WM_STATE_SKIP_PAGER"),
+                ],
+                Xatom.ATOM,
+            ),
+            ("_NET_WM_DESKTOP", [0xFFFFFFFF], Xatom.CARDINAL),
+            ("_NET_WM_USER_TIME", [0], Xatom.CARDINAL),
+        ):
+            window.change_property(connection.intern_atom(name), kind, 32, values)
+        connection.flush()
+
+    def _resize(self) -> None:
+        if self._closed:
+            return
+        QMetaObject.invokeMethod(self._root, "forceLayout", Qt.DirectConnection)
+        width, height = self._surface_size()
+        margin = self._shadow_margin
+        self._view.resize(width + margin * 2, height + margin * 2 + self._shadow_offset_y)
+        self._update_mask()
+        self._place()
+
+    def _update_mask(self) -> None:
+        if self._closed:
+            return
+        width, height = self._surface_size()
+        margin = self._shadow_margin
+        self._input_region = QRegion(margin, margin, width, height)
+        if self._set_x11_input_mask(width, height):
+            if not self._view.mask().isEmpty():
+                # A confirmed Input region survives clearing fallback Bounding.
+                self._view.setMask(QRegion())
+        else:
+            self._set_mask_fallback()
+
+    def _set_mask_fallback(self) -> None:
+        self._view.setMask(self._input_region)
+        if QGuiApplication.platformName() != "xcb":
+            return
+        # Bounding must constrain input before Qt resets any previous Input shape.
+        flags = self._view.flags()
+        try:
+            self._view.setFlags(flags | Qt.WindowTransparentForInput)
+        finally:
+            self._view.setFlags(flags)
+        self._prepare_window()
+
+    def _set_x11_input_mask(self, width: int, height: int) -> bool:
+        if QGuiApplication.platformName() != "xcb":
+            return False
+        try:
+            if self._x11.d is None and not self._x11.open():
+                return False
+            from Xlib import X
+            from Xlib.ext import shape
+
+            connection = self._x11.d
+            if not connection.has_extension("SHAPE") or not connection.has_extension("XFIXES"):
+                return False
+            window_id = int(self._view.winId())
+            if self._input_native_window_id != window_id:
+                # Flush Qt's native creation before using the separate Xlib connection.
+                self._input_native_window_id = window_id
+                QGuiApplication.sync()
+                # Qt synchronization may have completed another QML layout.
+                width = self._input_region.boundingRect().width()
+                height = self._input_region.boundingRect().height()
+            window = connection.create_resource_object("window", window_id)
+            ratio = float(self._view.devicePixelRatio())
+            margin = self._shadow_margin
+            left = top = floor(margin * ratio)
+            right = ceil((margin + width) * ratio)
+            bottom = ceil((margin + height) * ratio)
+            before = self._x11._error_count
+            window.shape_rectangles(
+                shape.SO.Set,
+                shape.SK.Input,
+                X.Unsorted,
+                0,
+                0,
+                [(left, top, right - left, bottom - top)],
+            )
+            connection.sync()
+            if self._x11._error_count != before:
+                raise RuntimeError("X11 input mask rejected")
+            return True
+        except Exception:
+            log.warning("meeting-overlay-input-mask-unavailable")
+            self._x11.close()
+            return False
+
+
+class MeetingOverlay(SurfaceWindow):
+    geometryChanged = pyqtSignal()
+
     def __init__(
         self,
         recording: MeetingRecording,
@@ -117,131 +283,12 @@ class MeetingOverlay(OverlayWindow):
                 self._prepare_window()
                 self._view.show()
                 self._prepare_window()
+                self.geometryChanged.emit()
         else:
             self.release_keyboard()
-            self._view.hide()
-
-    def _prepare_window(self) -> None:
-        try:
-            self._configure_native_window()
-        except Exception:
-            # Window metadata must not turn a capture update into a UI exception.
-            log.warning("meeting-overlay-window-unavailable")
-            self._x11.close()
-
-    def _configure_native_window(self) -> None:
-        if QGuiApplication.platformName() != "xcb":
-            return
-        if self._x11.d is None and not self._x11.open():
-            return
-        from Xlib import Xatom
-
-        connection = self._x11.d
-        window_type = (
-            "_NET_WM_WINDOW_TYPE_UTILITY"
-            if self._root.property("keyboardMode")
-            else "_NET_WM_WINDOW_TYPE_NOTIFICATION"
-        )
-        window = connection.create_resource_object("window", int(self._view.winId()))
-        for name, values, kind in (
-            (
-                "_NET_WM_WINDOW_TYPE",
-                [connection.intern_atom(window_type)],
-                Xatom.ATOM,
-            ),
-            (
-                "_NET_WM_STATE",
-                [
-                    connection.intern_atom("_NET_WM_STATE_ABOVE"),
-                    connection.intern_atom("_NET_WM_STATE_SKIP_TASKBAR"),
-                    connection.intern_atom("_NET_WM_STATE_SKIP_PAGER"),
-                ],
-                Xatom.ATOM,
-            ),
-            ("_NET_WM_DESKTOP", [0xFFFFFFFF], Xatom.CARDINAL),
-            ("_NET_WM_USER_TIME", [0], Xatom.CARDINAL),
-        ):
-            window.change_property(connection.intern_atom(name), kind, 32, values)
-        connection.flush()
-
-    def _resize(self) -> None:
-        if self._closed:
-            return
-        QMetaObject.invokeMethod(self._root, "forceLayout", Qt.DirectConnection)
-        self._view.resize(
-            ceil(float(self._root.property("pillWidth"))) + SHADOW_MARGIN * 2,
-            ceil(float(self._root.property("pillHeight"))) + SHADOW_MARGIN * 2 + SHADOW_OFFSET_Y,
-        )
-        self._update_mask()
-        self._place()
-
-    def _update_mask(self) -> None:
-        if self._closed:
-            return
-        width = ceil(float(self._root.property("pillWidth")))
-        height = ceil(float(self._root.property("pillHeight")))
-        self._input_region = QRegion(SHADOW_MARGIN, SHADOW_MARGIN, width, height)
-        if self._set_x11_input_mask(width, height):
-            if not self._view.mask().isEmpty():
-                # A confirmed Input region survives clearing fallback Bounding.
-                self._view.setMask(QRegion())
-        else:
-            self._set_mask_fallback()
-
-    def _set_mask_fallback(self) -> None:
-        self._view.setMask(self._input_region)
-        if QGuiApplication.platformName() != "xcb":
-            return
-        # Bounding must constrain input before Qt resets any previous Input shape.
-        flags = self._view.flags()
-        try:
-            self._view.setFlags(flags | Qt.WindowTransparentForInput)
-        finally:
-            self._view.setFlags(flags)
-        self._prepare_window()
-
-    def _set_x11_input_mask(self, width: int, height: int) -> bool:
-        if QGuiApplication.platformName() != "xcb":
-            return False
-        try:
-            if self._x11.d is None and not self._x11.open():
-                return False
-            from Xlib import X
-            from Xlib.ext import shape
-
-            connection = self._x11.d
-            if not connection.has_extension("SHAPE") or not connection.has_extension("XFIXES"):
-                return False
-            window_id = int(self._view.winId())
-            if self._input_native_window_id != window_id:
-                # Flush Qt's native creation before using the separate Xlib connection.
-                self._input_native_window_id = window_id
-                QGuiApplication.sync()
-                # Qt synchronization may have completed another QML layout.
-                width = self._input_region.boundingRect().width()
-                height = self._input_region.boundingRect().height()
-            window = connection.create_resource_object("window", window_id)
-            ratio = float(self._view.devicePixelRatio())
-            left = top = floor(SHADOW_MARGIN * ratio)
-            right = ceil((SHADOW_MARGIN + width) * ratio)
-            bottom = ceil((SHADOW_MARGIN + height) * ratio)
-            before = self._x11._error_count
-            window.shape_rectangles(
-                shape.SO.Set,
-                shape.SK.Input,
-                X.Unsorted,
-                0,
-                0,
-                [(left, top, right - left, bottom - top)],
-            )
-            connection.sync()
-            if self._x11._error_count != before:
-                raise RuntimeError("X11 input mask rejected")
-            return True
-        except Exception:
-            log.warning("meeting-overlay-input-mask-unavailable")
-            self._x11.close()
-            return False
+            if self._view.isVisible():
+                self._view.hide()
+                self.geometryChanged.emit()
 
     def _place(self) -> None:
         screen = (
@@ -259,19 +306,16 @@ class MeetingOverlay(OverlayWindow):
             )
         else:
             point = self._dragged_position
-        # Clamp the visible surface, allowing its transparent shadow past edges.
-        x = min(
-            max(point.x(), area.left() - SHADOW_MARGIN),
-            max(area.left() - SHADOW_MARGIN, area.right() + 1 - self._view.width() + SHADOW_MARGIN),
-        )
-        y = min(
-            max(point.y(), area.top() - SHADOW_MARGIN),
-            max(
-                area.top() - SHADOW_MARGIN,
-                area.bottom() + 1 - self._view.height() + SHADOW_MARGIN + SHADOW_OFFSET_Y,
-            ),
-        )
-        self._view.setPosition(x, y)
+        self._view.setPosition(self._clamped(point, area))
+        self.geometryChanged.emit()
+
+    def surface_rect(self) -> QRect | None:
+        """Global rectangle of the visible W2 body (no shadow), or None when hidden."""
+        if self._closed or not self._view.isVisible():
+            return None
+        width, height = self._surface_size()
+        position = self._view.position()
+        return QRect(position.x() + SHADOW_MARGIN, position.y() + SHADOW_MARGIN, width, height)
 
     def _drag(self, dx: float, dy: float) -> None:
         self._dragged_position = self._view.position() + QPoint(round(dx), round(dy))

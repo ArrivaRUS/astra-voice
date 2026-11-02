@@ -808,10 +808,17 @@ def _bind_meeting_recording(
     )
     bridge.bindRecording(recording)
     if recording.dev_enabled is True:
+        from astra_voice.ui.meeting_notice import MeetingNotice
+        from astra_voice.ui.meeting_notifications import MeetingNotifications
         from astra_voice.ui.meeting_overlay import MeetingOverlay
 
         bridge._meeting_overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
         bridge.overlayKeyboardRequested.connect(bridge._meeting_overlay.activate_keyboard)
+        bridge._meeting_notice = MeetingNotice(
+            recording, bridge._meeting_overlay, notice=bridge.notice, parent=bridge
+        )
+        bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
+        bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
         recording.bind_indicators(
             overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
             tray_visible=lambda: bool(
@@ -867,7 +874,7 @@ def _wire_tray_meetings(
     tray.on_meeting_open = show_meetings
     tray.on_meeting_pause = pause_or_resume
     tray.on_meeting_stop = bridge.on_overlay_stop_clicked
-    tray.on_meeting_notice = bridge.on_overlay_participants_clicked
+    tray.on_meeting_notice = bridge.openNoticeWithKeyboard
     tray.on_meeting_extend = bridge.on_overlay_extend_clicked
     tray.on_meeting_keyboard = bridge.activateOverlayKeyboard
     refresh()
@@ -2056,6 +2063,10 @@ def main(argv: list[str] | None = None) -> int:
                 meeting_tray_disconnect = _wire_tray_meetings(
                     runtime.tray, meeting_bridge, show_meetings
                 )
+                # T-478: tray «Выход» asks during a recording; signals still quit directly.
+                bound_bridge = meeting_bridge
+                runtime.on_quit_requested = lambda: bound_bridge.request_quit(app.quit)
+                meeting_bridge.exitConfirmed.connect(app.quit)
         # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
         settings_bridge.offlineChanged.connect(downloads.network_changed)
         about_bridge = _make_about_bridge(runtime if runtime_ready else None)

@@ -50,6 +50,16 @@ __all__ = [
     "notify_hotkey_not_grabbed",
     "notify_hotkey_regrabbed",
     "notify_indicators_lost",
+    "notify_meeting_disk_stopped",
+    "notify_meeting_indicators_paused",
+    "notify_meeting_limit_final",
+    "notify_meeting_limit_soon",
+    "notify_meeting_limit_stopped",
+    "notify_meeting_lock_paused",
+    "notify_meeting_mic_paused",
+    "notify_meeting_saved",
+    "notify_meeting_session_stopped",
+    "notify_meeting_sleep_stopped",
     "notify_microphone_changed",
     "notify_microphone_lost",
     "notify_microphone_muted",
@@ -63,6 +73,7 @@ __all__ = [
     "pending_count",
     "reset_state",
     "set_action_handler",
+    "set_delivery_handler",
     "shutdown_dispatch",
 ]
 
@@ -337,6 +348,7 @@ def reset_state() -> None:
         except Exception:
             _logger.debug("Не удалось отключить сигналы уведомлений")
     _action_bus = None
+    set_delivery_handler(None)
 
 
 def pending_count() -> int:
@@ -547,6 +559,7 @@ def _on_reply(seq: int, notification_id: int | None, error_name: str | None) -> 
         _timeout_streak = 0
         _timeout_warned = False
         _logger.warning("Служба уведомлений вернула ошибку: %s", error_name)
+    _report_delivery(notice.summary, notification_id is not None)
     if _in_flight_seq == seq:
         _in_flight_seq = None
         _drain()
@@ -867,3 +880,97 @@ def notify_fly_tray(outcome: str) -> None:
         )
     else:
         raise KeyError(outcome)
+
+
+# E13 recording notices (design/meetings/spec.md §4.6). Every action also exists on
+# W2 and in the tray menu: Fly may show notices without buttons (S17-A4).
+ACTION_MEETING_EXTEND = "meeting-extend"
+ACTION_MEETING_RESUME = "meeting-resume"
+ACTION_MEETING_STOP = "meeting-stop"
+ACTION_MEETING_OPEN = "meeting-open"
+MEETING_LIMIT_SOON = "Запись остановится через 5 минут"
+MEETING_MIC_PAUSED = "Микрофон сменился. Запись вашего голоса приостановлена"
+MEETING_LOCK_PAUSED = "Запись на паузе: экран был заблокирован"
+MEETING_INDICATORS_PAUSED = "Запись встречи на паузе: индикатор записи не отображается"
+MEETING_SAVED = "Встреча сохранена."
+MEETING_LIMIT_STOPPED = "Запись встречи остановлена: достигнут предел длительности"
+MEETING_DISK_STOPPED = "Запись остановлена: заканчивается место на диске. Записанное сохранено"
+MEETING_SLEEP_STOPPED = "Запись встречи остановлена перед сном компьютера. Записанное сохранено"
+MEETING_SESSION_STOPPED = (
+    "Запись встречи остановлена: вы переключились на другой сеанс. Записанное сохранено"
+)
+_MEETING_EXTEND = "Продлить на час"
+_MEETING_RESUME = "Продолжить"
+_MEETING_STOP = "Остановить запись"
+_MEETING_OPEN = "Открыть встречи"
+_MEETING_LOCK_BODY = "Продолжить можно только вручную"
+_MEETING_INDICATORS_BODY = "Продолжится сама, когда значок или плашка снова появятся"
+_delivery_handler: Callable[[str, bool], None] | None = None
+
+
+def set_delivery_handler(callback: Callable[[str, bool], None] | None) -> None:
+    """Report (summary, delivered) for each finished send; None removes the listener."""
+    global _delivery_handler
+    _delivery_handler = callback
+
+
+def _report_delivery(summary: str, delivered: bool) -> None:
+    handler = _delivery_handler
+    if handler is None:
+        return
+    try:
+        handler(summary, delivered)
+    except Exception:
+        _logger.warning("Не удалось обработать итог доставки уведомления")
+
+
+def notify_meeting_limit_soon() -> None:
+    notify(
+        MEETING_LIMIT_SOON,
+        actions=[(ACTION_MEETING_EXTEND, _MEETING_EXTEND)],
+        retry=False,
+    )
+
+
+def notify_meeting_limit_final() -> None:
+    """The last hour before the 4:00:00 ceiling has no «Продлить на час»."""
+    notify(MEETING_LIMIT_SOON, retry=False)
+
+
+def notify_meeting_mic_paused() -> None:
+    # M2 publishes no replacement candidate: no «Продолжить с …» until it does.
+    notify(MEETING_MIC_PAUSED, actions=[(ACTION_MEETING_STOP, _MEETING_STOP)], retry=False)
+
+
+def notify_meeting_lock_paused() -> None:
+    notify(
+        MEETING_LOCK_PAUSED,
+        _MEETING_LOCK_BODY,
+        actions=[(ACTION_MEETING_RESUME, _MEETING_RESUME)],
+        retry=False,
+    )
+
+
+def notify_meeting_indicators_paused() -> None:
+    notify(MEETING_INDICATORS_PAUSED, _MEETING_INDICATORS_BODY, retry=False)
+
+
+def notify_meeting_saved() -> None:
+    # Spec offers «Расшифровать» here; transcription arrives in M4.
+    notify(MEETING_SAVED, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)], retry=False)
+
+
+def notify_meeting_limit_stopped() -> None:
+    notify(MEETING_LIMIT_STOPPED, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)], retry=False)
+
+
+def notify_meeting_disk_stopped() -> None:
+    notify(MEETING_DISK_STOPPED, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)], retry=False)
+
+
+def notify_meeting_sleep_stopped() -> None:
+    notify(MEETING_SLEEP_STOPPED, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)], retry=False)
+
+
+def notify_meeting_session_stopped() -> None:
+    notify(MEETING_SESSION_STOPPED, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)], retry=False)

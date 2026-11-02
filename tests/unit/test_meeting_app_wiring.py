@@ -61,7 +61,7 @@ def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
         on_overlay_pause_clicked=Mock(),
         on_overlay_resume_clicked=Mock(),
         on_overlay_stop_clicked=Mock(),
-        on_overlay_participants_clicked=Mock(),
+        openNoticeWithKeyboard=Mock(),
         on_overlay_extend_clicked=Mock(),
         activateOverlayKeyboard=Mock(),
     )
@@ -103,7 +103,7 @@ def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
     bridge.on_overlay_resume_clicked.assert_called_once_with()
     for callback, handler in [
         (tray.on_meeting_stop, bridge.on_overlay_stop_clicked),
-        (tray.on_meeting_notice, bridge.on_overlay_participants_clicked),
+        (tray.on_meeting_notice, bridge.openNoticeWithKeyboard),
         (tray.on_meeting_extend, bridge.on_overlay_extend_clicked),
         (tray.on_meeting_keyboard, bridge.activateOverlayKeyboard),
     ]:

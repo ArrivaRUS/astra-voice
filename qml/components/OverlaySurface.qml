@@ -11,6 +11,10 @@ Item {
     property real shadowY: 6
     property real shadowRadius: 18
     property color shadowColor: Qt.rgba(0, 0, 0, 0.4)
+    // W2/pill defaults; W3 uses notifyBg with a 1 px notifyBorder (tokens.md §5.3).
+    property color surfaceColor: PillTheme.pillBg
+    property color borderColor: "transparent"
+    property real borderWidth: 0
     Canvas {
         x: -root.shadowRadius
         y: -root.shadowRadius
@@ -57,7 +61,9 @@ Item {
         width: root.surfaceWidth
         height: root.surfaceHeight
         radius: root.surfaceRadius
-        color: PillTheme.pillBg
+        color: root.surfaceColor
+        border.width: root.borderWidth
+        border.color: root.borderColor
         antialiasing: true
     }
 }

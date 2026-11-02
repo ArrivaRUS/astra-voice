@@ -140,10 +140,12 @@ class MeetingRecording(QObject):
         microphone: Callable[[], str | None] = lambda: None,
         submit: Callable[[Callable[[], None]], None] | None = None,
         id_factory: Callable[[], str] = lambda: new_meeting_id(datetime.now(UTC)),
+        exit_stop_timeout: float = 3.0,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.store, self.enabled, self.policy_allowed = store, enabled, policy_allowed
+        self._exit_stop_timeout = exit_stop_timeout
         self.session_kind, self.clock = session_kind, clock
         self.dev_enabled = os.environ.get(DEV_ENV) == "1" if dev_enabled is None else dev_enabled
         self.session_factory, self.owns_session = session_factory, owns_session
@@ -183,6 +185,9 @@ class MeetingRecording(QObject):
         self._overlay_recovery_deadline = 0.0
         self._overlay_recovery_text = ""
         self._overlay_recovery_reason = ""
+        self._overlay_fallback_text = ""
+        self._overlay_fallback_deadline = 0.0
+        self._notice_app = ""
         self._indicator_guard: MeetingIndicatorGuard | None = None
         role = self._new_supervisor()
         self.controller = MeetingController(
@@ -467,6 +472,7 @@ class MeetingRecording(QObject):
                 "object_serial": self.target["object_serial"],
                 "call_id": self._call_id,
             }
+        self._notice_app = self.app_class if far["kind"] == "app_stream" else ""
         if self.clicks.on_start_clicked(far):
             # A consumed role must exit before replacement; an already launched
             # fresh query-only role can accept its first explicit start click.
@@ -603,6 +609,9 @@ class MeetingRecording(QObject):
                 secondary = self._overlay_recovery_text
             elif self.clock() < self._overlay_far_deadline:
                 state, secondary = "app-closed", W2_TEXTS["farEnded"]
+            elif self.clock() < self._overlay_fallback_deadline:
+                # S17-A4: the notification service did not take the notice.
+                state, secondary = "notify-fallback", self._overlay_fallback_text
         if self.dev_enabled and self.clock() < self._overlay_error_deadline:
             visible, state, secondary = True, "error", W2_TEXTS["audioError"]
         pause_minutes = (
@@ -815,6 +824,7 @@ class MeetingRecording(QObject):
             self._overlay_recovery_key = None
             self._overlay_recovery_deadline = 0.0
             self._overlay_recovery_text = self._overlay_recovery_reason = ""
+            self._overlay_fallback_text, self._overlay_fallback_deadline = "", 0.0
         recovery = self.controller.indicator_recovery
         if recovery is not None:
             key = (recovery["capture_id"], recovery["state_rev"])
@@ -868,17 +878,78 @@ class MeetingRecording(QObject):
             self._signature = signature
             self.changed.emit()
 
+    @property
+    def active_meeting_id(self) -> str:
+        """Committed meeting shown by W2 as an active recording, else ""."""
+        meeting = self.controller.meeting
+        if meeting is None or not self.overlay["active"]:
+            return ""
+        return meeting.id
+
+    @property
+    def notice_app_class(self) -> str:
+        """App class of the verified call target this recording was started with."""
+        return self._notice_app
+
+    def show_notify_fallback(self, text: str) -> None:
+        """W2 second row for 8 s when a recording notice was not delivered (S17-A4)."""
+        if self._closed or not self.overlay["active"]:
+            return
+        self._overlay_fallback_text = text
+        self._overlay_fallback_deadline = self.clock() + 8
+        self._publish()
+
+    def _stop_for_exit(self, deadline: float) -> None:
+        """Exit/SIGTERM during capture: the ordinary stop and M2 finalization.
+
+        Capture closes within the controller's 1 s close deadline (or is killed);
+        the final metadata write is then drained before the role is released.
+        A consumed role already `stopped` after `closed` is still finalizing:
+        exit waits for it too, within the same deadline.
+        """
+        controller = self.controller
+        if not self._role_started:
+            return
+        finalizing = (
+            controller.state == "stopped"
+            and not self._standby_role
+            and not controller.supervisor.exited
+        )
+        if not finalizing and controller.state not in {
+            "preparing",
+            "opening",
+            "recording",
+            "paused",
+            "stopping",
+        }:
+            return
+        if controller.state not in {"stopping", "stopped"}:
+            self.clicks.on_stop_clicked()
+        while time.monotonic() < deadline:
+            controller.tick()
+            if controller.state in {"stopped", "closing-unknown"} and controller.supervisor.exited:
+                break
+            controller.supervisor.pump(0.02)
+        controller.tick()
+
     def shutdown(self) -> None:
         if self._closed:
             return
-        self._closed = True
         self._lease_timer.stop()
         self._control_timer.stop()
         self.unbind_indicators()
+        # One exit budget for the stop, finalization and the metadata drain.
+        deadline = time.monotonic() + self._exit_stop_timeout
+        try:
+            self._stop_for_exit(deadline)
+        except Exception:
+            log.warning("meeting-exit-stop-failed")
+        self._closed = True
         try:
             if self._role_started:
+                # Terminal for the role; after a graceful exit it only releases IPC.
                 self.controller.supervisor.kill()
             self._release_session()
         finally:
-            if not self.controller.close(timeout=1.0):
+            if not self.controller.close(timeout=max(0.0, deadline - time.monotonic())):
                 log.warning("meeting-metadata-close-timeout")
