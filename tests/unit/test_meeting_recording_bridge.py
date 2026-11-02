@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -733,3 +736,98 @@ def test_unused_role_releases_borrowed_subscription_without_closing_monitor(
     rig.bridge.closeStartDialog()
     assert rig.session.receivers(rig.session.changed) == 0
     assert rig.session.closes == 0
+
+
+def test_shutdown_drains_accepted_metadata_before_return(rig: Rig) -> None:
+    entered, release, written = threading.Event(), threading.Event(), threading.Event()
+    writer = rig.recording.controller._writer
+
+    def write() -> None:
+        entered.set()
+        assert release.wait(3)
+        written.set()
+
+    writer.submit(write)
+    releaser = threading.Timer(0.3, release.set)
+    try:
+        assert entered.wait(1)
+        releaser.start()
+        rig.recording.shutdown()
+        assert written.is_set(), "shutdown returned before accepted metadata was written"
+        with pytest.raises(RuntimeError, match="meeting-writer-closed"):
+            writer.submit(lambda: None)
+    finally:
+        release.set()
+        if releaser.ident is not None:
+            releaser.join(1)
+        assert writer.close(timeout=1)
+
+
+def test_shutdown_metadata_deadline_warns_once_without_waiting_for_disk(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    entered, release, written = threading.Event(), threading.Event(), threading.Event()
+    writer = rig.recording.controller._writer
+
+    def write() -> None:
+        entered.set()
+        assert release.wait(3)
+        written.set()
+
+    caplog.set_level(logging.WARNING, logger="astra_voice.ui.meeting_recording")
+    writer.submit(write)
+    try:
+        assert entered.wait(1)
+        started = time.monotonic()
+        rig.recording.shutdown()
+        elapsed = time.monotonic() - started
+        assert 0.9 <= elapsed < 1.3
+        assert not written.is_set()
+        rig.recording.shutdown()
+        assert [
+            (record.levelname, record.getMessage())
+            for record in caplog.records
+            if record.name == "astra_voice.ui.meeting_recording"
+        ] == [("WARNING", "meeting-metadata-close-timeout")]
+        with pytest.raises(RuntimeError, match="meeting-writer-closed"):
+            writer.submit(lambda: None)
+    finally:
+        release.set()
+        assert writer.close(timeout=1)
+
+
+@pytest.mark.parametrize("failure", ["kill", "release"])
+def test_shutdown_drains_metadata_even_when_other_cleanup_raises(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    entered, release, written = threading.Event(), threading.Event(), threading.Event()
+    writer = rig.recording.controller._writer
+
+    def write() -> None:
+        entered.set()
+        assert release.wait(3)
+        written.set()
+
+    def fail() -> None:
+        raise RuntimeError("shutdown-cleanup-failed")
+
+    rig.recording._role_started = True
+    if failure == "kill":
+        monkeypatch.setattr(rig.supervisor, "kill", fail)
+    else:
+        monkeypatch.setattr(rig.recording, "_release_session", fail)
+    writer.submit(write)
+    releaser = threading.Timer(0.05, release.set)
+    try:
+        assert entered.wait(1)
+        releaser.start()
+        with pytest.raises(RuntimeError, match="shutdown-cleanup-failed"):
+            rig.recording.shutdown()
+        assert written.is_set(), "cleanup exception skipped accepted metadata"
+        with pytest.raises(RuntimeError, match="meeting-writer-closed"):
+            writer.submit(lambda: None)
+    finally:
+        release.set()
+        if releaser.ident is not None:
+            releaser.join(1)
+        assert writer.close(timeout=1)

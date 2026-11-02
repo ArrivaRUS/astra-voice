@@ -25,6 +25,8 @@ import json
 import re
 import subprocess
 import sys
+import threading
+import time
 import traceback
 from collections.abc import Generator, Iterator, Mapping, Set
 from pathlib import Path
@@ -36,6 +38,8 @@ from _pytest.nodes import Node
 from _pytest.terminal import TerminalReporter
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     from helpers.snapshots import RefsGuard
 
 pytest_plugins = ("pytester",)
@@ -363,6 +367,48 @@ def audio_isolation(pytestconfig: pytest.Config) -> Iterator[None]:
         check_pulseaudio_processes(
             pytestconfig.stash.get(_PULSE_PROCESSES, None), pulseaudio_processes()
         )
+
+
+def _meeting_thread_module(name: str) -> bool:
+    return name.startswith(("astra_voice.worker.meeting_", "astra_voice.ui.meeting_")) or (
+        name == "astra_voice.core.meeting_session"
+    )
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_meeting_threads(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Attribute meeting workers by origin, including anonymous/daemon threads."""
+    before = set(threading.enumerate())
+    started: list[threading.Thread] = []
+    original_start = threading.Thread.start
+
+    def start(thread: threading.Thread) -> None:
+        frame: FrameType | None = sys._getframe(1)
+        while frame is not None:
+            if _meeting_thread_module(str(frame.f_globals.get("__name__", ""))):
+                started.append(thread)
+                break
+            frame = frame.f_back
+        original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    yield
+    frames = sys._current_frames()
+    candidates = set(started)
+    for thread in set(threading.enumerate()) - before:
+        frame = frames.get(thread.ident) if thread.ident is not None else None
+        while frame is not None:
+            if _meeting_thread_module(str(frame.f_globals.get("__name__", ""))):
+                candidates.add(thread)
+                break
+            frame = frame.f_back
+    # Allow finite workers already released by fixture finalizers to return.
+    deadline = time.monotonic() + 0.5
+    for thread in candidates:
+        if thread.is_alive():
+            thread.join(max(0.0, deadline - time.monotonic()))
+    alive = sorted(thread.name for thread in candidates if thread.is_alive())
+    assert not alive, "meeting-thread-leak: " + ", ".join(alive)
 
 
 @pytest.fixture(autouse=True)

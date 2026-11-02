@@ -92,16 +92,52 @@ class MetadataWriter:
     def __init__(self) -> None:
         self._jobs: queue.Queue[Callable[[], None]] = queue.Queue(64)
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._closed = False
 
     def submit(self, operation: Callable[[], None]) -> None:
-        self._jobs.put_nowait(operation)
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._run, name="meeting-metadata", daemon=True)
-            self._thread.start()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("meeting-writer-closed")
+            self._jobs.put_nowait(operation)
+            if not self._running:
+                self._thread = threading.Thread(
+                    target=self._run, name="meeting-metadata", daemon=True
+                )
+                self._running = True
+                try:
+                    self._thread.start()
+                except RuntimeError:
+                    self._running = False
+                    raise
 
     def _run(self) -> None:
         while True:
-            self._jobs.get()()
+            with self._lock:
+                try:
+                    operation = self._jobs.get_nowait()
+                except queue.Empty:
+                    # Submit and retirement share the lock: a new job either
+                    # belongs to this worker or starts its replacement.
+                    self._running = False
+                    return
+            try:
+                operation()
+            except BaseException:
+                with self._lock:
+                    self._running = False
+                raise
+
+    def close(self, *, timeout: float = 0.0) -> bool:
+        """Drain accepted work; GUI shutdown never waits on filesystem I/O."""
+        with self._lock:
+            self._closed = True
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            if thread.ident is not None:
+                thread.join(timeout)
+        return (thread is None or not thread.is_alive()) and self._jobs.empty()
 
 
 def filesystem_type(descriptor: int) -> int:
@@ -144,6 +180,9 @@ def probe_storage(path: Path) -> StorageStatus:
 
 
 class MeetingController:
+    def close(self, *, timeout: float = 0.0) -> bool:
+        return self._writer.close(timeout=timeout)
+
     def __init__(
         self,
         store: MeetingStore,
@@ -170,9 +209,9 @@ class MeetingController:
         self.id_factory = id_factory
         self._mic_device = mic_device
         self._selected_mic: str | None = None
-        writer = MetadataWriter()
-        self._metadata_submit = metadata_submit or writer.submit
-        self._filesystem_submit = filesystem_submit or writer.submit
+        self._writer = MetadataWriter()
+        self._metadata_submit = metadata_submit or self._writer.submit
+        self._filesystem_submit = filesystem_submit or self._writer.submit
         self._filesystem_results: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._filesystem_pending = 0
         self._disk_pending = False

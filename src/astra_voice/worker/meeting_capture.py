@@ -7,6 +7,7 @@ supervision. A daemon storage worker cannot hold up microphone disconnection.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import threading
@@ -83,6 +84,7 @@ class _Archive:
         self.pending_bytes = 0
         self.pending_track_bytes = {"mic": 0, "far": 0}
         self.failed = threading.Event()
+        self.stopping = threading.Event()
         self.counts = {"mic": index, "far": index}
         self.segments: dict[str, tuple[Any, Any, SegmentSidecar]] = {}
         self.next_sample = {"mic": 0, "far": 0}
@@ -96,6 +98,13 @@ class _Archive:
         self.thread.start()
 
     def put(self, kind: str, payload: Any) -> bool:
+        if kind == "quit":
+            # Shutdown is independent of PCM/control queue credits. Wake an
+            # idle reader; a full queue drains before observing the same flag.
+            self.stopping.set()
+            with contextlib.suppress(queue.Full):
+                self.jobs.put_nowait((kind, payload))
+            return True
         size = len(payload[1]) if kind == "pcm" else 0
         with self.lock:
             if (
@@ -327,6 +336,8 @@ class _Archive:
             with store.writer(self.directory.name, Writer.CAPTURE) as owner:
                 with private_directory(self.directory / "audio") as audio:
                     while True:
+                        if self.stopping.is_set() and self.jobs.empty():
+                            return
                         kind, payload = self.jobs.get()
                         try:
                             if kind == "start":
@@ -1615,3 +1626,8 @@ class MeetingCaptureState:
         while not self.stopped and time.monotonic() < deadline:
             self.poll()
             time.sleep(0.005)
+        # An escalated close can already have set stopped while storage is
+        # finishing. It still owns a worker that must receive its exit request.
+        if self.archive is not None:
+            self.archive.put("quit", None)
+            self.archive.thread.join(max(0.0, deadline - time.monotonic()))

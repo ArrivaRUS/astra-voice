@@ -654,3 +654,80 @@ def test_track_resume_installs_guard_inside_native_open(rig: Rig) -> None:
     assert admit(rig, "track.resume", track="mic", mic_device="test")[0]["type"] == "meeting.ack"
     rig.until("meeting.capture.closed")
     assert attempted == [False]
+
+
+def test_session_close_joins_inflight_poll_and_signal_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = session_module()
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class Source:
+        def read(self) -> dict[str, bool]:
+            entered.set()
+            assert release.wait(2)
+            return dict(known=True, active=True, locked=False, sleeping=False)
+
+    monitor = module.MeetingSession(ready_session(time.monotonic), source=Source())
+    signal_workers: list[threading.Thread] = []
+
+    def signals() -> None:
+        signal_workers.append(threading.current_thread())
+        monitor.signals_ready.set()
+        monitor.stop.wait(2)
+
+    monkeypatch.setattr(monitor, "_signals", signals)
+    outcome: list[bool] = []
+
+    def close() -> None:
+        outcome.append(monitor.close())
+        closed.set()
+
+    closer = threading.Thread(target=close)
+    try:
+        monitor.start()
+        assert entered.wait(1)
+        closer.start()
+        assert not closed.wait(0.05), "close returned before its in-flight login1 read"
+        release.set()
+        closer.join(2)
+        assert outcome == [True]
+        assert not monitor.thread.is_alive()
+        assert signal_workers and not signal_workers[0].is_alive()
+        assert monitor.close() is True
+    finally:
+        release.set()
+        monitor.close()
+        if closer.ident is not None:
+            closer.join(2)
+        if monitor.thread is not None:
+            monitor.thread.join(2)
+        for thread in signal_workers:
+            thread.join(2)
+
+
+def test_session_close_reports_live_reader_and_can_be_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = session_module()
+    entered, release = threading.Event(), threading.Event()
+
+    class Source:
+        def read(self) -> dict[str, bool]:
+            entered.set()
+            release.wait(2)
+            return dict(known=True, active=True, locked=False, sleeping=False)
+
+    monitor = module.MeetingSession(ready_session(time.monotonic), source=Source())
+    monkeypatch.setattr(monitor, "_signals", monitor.signals_ready.set)
+    try:
+        monitor.start()
+        assert entered.wait(1)
+        started = time.monotonic()
+        assert monitor.close() is False
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        assert monitor.close() is True
+    monitor.start()
+    assert not monitor.thread.is_alive()

@@ -513,3 +513,34 @@ def test_clock_discontinuity_tolerates_fragment_jitter_and_minus_200ppm(tmp_path
         assert not sidecar["discontinuity"] and sidecar["close_reason"] == "stop"
     finally:
         rig.cleanup()
+
+
+def test_cleanup_stops_archive_even_when_control_queue_is_full(tmp_path: Path) -> None:
+    entered, release = threading.Event(), threading.Event()
+
+    def fsync(fd: int) -> None:
+        entered.set()
+        assert release.wait(4)
+
+    rig = Rig(tmp_path, fsync=fsync)
+    archive = None
+    try:
+        rig.prepare()
+        rig.open()
+        assert entered.wait(1)
+        archive = rig.state.archive
+        assert archive is not None
+        while archive.put("track_close", ("mic", "stop")):
+            pass
+        assert archive.jobs.full()
+        rig.cleanup()
+        release.set()
+        archive.thread.join(1)
+        assert not archive.thread.is_alive(), "full queue discarded archive shutdown"
+    finally:
+        release.set()
+        if archive is not None:
+            wait_until(lambda: archive.jobs.empty() or not archive.thread.is_alive())
+            archive.put("quit", None)
+            archive.thread.join(1)
+        rig.cleanup()

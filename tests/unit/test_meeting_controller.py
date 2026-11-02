@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -104,8 +105,12 @@ class Rig:
 
 
 @pytest.fixture
-def rig(tmp_path: Path) -> Rig:
-    return Rig(tmp_path)
+def rig(tmp_path: Path) -> Iterator[Rig]:
+    instance = Rig(tmp_path)
+    try:
+        yield instance
+    finally:
+        assert instance.controller.close(timeout=1)
 
 
 def test_reservation_not_visible_and_commit(rig: Rig) -> None:
@@ -585,6 +590,7 @@ def test_hanging_metadata_writer_does_not_stall_control(
     finally:
         release.set()
         thread.join(2)
+        assert rig.controller.close(timeout=1)
 
 
 def test_recovery_never_interpolates_clock_epoch_gap(rig: Rig) -> None:
@@ -1032,14 +1038,20 @@ def test_click_epoch_survives_lock_unlock_during_storage_probe(rig: Rig) -> None
     assert rig.controller.error_code == "session-blocked"
 
 
-def test_pause_inflight_keepalive_stale_revision_is_not_fatal(rig: Rig) -> None:
+def test_pause_inflight_keepalive_stale_revision_is_not_fatal(
+    rig: Rig, request: pytest.FixtureRequest
+) -> None:
     from astra_voice.worker.meeting_capture import MeetingCaptureState
+    from astra_voice.worker.meeting_session import SessionAdmission
 
     rig.recording()
     rig.now += 0.9
     rig.bridge.on_pause_clicked()
     # Capture processed pause, but its ACK/closed are still in the pipe.
-    capture = MeetingCaptureState(clock=lambda: rig.now)
+    capture = MeetingCaptureState(
+        clock=lambda: rig.now, session=SessionAdmission(kind="KDE", clock=lambda: rig.now)
+    )
+    request.addfinalizer(capture.cleanup)
     capture.identity = {**rig.controller._identity, "state_rev": 2}
     capture.state = "paused"
     capture.pause_reasons = {"user"}
@@ -1056,7 +1068,7 @@ def test_pause_inflight_keepalive_stale_revision_is_not_fatal(rig: Rig) -> None:
 
 @pytest.mark.parametrize("phase", ["probe-start", "reserve", "commit", "probe-tick"])
 def test_filesystem_wait_never_blocks_controller(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch, phase: str
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, phase: str, request: pytest.FixtureRequest
 ) -> None:
     import threading
 
@@ -1070,7 +1082,9 @@ def test_filesystem_wait_never_blocks_controller(
         rig.bridge.on_start_clicked()
     # The default implementation must offload filesystem work; injecting a real
     # writer here keeps other rig setup synchronous and deterministic.
-    rig.controller._filesystem_submit = MetadataWriter().submit
+    writer = MetadataWriter()
+    request.addfinalizer(lambda: writer.close(timeout=1))
+    rig.controller._filesystem_submit = writer.submit
     if phase.startswith("probe"):
         original = rig.controller.storage_probe
 
@@ -1372,3 +1386,48 @@ def test_session_cancel_before_capture_hello_uses_exit_escalation(rig: Rig, bloc
     rig.controller.tick()  # exited is true: no spawned process in this isolated test.
     assert rig.controller.state == "stopped"
     assert not (rig.store.root / MID).exists()
+
+
+def test_metadata_writer_retires_idle_and_restarts_without_losing_jobs() -> None:
+    import threading
+
+    from astra_voice.core.meeting_session import MetadataWriter
+
+    writer = MetadataWriter()
+    completed = threading.Event()
+    writer.submit(completed.set)
+    assert completed.wait(1)
+    first = writer._thread
+    if first is not None:
+        first.join(1)
+        assert not first.is_alive(), "idle metadata worker outlived its work"
+    completed.clear()
+    writer.submit(completed.set)
+    assert completed.wait(1)
+    assert writer.close(timeout=1)
+    with pytest.raises(RuntimeError, match="meeting-writer-closed"):
+        writer.submit(lambda: None)
+
+
+def test_metadata_writer_close_never_waits_for_blocked_filesystem() -> None:
+    import threading
+    import time
+
+    from astra_voice.core.meeting_session import MetadataWriter
+
+    entered, release = threading.Event(), threading.Event()
+    writer = MetadataWriter()
+
+    def blocked() -> None:
+        entered.set()
+        release.wait(2)
+
+    writer.submit(blocked)
+    try:
+        assert entered.wait(1)
+        started = time.monotonic()
+        assert writer.close() is False
+        assert time.monotonic() - started < 0.1
+    finally:
+        release.set()
+        assert writer.close(timeout=1)

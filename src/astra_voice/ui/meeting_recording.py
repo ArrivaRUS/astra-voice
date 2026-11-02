@@ -7,6 +7,7 @@ Filesystem and read-only audio preview work publish plain values to the GUI.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import shutil
@@ -48,6 +49,7 @@ from astra_voice.worker.supervisor import WorkerSupervisor
 
 Message = dict[str, Any]
 DEV_ENV = "ASTRA_VOICE_MEETING_CAPTURE_DEV"
+log = logging.getLogger(__name__)
 
 
 class Role(CaptureSupervisor, Protocol):
@@ -685,6 +687,10 @@ class MeetingRecording(QObject):
         self._closed = True
         self._lease_timer.stop()
         self._control_timer.stop()
-        if self._role_started:
-            self.controller.supervisor.kill()
-        self._release_session()
+        try:
+            if self._role_started:
+                self.controller.supervisor.kill()
+            self._release_session()
+        finally:
+            if not self.controller.close(timeout=1.0):
+                log.warning("meeting-metadata-close-timeout")

@@ -264,6 +264,8 @@ class MeetingSession:
         self.process: subprocess.Popen[str] | None = None
         self.helper_lock = threading.Lock()
         self.thread: threading.Thread | None = None
+        self.signal_thread: threading.Thread | None = None
+        self.helper_reaped = True
         self.signals_ready = threading.Event()
         self.signals_disabled = threading.Event()
 
@@ -287,7 +289,7 @@ class MeetingSession:
             self.state.update(**values, generation=generation)
 
     def start(self) -> None:
-        if self.thread is not None:
+        if self.thread is not None or self.stop.is_set():
             return
 
         def poll() -> None:
@@ -303,7 +305,10 @@ class MeetingSession:
                 self.stop.wait(max(0, POLL_SECONDS - (time.monotonic() - started)))
 
         self.thread = threading.Thread(target=poll, name="meeting-session", daemon=True)
-        threading.Thread(target=self._signals, name="meeting-session-signals", daemon=True).start()
+        self.signal_thread = threading.Thread(
+            target=self._signals, name="meeting-session-signals", daemon=True
+        )
+        self.signal_thread.start()
         self.thread.start()
 
     def _signals(self) -> None:
@@ -332,6 +337,7 @@ class MeetingSession:
             self.signals_ready.set()  # Optional helper unavailable: poll-only mode.
             return
         self.process = process
+        self.helper_reaped = False
         if self.stop.is_set() or self.signals_disabled.is_set():
             self._reap_helper(process)
         assert process.stdout is not None
@@ -385,11 +391,22 @@ class MeetingSession:
                     # TimeoutExpired carries argv; do not let a helper thread
                     # print it. Kill was sent, but reap is not yet confirmed.
                     self.state.signal("unknown")
+                    self.helper_reaped = False
                     return False
+            self.helper_reaped = True
             return True
 
     def close(self) -> bool:
         self.stop.set()
+        self.signals_ready.set()  # Wake startup as well as the regular poll wait.
+        deadline = time.monotonic() + 0.5
         if self.process is not None:
-            return self._reap_helper(self.process)
-        return True
+            self._reap_helper(self.process)
+        workers = (self.thread, self.signal_thread)
+        for thread in workers:
+            if thread is not None and thread is not threading.current_thread():
+                if thread.ident is not None:
+                    thread.join(max(0.0, deadline - time.monotonic()))
+        # A late helper spawn is reaped by its own signal reader before it exits.
+        # An unresponsive reader is a failed close, never a false success.
+        return self.helper_reaped and all(t is None or not t.is_alive() for t in workers)
