@@ -9,13 +9,17 @@ private environment, model.load → meeting.job.start → credits 64/32.
 Only numbers are reported (WER per track, timecode deltas, wall/RTF, peak RSS);
 recognized and reference texts never reach stdout/stderr.
 
-Gate (DoD E13.M4): timecodes p95 ≤ 1 s and max ≤ 2 s. WER (no dictation WER
+Gate (DoD E13.M4): timecodes p95 ≤ 1 s and max ≤ 2 s, measured from every reply
+of ours to the nearest reference reply/sentence onset of its track — the timecode
+a person sees. «Reference → ours» is reported without a verdict: VAD joins turns
+separated by < 0.5 s into one reply. WER (no dictation WER
 on this TTS corpus is known) and speed (the laptop is the reference, not the
 VPS) are reported as guides.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -189,11 +193,12 @@ def evaluate(
     """Metrics and verdicts from the role's utterances (text is consumed here only)."""
     rows = sorted(utterances, key=lambda u: (int(u["start_ms"]), int(u.get("seq", 0))))
     spoken = [u for u in rows if str(u.get("text", "")).strip() not in PLACEHOLDERS]
-    report: dict[str, Any] = {"wer": {}, "timecodes_by_track": {}, "reverse_by_track": {}}
-    deltas: list[int] = []
-    reverse: list[int] = []
+    report: dict[str, Any] = {"wer": {}, "timecodes_by_track": {}}
+    forward_by_track: dict[str, Any] = {}
+    deltas: list[int] = []  # gate: our start -> nearest reference onset (what a person sees)
+    forward: list[int] = []  # info: reference reply -> nearest start of ours
     separable: list[int] = []
-    missing = 0
+    missing: list[str] = []
     for track in ("mic", "far"):
         mine = [u for u in spoken if u["track"] == track]
         hypothesis: list[str] = []
@@ -206,21 +211,24 @@ def evaluate(
             "hypothesis_words": len(hypothesis),
         }
         starts = [int(u["start_ms"]) for u in mine]
-        found = nearest_deltas(reference.starts[track], starts)
-        if reference.starts[track] and not found:
-            missing += len(reference.starts[track])
+        if reference.starts[track] and not starts:
+            missing.append(track)  # the track has speech and we produced nothing
+        found = nearest_deltas(starts, reference.onsets[track])
         deltas.extend(found)
         report["timecodes_by_track"][track] = summary(found)
+        back = nearest_deltas(reference.starts[track], starts)
+        forward.extend(back)
+        forward_by_track[track] = summary(back)
         separable.extend(nearest_deltas(reference.separable[track], starts))
-        back = nearest_deltas(starts, reference.onsets[track])
-        reverse.extend(back)
-        report["reverse_by_track"][track] = summary(back)
-    report["timecodes"] = summary(deltas)
-    report["timecodes"]["missing"] = missing
-    # Diagnostic: our start → nearest reference reply/sentence onset (merges of
-    # turns separated by < 0.5 s show up in "timecodes", not here).
-    report["timecodes_reverse"] = summary(reverse)
-    report["timecodes_separable"] = summary(separable)
+    report["timecodes"] = {**summary(deltas), "missing_tracks": missing}
+    # Information only, no verdict: VAD joins adjacent turns of one track separated
+    # by < 0.5 s into one reply, so the second turn has no start of its own.
+    report["reference_to_ours"] = {
+        **summary(forward),
+        "by_track": forward_by_track,
+        "after_pause_1s": summary(separable),
+        "note": "без вердикта: VAD склеивает соседние реплики одной дорожки при паузе < 0,5 с",
+    }
     rtf = wall_ms / audio_ms if audio_ms > 0 else None
     report.update(
         {
@@ -508,6 +516,16 @@ def run_role(
 # ---- command ----------------------------------------------------------------
 
 
+REQUIRED_MODULES = ("onnxruntime", "onnx_asr", "jsonschema", "PyQt5")
+
+
+def missing_modules(
+    find: Callable[[str], Any] = importlib.util.find_spec,
+) -> list[str]:
+    """Modules of this interpreter (the role runs on the same ``sys.executable``)."""
+    return [name for name in REQUIRED_MODULES if find(name) is None]
+
+
 def _prepare_out(out: Path | None) -> tuple[Path, bool]:
     if out is None:
         return Path(tempfile.mkdtemp(prefix="astra-voice-meetings-")), True
@@ -546,6 +564,11 @@ def run_transcribe(
     }
     root: Path | None = None
     temporary = False
+    missing = missing_modules()
+    if missing:
+        report["failure"] = "modules-missing: " + ", ".join(missing)
+        report["missing_modules"] = missing
+        return 2, report
     from astra_voice.meetings import MeetingValidationError
     from astra_voice.meetings.store import MeetingStoreError
 
@@ -618,19 +641,18 @@ def text_report(report: dict[str, Any]) -> list[str]:
                 f"(эталон {item['reference_words']} сл., распознано {item['hypothesis_words']})"
             )
         tc = report["timecodes"]
+        silent = ", ".join(tc["missing_tracks"]) or "нет"
         lines.append(
-            f"таймкоды |Δstart|, мс: p50 {tc['p50']} · p95 {tc['p95']} · max {tc['max']} "
-            f"(n {tc['n']}, пропущено {tc['missing']})"
+            f"таймкоды (наша реплика → начало эталона), мс: p50 {tc['p50']} · p95 {tc['p95']}"
+            f" · max {tc['max']} (n {tc['n']}, дорожки без реплик: {silent})"
         )
-        for key, name in (
-            ("timecodes_separable", "реплики после паузы ≥ 1 с"),
-            ("timecodes_reverse", "наша реплика → ближайшее начало эталона"),
-        ):
-            item = report[key]
-            lines.append(
-                f"{name}, мс: p50 {item['p50']} · p95 {item['p95']} · max {item['max']}"
-                f" (n {item['n']})"
-            )
+        info = report["reference_to_ours"]
+        pause = info["after_pause_1s"]
+        lines.append(
+            f"эталон → наша (без вердикта, склейка VAD < 0,5 с), мс: p50 {info['p50']}"
+            f" · p95 {info['p95']} · max {info['max']} (n {info['n']});"
+            f" после паузы ≥ 1 с: p95 {pause['p95']} · max {pause['max']} (n {pause['n']})"
+        )
         lines.append(
             f"звук {report['audio_ms']} мс · wall {report['wall_ms']} мс · RTF {report['rtf']}"
             f" · 1 ч ≈ {report['hour_wall_ms']} мс · пик RSS {report['peak_rss_kb']} КиБ"

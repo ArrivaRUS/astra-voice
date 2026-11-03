@@ -361,7 +361,14 @@ def test_evaluate_passes_with_close_timecodes_and_reports_numbers_only() -> None
     report = check.evaluate(reference, ours, audio_ms=12_000, wall_ms=600, done=DONE)
     assert report["wer"]["mic"] == {"percent": 0.0, "reference_words": 2, "hypothesis_words": 2}
     assert report["wer"]["far"]["percent"] == 0.0  # the placeholder is not text
-    assert report["timecodes"] == {"n": 4, "p50": 180, "p95": 200, "max": 200, "missing": 0}
+    # Gate: every reply of ours -> nearest reference onset of its track.
+    assert report["timecodes"] == {
+        "n": 4,
+        "p50": 180,
+        "p95": 200,
+        "max": 200,
+        "missing_tracks": [],
+    }
     assert (report["utterances"], report["unrecognized"]) == (5, 1)
     assert report["rtf"] == 0.05 and report["hour_wall_ms"] == 180_000
     assert report["verdicts"]["timecodes"] == "pass" and report["verdicts"]["job"] == "pass"
@@ -372,7 +379,7 @@ def test_evaluate_passes_with_close_timecodes_and_reports_numbers_only() -> None
         assert word not in dumped
 
 
-def test_evaluate_fails_on_merged_turn_missing_track_or_failed_job() -> None:
+def test_merged_turn_is_information_only_late_reply_or_silent_track_fail() -> None:
     reference = check.load_reference(corpus_document(), 12_000)
     merged = [
         utterance(0, "far", 100, "был мальчик звали его пошли раз"),
@@ -380,13 +387,23 @@ def test_evaluate_fails_on_merged_turn_missing_track_or_failed_job() -> None:
         utterance(2, "far", 9_100, "филипп взял шапку и"),
     ]
     report = check.evaluate(reference, merged, audio_ms=12_000, wall_ms=600, done=DONE)
-    assert report["timecodes"]["max"] == 3_200  # far2 at 3.3 s merged into far1
-    assert report["timecodes_separable"]["max"] == 100
+    # far2 (3.3 s) joined far1 by VAD: «reference -> ours» shows it, without a verdict.
+    info = report["reference_to_ours"]
+    assert (info["max"], info["after_pause_1s"]["max"]) == (3_200, 100)
+    assert "0,5 с" in info["note"] and "reference_to_ours" not in report["verdicts"]
+    assert report["timecodes"]["max"] == 100
+    assert report["verdicts"]["timecodes"] == "pass" and report["exit_code"] == 0
+    late = [*merged, utterance(3, "far", 6_500, "лишнее")]  # 2.5 s from any onset
+    report = check.evaluate(reference, late, audio_ms=12_000, wall_ms=600, done=DONE)
+    assert report["timecodes"]["max"] == 2_500
     assert report["verdicts"]["timecodes"] == "fail" and report["exit_code"] == 1
     no_mic = [u for u in merged if u["track"] == "far"]
     report = check.evaluate(reference, no_mic, audio_ms=12_000, wall_ms=600, done=DONE)
-    assert report["timecodes"]["missing"] == 1 and report["wer"]["mic"]["percent"] == 100.0
+    assert report["timecodes"]["missing_tracks"] == ["mic"]
+    assert report["wer"]["mic"]["percent"] == 100.0
     assert report["verdict"] == "fail"
+    lines = "\n".join(check.text_report(report))
+    assert "дорожки без реплик: mic" in lines and "без вердикта" in lines
     close = [utterance(0, "far", 0, "x"), utterance(1, "far", 3_300, "x")]
     close += [utterance(2, "mic", 4_000, "x"), utterance(3, "far", 9_000, "x")]
     report = check.evaluate(reference, close, audio_ms=12_000, wall_ms=6_000, done=None)
@@ -399,6 +416,29 @@ def test_evaluate_fails_on_merged_turn_missing_track_or_failed_job() -> None:
     assert (report["verdict"], report["exit_code"]) == ("fail", 1)
 
 
+def test_missing_modules_are_named_and_stop_before_any_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    absent = {"onnxruntime", "jsonschema"}
+    assert check.missing_modules(lambda name: None if name in absent else object()) == [
+        "onnxruntime",
+        "jsonschema",
+    ]
+    monkeypatch.setattr(check, "missing_modules", lambda: ["onnxruntime", "onnx_asr"])
+    out = tmp_path / "out"
+    code, report = check.run_transcribe(tmp_path, out=out)
+    assert (code, report["verdict"]) == (2, "unavailable")
+    assert report["failure"] == "modules-missing: onnxruntime, onnx_asr"
+    assert "onnxruntime, onnx_asr" in "\n".join(check.text_report(report))
+    assert not out.exists()
+
+
+@pytest.fixture
+def modules_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(check, "missing_modules", lambda: [])
+
+
+@pytest.mark.usefixtures("modules_present")
 def test_run_transcribe_without_model_is_unavailable_and_leaves_no_files(
     tmp_path: Path,
 ) -> None:
@@ -410,6 +450,7 @@ def test_run_transcribe_without_model_is_unavailable_and_leaves_no_files(
     assert not out.exists()
 
 
+@pytest.mark.usefixtures("modules_present")
 def test_run_transcribe_refuses_non_empty_out_and_bad_corpus(tmp_path: Path) -> None:
     from astra_voice.worker.engine import LAYOUTS
 
