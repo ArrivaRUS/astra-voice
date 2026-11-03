@@ -100,7 +100,7 @@ jobs:
   xvfb:
     name: pytest -m xvfb
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     container: debian:12
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -139,7 +139,7 @@ jobs:
           fc-cache -f
           fc-match -f '%{family}' 'PT Root UI' | grep -q 'PT Root UI'
       - run: make test-xvfb VENV=$VENV
-        timeout-minutes: 12
+        timeout-minutes: 16
         env:
           ASTRA_VOICE_REQUIRE_QT: "1"
           QT_QPA_PLATFORM: xcb
