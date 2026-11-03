@@ -813,6 +813,9 @@ FocusScope {
                             id: participantsTitle
                             x: Theme.participantsHeadPaddingX
                             anchors.verticalCenter: parent.verticalCenter
+                            // FixedHeight оставляет leading снизу; CSS делит его пополам (как Step4Mic).
+                            topPadding: (lineHeight - participantsTitleMetrics.height) / 2
+                            height: lineHeight
                             text: root.txt("participants")
                             textFormat: Text.PlainText
                             color: Theme.fg
@@ -822,6 +825,7 @@ FocusScope {
                             lineHeightMode: Text.FixedHeight
                             font.weight: Font.Medium
                             renderType: Text.NativeRendering
+                            FontMetrics { id: participantsTitleMetrics; font: participantsTitle.font }
                         }
                         Icon {
                             x: parent.width - Theme.participantsHeadPaddingX - width
