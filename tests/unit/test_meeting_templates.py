@@ -21,6 +21,7 @@ from astra_voice.meetings.model import (
     Warnings,
 )
 from astra_voice.meetings.templates import (
+    FORMATS,
     ExportError,
     ExportExists,
     meeting_marks,
@@ -108,12 +109,31 @@ def test_stenogram_rules() -> None:
     assert "Олег, <b>это</b> & *всё*?" in text
     md = stenogram(fixture_meeting(), fixture_transcript(), "md", tz=MSK)
     assert "Олег, \\<b\\>это\\</b\\> \\& \\*всё\\*?" in md
-    # Pause range = recorded point + wall-clock gap of the intervals; stop is not a pause.
-    assert "Пауза 0:31:10–0:34:02" in text
-    assert "1:12:40–" not in text and text.count("Пауза") == 2
+    # Pause = recorded point + wall-clock gap of the intervals (decision 03.11: the
+    # recorded axis excludes paused time, so no range); stop is not a pause.
+    assert "Пауза 0:31:10 · 2 мин 52 с" in text and "0:34:02" not in text
+    assert "1:12:40" not in text.split("Длительность: 1:12:40", 1)[1]
+    assert text.count("Пауза") == 2
     assert text.index("— Ваш микрофон не записывался: 0:12:03–0:12:40") < text.index(
         "[0:41:40] Я: Я вернулся."
     )
+
+
+def test_markdown_links_images_and_headings_stay_literal() -> None:
+    meeting = fixture_meeting()
+    meeting.title = "# заголовок [клик](https://example.com)"
+    transcript = fixture_transcript()
+    transcript.utterances[0].text = "[клик](https://example.com) ![x](file:///etc/passwd)"
+    md = stenogram(meeting, transcript, "md", tz=MSK)
+    assert md.startswith("# \\# заголовок \\[клик\\]\\(https://example.com\\)\n")
+    assert (
+        "[0:00:04] Я: \\[клик\\]\\(https://example.com\\) \\!\\[x\\]\\(file:///etc/passwd\\)\n"
+        in md
+    )
+    assert "](" not in md and "![" not in md
+    txt = stenogram(meeting, transcript, "txt", tz=MSK)
+    assert txt.startswith("# заголовок [клик](https://example.com)\n")
+    assert "[0:00:04] Я: [клик](https://example.com) ![x](file:///etc/passwd)\n" in txt
 
 
 def test_stenogram_unknown_format_is_rejected() -> None:
@@ -139,7 +159,7 @@ def test_marks_order_texts_and_tones() -> None:
     meeting.warnings.whole_output = True
     marks = meeting_marks(meeting, fixture_transcript().utterances)
     assert [mark.badge for mark in marks] == [
-        "Пауза 0:31:10–0:34:02",
+        "Пауза 0:31:10 · 2 мин 52 с",
         "Ваш микрофон не записывался 0:12:03–0:12:40",
         "Пауза: экран был заблокирован 0:50:00",
         "Пауза: индикатор записи не отображался 0:51:00",
@@ -210,6 +230,20 @@ def test_export_refuses_symlinks_and_special_files(tmp_path: Path) -> None:
     assert folder.is_dir()
 
 
+@pytest.mark.parametrize("title", ["Ж" * 120, "🎉" * 70, "é" * 200])
+def test_long_multibyte_names_are_written_and_overwritten(tmp_path: Path, title: str) -> None:
+    # NAME_MAX is 255 bytes: the name fits in bytes, the temporary name stays short.
+    for fmt in FORMATS:
+        name = sanitize_filename(title, fmt)
+        assert len(name.encode("utf-8")) <= 255
+        assert name.endswith("." + fmt) and name[0] == title[0]
+        target = tmp_path / name
+        write_export(target, "1\n", overwrite=False)
+        write_export(target, "2\n", overwrite=True)
+        assert target.read_text(encoding="utf-8") == "2\n"
+    assert len(list(tmp_path.iterdir())) == len(FORMATS)
+
+
 def test_export_to_unwritable_folder_fails_cleanly(tmp_path: Path) -> None:
     with pytest.raises(ExportError):
         write_export(tmp_path / "missing" / "a.md", "x", overwrite=False)
@@ -224,3 +258,44 @@ def test_export_to_unwritable_folder_fails_cleanly(tmp_path: Path) -> None:
         assert not isinstance(error.value, ExportExists)
     finally:
         locked.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    ("milliseconds", "expected"),
+    [
+        (0, "0 с"),
+        (52_999, "52 с"),
+        (60_000, "1 мин"),
+        (172_000, "2 мин 52 с"),
+        (720_000, "12 мин"),
+        (3_599_999, "59 мин 59 с"),
+        (3_600_000, "1 ч"),
+        (3_900_000, "1 ч 5 мин"),
+        (7_259_000, "2 ч"),
+    ],
+)
+def test_pause_duration_text(milliseconds: int, expected: str) -> None:
+    assert templates.duration_text(milliseconds) == expected
+
+
+def test_pause_marks_show_point_and_real_length_ranges_stay() -> None:
+    meeting = fixture_meeting()
+    meeting.intervals = [
+        Interval(0, 0),
+        Interval(1_870_000, 1_870_000),
+        Interval(2_042_000, 1_870_000),
+        Interval(3_172_000, 3_000_000),  # lock: 12 min of real time, a point on the axis
+        Interval(3_892_000, 3_000_000),
+        Interval(5_252_000, 4_360_000),
+    ]
+    meeting.marks += [Mark(3_000_000, "pause", "lock")]
+    marks = {mark.kind: mark for mark in meeting_marks(meeting, fixture_transcript().utterances)}
+    assert marks["pause"].badge == "Пауза 0:31:10 · 2 мин 52 с"
+    assert (marks["pause"].badge_label, marks["pause"].badge_mono) == (
+        "Пауза",
+        "0:31:10 · 2 мин 52 с",
+    )
+    assert marks["lock"].line == "Пауза: экран был заблокирован 0:50:00 · 12 мин"
+    # Microphone gaps and damage are on the recorded axis: ranges stay.
+    assert marks["mic"].line == "Ваш микрофон не записывался: 0:12:03–0:12:40"
+    assert marks["damaged"].badge == "Кусок записи повреждён 0:40:00–0:40:10"

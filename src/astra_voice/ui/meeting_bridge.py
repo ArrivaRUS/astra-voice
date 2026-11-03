@@ -35,6 +35,7 @@ from astra_voice.meetings.settings_ext import (
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.meetings.templates import (
     ExportError,
+    ExportExists,
     sanitize_filename,
     stenogram,
     visible_utterances,
@@ -103,11 +104,16 @@ def _submit(work: Callable[[], None]) -> None:
 
 
 def _pick_save_path(suggested: str, fmt: str) -> str | None:
-    """System «Save» dialog (KDE portal / Qt in Fly) for D4; it confirms overwrite itself."""
+    """System «Save» dialog (KDE portal / Qt in Fly) for D4.
+
+    It does not ask about overwriting: the file is created with O_EXCL and an
+    existing one is replaced only after the card's own question (MN-3/15).
+    """
     from PyQt5.QtWidgets import QFileDialog
 
     dialog = QFileDialog(None, "Сохранить как", suggested)
     dialog.setAcceptMode(QFileDialog.AcceptSave)
+    dialog.setOption(QFileDialog.DontConfirmOverwrite, True)
     dialog.setFileMode(QFileDialog.AnyFile)
     dialog.setDefaultSuffix(fmt)
     dialog.setNameFilters(["Markdown (*.md)"] if fmt == "md" else ["Текст (*.txt)"])
@@ -171,6 +177,9 @@ class MeetingBridge(QObject):
     openMeetingsRequested = pyqtSignal()
     participantsRequested = pyqtSignal()
     cardSaveRequested = pyqtSignal()
+    # QML bindings run before ordinary slots of the same signal: «card» is notified by
+    # its own signal, emitted after the cache is dropped (a stale cache never reaches QML).
+    cardChanged = pyqtSignal()
     overlayKeyboardRequested = pyqtSignal()
     noticeKeyboardRequested = pyqtSignal()
     exitConfirmed = pyqtSignal()
@@ -227,6 +236,11 @@ class MeetingBridge(QObject):
         self._card_timer.setInterval(20)
         self._card_timer.timeout.connect(self._card_poll)
         self._card_save_error = ""
+        self._replace_target: tuple[Path, str] | None = None  # (path, fmt) awaiting «Заменить»
+        # «Сохранить как…» from the list waits until the opened card has loaded (D4 needs «ready»).
+        self._card_save_pending = False
+        # TRANSCRIBING → DONE of one generation: the live rows stay, the final text adds its tail.
+        self._card_tail = False
         self._saved_folder = ""
         self._toast: dict[str, Any] = {"serial": 0, "folder": "", "file": ""}
         # The card is read by several QML bindings per change: build it once.
@@ -713,7 +727,8 @@ class MeetingBridge(QObject):
                 if action in {"Открыть", "Сохранить как…"}:
                     self.openMeeting(meeting_id)
                     if action == "Сохранить как…" and self._card_id == meeting_id:
-                        self.cardSaveRequested.emit()
+                        self._card_save_pending = True
+                        self._flush_card_save()
                     return
                 if self._capture is not None and action in {"Остановить", "Продолжить"}:
                     self._capture.action(meeting_id, action)
@@ -860,8 +875,9 @@ class MeetingBridge(QObject):
             self.overlayKeyboardRequested.emit()
 
     @pyqtProperty(bool, notify=changed)
-    def recordingDevEnabled(self) -> bool:
-        return self._capture is not None and self._capture.dev_enabled
+    def recordingAvailable(self) -> bool:
+        """Capture is bound; whether it may start is ``enabled`` (setting + policy)."""
+        return self._capture is not None
 
     @pyqtProperty(bool, notify=changed)
     def startDialogOpen(self) -> bool:
@@ -962,8 +978,21 @@ class MeetingBridge(QObject):
         self._card_id = meeting_id
         self._card_key = None
         self._card_save_error = ""
+        self._card_save_pending = False
+        self._replace_target = None  # a question of another card never applies here
         self._sync_card()
         self.changed.emit()
+
+    def _flush_card_save(self) -> None:
+        """Emit a pending list «Сохранить как…» once the card is no longer loading."""
+        if not self._card_save_pending:
+            return
+        view = self.card.get("view")
+        if view == "loading":
+            return
+        self._card_save_pending = False
+        if view == "ready":
+            self.cardSaveRequested.emit()
 
     @pyqtSlot()
     def closeMeeting(self) -> None:
@@ -973,6 +1002,8 @@ class MeetingBridge(QObject):
         self._card_key = None
         self._card_builder = None
         self._card_transcript = None
+        self._card_save_pending = False
+        self._replace_target = None
         self._card_serial += 1  # late reads of the closed card are dropped
         self._card_rows.reset()
         self._card_timer.stop()
@@ -1016,8 +1047,9 @@ class MeetingBridge(QObject):
 
     def _drop_card_cache(self) -> None:
         self._card_cache = None
+        self.cardChanged.emit()
 
-    @pyqtProperty("QVariantMap", notify=changed)
+    @pyqtProperty("QVariantMap", notify=cardChanged)
     def card(self) -> dict[str, Any]:
         if self._card_cache is None:
             self._card_cache = self._build_card()
@@ -1056,7 +1088,22 @@ class MeetingBridge(QObject):
             return
         key = (str(meeting.state), meeting.meeting_generation)
         if key != self._card_key:
-            self._card_key = key
+            previous, self._card_key = self._card_key, key
+            live = (str(MeetingState.TRANSCRIBING), meeting.meeting_generation)
+            if (
+                previous == live
+                and meeting.state == MeetingState.DONE
+                and self._card_builder is not None
+                and self._card_loaded
+                and not self._card_error
+            ):
+                # The finished run keeps its live rows: no model reset, only the tail.
+                self._card_builder.meeting = meeting
+                self._card_progress = None
+                self._card_tail = True
+                self._load_transcript(meeting)
+                return
+            self._card_tail = False
             self._card_builder = CardRows(meeting, self._card_rows)
             self._card_rows.reset()
             self._card_loaded = self._card_error = False
@@ -1137,10 +1184,15 @@ class MeetingBridge(QObject):
         self._card_loaded, self._card_error = True, failed
         utterances = visible_utterances(transcript)
         done = meeting.state == MeetingState.DONE
-        self._card_builder.load(utterances, complete=done)
+        tail, self._card_tail = self._card_tail, False
+        if tail and done and not failed and self._card_builder.continues(utterances):
+            self._card_builder.finish(utterances)
+        else:
+            self._card_builder.load(utterances, complete=done)
         if meeting.state == MeetingState.TRANSCRIBING:
             self._append_live(meeting)
         self.changed.emit()
+        self._flush_card_save()
 
     @pyqtSlot()
     def retryCard(self) -> None:
@@ -1166,9 +1218,46 @@ class MeetingBridge(QObject):
     def saveAs(self, fmt: str) -> str:
         """D4 «Выбрать папку и сохранить…»: system dialog, then a 0600 file (MN-3/15).
 
-        Returns ``saved`` / ``cancelled`` / ``error``; the file is written here,
-        never from QML.
+        Returns ``saved`` / ``cancelled`` / ``error`` / ``exists``; the file is
+        written here, never from QML. ``exists``: the chosen file is already there
+        (``cardReplaceFile``) and is replaced only by ``replaceSaveTarget``.
         """
+        self._replace_target = None
+        meeting = self._savable_meeting(fmt)
+        if meeting is None:
+            return "error"
+        name = sanitize_filename(meeting.title, fmt)
+        chosen = self._pick_save_path(str(self._documents_dir() / name), fmt)
+        if not chosen:
+            return "cancelled"
+        # Never derived from «exists after the dialog»: another process may have
+        # created the file meanwhile. O_EXCL first, replacing needs the person's «Заменить».
+        return self._write_card(meeting, with_extension(Path(chosen), fmt), fmt, overwrite=False)
+
+    @pyqtProperty(str, notify=changed)
+    def cardReplaceFile(self) -> str:
+        return self._replace_target[0].name if self._replace_target is not None else ""
+
+    @pyqtSlot(result=str)
+    def replaceSaveTarget(self) -> str:
+        """«Заменить» in the question after ``exists``: replace that regular file."""
+        pending, self._replace_target = self._replace_target, None
+        if pending is None:
+            return "error"
+        target, fmt = pending
+        meeting = self._savable_meeting(fmt)
+        if meeting is None:
+            self.changed.emit()
+            return "error"
+        return self._write_card(meeting, target, fmt, overwrite=True)
+
+    @pyqtSlot()
+    def cancelReplace(self) -> None:
+        if self._replace_target is not None:
+            self._replace_target = None
+            self.changed.emit()
+
+    def _savable_meeting(self, fmt: str) -> Meeting | None:
         meeting = self._card_meeting()
         if (
             meeting is None
@@ -1176,20 +1265,19 @@ class MeetingBridge(QObject):
             or fmt not in ("md", "txt")
             or meeting.state != MeetingState.DONE
             or not self._card_loaded
+            or self._card_tail  # the final text is still being read
         ):
-            return "error"
-        name = sanitize_filename(meeting.title, fmt)
-        chosen = self._pick_save_path(str(self._documents_dir() / name), fmt)
-        if not chosen:
-            return "cancelled"
-        picked = Path(chosen)
-        target = with_extension(picked, fmt)
-        # The system dialog asked before returning an existing file; a name
-        # changed after it (added extension) was never confirmed.
-        confirmed = target == picked and os.path.lexists(target)
+            return None
+        return meeting
+
+    def _write_card(self, meeting: Meeting, target: Path, fmt: str, *, overwrite: bool) -> str:
         try:
             text = stenogram(meeting, self._card_transcript, fmt)
-            write_export(target, text, overwrite=confirmed)
+            write_export(target, text, overwrite=overwrite)
+        except ExportExists:
+            self._replace_target = (target, fmt)
+            self.changed.emit()
+            return "exists"
         except (ExportError, ValueError):
             self._card_save_error = meeting_card.TEXTS["saveError"]
             self.changed.emit()

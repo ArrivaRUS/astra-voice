@@ -91,9 +91,9 @@ def fixture_meeting(state: str = "done", **changes: Any) -> Any:
         recorded_ms=4_360_000,
         intervals=[
             Interval(0, 0),
-            Interval(1_870_000, 1_870_000),  # «Пауза 0:31:10–0:34:02»
+            Interval(1_870_000, 1_870_000),  # «Пауза 0:31:10 · 2 мин 52 с»
             Interval(2_042_000, 1_870_000),
-            Interval(3_172_000, 3_000_000),  # «Пауза: экран был заблокирован 0:50:00–1:02:00»
+            Interval(3_172_000, 3_000_000),  # «Пауза: экран был заблокирован 0:50:00 · 12 мин»
             Interval(3_892_000, 3_000_000),
             Interval(5_252_000, 4_360_000),
         ],
@@ -183,6 +183,8 @@ def make_bridge() -> Any:
             self.saves: list[str] = []
             self.save_error = ""
             self.save_result = "cancelled"
+            self.replace_file = ""
+            self.replace_result = "saved"
 
         def _get_card(self) -> dict[str, Any]:
             return self._card
@@ -199,11 +201,15 @@ def make_bridge() -> Any:
         def _get_toast(self) -> dict[str, Any]:
             return {"serial": 0}
 
+        def _get_replace(self) -> str:
+            return self.replace_file
+
         card = pyqtProperty("QVariantMap", _get_card, notify=changed)
         cardRows = pyqtProperty(QObject, _get_rows, constant=True)  # noqa: N815
         cardTexts = pyqtProperty("QVariantMap", _get_texts, constant=True)  # noqa: N815
         cardSaveError = pyqtProperty(str, _get_error, notify=changed)  # noqa: N815
         toast = pyqtProperty("QVariantMap", _get_toast, notify=changed)
+        cardReplaceFile = pyqtProperty(str, _get_replace, notify=changed)  # noqa: N815
 
         def show(
             self,
@@ -245,6 +251,19 @@ def make_bridge() -> Any:
             self.saves.append(fmt)
             self.changed.emit()  # like MeetingBridge: cardSaveError is published first
             return self.save_result
+
+        @pyqtSlot(result=str)
+        def replaceSaveTarget(self) -> str:  # noqa: N802
+            self.actions.append("replace")
+            self.replace_file = ""
+            self.changed.emit()
+            return self.replace_result
+
+        @pyqtSlot()
+        def cancelReplace(self) -> None:  # noqa: N802
+            self.actions.append("keep")
+            self.replace_file = ""
+            self.changed.emit()
 
         @pyqtSlot()
         def closeMeeting(self) -> None:  # noqa: N802

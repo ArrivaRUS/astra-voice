@@ -58,12 +58,13 @@ def test_m2_rows_literal_state_and_real_glyph(
     try:
         window, _bridge, messages = rendered("success", False, bridge)
         values = texts(window.contentItem())
-        assert badge in values
+        # «Запись ·» — шрифтом интерфейса, «0:42:10» — PT Mono (макеты 01/04).
+        assert (f"{badge} ·" if glyph else badge) in values
         if glyph:
             symbol = visual_named(window, "meetingBadgeSymbol")
             assert symbol is not None and symbol.property("name") == glyph
             assert symbol.property("visible")
-            assert "· 0:42:10" in values
+            assert "0:42:10" in values
         if state == MeetingState.PAUSED:
             assert "Экран был заблокирован — продолжите вручную" in values
         if state == MeetingState.INTERRUPTED:

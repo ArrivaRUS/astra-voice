@@ -52,7 +52,7 @@ for locks, expected in [([], True), (['device'], False), (['other'], True), ([],
     assert selector.property('enabled') == expected, (locks, warnings)
 window.setProperty('meeting', {
     'startTexts': {}, 'startOptions': [], 'startWarnings': [], 'startState': 'starting',
-    'startError': '', 'recordingDevEnabled': False, 'startDialogOpen': False,
+    'startError': '', 'recordingAvailable': False, 'startDialogOpen': False,
     'selectedSource': 'room', 'startSpeakers': False, 'startCanStart': False,
 })
 app.processEvents()

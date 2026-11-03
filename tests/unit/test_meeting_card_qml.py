@@ -95,8 +95,8 @@ speech = [item for item in named('meetingCardText') if item.property('visible')]
 assert speech and all(abs(item.property('width') - 302) < 0.01 for item in speech)
 assert [i.property('text') for i in named('meetingCardMarkText') if i.property('text')] == [
     'Ваш микрофон не записывался: 0:12:03–0:12:40',
-    'Пауза 0:31:10–0:34:02',
-    'Пауза: экран был заблокирован 0:50:00–1:02:00',
+    'Пауза 0:31:10 · 2 мин 52 с',
+    'Пауза: экран был заблокирован 0:50:00 · 12 мин',
 ]
 
 # 900: strip above a full-width table, panel hidden (spec §5.2, point 760).
@@ -201,6 +201,28 @@ dialog.accept()
 QTest.qWait(80)
 assert bridge.saves == ['txt', 'txt'] and dialog.property('opened') is False
 bridge.save_error = ''
+# The chosen file exists (K5): the card's own question, focus on «Отмена»; Esc → D4.
+replace = window.findChild(QObject, 'meetingReplaceDialog')
+bridge.save_result, bridge.replace_file = 'exists', 'итог.md'
+dialog.open()
+QTest.qWait(50)
+dialog.accept()
+QTest.qWait(80)
+assert replace.property('opened') is True and dialog.property('opened') is False
+assert replace.property('message') == 'Файл «итог.md» уже существует. Заменить?'
+assert window.activeFocusItem().property('text') == 'Отмена'
+QTest.keyClick(window, Qt.Key_Escape)
+QTest.qWait(80)
+assert bridge.actions[-1] == 'keep' and replace.property('opened') is False
+assert dialog.property('opened') is True
+bridge.replace_file = 'итог.md'
+dialog.accept()
+QTest.qWait(80)
+replace.accept()  # «Заменить»
+QTest.qWait(80)
+assert bridge.actions[-1] == 'replace'
+assert replace.property('opened') is False and dialog.property('opened') is False
+bridge.save_result = 'saved'
 
 # Keyboard (spec §5.2/§7): «← Все встречи» → «Сохранить как…» → «⋯» → table (one stop, arrows).
 show('ready-1024')
@@ -264,7 +286,7 @@ def test_meeting_card_qml_states_rows_and_keyboard() -> None:
 MAIN_PROBE = r"""
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QObject, QPointF, Qt, QUrl
+from PyQt5.QtCore import QMetaObject, QObject, QPointF, Qt, QUrl
 from PyQt5.QtGui import QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
@@ -341,6 +363,15 @@ bridge.openMeeting(rc.MEETING_ID)
 wait(lambda: bridge.cardOpen, 'reopen')
 assert sidebar.setProperty('currentIndex', 0)
 wait(lambda: not bridge.cardOpen, 'closed with the section')
+# List row «Сохранить как…»: the card opens and D4 follows once the text is loaded.
+assert sidebar.setProperty('currentIndex', 3)
+wait(lambda: item('meetingRowOpen') is not None, 'list again')
+bridge.requestMeetingAction(rc.MEETING_ID, 'Сохранить как…')
+save_dialog = window.findChild(QObject, 'meetingSaveDialog')
+wait(lambda: save_dialog.property('opened') is True, 'D4 from the list')
+assert bridge.card.get('view') == 'ready'
+QMetaObject.invokeMethod(save_dialog, 'close')
+wait(lambda: save_dialog.property('opened') is False, 'D4 closed')
 bridge.shutdown()
 window.hide()
 from PyQt5 import sip

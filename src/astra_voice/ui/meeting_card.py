@@ -9,7 +9,7 @@ table says «Я» / «Собеседники».
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -88,6 +88,11 @@ TEXTS = {
     "saveCancel": "Отмена",
     "saveConfirm": "Выбрать папку и сохранить…",
     "saveError": "Не удалось сохранить файл: папка недоступна для записи",
+    # The file appeared at the chosen path: replace only after an explicit answer.
+    "replacePrefix": "Файл «",
+    "replaceSuffix": "» уже существует. Заменить?",
+    "replaceCancel": "Отмена",
+    "replaceConfirm": "Заменить",
     "savedPrefix": "Сохранено в «",
     "savedMiddle": "»: ",
     "openFolder": "Открыть папку",
@@ -203,6 +208,16 @@ def table_marks(meeting: Meeting, utterances: Iterable[Utterance] = ()) -> list[
     )
 
 
+def _same(a: Utterance, b: Utterance) -> bool:
+    return (a.seq, a.start_ms, a.end_ms, a.speaker, a.text) == (
+        b.seq,
+        b.start_ms,
+        b.end_ms,
+        b.speaker,
+        b.text,
+    )
+
+
 class CardRows:
     """Chronological merge of replies and marks, appended as replies arrive."""
 
@@ -237,6 +252,17 @@ class CardRows:
     def extend(self, utterances: list[Utterance]) -> None:
         fresh = [item for item in utterances if item.seq > self.last_seq]
         self.model.append(self._rows(fresh, complete=False))
+
+    def continues(self, utterances: Sequence[Utterance]) -> bool:
+        """The shown replies are the start of ``utterances`` (the finished run's text)."""
+        shown = self.utterances
+        return len(shown) <= len(utterances) and all(
+            _same(a, b) for a, b in zip(shown, utterances, strict=False)
+        )
+
+    def finish(self, utterances: Sequence[Utterance]) -> None:
+        """Append the replies after the shown ones and the remaining marks (no reset)."""
+        self.model.append(self._rows(list(utterances[len(self.utterances) :]), complete=True))
 
     def _rows(self, utterances: list[Utterance], *, complete: bool) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []

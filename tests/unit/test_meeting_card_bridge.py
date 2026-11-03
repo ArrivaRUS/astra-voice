@@ -151,8 +151,38 @@ def test_open_from_the_list_action_and_save_request(rig: SaveRig) -> None:
     saves = Mock()
     rig.bridge.cardSaveRequested.connect(saves)
     rig.bridge.requestMeetingAction(MID, "Сохранить как…")
+    # D4 needs a loaded card: the request waits for the transcript, then fires once.
+    saves.assert_not_called()
+    assert rig.bridge.card["view"] == "loading"
+    while rig.tasks:
+        rig.tasks.pop(0)()
+    rig.bridge._card_poll()  # the read of the first «Открыть» is stale and dropped
+    saves.assert_not_called()
+    rig.bridge._card_poll()
+    saves.assert_called_once_with()
+    assert rig.bridge.card["showActions"]
+    rig.bridge._card_poll()
     saves.assert_called_once_with()
     assert rig.bridge.meetings[0]["openable"]
+
+
+def test_list_save_request_is_dropped_when_the_card_has_nothing_to_save(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript([(0, 1000, "others", "")])
+    rig.refresh()
+    saves = Mock()
+    rig.bridge.cardSaveRequested.connect(saves)
+    rig.bridge.requestMeetingAction(MID, "Сохранить как…")
+    while rig.tasks:
+        rig.tasks.pop(0)()
+    rig.bridge._card_poll()
+    assert rig.bridge.card["view"] == "empty"
+    saves.assert_not_called()
+    rig.bridge.openMeeting(MID)  # a later open never inherits the dropped request
+    while rig.tasks:
+        rig.tasks.pop(0)()
+    rig.bridge._card_poll()
+    saves.assert_not_called()
 
 
 def test_live_rows_are_appended_without_reset(rig: SaveRig) -> None:
@@ -200,6 +230,99 @@ def test_live_rows_are_appended_without_reset(rig: SaveRig) -> None:
     assert model.rowCount() == 201  # 200 replies + the microphone mark at 0:00:30
     assert inserts[0] == (0, 0) and len(inserts) == 200
     assert model.rows()[30]["kind"] == "mark" and model.rows()[31]["text"] == "реплика 30"
+
+
+def finish(rig: SaveRig, generation: int) -> None:
+    """The role reports the finished run (the final text is already on disk)."""
+    rig.role.emit(
+        "meeting.job.done",
+        meeting_id=MID,
+        meeting_generation=generation,
+        utterances=1,
+        speakers=1,
+        diar_status="skipped",
+        wall_ms=1,
+        peak_rss_kb=1,
+        echo_dropped=0,
+        transcript_revision=1,
+    )
+    rig.recording.tick()
+    assert rig.meeting().state == MeetingState.DONE
+
+
+def test_done_after_live_rows_appends_the_tail_without_reset(rig: SaveRig) -> None:
+    rig.create(marks=[Mark(30_000, "mic_gap_start"), Mark(31_000, "mic_gap_end")])
+    rig.save()
+    rig.start_running()
+    rig.open_card()
+    start = next(m for m in rig.role.sent if m["type"] == "meeting.job.start")
+    for seq in range(20):
+        rig.role.emit(
+            "meeting.job.utterance",
+            meeting_id=MID,
+            meeting_generation=start["meeting_generation"],
+            seq=seq,
+            id=f"u{seq:05d}",
+            track="far",
+            start_ms=seq * 1000,
+            end_ms=seq * 1000 + 500,
+            text=f"реплика {seq}",
+            speaker="others",
+        )
+        rig.recording.tick()
+    model = rig.bridge.cardRows
+    shown = model.rows()
+    assert len(shown) == 20
+    resets, inserts = Mock(), []
+    model.modelReset.connect(resets)
+    model.rowsInserted.connect(lambda parent, first, last: inserts.append((first, last)))
+    # The run finishes: the final text = the live replies + two more; same generation.
+    rig.transcript(
+        [(seq * 1000, seq * 1000 + 500, "others", f"реплика {seq}") for seq in range(22)]
+    )
+    finish(rig, start["meeting_generation"])
+    assert rig.bridge.card["view"] == "ready"  # the table never turns into «loading»
+    assert rig.bridge.saveAs("md") == "error"  # not before the final text is read
+    while rig.tasks:
+        rig.tasks.pop(0)()
+    rig.bridge._card_poll()
+    resets.assert_not_called()
+    assert inserts == [(20, 22)]  # two replies and the microphone mark at the end
+    rows = model.rows()
+    assert rows[:20] == shown
+    assert [r["text"] for r in rows[20:22]] == ["реплика 20", "реплика 21"]
+    assert rows[22]["kind"] == "mark"
+    assert rig.bridge.card["view"] == "ready" and rig.bridge.card["showActions"]
+
+
+def test_done_with_other_text_reloads_the_table(rig: SaveRig) -> None:
+    rig.create()
+    rig.save()
+    rig.start_running()
+    rig.open_card()
+    start = next(m for m in rig.role.sent if m["type"] == "meeting.job.start")
+    rig.role.emit(
+        "meeting.job.utterance",
+        meeting_id=MID,
+        meeting_generation=start["meeting_generation"],
+        seq=0,
+        id="u00000",
+        track="far",
+        start_ms=0,
+        end_ms=500,
+        text="черновик",
+        speaker="others",
+    )
+    rig.recording.tick()
+    resets = Mock()
+    rig.bridge.cardRows.modelReset.connect(resets)
+    rig.transcript([(0, 500, "others", "итог")])
+    finish(rig, start["meeting_generation"])
+    while rig.tasks:
+        rig.tasks.pop(0)()
+    rig.bridge._card_poll()
+    resets.assert_called_once_with()
+    assert [r["text"] for r in rig.bridge.cardRows.rows()] == ["итог"]
 
 
 def test_failure_reason_survives_a_restart(rig: SaveRig, tmp_path: Path) -> None:
@@ -328,17 +451,49 @@ def test_save_as_writes_a_private_file_and_shows_the_toast(rig: SaveRig) -> None
     serial = rig.bridge.toast["serial"]
     rig.bridge.openSavedFolder()
     assert rig.opened == [str(rig.documents)]
-    # The dialog confirmed this existing name: replaced, still 0600.
+    # An existing name is never replaced on the system dialog's word: the card asks.
+    written.write_text("старое", encoding="utf-8")
     rig.answer = str(written)
-    assert rig.bridge.saveAs("txt") == "saved" and rig.bridge.toast["serial"] == serial + 1
-    # A name that only exists after the extension was added was never confirmed.
+    assert rig.bridge.saveAs("txt") == "exists" and rig.bridge.cardReplaceFile == "итог.txt"
+    assert written.read_text(encoding="utf-8") == "старое"
+    assert rig.bridge.replaceSaveTarget() == "saved"  # «Заменить»
+    assert rig.bridge.toast["serial"] == serial + 1 and rig.bridge.cardReplaceFile == ""
+    assert "Добрый" in written.read_text(encoding="utf-8")
+    assert stat.S_IMODE(written.stat().st_mode) == 0o600
+    assert rig.bridge.replaceSaveTarget() == "error"  # the answer is used once
+    # A name that only exists after the extension was added: asked as well; «Отмена» keeps it.
     (rig.documents / "новое.md").write_text("старое", encoding="utf-8")
     rig.answer = str(rig.documents / "новое")
-    assert rig.bridge.saveAs("md") == "error"
-    assert rig.bridge.cardSaveError == "Не удалось сохранить файл: папка недоступна для записи"
+    assert rig.bridge.saveAs("md") == "exists" and rig.bridge.cardReplaceFile == "новое.md"
+    rig.bridge.cancelReplace()
+    assert rig.bridge.cardReplaceFile == "" and rig.bridge.replaceSaveTarget() == "error"
     assert (rig.documents / "новое.md").read_text(encoding="utf-8") == "старое"
     rig.answer = str(rig.documents / "нет" / "файл.md")
     assert rig.bridge.saveAs("md") == "error"
+
+
+def test_file_created_after_the_dialog_is_not_replaced_without_an_answer(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:2])
+    rig.open_card()
+    target = rig.documents / "общий.md"
+
+    def pick(suggested: str, fmt: str) -> str:
+        # The dialog saw no such file; another process creates it before the write.
+        target.write_text("чужой", encoding="utf-8")
+        return str(target)
+
+    rig.bridge._pick_save_path = pick
+    assert rig.bridge.saveAs("md") == "exists"
+    assert target.read_text(encoding="utf-8") == "чужой"
+    rig.bridge.openMeeting(MID)  # another open drops the question
+    assert rig.bridge.replaceSaveTarget() == "error"
+    assert target.read_text(encoding="utf-8") == "чужой"
+    rig.open_card()
+    rig.bridge._card_poll()  # the first open's read is stale; this one loads the card
+    assert rig.bridge.saveAs("md") == "exists"
+    assert rig.bridge.replaceSaveTarget() == "saved"
+    assert "Коллеги, добрый день." in target.read_text(encoding="utf-8")
 
 
 def test_save_needs_a_loaded_done_meeting(rig: SaveRig) -> None:

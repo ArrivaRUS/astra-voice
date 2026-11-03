@@ -99,11 +99,18 @@ Item {
         y: root.lead + Theme.transcriptRowPaddingY
         width: Math.max(0, root.width - x - Theme.transcriptRowPaddingX)
         spacing: 4 // макет: пробел между глифом и текстом отметки.
-        Icon {
+        // Icon (Screen и Image) только у отметок: тысячи таких объектов в строках
+        // реплик делали удаление таблицы квадратичным (секунды на 9000 строк).
+        Loader {
             y: (Theme.transcriptMarkSize * Theme.transcriptTextLineHeight - height) / 2
-            name: root.isMark ? root.iconName : ""
-            size: Theme.transcriptMarkIcon
-            color: Theme.transcriptMarkFg
+            width: Theme.transcriptMarkIcon
+            height: Theme.transcriptMarkIcon
+            active: root.isMark
+            sourceComponent: Icon {
+                name: root.iconName
+                size: Theme.transcriptMarkIcon
+                color: Theme.transcriptMarkFg
+            }
         }
         Text {
             id: markText

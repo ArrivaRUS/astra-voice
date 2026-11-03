@@ -45,8 +45,32 @@ AvDialog {
     onConfirmed: Qt.callLater(function() {
         if (!root.bridge) return
         var result = root.bridge.saveAs(root.formatIndex === 0 ? "md" : "txt")
-        if (result !== "saved") root.open()
+        if (result === "exists") root.replaceDialog.open()
+        else if (result !== "saved") root.open()
     })
+
+    // Файл по выбранному пути уже есть (или появился после системного диалога):
+    // заменяется только по «Заменить»; фокус на «Отмена», «Отмена»/Esc — обратно в D4.
+    readonly property AvDialog replaceDialog: AvDialog {
+        objectName: "meetingReplaceDialog"
+        parent: root.parent // Overlay.overlay окна D4
+        brandHeader: true
+        heading: root.heading
+        iconName: "alert"
+        message: root.txt("replacePrefix")
+            + (root.bridge && root.bridge.cardReplaceFile !== undefined ? root.bridge.cardReplaceFile : "")
+            + root.txt("replaceSuffix")
+        cancelText: root.txt("replaceCancel")
+        confirmText: root.txt("replaceConfirm")
+        safeConfirmation: true
+        onCancelled: {
+            if (root.bridge) root.bridge.cancelReplace()
+            root.open()
+        }
+        onConfirmed: Qt.callLater(function() {
+            if (root.bridge && root.bridge.replaceSaveTarget() !== "saved") root.open()
+        })
+    }
 
     // Низ D4: подпись о копиях и правах + «Отмена» / «Выбрать папку и сохранить…»,
     // рамка сверху borderSoft (tokens.md §4). Подпись в две строки — своя раскладка без

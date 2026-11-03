@@ -805,7 +805,7 @@ def _bind_meeting_recording(
     runtime: Any | None = None,
     model: Any | None = None,
 ) -> None:
-    """M2 GUI adapter; recovery is inert and capture requires the explicit dev click."""
+    """Meeting recording + transcription queue; inert until setting and policy allow it."""
     from astra_voice.ui.meeting_recording import MeetingRecording
 
     options: dict[str, Any] = {}
@@ -826,46 +826,42 @@ def _bind_meeting_recording(
         **options,
     )
     bridge.bindRecording(recording)
-    if recording.dev_enabled is True:
-        from astra_voice.ui.meeting_notice import MeetingNotice
-        from astra_voice.ui.meeting_notifications import MeetingNotifications
-        from astra_voice.ui.meeting_overlay import MeetingOverlay
+    from astra_voice.ui.meeting_notice import MeetingNotice
+    from astra_voice.ui.meeting_notifications import MeetingNotifications
+    from astra_voice.ui.meeting_overlay import MeetingOverlay
 
-        bridge._meeting_overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
-        bridge.overlayKeyboardRequested.connect(bridge._meeting_overlay.activate_keyboard)
-        bridge._meeting_notice = MeetingNotice(
-            recording, bridge._meeting_overlay, notice=bridge.notice, parent=bridge
-        )
-        bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
-        bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
-        from astra_voice.core.meeting_jobs import MeetingJobs, probe_gigaam_model
-        from astra_voice.ui.meeting_notifications import job_notifier
-        from astra_voice.ui.meeting_recording import transcribe_supervisor
+    bridge._meeting_overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
+    bridge.overlayKeyboardRequested.connect(bridge._meeting_overlay.activate_keyboard)
+    bridge._meeting_notice = MeetingNotice(
+        recording, bridge._meeting_overlay, notice=bridge.notice, parent=bridge
+    )
+    bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
+    bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
+    from astra_voice.core.meeting_jobs import MeetingJobs, probe_gigaam_model
+    from astra_voice.ui.meeting_notifications import job_notifier
+    from astra_voice.ui.meeting_recording import transcribe_supervisor
 
-        # E13.M4: the transcription queue follows the same dev gate as capture.
-        recording.bind_jobs(
-            MeetingJobs(
-                bridge._store,
-                transcribe_supervisor,
-                transcribe_immediately=lambda: bool(
-                    bridge.settings["meeting_transcribe_immediately"]
-                ),
-                audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
-                notify=job_notifier(),
-                # The catalog's min_ram_mb is known before initialize() -> recover().
-                model_probe=(
-                    _meeting_model_probe(model) if model is not None else probe_gigaam_model
-                ),
-            )
+    # E13.M4: the transcription queue is bound with capture; both start only when
+    # the setting (D1 accepted) and the administrator policy allow recording.
+    recording.bind_jobs(
+        MeetingJobs(
+            bridge._store,
+            transcribe_supervisor,
+            transcribe_immediately=lambda: bool(bridge.settings["meeting_transcribe_immediately"]),
+            audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
+            notify=job_notifier(),
+            # The catalog's min_ram_mb is known before initialize() -> recover().
+            model_probe=(_meeting_model_probe(model) if model is not None else probe_gigaam_model),
         )
-        recording.bind_indicators(
-            overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
-            tray_visible=lambda: bool(
-                runtime is not None
-                and runtime.tray is not None
-                and runtime.tray.meeting_indicator_visible
-            ),
-        )
+    )
+    recording.bind_indicators(
+        overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
+        tray_visible=lambda: bool(
+            runtime is not None
+            and runtime.tray is not None
+            and runtime.tray.meeting_indicator_visible
+        ),
+    )
     recording.initialize()
 
 
@@ -891,7 +887,7 @@ def _wire_tray_meetings(
     def refresh() -> None:
         tray.set_meetings_enabled(bridge.enabled)
         presentation = bridge.overlay
-        tray.set_meeting_record_entry_enabled(bridge.recordingDevEnabled)
+        tray.set_meeting_record_entry_enabled(bridge.recordingAvailable)
         state = None
         if presentation.get("active"):
             from astra_voice.ui.tray import TrayState

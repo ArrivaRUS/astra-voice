@@ -23,6 +23,7 @@ from astra_voice.meetings.model import Meeting, Transcript, Utterance
 FORMATS = ("md", "txt")
 MERGE_GAP_MS = 2000  # adjacent replies of one speaker closer than 2 s are joined
 FILENAME_LIMIT = 120
+NAME_MAX_BYTES = 255  # a file name in bytes (Linux NAME_MAX)
 DEFAULT_NAME = "Встреча"
 OTHERS_LABEL = "Собеседники"
 # Constant placeholder texts of the role (worker/meeting_transcribe.py, core/meeting_jobs.py).
@@ -48,14 +49,34 @@ def clock(milliseconds: int) -> str:
     return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
+def duration_text(milliseconds: int) -> str:
+    """Real length of a pause: «52 с», «2 мин 52 с», «12 мин», «1 ч 5 мин» (decision 03.11)."""
+    seconds = max(0, int(milliseconds)) // 1000
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        minutes, rest = divmod(seconds, 60)
+        return f"{minutes} мин {rest} с" if rest else f"{minutes} мин"
+    hours, minutes = seconds // 3600, seconds // 60 % 60
+    return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+
+
+PAUSE_KINDS = frozenset({"pause", "lock", "indicators"})
+
+
 @dataclass(frozen=True)
 class MarkInfo:
-    """One meeting mark: a header badge and, when timed, a table/file line."""
+    """One meeting mark: a header badge and, when timed, a table/file line.
+
+    Pauses are a point on the recorded axis (it excludes paused time) plus their
+    real length: «Пауза 0:31:10 · 2 мин 52 с»; other marks keep recorded ranges.
+    """
 
     kind: str  # pause | mic | lock | indicators | damaged | far | whole | network | remote
     label: str
     at_ms: int | None = None
     end_ms: int | None = None
+    duration_ms: int | None = None  # pauses only: wall-clock length
 
     @property
     def range_text(self) -> str:
@@ -63,6 +84,10 @@ class MarkInfo:
             return ""
         if self.kind == "far":
             return "в " + clock(self.at_ms)
+        if self.kind in PAUSE_KINDS:
+            if self.duration_ms is None or self.duration_ms <= 0:
+                return clock(self.at_ms)
+            return f"{clock(self.at_ms)} · {duration_text(self.duration_ms)}"
         if self.end_ms is None or self.end_ms <= self.at_ms:
             return clock(self.at_ms)
         return f"{clock(self.at_ms)}–{clock(self.end_ms)}"
@@ -80,7 +105,7 @@ class MarkInfo:
 
     @property
     def badge(self) -> str:
-        """«Пауза 0:31:10–0:34:02», «DION закрылся в 1:05:20» (spec §4.7)."""
+        """«Пауза 0:31:10 · 2 мин 52 с», «DION закрылся в 1:05:20» (spec §4.7)."""
         return f"{self.label} {self.range_text}" if self.range_text else self.label
 
     @property
@@ -109,8 +134,8 @@ class MarkInfo:
         }[self.kind]
 
 
-def _pause_end(meeting: Meeting, at_ms: int) -> int | None:
-    """End of a pause on the recorded timeline plus its wall-clock length.
+def _pause_length(meeting: Meeting, at_ms: int) -> int | None:
+    """Wall-clock length of the pause that closed the recording at ``at_ms``.
 
     Intervals are [open, close] pairs of (monotonic, recorded) points; the gap
     between a close at ``at_ms`` and the next open is the pause length.
@@ -119,7 +144,7 @@ def _pause_end(meeting: Meeting, at_ms: int) -> int | None:
     for index in range(1, len(points) - 1, 2):
         if points[index].recorded_ms == at_ms:
             gap = points[index + 1].t_mono_ms - points[index].t_mono_ms
-            return at_ms + gap if gap > 0 else None
+            return gap if gap > 0 else None
     return None
 
 
@@ -144,13 +169,14 @@ def meeting_marks(meeting: Meeting, utterances: Iterable[Utterance] = ()) -> lis
                 "indicators": "Пауза: индикатор записи не отображался",
             }.get(mark.reason or "", "Пауза")
             kind = {"lock": "lock", "indicators": "indicators"}.get(mark.reason or "", "pause")
-            end = _pause_end(meeting, mark.at_ms)
-            if end is None and mark.at_ms >= meeting.recorded_ms:
+            length = _pause_length(meeting, mark.at_ms)
+            if length is None and mark.at_ms >= meeting.recorded_ms:
                 continue  # the recording ended paused: nothing was missed after it
-            add(MarkInfo(kind, label, mark.at_ms, end))
+            add(MarkInfo(kind, label, mark.at_ms, duration_ms=length))
         elif mark.kind == "indicators_lost":
             label = "Пауза: индикатор записи не отображался"
-            add(MarkInfo("indicators", label, mark.at_ms, _pause_end(meeting, mark.at_ms)))
+            length = _pause_length(meeting, mark.at_ms)
+            add(MarkInfo("indicators", label, mark.at_ms, duration_ms=length))
         elif mark.kind == "mic_gap_start":
             gap_start = mark.at_ms
         elif mark.kind == "mic_gap_end" and gap_start is not None:
@@ -226,8 +252,12 @@ def _one_line(text: str) -> str:
 
 
 def _md_escape(text: str) -> str:
-    """Literal text in Markdown: no HTML, no emphasis, no code spans."""
-    return "".join("\\" + c if c in "\\<>&*_`" else c for c in text)
+    """Literal text in Markdown: no HTML, emphasis, code spans, links, images or headings.
+
+    User text never starts a line (it follows «# », «[ч:мм:сс] Кто: » or a label),
+    so line-start markers (-, +, 1.) need no escaping.
+    """
+    return "".join("\\" + c if c in "\\<>&*_`[]()!#" else c for c in text)
 
 
 def _merged(meeting: Meeting, utterances: Sequence[Utterance]) -> list[tuple[int, str, str]]:
@@ -306,7 +336,9 @@ def sanitize_filename(title: str, fmt: str) -> str:
         if unicodedata.category(c) not in {"Cc", "Cf", "Cs", "Co", "Cn"}
     )
     stem = " ".join(cleaned.split()).lstrip(". ")
-    stem = stem[:FILENAME_LIMIT].rstrip(" .")
+    # NAME_MAX is 255 bytes, not characters: cut the UTF-8 stem on a character boundary.
+    limited = stem[:FILENAME_LIMIT].encode("utf-8")[: NAME_MAX_BYTES - 1 - len(fmt)]
+    stem = limited.decode("utf-8", "ignore").rstrip(" .")
     if not stem:
         stem = DEFAULT_NAME
     return f"{stem}.{fmt}"
@@ -354,7 +386,7 @@ def write_export(path: Path, text: str, *, overwrite: bool) -> None:
             current = os.stat(name, dir_fd=directory, follow_symlinks=False)
             if not stat.S_ISREG(current.st_mode):
                 raise ExportError("Это не обычный файл") from None
-            temporary = f".{name[:200]}.{uuid4().hex}.tmp"
+            temporary = f".astra-voice-{uuid4().hex}.tmp"  # short: name may be 255 bytes
             fd = os.open(temporary, flags, 0o600, dir_fd=directory)
             try:
                 _write_all(fd, data)

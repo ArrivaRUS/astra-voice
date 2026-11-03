@@ -54,7 +54,7 @@ def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
     bridge = SimpleNamespace(
         changed=Mock(),
         enabled=False,
-        recordingDevEnabled=False,
+        recordingAvailable=False,
         overlay={},
         requestRecording=Mock(),
         on_start_clicked=Mock(),
@@ -71,7 +71,7 @@ def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
     assert tray.set_meeting_state.call_args.args[0] is None
     tray.set_meeting_record_entry_enabled.assert_called_with(False)
     refresh = bridge.changed.connect.call_args.args[0]
-    bridge.enabled, bridge.recordingDevEnabled = True, True
+    bridge.enabled, bridge.recordingAvailable = True, True
     bridge.overlay = {
         "visible": True,
         "active": True,
@@ -215,7 +215,7 @@ def test_finalizer_meeting_cleanup_preserves_resource_and_lock_barriers(
 @pytest.mark.parametrize("can_resume", [False, True])
 def test_tray_wiring_forwards_resume_admission(can_resume: bool) -> None:
     tray = Mock()
-    bridge = Mock(enabled=True, recordingDevEnabled=True)
+    bridge = Mock(enabled=True, recordingAvailable=True)
     bridge.overlay = {
         "visible": True,
         "active": True,
@@ -238,3 +238,20 @@ def test_tray_wiring_forwards_resume_admission(can_resume: bool) -> None:
         bridge.on_overlay_pause_clicked.assert_called_once_with()
     finally:
         disconnect()
+
+
+def test_no_meeting_dev_gate_remains_in_product_or_admin_docs() -> None:
+    """E13.M4: recording and transcription switch on only by setting + policy + D1."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    files = [
+        *(root / "src").rglob("*.py"),
+        *(root / "qml").rglob("*.qml"),
+        root / "README.md",
+        *(path for path in (root / "docs").rglob("*.md") if "reports" not in path.parts),
+    ]
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for marker in ("ASTRA_VOICE_MEETING_CAPTURE_DEV", "recordingDevEnabled", "dev_enabled"):
+            assert marker not in text, (path.relative_to(root), marker)

@@ -50,7 +50,6 @@ from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
 Message = dict[str, Any]
-DEV_ENV = "ASTRA_VOICE_MEETING_CAPTURE_DEV"
 EXIT_QUEUE_WRITE_S = 1.0  # floor for the exit-time «transcribing» write (one meeting.json)
 log = logging.getLogger(__name__)
 
@@ -137,7 +136,6 @@ class MeetingRecording(QObject):
         enabled: Callable[[], bool],
         policy_allowed: Callable[[], bool],
         session_kind: SessionKind,
-        dev_enabled: bool | None = None,
         session_factory: Callable[[], Any] = SessionMonitor,
         owns_session: bool = True,
         supervisor_factory: Callable[
@@ -156,7 +154,6 @@ class MeetingRecording(QObject):
         self.store, self.enabled, self.policy_allowed = store, enabled, policy_allowed
         self._exit_stop_timeout = exit_stop_timeout
         self.session_kind, self.clock = session_kind, clock
-        self.dev_enabled = os.environ.get(DEV_ENV) == "1" if dev_enabled is None else dev_enabled
         self.session_factory, self.owns_session = session_factory, owns_session
         self._monitor: Any = None
         self._supervisor_factory = supervisor_factory
@@ -209,7 +206,7 @@ class MeetingRecording(QObject):
             session_kind=session_kind,
             clock=clock,
             storage_probe=storage_probe,
-            enabled=lambda: self.dev_enabled and enabled(),
+            enabled=enabled,
             policy_allowed=policy_allowed,
             id_factory=id_factory,
             metadata_submit=submit,
@@ -327,7 +324,7 @@ class MeetingRecording(QObject):
         self.tick()
 
     def _activate(self) -> bool:
-        if self._closed or not self.dev_enabled or not self.enabled() or not self.policy_allowed():
+        if self._closed or not self.enabled() or not self.policy_allowed():
             return False
         if self._retire_deadline is not None:
             return False
@@ -360,7 +357,7 @@ class MeetingRecording(QObject):
         return True
 
     def open_dialog(self) -> None:
-        if self._closed or not self.dev_enabled or not self.enabled() or not self.policy_allowed():
+        if self._closed or not self.enabled() or not self.policy_allowed():
             return
         if self.busy:
             self._preview_error = "busy"
@@ -453,7 +450,6 @@ class MeetingRecording(QObject):
     def can_start(self) -> bool:
         return (
             self.dialog_open
-            and self.dev_enabled
             and self.enabled()
             and self.policy_allowed()
             and self._preview_ready
@@ -596,7 +592,7 @@ class MeetingRecording(QObject):
             return
         if action == "Остановить":
             self.clicks.on_stop_clicked()
-        elif action == "Продолжить" and self.dev_enabled and self.enabled():
+        elif action == "Продолжить" and self.enabled():
             self.clicks.on_resume_clicked()
         self._publish()
 
@@ -612,8 +608,7 @@ class MeetingRecording(QObject):
         meeting = controller.meeting
         state = controller.state
         visible = bool(
-            self.dev_enabled
-            and controller._committed
+            controller._committed
             and meeting is not None
             and (
                 state in {"recording", "paused", "stopping", "closing-unknown"}
@@ -665,7 +660,7 @@ class MeetingRecording(QObject):
             elif self.clock() < self._overlay_fallback_deadline:
                 # S17-A4: the notification service did not take the notice.
                 state, secondary = "notify-fallback", self._overlay_fallback_text
-        if self.dev_enabled and self.clock() < self._overlay_error_deadline:
+        if self.clock() < self._overlay_error_deadline:
             visible, state, secondary = True, "error", W2_TEXTS["audioError"]
         pause_minutes = (
             max(0, int((self.clock() - controller._pause_at) // 60))
@@ -693,7 +688,7 @@ class MeetingRecording(QObject):
         }
 
     def overlay_action(self, action: str) -> None:
-        if self._closed or not self.dev_enabled or not self.overlay["visible"]:
+        if self._closed or not self.overlay["visible"]:
             return
         if action == "stop":
             self.clicks.on_stop_clicked()

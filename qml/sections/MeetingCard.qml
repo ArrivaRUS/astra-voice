@@ -21,6 +21,9 @@ FocusScope {
     readonly property bool wide: width >= 760
     readonly property bool panelState: card.panel !== undefined && card.panel.title !== undefined
     readonly property real tableWidth: wide ? width - Theme.participantsPanelGap - Theme.participantsPanelW : width
+    // Рамка карточек: в тёмной теме border полупрозрачный; Qt не кладёт под рамку заливку,
+    // поэтому смешиваем его с bgSurface заранее (CSS border-box), как OverlaySurface (M3).
+    readonly property color cardBorderColor: Qt.tint(Theme.bgSurface, Theme.border)
     // Сколько строк таблицы создано: инкрементальная модель не пересоздаёт старые.
     property int rowsCreated: 0
     property int currentRow: 0
@@ -45,6 +48,58 @@ FocusScope {
         target: root.bridge
         ignoreUnknownSignals: true
         function onCardSaveRequested() { Qt.callLater(root.openSaveDialog) }
+    }
+
+    // Строки таблицы создаются порциями (spec §5.2 — одна прокрутка окна, без своей):
+    // открытие 9000 реплик не держит GUI-поток дольше одной порции; живые реплики
+    // по одной добавляются сразу, старые делегаты не пересоздаются.
+    // Сброс модели тоже идёт порциями: старые строки убираются с конца (удаление
+    // тысяч делегатов разом держит поток секундами), а пока убираются — таблица
+    // схлопнута и обрезана (не visible/opacity: те обходят каждый делегат).
+    readonly property int rowsPerFrame: 100
+    readonly property int rowsDrainPerFrame: 300
+    property int rowsFed: 0
+    property int rowsStale: 0
+    property bool rowsDraining: false
+    function feedRows() {
+        if (root.rowsStale > 0) {
+            var k = Math.min(root.rowsStale, root.rowsDrainPerFrame)
+            shownRows.remove(shownRows.count - k, k)
+            root.rowsStale -= k
+            rowFeeder.restart()
+            return
+        }
+        root.rowsDraining = false
+        var source = root.rowsModel
+        var total = source ? source.count : 0
+        var end = Math.min(total, root.rowsFed + root.rowsPerFrame)
+        var batch = []
+        for (var i = root.rowsFed; i < end; ++i) batch.push(source.get(i))
+        root.rowsFed = end
+        if (batch.length > 0) shownRows.append(batch)
+        if (end < total) rowFeeder.restart()
+        else rowFeeder.stop()
+    }
+    function refeedRows() {
+        rowFeeder.stop()
+        root.rowsFed = 0
+        if (shownRows.count > root.rowsPerFrame) {
+            root.rowsStale = shownRows.count
+            root.rowsDraining = true
+        } else {
+            root.rowsStale = 0
+            shownRows.clear()
+        }
+        root.feedRows()
+    }
+    onRowsModelChanged: refeedRows()
+    Component.onCompleted: refeedRows()
+    ListModel { id: shownRows }
+    Timer { id: rowFeeder; interval: 0; onTriggered: root.feedRows() }
+    Connections {
+        target: root.rowsModel
+        function onModelReset() { root.refeedRows() }
+        function onRowsInserted() { if (!rowFeeder.running) root.feedRows() }
     }
 
     Column {
@@ -79,8 +134,10 @@ FocusScope {
                     color: Theme.primary
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.meetingHeadBackSize
-                    lineHeight: Theme.meetingHeadBackSize * Theme.fontBodyLineHeight
-                    lineHeightMode: Text.FixedHeight
+                    // Строка 19.5 с глифами по центру (половинный интерлиньяж, как в CSS):
+                    // FixedHeight кладёт глифы к верху строки — на 1 px выше макета.
+                    height: Theme.meetingHeadBackSize * Theme.fontBodyLineHeight
+                    verticalAlignment: Text.AlignVCenter
                     renderType: Text.NativeRendering
                 }
             }
@@ -101,15 +158,17 @@ FocusScope {
         Item { width: 1; height: Theme.meetingHeadBackMarginBottom }
 
         // ── шапка: название, карандаш, бейдж; подстрока; действия справа ──────
-        RowLayout {
+        // Item, не RowLayout: раскладка округляет высоту 44.5 до 45, и всё ниже
+        // съезжает на полпикселя (отметки на 1 px ниже макета).
+        Item {
             id: head
             width: parent.width
-            spacing: 12 // макет .shead: зазор колонки названия и кнопок.
+            height: Math.max(headText.height, headActions.visible ? headActions.height : 0)
 
             Column {
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-                Layout.alignment: Qt.AlignTop
+                id: headText
+                // макет .shead: зазор 12 между колонкой названия и кнопками.
+                width: Math.max(0, parent.width - (headActions.visible ? headActions.width + 12 : 0))
 
                 Flow {
                     id: titleRow
@@ -155,7 +214,8 @@ FocusScope {
                         MeetingBadge {
                             id: badge
                             objectName: "meetingCardBadge"
-                            anchors.verticalCenter: parent.verticalCenter
+                            // По центру строки по расчётной высоте 21.25 (не по снапнутой 21), как в макете.
+                            y: (parent.height - implicitHeight) / 2
                             text: root.card.badge !== undefined ? root.card.badge.text : ""
                             kind: root.card.badge !== undefined ? root.card.badge.kind : "neutral"
                             iconName: root.card.badge !== undefined ? root.card.badge.icon : ""
@@ -203,7 +263,8 @@ FocusScope {
             }
 
             Row {
-                Layout.alignment: Qt.AlignTop
+                id: headActions
+                x: parent.width - width
                 visible: root.card.showActions === true
                 spacing: Theme.meetingHeadActionsGap
                 AvButton {
@@ -291,78 +352,96 @@ FocusScope {
                 id: progressCard
                 objectName: "meetingCardProgress"
                 width: parent.width
-                height: progressRow.implicitHeight + Theme.transcribeProgressPaddingY * 2
+                // Паддинги — от внутренней стороны рамки 1 (как border-box в макете).
+                height: progressRow.implicitHeight + (Theme.transcribeProgressPaddingY + Theme.cardBorder) * 2
                 color: Theme.bgSurface
                 radius: Theme.cardRadius
                 border.width: Theme.cardBorder
-                border.color: Theme.border
+                border.color: root.cardBorderColor
                 RowLayout {
                     id: progressRow
-                    x: Theme.transcribeProgressPaddingX
-                    y: Theme.transcribeProgressPaddingY
-                    width: parent.width - Theme.transcribeProgressPaddingX * 2
+                    x: Theme.cardBorder + Theme.transcribeProgressPaddingX
+                    y: Theme.cardBorder + Theme.transcribeProgressPaddingY
+                    width: parent.width - (Theme.transcribeProgressPaddingX + Theme.cardBorder) * 2
                     spacing: Theme.transcribeProgressGap
                     Icon { name: "clock"; size: Theme.transcribeProgressIcon; color: Theme.primary; Layout.alignment: Qt.AlignVCenter }
                     Column {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
-                        Flow {
+                        // Строка 13.5 × 1.5 из PT Root UI и PT Mono на общей базовой линии (CSS):
+                        // её коробка выше на полуразность (ascent − descent) двух шрифтов, а глифы
+                        // стоят по базовой линии — отсюда 71.3 у карточки (tokens.md §3.8).
+                        Item {
+                            id: progressLine
                             width: parent.width
-                            Text {
-                                text: root.txt("progressDone")
-                                textFormat: Text.PlainText
-                                color: Theme.fg
-                                font.family: Theme.fontUi
-                                font.pixelSize: Theme.transcribeProgressTextSize
-                                lineHeight: Theme.transcribeProgressTextSize * Theme.fontBodyLineHeight
-                                lineHeightMode: Text.FixedHeight
-                                renderType: Text.NativeRendering
-                            }
-                            Text {
-                                objectName: "meetingCardProgressDone"
-                                text: root.card.progressDone !== undefined ? root.card.progressDone : ""
-                                textFormat: Text.PlainText
-                                color: Theme.fg
-                                font.family: Theme.fontMono
-                                font.pixelSize: Theme.transcribeProgressTextSize
-                                lineHeight: Theme.transcribeProgressTextSize * Theme.fontBodyLineHeight
-                                lineHeightMode: Text.FixedHeight
-                                font.letterSpacing: Theme.transcribeProgressTextSize * Theme.fontMonoInlineTracking
-                                renderType: Text.NativeRendering
-                            }
-                            Text {
-                                text: root.txt("progressOf")
-                                textFormat: Text.PlainText
-                                color: Theme.fg
-                                font.family: Theme.fontUi
-                                font.pixelSize: Theme.transcribeProgressTextSize
-                                lineHeight: Theme.transcribeProgressTextSize * Theme.fontBodyLineHeight
-                                lineHeightMode: Text.FixedHeight
-                                renderType: Text.NativeRendering
-                            }
-                            Text {
-                                text: root.card.progressTotal !== undefined ? root.card.progressTotal : ""
-                                textFormat: Text.PlainText
-                                color: Theme.fg
-                                font.family: Theme.fontMono
-                                font.pixelSize: Theme.transcribeProgressTextSize
-                                lineHeight: Theme.transcribeProgressTextSize * Theme.fontBodyLineHeight
-                                lineHeightMode: Text.FixedHeight
-                                font.letterSpacing: Theme.transcribeProgressTextSize * Theme.fontMonoInlineTracking
-                                renderType: Text.NativeRendering
+                            readonly property real lead: Theme.transcribeProgressTextSize * Theme.fontBodyLineHeight
+                            readonly property real kUi: uiMetrics.ascent - uiMetrics.descent
+                            readonly property real kMono: monoMetrics.ascent - monoMetrics.descent
+                            readonly property real baseY: (lead + Math.max(kUi, kMono)) / 2
+                            height: lead + Math.abs(kUi - kMono) / 2
+                            FontMetrics { id: uiMetrics; font.family: Theme.fontUi; font.pixelSize: Theme.transcribeProgressTextSize }
+                            FontMetrics { id: monoMetrics; font.family: Theme.fontMono; font.pixelSize: Theme.transcribeProgressTextSize }
+                            Row {
+                                Text {
+                                    text: root.txt("progressDone")
+                                    textFormat: Text.PlainText
+                                    color: Theme.fg
+                                    font.family: Theme.fontUi
+                                    font.pixelSize: Theme.transcribeProgressTextSize
+                                    y: progressLine.baseY - baselineOffset
+                                    renderType: Text.NativeRendering
+                                }
+                                Text {
+                                    objectName: "meetingCardProgressDone"
+                                    text: root.card.progressDone !== undefined ? root.card.progressDone : ""
+                                    textFormat: Text.PlainText
+                                    color: Theme.fg
+                                    font.family: Theme.fontMono
+                                    font.pixelSize: Theme.transcribeProgressTextSize
+                                    y: progressLine.baseY - baselineOffset
+                                    font.letterSpacing: Theme.transcribeProgressTextSize * Theme.fontMonoInlineTracking
+                                    renderType: Text.NativeRendering
+                                }
+                                Text {
+                                    text: root.txt("progressOf")
+                                    textFormat: Text.PlainText
+                                    color: Theme.fg
+                                    font.family: Theme.fontUi
+                                    font.pixelSize: Theme.transcribeProgressTextSize
+                                    y: progressLine.baseY - baselineOffset
+                                    renderType: Text.NativeRendering
+                                }
+                                Text {
+                                    text: root.card.progressTotal !== undefined ? root.card.progressTotal : ""
+                                    textFormat: Text.PlainText
+                                    color: Theme.fg
+                                    font.family: Theme.fontMono
+                                    font.pixelSize: Theme.transcribeProgressTextSize
+                                    y: progressLine.baseY - baselineOffset
+                                    font.letterSpacing: Theme.transcribeProgressTextSize * Theme.fontMonoInlineTracking
+                                    renderType: Text.NativeRendering
+                                }
                             }
                         }
-                        Text {
+                        // FixedHeight оставляет leading снизу; CSS делит его пополам (как Step4Mic).
+                        Item {
                             width: parent.width
-                            text: root.txt("progressCaption")
-                            textFormat: Text.PlainText
-                            wrapMode: Text.WordWrap
-                            color: Theme.fgMuted
-                            font.family: Theme.fontUi
-                            font.pixelSize: Theme.transcribeProgressSubSize
-                            lineHeight: Theme.transcribeProgressSubSize * Theme.fontBodyLineHeight
-                            lineHeightMode: Text.FixedHeight
-                            renderType: Text.NativeRendering
+                            height: caption.height
+                            Text {
+                                id: caption
+                                y: (lineHeight - captionMetrics.height) / 2
+                                width: parent.width
+                                text: root.txt("progressCaption")
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                                color: Theme.fgMuted
+                                font.family: Theme.fontUi
+                                font.pixelSize: Theme.transcribeProgressSubSize
+                                lineHeight: Theme.transcribeProgressSubSize * Theme.fontBodyLineHeight
+                                lineHeightMode: Text.FixedHeight
+                                renderType: Text.NativeRendering
+                            }
+                            FontMetrics { id: captionMetrics; font: caption.font }
                         }
                         Item { width: 1; height: Theme.transcribeProgressTrackMarginTop }
                         Rectangle {
@@ -396,14 +475,15 @@ FocusScope {
             readonly property var info: root.panelState ? root.card.panel : ({})
             visible: root.panelState
             width: parent.width
-            height: visible ? Math.max(Theme.meetingStatePanelIcon, panelColumn.height) + Theme.meetingStatePanelPaddingY * 2 : 0
+            // Паддинги — от внутренней стороны рамки 1 (как border-box в макете).
+            height: visible ? Math.max(Theme.meetingStatePanelIcon, panelColumn.height) + (Theme.meetingStatePanelPaddingY + Theme.cardBorder) * 2 : 0
             color: Theme.bgSurface
             radius: Theme.cardRadius
             border.width: Theme.cardBorder
-            border.color: Theme.border
+            border.color: root.cardBorderColor
             Icon {
-                x: Theme.meetingStatePanelPaddingX
-                y: Theme.meetingStatePanelPaddingY
+                x: Theme.cardBorder + Theme.meetingStatePanelPaddingX
+                y: Theme.cardBorder + Theme.meetingStatePanelPaddingY
                 name: statePanel.info.icon !== undefined ? statePanel.info.icon : ""
                 size: Theme.meetingStatePanelIcon
                 color: statePanel.info.tone === "warning" ? Theme.warningInk
@@ -412,15 +492,19 @@ FocusScope {
             }
             Column {
                 id: panelColumn
-                x: Theme.meetingStatePanelPaddingX + Theme.meetingStatePanelIcon + Theme.meetingStatePanelGap
-                y: Theme.meetingStatePanelPaddingY
-                width: parent.width - x - Theme.meetingStatePanelPaddingX
+                x: Theme.cardBorder + Theme.meetingStatePanelPaddingX + Theme.meetingStatePanelIcon + Theme.meetingStatePanelGap
+                y: Theme.cardBorder + Theme.meetingStatePanelPaddingY
+                width: parent.width - x - Theme.meetingStatePanelPaddingX - Theme.cardBorder
                 spacing: Theme.meetingStatePanelColGap
                 Flow {
                     width: parent.width
                     Text {
+                        id: panelTitle
                         objectName: "meetingCardPanelTitle"
                         width: Math.min(implicitWidth, parent.width)
+                        // FixedHeight оставляет leading снизу; CSS делит его пополам (как Step4Mic).
+                        topPadding: (lineHeight - panelTitleMetrics.height) / 2
+                        height: lineCount * lineHeight
                         text: statePanel.info.title !== undefined ? statePanel.info.title : ""
                         textFormat: Text.PlainText
                         wrapMode: Text.WordWrap
@@ -431,9 +515,14 @@ FocusScope {
                         lineHeightMode: Text.FixedHeight
                         font.weight: Font.Medium
                         renderType: Text.NativeRendering
+                        FontMetrics { id: panelTitleMetrics; font: panelTitle.font }
                     }
                     Text {
+                        id: panelTitleMono
                         visible: text !== ""
+                        // Базовая линия — общая с названием (PT Mono выше по ascent).
+                        topPadding: panelTitle.topPadding + panelTitleMetrics.ascent - panelMonoMetrics.ascent
+                        height: lineHeight
                         text: statePanel.info.titleMono !== undefined ? statePanel.info.titleMono : ""
                         textFormat: Text.PlainText
                         color: Theme.fg
@@ -444,10 +533,14 @@ FocusScope {
                         font.weight: Font.Medium
                         font.letterSpacing: Theme.meetingStatePanelTitleSize * Theme.fontMonoInlineTracking
                         renderType: Text.NativeRendering
+                        FontMetrics { id: panelMonoMetrics; font: panelTitleMono.font }
                     }
                 }
                 Text {
+                    id: panelText
                     width: parent.width
+                    topPadding: (lineHeight - panelTextMetrics.height) / 2
+                    height: lineCount * lineHeight
                     text: statePanel.info.text !== undefined ? statePanel.info.text : ""
                     textFormat: Text.PlainText
                     wrapMode: Text.WordWrap
@@ -457,13 +550,15 @@ FocusScope {
                     lineHeight: Theme.meetingStatePanelTextSize * Theme.fontBodyLineHeight
                     lineHeightMode: Text.FixedHeight
                     renderType: Text.NativeRendering
+                    FontMetrics { id: panelTextMetrics; font: panelText.font }
                 }
                 Item {
                     id: buttonsBox
                     readonly property var buttons: statePanel.info.buttons !== undefined ? statePanel.info.buttons : []
                     visible: buttons.length > 0
                     width: parent.width
-                    height: visible ? panelButtons.height + Theme.meetingStatePanelActionsMarginTop : 0
+                    // Кнопка по токену 33.5; AvButton снапит её к 34 — полпикселя не в высоту панели.
+                    height: visible ? panelButtons.height - (Math.round(Theme.buttonHeight) - Theme.buttonHeight) + Theme.meetingStatePanelActionsMarginTop : 0
                     Flow {
                         id: panelButtons
                         y: Theme.meetingStatePanelActionsMarginTop
@@ -516,15 +611,16 @@ FocusScope {
                 id: strip
                 objectName: "meetingCardStrip"
                 width: parent.width
-                height: Math.max(Theme.participantsStripH, stripRow.implicitHeight + Theme.participantsStripPaddingTop + Theme.participantsStripPaddingBottom)
+                // participantsStripH — внешняя высота (замер); паддинги — внутри рамки 1.
+                height: Math.max(Theme.participantsStripH, stripRow.implicitHeight + Theme.participantsStripPaddingTop + Theme.participantsStripPaddingBottom + Theme.cardBorder * 2)
                 color: Theme.bgSurface
                 radius: Theme.cardRadius
                 border.width: Theme.cardBorder
-                border.color: Theme.border
+                border.color: root.cardBorderColor
                 RowLayout {
                     id: stripRow
-                    x: Theme.participantsStripPaddingLeft
-                    width: parent.width - Theme.participantsStripPaddingLeft - Theme.participantsStripPaddingRight
+                    x: Theme.cardBorder + Theme.participantsStripPaddingLeft
+                    width: parent.width - Theme.participantsStripPaddingLeft - Theme.participantsStripPaddingRight - Theme.cardBorder * 2
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Theme.participantsStripGap
                     Flow {
@@ -582,11 +678,12 @@ FocusScope {
                 id: tableCard
                 objectName: "meetingCardTable"
                 width: root.tableWidth
-                height: tableColumn.height + Theme.cardBorder * 2
+                height: (root.rowsDraining ? 0 : tableColumn.height) + Theme.cardBorder * 2
+                clip: root.rowsDraining
                 color: Theme.bgSurface
                 radius: Theme.cardRadius
                 border.width: Theme.cardBorder
-                border.color: Theme.border
+                border.color: root.cardBorderColor
 
                 FocusScope {
                     id: table
@@ -618,21 +715,35 @@ FocusScope {
                         id: tableColumn
                         width: parent.width
 
-                        Repeater {
-                            id: rows
-                            objectName: "meetingCardRows"
-                            model: root.rowsModel
-                            delegate: MeetingTranscriptRow {
-                                width: tableColumn.width
-                                first: index === 0
-                                kind: model.kind
-                                time: model.time
-                                who: model.who
-                                whoKind: model.whoKind
-                                text: model.text
-                                iconName: model.icon
-                                accessibleName: model.accessibleName
-                                Component.onCompleted: root.rowsCreated += 1
+                        // Свой столбик вместо Column: Column пересчитывает все строки на
+                        // каждое добавление (9000 — ~65 мс), цепочка y — только новую.
+                        Item {
+                            id: rowsBox
+                            width: parent.width
+                            readonly property Item last: rows.count > 0 ? rows.itemAt(rows.count - 1) : null
+                            height: last ? last.y + last.height : 0
+                            Repeater {
+                                id: rows
+                                objectName: "meetingCardRows"
+                                model: shownRows
+                                delegate: MeetingTranscriptRow {
+                                    property Item above: null
+                                    y: above ? above.y + above.height : 0
+                                    width: tableColumn.width
+                                    first: index === 0
+                                    kind: model.kind
+                                    time: model.time
+                                    who: model.who
+                                    whoKind: model.whoKind
+                                    text: model.text
+                                    iconName: model.icon
+                                    accessibleName: model.accessibleName
+                                    Component.onCompleted: {
+                                        // Строки только дописываются в конец и убираются с конца.
+                                        above = index > 0 ? rows.itemAt(index - 1) : null
+                                        root.rowsCreated += 1
+                                    }
+                                }
                             }
                         }
 
@@ -689,7 +800,7 @@ FocusScope {
                 color: Theme.bgSurface
                 radius: Theme.cardRadius
                 border.width: Theme.cardBorder
-                border.color: Theme.border
+                border.color: root.cardBorderColor
                 Column {
                     id: participantsColumn
                     x: Theme.cardBorder

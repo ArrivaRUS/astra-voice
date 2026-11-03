@@ -209,7 +209,7 @@ ApplicationWindow {
 
             Column {
                 visible: window.currentSection.key === "meetings" && window.meetings !== null
-                    && window.meetings.enabled && window.meetings.recordingDevEnabled === true
+                    && window.meetings.enabled && window.meetings.recordingAvailable === true
                 spacing: Theme.meetingSectionRecCaptionGap
                 AvButton {
                     objectName: "meetingRecord"

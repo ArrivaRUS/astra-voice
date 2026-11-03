@@ -114,7 +114,6 @@ class Rig:
             enabled=lambda: self.bridge.enabled,
             policy_allowed=lambda: self.bridge.canEnable,
             session_kind=SessionKind.KDE,
-            dev_enabled=True,
             session_factory=Mock,
             supervisor_factory=lambda event, exited: Capture(event, exited),
             storage_probe=lambda path: StorageStatus(1000, True, False),
@@ -324,7 +323,7 @@ def test_tray_hint_has_a_second_transcription_line(harness: Harness) -> None:
 
 def test_tray_wiring_publishes_transcription_percent() -> None:
     tray = Mock()
-    bridge = Mock(enabled=True, recordingDevEnabled=True, transcriptionPercent=40)
+    bridge = Mock(enabled=True, recordingAvailable=True, transcriptionPercent=40)
     bridge.overlay = {"active": False}
     disconnect = app._wire_tray_meetings(tray, bridge, Mock())
     try:
@@ -486,7 +485,7 @@ def test_app_gives_the_catalog_probe_before_initialize_recovers_9(
         (meeting_notifications, "MeetingNotifications"),
     ):
         monkeypatch.setattr(module, name, Mock())
-    recording = Mock(dev_enabled=True)
+    recording = Mock()
     seen: list[int] = []
 
     def initialize() -> None:
