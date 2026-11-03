@@ -85,11 +85,11 @@ def audio_digest(disk: store_module.MeetingStore) -> dict[str, str]:
 
 
 def tree(disk: store_module.MeetingStore) -> dict[str, bytes]:
+    """Every entry, dot files (leases, temporaries) included."""
     base = disk.root / MID
     return {
-        str(p.relative_to(base)): p.read_bytes()
+        str(p.relative_to(base)): p.read_bytes() if p.is_file() else b"<dir>"
         for p in sorted(base.rglob("*"))
-        if p.is_file() and not p.name.startswith(".")
     }
 
 
@@ -447,6 +447,73 @@ def test_cancel_within_one_second_and_no_writes_after(tmp_path: Path, rigs: list
     assert tree(disk) == snapshot
 
 
+def test_cancel_before_lease_loads_nothing_and_leaves_directory_untouched(
+    tmp_path: Path, rigs: list[Rig]
+) -> None:
+    disk = two_track_disk(tmp_path)
+    rig = new_rig(rigs, disk, memory_mb=100)
+    rig.send("model.load", **MODEL)
+    assert rig.wait(lambda e: e["type"] in {"model.loaded", "error"})["code"] == "memory"
+    rig.memory_mb = 100_000  # the job itself would load the model now
+    snapshot = tree(disk)
+    gate, entered = threading.Event(), threading.Event()
+    check_dir = rig.state._check_dir
+
+    def held(job: Any) -> None:
+        entered.set()
+        gate.wait(5)
+        check_dir(job)
+
+    rig.state._check_dir = held  # type: ignore[method-assign]
+    rig.start()
+    assert entered.wait(5)
+    replies = rig.send("meeting.job.cancel", **rig.identity())
+    assert replies[0]["type"] == "meeting.job.cancelled"  # nothing in flight: at once
+    job = rig.state.job
+    gate.set()
+    rig.settle(job)
+    assert rig.engine.loads == 0 and rig.engine.calls == 0
+    assert tree(disk) == snapshot  # no .writer-transcribe.lock, no text
+    assert not any(
+        e["type"].startswith("meeting.job.") and e["type"] != "meeting.job.cancelled"
+        for e in rig.events
+        if e.get("request_type") != "meeting.job.start"
+    )
+
+
+def test_cancel_during_slow_serialization_is_acknowledged_within_one_second(
+    tmp_path: Path, rigs: list[Rig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validation/encoding of a long text runs outside the write fence."""
+    disk = many_bursts_disk(tmp_path)
+    encoding, original = threading.Event(), store_module._encode
+
+    def slow_encode(data: dict[str, Any]) -> bytes:
+        if "utterances" in data and data["utterances"]:
+            encoding.set()
+            time.sleep(2.5)  # ~ one 3000-utterance text on the VPS before the fix
+        return original(data)
+
+    monkeypatch.setattr(store_module, "_encode", slow_encode)
+    rig = new_rig(rigs, disk)
+    rig.load()
+    rig.start(tracks=["mic"])
+    deadline = time.monotonic() + 10
+    while not encoding.is_set() and time.monotonic() < deadline:
+        rig.pump()
+        time.sleep(0.005)
+    assert encoding.is_set()
+    snapshot = tree(disk)
+    started = time.monotonic()
+    replies = rig.send("meeting.job.cancel", **rig.identity())
+    if replies[0]["type"] != "meeting.job.cancelled":
+        rig.wait(lambda e: e["type"] == "meeting.job.cancelled", 1.0)
+    assert time.monotonic() - started <= 1.0
+    rig.settle(rig.state.job)
+    assert tree(disk) == snapshot  # the prepared window is never published
+    assert not (disk.root / MID / "transcript.json").exists()
+
+
 def test_memory_below_threshold_waits_without_touching_files(
     tmp_path: Path, rigs: list[Rig]
 ) -> None:
@@ -496,6 +563,190 @@ def test_directory_outside_meetings_root_fails_io_before_opening(
     assert not any(e["type"] == "meeting.job.accepted" for e in rig.events)
     assert rig.engine.calls == 0 and rig.engine.loads == loads
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("nth", [1, 2])
+def test_stale_checkpoint_never_vouches_for_text_of_another_model(
+    tmp_path: Path, rigs: list[Rig], monkeypatch: pytest.MonkeyPatch, nth: int
+) -> None:
+    """A (r1) crashes: text rev 2 + checkpoint rev 2. B (r2, resume) is incompatible,
+    starts from zero and crashes before (nth=2: after) its own first checkpoint.
+    C (r1, resume) must not take any of B's text as its durable prefix (D10)."""
+    disk = many_bursts_disk(tmp_path)
+    with monkeypatch.context() as patch:
+        crash_on(patch, 3, "transcript.json")
+        first = new_rig(rigs, disk)
+        first.load()
+        first.start(tracks=["mic"])
+        assert first.finish()["code"] == "io"
+        first.close()
+    with monkeypatch.context() as patch:
+        crash_on(patch, nth, "checkpoint.json")
+        engine = FakeEngine()
+        engine.text_override = "TEXT-FROM-r2"
+        second = new_rig(rigs, disk, engine=engine)
+        second.send("model.load", **{**MODEL, "revision": "r2"})
+        second.wait(lambda e: e["type"] == "model.loaded")
+        second.start(tracks=["mic"], resume=True)
+        assert second.finish()["code"] == "io"
+        second.close()
+    written = transcript(disk)
+    stale = disk.read(MID, "checkpoint.json")
+    assert isinstance(stale, Checkpoint)
+    if nth == 2:  # the dangerous state: r2 text newer than the last checkpoint
+        assert [u.text for u in written.utterances] == ["TEXT-FROM-r2"] * 32
+        assert stale.transcript_revision == written.transcript_revision - 1
+        assert stale.model.revision == "r2"  # B vouches only for its own (empty) start
+    else:
+        assert written.utterances == [] and stale.model.revision == MODEL["revision"]
+    third = new_rig(rigs, disk)
+    third.load()
+    third.start(tracks=["mic"], resume=True)
+    assert third.finish()["type"] == "meeting.job.done"
+    final = transcript(disk)
+    assert len(final.utterances) == 70
+    assert all(u.text != "TEXT-FROM-r2" for u in final.utterances)
+
+
+@pytest.mark.parametrize("crash", ["before-done", "before-final-checkpoint"])
+def test_resume_after_durable_final_text_reports_done_without_asr(
+    tmp_path: Path, rigs: list[Rig], monkeypatch: pytest.MonkeyPatch, crash: str
+) -> None:
+    from astra_voice.worker import meeting_transcribe
+
+    disk = many_bursts_disk(tmp_path)
+    with monkeypatch.context() as patch:
+        if crash == "before-done":
+
+            def killed(self: Any, *args: Any) -> None:
+                raise store_module.MeetingStoreError("crash")  # dies before done leaves
+
+            patch.setattr(meeting_transcribe.MeetingTranscribeState, "_finish", killed)
+        else:
+            crash_on(patch, 3)  # windows 1-2 durable, the final text's checkpoint lost
+        first = new_rig(rigs, disk)
+        first.load()
+        first.start(tracks=["mic"])
+        assert first.finish()["type"] == "meeting.job.failed"
+        first.close()
+    final = transcript(disk)
+    assert final.labels_final and len(final.utterances) == 70
+    checkpoint = disk.read(MID, "checkpoint.json")
+    assert isinstance(checkpoint, Checkpoint)
+    expected_revision = final.transcript_revision - (crash != "before-done")
+    assert checkpoint.transcript_revision == expected_revision
+    raw = (disk.root / MID / "transcript.json").read_bytes()
+    rig = new_rig(rigs, disk)
+    rig.load()
+    rig.start(tracks=["mic"], resume=True)
+    job = rig.state.job
+    done = rig.wait(lambda e: e["type"] in {"meeting.job.done", "meeting.job.failed"})
+    assert done["type"] == "meeting.job.done", done
+    rig.settle(job)
+    accepted = next(e for e in rig.events if e["type"] == "meeting.job.accepted")
+    assert accepted["resume_from"]["mic_ms"] == final.utterances[-1].end_ms
+    assert done["utterances"] == 70 and done["transcript_revision"] == final.transcript_revision
+    assert rig.engine.calls == 0 and rig.utterances() == []
+    assert (disk.root / MID / "transcript.json").read_bytes() == raw
+    assert not (disk.root / MID / "checkpoint.json").exists()  # dropped after done left
+
+
+def test_resume_after_dropped_final_checkpoint_reports_done_without_asr(
+    tmp_path: Path, rigs: list[Rig]
+) -> None:
+    """done left, checkpoint dropped, bytes never reached the GUI: same generation
+    final text is this job's, so resume is done again without VAD/ASR or rewrite."""
+    disk = many_bursts_disk(tmp_path)
+    run_to_end(rigs, disk)
+    final = transcript(disk)
+    assert final.labels_final and not (disk.root / MID / "checkpoint.json").exists()
+    raw = (disk.root / MID / "transcript.json").read_bytes()
+    rig = new_rig(rigs, disk)
+    rig.load()
+    rig.start(tracks=["mic"], resume=True)
+    job = rig.state.job
+    done = rig.wait(lambda e: e["type"] in {"meeting.job.done", "meeting.job.failed"})
+    assert done["type"] == "meeting.job.done", done
+    rig.settle(job)
+    assert done["utterances"] == 70 and done["transcript_revision"] == final.transcript_revision
+    assert done["echo_dropped"] == 0
+    accepted = next(e for e in rig.events if e["type"] == "meeting.job.accepted")
+    assert accepted["resume_from"]["mic_ms"] == final.utterances[-1].end_ms
+    assert rig.engine.calls == 0 and rig.utterances() == []
+    assert (disk.root / MID / "transcript.json").read_bytes() == raw
+    assert not (disk.root / MID / "checkpoint.json").exists()
+
+
+def test_resume_without_checkpoint_over_unfinished_text_restarts_with_empty_persist(
+    tmp_path: Path, rigs: list[Rig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    disk = many_bursts_disk(tmp_path)
+    with monkeypatch.context() as patch:
+        crash_on(patch, 1)  # text rev 1 (32 utterances), no checkpoint at all
+        first = new_rig(rigs, disk)
+        first.load()
+        first.start(tracks=["mic"])
+        assert first.finish()["code"] == "io"
+        first.close()
+    durable = transcript(disk)
+    assert not durable.labels_final and len(durable.utterances) == 32
+    assert not (disk.root / MID / "checkpoint.json").exists()
+    written: list[tuple[str, int, int]] = []
+    original = store_module.MeetingWriter._persist
+
+    def persist(self: Any, filename: str, raw: bytes) -> None:
+        document = json.loads(raw)
+        written.append(
+            (filename, document["transcript_revision"], len(document.get("utterances", [])))
+        )
+        original(self, filename, raw)
+
+    monkeypatch.setattr(store_module.MeetingWriter, "_persist", persist)
+    rig = new_rig(rigs, disk)
+    rig.load()
+    rig.start(tracks=["mic"], resume=True)
+    accepted = rig.wait(lambda e: e["type"] == "meeting.job.accepted")
+    assert accepted["resume_from"] == {"mic_ms": 0, "far_ms": 0}
+    revision = durable.transcript_revision + 1
+    assert written[:2] == [("transcript.json", revision, 0), ("checkpoint.json", revision, 0)]
+    assert rig.finish()["type"] == "meeting.job.done"
+    assert [u["seq"] for u in rig.utterances()] == list(range(70))
+    assert len(transcript(disk).utterances) == 70
+
+
+def test_final_checkpoint_dropped_only_after_done_is_polled(
+    tmp_path: Path, rigs: list[Rig]
+) -> None:
+    disk = two_track_disk(tmp_path)
+    rig = new_rig(rigs, disk)
+    rig.load()
+    rig.start()
+    job = rig.state.job
+    assert job is not None
+    deadline = time.monotonic() + 10
+    while not any(e["type"] == "meeting.job.accepted" for e in rig.events):
+        assert time.monotonic() < deadline
+        rig.pump()
+        time.sleep(0.005)
+    # Stop polling: done stays inside the role, so must the final checkpoint.
+    while transcript_final(disk) is False:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    time.sleep(0.3)
+    final = transcript(disk)
+    checkpoint = disk.read(MID, "checkpoint.json")
+    assert isinstance(checkpoint, Checkpoint)
+    assert checkpoint.transcript_revision == final.transcript_revision
+    assert not job.finished
+    assert rig.finish()["type"] == "meeting.job.done"
+    assert not (disk.root / MID / "checkpoint.json").exists()
+
+
+def transcript_final(disk: store_module.MeetingStore) -> bool:
+    try:
+        return transcript(disk).labels_final
+    except store_module.MeetingStoreError:
+        return False
 
 
 def test_t482_model_refusal_is_failed_model_and_checkpoint_does_not_bypass(
@@ -552,15 +803,16 @@ def test_t414_checkpoint_only_text_and_numbers_and_removed_after_done(
     written: list[Any] = []
     original = store_module.MeetingWriter._persist
 
-    def persist(self: Any, filename: str, data: dict[str, Any]) -> None:
+    def persist(self: Any, filename: str, raw: bytes) -> None:
         if filename == "checkpoint.json":
-            written.append(json.loads(json.dumps(data)))
-        original(self, filename, data)
+            written.append(json.loads(raw))
+        original(self, filename, raw)
 
     monkeypatch.setattr(store_module.MeetingWriter, "_persist", persist)
     disk = many_bursts_disk(tmp_path)
     run_to_end(rigs, disk)
-    assert len(written) == 2
+    assert len(written) == 3  # two windows + the final text's checkpoint
+    assert written[-1]["transcript_revision"] == transcript(disk).transcript_revision
     for document in written:
         assert all(length <= 16 for length in walk_numeric_arrays(document))
         assert set(document) == set(Checkpoint.SCHEMA["properties"])

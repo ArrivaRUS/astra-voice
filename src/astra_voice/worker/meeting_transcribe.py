@@ -3,8 +3,13 @@
 One job at a time runs on a single executor thread. The control path (ping,
 cancel, credits) never waits for inference, fsync or credits. Durability is D10:
 transcript.json (atomic + fsync, revision + 1) strictly before checkpoint.json
-referencing that revision; ASR cursors never pass durable text. After a cancel
-is acknowledged no write to the meeting directory can start (write fence).
+referencing that revision; ASR cursors never pass durable text. Every run that
+starts its text from zero over existing files first publishes an empty text
+and its own checkpoint, so an older checkpoint never vouches for foreign text.
+The final text also gets a checkpoint; it is dropped only after done was handed
+to the transport, so a crash in between resumes straight to done. After a
+cancel is acknowledged no write to the meeting directory can start (write
+fence); serialization and validation run outside the fence.
 Speech text, user paths and file names never reach logs or error messages.
 Diarization (stage 4) is not part of this step: done carries diar_status=skipped.
 """
@@ -12,6 +17,7 @@ Diarization (stage 4) is not part of this step: done carries diar_status=skipped
 from __future__ import annotations
 
 import bisect
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -82,6 +88,7 @@ MAX_SEGMENT_FRAMES = 4_800_000
 TRANSCRIPT_CAPACITY = 9000  # Transcript schema maximum
 TEXT_LIMIT_BYTES = ipc.MAX_TEXT_BYTES
 MAX_CREDITS = 4096
+DONE_DELIVERY_S = 5.0  # final checkpoint is dropped only after done left the role
 UNRECOGNIZED_TEXT = "[не распознано]"
 DAMAGED_TEXT = "[кусок записи повреждён]"
 _SEGMENT_FILE = re.compile(r"(mic|far)-([0-9]{4})\.(wav|json)\Z")
@@ -319,6 +326,27 @@ class _Entry:
     wav: _Wav | None
 
 
+@dataclass
+class _Resume:
+    kept: list[Utterance]
+    cursors: dict[str, int]
+    revision: int
+    fresh: bool  # the text starts from zero
+    on_disk: bool  # transcript.json or checkpoint.json already exists
+    complete: Transcript | None = None  # final text of this very configuration
+
+
+@dataclass
+class _Durable:
+    """What every checkpoint of a run carries; revision = last durable text."""
+
+    manifest: str
+    config: str
+    identity: ModelIdentity
+    capacity: int
+    revision: int
+
+
 class _Reader:
     """Read-only PCM access through the pinned audio directory, no link following."""
 
@@ -382,6 +410,7 @@ class _Job:
         self.token = CancelToken()  # VAD/whole-job token
         self.current: CancelToken | None = None  # one ASR window
         self.progress_at = -math.inf
+        self.delivered = threading.Event()  # done handed to the transport
 
     def matches(self, message: Message) -> bool:
         return all(message.get(key) == value for key, value in self.identity.items())
@@ -472,7 +501,10 @@ class MeetingTranscribeState:
         return message
 
     def _job_active(self) -> bool:
-        return self.job is not None and not self.job.cancelled and not self.job.finished
+        job = self.job
+        if job is None or job.cancelled or job.finished:
+            return False
+        return not job.delivered.is_set()  # after done only cleanup remains
 
     def handle(self, message: Message) -> list[Message]:
         message = ipc.decode(ipc.encode(message, role=ROLE)[4:], role=ROLE)
@@ -568,6 +600,8 @@ class MeetingTranscribeState:
                 result.append(self._outcome(owner[0], message))
             elif not (isinstance(owner, _Job) and owner.cancelled):
                 result.append(message)
+                if message["type"] == "meeting.job.done" and isinstance(owner, _Job):
+                    owner.delivered.set()
         return result
 
     def cleanup(self) -> None:
@@ -668,10 +702,15 @@ class MeetingTranscribeState:
         return {"type": "meeting.job.failed", **job.identity, "code": code}
 
     def _write(self, job: _Job, owner: MeetingWriter, filename: str, document: Any) -> None:
+        if job.cancelled:
+            raise _Cancelled
+        # O(text) validation/serialization stays outside the fence: a cancel
+        # waits at most for one atomic replace + fsync, not for the encoder.
+        prepared = owner.prepare(filename, document)
         with self.fence:
             if job.cancelled:
                 raise _Cancelled
-            owner.write(filename, document)
+            owner.write(filename, prepared)
 
     def _remove_checkpoint(self, job: _Job, owner: MeetingWriter) -> None:
         with self.fence:
@@ -705,6 +744,8 @@ class MeetingTranscribeState:
             raise _Failed("io")
 
     def _ensure_model(self, job: _Job) -> bool:
+        if job.cancelled:
+            raise _Cancelled  # never load a model for a cancelled job
         if self.engine is not None:
             return True
         if self.spec is None:
@@ -737,6 +778,8 @@ class MeetingTranscribeState:
         self._check_dir(job)
         if not self._ensure_model(job):
             return
+        if job.cancelled:
+            raise _Cancelled
         meeting_id = job.identity["meeting_id"]
         meeting = self.store.read(meeting_id, "meeting.json")
         if (
@@ -745,7 +788,13 @@ class MeetingTranscribeState:
             or meeting.cancelled
         ):
             raise _Failed("io")
-        with self.store.writer(meeting_id, Writer.TRANSCRIBE) as owner:
+        with contextlib.ExitStack() as lease:
+            # Taking the lease creates its lock file and fsyncs the directory:
+            # behind the fence, so nothing changes on disk after a cancel ack.
+            with self.fence:
+                if job.cancelled:
+                    raise _Cancelled
+                owner = lease.enter_context(self.store.writer(meeting_id, Writer.TRANSCRIBE))
             audio_path = self.store.root / meeting_id / "audio"
             with private_directory(audio_path, private_from=self.store.root) as audio:
                 reader = _Reader(audio)
@@ -927,30 +976,67 @@ class MeetingTranscribeState:
         try:
             return self.store.read(meeting_id, name)
         except MeetingStoreError:
-            if name == "transcript.json":
-                raise _Failed("io") from None  # cannot be superseded safely
-            return None
+            return None  # an unreadable checkpoint is never trusted
 
     def _resume(
-        self, job: _Job, manifest: str, config: str, identity: ModelIdentity
-    ) -> tuple[list[Utterance], dict[str, int], int]:
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        manifest: str,
+        config: str,
+        identity: ModelIdentity,
+    ) -> _Resume:
         meeting_id = job.identity["meeting_id"]
         generation = job.identity["meeting_generation"]
-        transcript = self._read_optional(meeting_id, "transcript.json")
+        try:
+            # Through the lease: one read + validation also serves the writer's
+            # revision cache, so the next publication does not re-read the text.
+            transcript = owner.read_transcript()
+        except MeetingStoreError:
+            raise _Failed("io") from None  # cannot be superseded safely
         checkpoint = self._read_optional(meeting_id, "checkpoint.json")
+        on_disk = transcript is not None or os.path.lexists(
+            self.store.root / meeting_id / "checkpoint.json"
+        )
         same = (
             isinstance(transcript, Transcript)
             and transcript.meeting_id == meeting_id
             and transcript.meeting_generation == generation
         )
-        base = transcript.transcript_revision if same else 0
-        fresh: tuple[list[Utterance], dict[str, int], int] = ([], {"mic": 0, "far": 0}, base)
+        base = transcript.transcript_revision if same and transcript is not None else 0
+        fresh = _Resume([], {"mic": 0, "far": 0}, base, True, on_disk)
+        if (
+            job.request["resume"]
+            and same
+            and isinstance(transcript, Transcript)
+            and transcript.labels_final
+            and checkpoint is None
+            and not os.path.lexists(self.store.root / meeting_id / "checkpoint.json")
+            and all(u.seq == i for i, u in enumerate(transcript.utterances))
+        ):
+            # Checkpoint already dropped after done: within one generation the final
+            # text is this job's (a model/config change comes with a new generation
+            # and resume=false), so it is done again without VAD/ASR or a rewrite.
+            cursors = {"mic": 0, "far": 0}
+            for utterance in transcript.utterances:
+                cursors[utterance.track] = max(cursors[utterance.track], utterance.end_ms)
+            return _Resume(
+                list(transcript.utterances),
+                cursors,
+                transcript.transcript_revision,
+                False,
+                on_disk,
+                transcript,
+            )
         if not (job.request["resume"] and same and isinstance(checkpoint, Checkpoint)):
             return fresh
         assert isinstance(transcript, Transcript)
         if checkpoint.transcript_revision > transcript.transcript_revision:
             return fresh  # never trust a checkpoint ahead of durable text
-        view = dataclasses.replace(transcript, transcript_revision=checkpoint.transcript_revision)
+        # Identity fields only: the text itself was validated when it was read.
+        view = dataclasses.replace(
+            transcript, transcript_revision=checkpoint.transcript_revision, utterances=[]
+        )
         try:
             compatible = checkpoint.compatible_with(
                 view,
@@ -969,7 +1055,10 @@ class MeetingTranscribeState:
         if checkpoint.transcript_revision == transcript.transcript_revision:
             cursors["mic"] = max(cursors["mic"], checkpoint.asr.mic.done_until_ms)
             cursors["far"] = max(cursors["far"], checkpoint.asr.far.done_until_ms)
-        return kept, cursors, transcript.transcript_revision
+        # Every run that writes text from zero first publishes its own checkpoint,
+        # so the latest compatible checkpoint vouches for the final text as well.
+        complete = transcript if transcript.labels_final else None
+        return _Resume(kept, cursors, transcript.transcript_revision, False, on_disk, complete)
 
     # ---- pipeline ---------------------------------------------------------
 
@@ -1044,7 +1133,14 @@ class MeetingTranscribeState:
         vad_name, probabilities = self.vad_factory()
         identity = self._identity(vad_name)
         config = self._config(job, identity)
-        kept, cursors, revision = self._resume(job, manifest, config, identity)
+        resume = self._resume(job, owner, manifest, config, identity)
+        kept, cursors = resume.kept, resume.cursors
+        capacity = min(int(limits["max_utterances"]), TRANSCRIPT_CAPACITY)
+        durable = _Durable(manifest, config, identity, capacity, resume.revision)
+        if resume.fresh and resume.on_disk and duration <= int(limits["max_ms"]):
+            # From zero over existing files: our empty text and checkpoint go first,
+            # so no older checkpoint can vouch for the text this run writes (D10).
+            self._persist(job, owner, durable, [], cursors)
         reply = self._reply(
             "meeting.job.accepted",
             {**job.identity, **{k: request[k] for k in ("req", "request_type")}},
@@ -1053,10 +1149,14 @@ class MeetingTranscribeState:
         if job.cancelled:
             raise _Cancelled
         self.outbox.put(("reply", (request, job), reply))
+        if resume.complete is not None:
+            # The final text of this configuration is durable: no VAD/ASR, no rewrite.
+            # echo_dropped of the original run is not durable; it is reported as 0.
+            self._finish(job, owner, resume.complete, 0, started)
+            return
         if duration > int(limits["max_ms"]):
             raise _Failed("limit")
         deadline = started + (2 * duration + WALL_SLACK_MS) / 1000
-        capacity = min(int(limits["max_utterances"]), TRANSCRIPT_CAPACITY)
         # Stage 1: VAD per span (deterministic, so resume yields the same list).
         candidates = list(damaged)
         for index, span in enumerate(spans):
@@ -1085,6 +1185,7 @@ class MeetingTranscribeState:
             for u, c in zip(kept, transcribable, strict=False)
         ) or len(kept) > len(transcribable):
             kept, cursors = [], {"mic": 0, "far": 0}  # durable text is not this input
+            self._persist(job, owner, durable, [], cursors)
         # Stage 3: ASR in chronological order of both tracks.
         self._asr(
             job,
@@ -1095,8 +1196,8 @@ class MeetingTranscribeState:
             echoes,
             kept,
             cursors,
-            revision,
-            (manifest, config, identity, capacity, duration, deadline, started),
+            durable,
+            (duration, deadline, started),
         )
 
     def _span_probabilities(
@@ -1205,6 +1306,75 @@ class MeetingTranscribeState:
             return UNRECOGNIZED_TEXT
         return sanitize_text(result.text)
 
+    def _persist(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        durable: _Durable,
+        utterances: list[Utterance],
+        cursors: dict[str, int],
+        *,
+        final: bool = False,
+    ) -> Transcript:
+        """Text (atomic + fsync) strictly before the checkpoint referencing it (D10)."""
+        durable.revision += 1
+        identity_fields = job.identity
+        transcript = Transcript(
+            meeting_id=identity_fields["meeting_id"],
+            meeting_generation=identity_fields["meeting_generation"],
+            transcript_revision=durable.revision,
+            utterances=[dataclasses.replace(u, final=True) for u in utterances]
+            if final
+            else list(utterances),
+            labels_final=final,
+        )
+        self._write(job, owner, "transcript.json", transcript)
+        checkpoint = Checkpoint(
+            meeting_id=identity_fields["meeting_id"],
+            meeting_generation=identity_fields["meeting_generation"],
+            transcript_revision=durable.revision,
+            input_manifest_sha256=durable.manifest,
+            processing_config_sha256=durable.config,
+            model=durable.identity,
+            asr=AsrProgress(AsrCursor(cursors["mic"]), AsrCursor(cursors["far"])),
+            limits=ProcessingLimits(
+                utterances=durable.capacity, blocks=job.request["limits"]["max_blocks"]
+            ),
+        )
+        self._write(job, owner, "checkpoint.json", checkpoint)
+        return transcript
+
+    def _finish(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        transcript: Transcript,
+        echo_dropped: int,
+        started: float,
+    ) -> None:
+        self._emit(
+            job,
+            {
+                "type": "meeting.job.done",
+                **job.identity,
+                "utterances": len(transcript.utterances),
+                "speakers": len({u.speaker for u in transcript.utterances}),
+                "diar_status": "skipped",
+                "wall_ms": max(0, round((self.clock() - started) * 1000)),
+                "peak_rss_kb": _status_kb("VmHWM", self.status_path),
+                "echo_dropped": echo_dropped,
+                "transcript_revision": transcript.transcript_revision,
+            },
+        )
+        # The final checkpoint outlives done until the transport took it: a crash
+        # in between resumes straight to done instead of recomputing the text.
+        deadline = time.monotonic() + DONE_DELIVERY_S
+        while not job.delivered.wait(0.05):
+            if job.cancelled or time.monotonic() > deadline:
+                return  # a leftover final checkpoint only short-cuts a later resume
+        with contextlib.suppress(MeetingStoreError):
+            self._remove_checkpoint(job, owner)
+
     def _asr(
         self,
         job: _Job,
@@ -1215,44 +1385,14 @@ class MeetingTranscribeState:
         echoes: list[bool],
         kept: list[Utterance],
         cursors: dict[str, int],
-        revision: int,
-        context: tuple[str, str, ModelIdentity, int, int, float, float],
+        durable: _Durable,
+        context: tuple[int, float, float],
     ) -> None:
-        manifest, config, identity, capacity, duration, deadline, started = context
+        duration, deadline, started = context
         identity_fields = job.identity
         utterances = list(kept)
         self_track = job.request["self_track"]
         window_utterances = window_ms = 0
-        state = {"revision": revision}
-
-        def persist(final: bool = False) -> None:
-            state["revision"] += 1
-            items = (
-                [dataclasses.replace(u, final=True) for u in utterances] if final else utterances
-            )
-            transcript = Transcript(
-                meeting_id=identity_fields["meeting_id"],
-                meeting_generation=identity_fields["meeting_generation"],
-                transcript_revision=state["revision"],
-                utterances=items,
-                labels_final=final,
-            )
-            self._write(job, owner, "transcript.json", transcript)
-            if final:
-                return
-            checkpoint = Checkpoint(
-                meeting_id=identity_fields["meeting_id"],
-                meeting_generation=identity_fields["meeting_generation"],
-                transcript_revision=state["revision"],
-                input_manifest_sha256=manifest,
-                processing_config_sha256=config,
-                model=identity,
-                asr=AsrProgress(AsrCursor(cursors["mic"]), AsrCursor(cursors["far"])),
-                limits=ProcessingLimits(
-                    utterances=capacity, blocks=job.request["limits"]["max_blocks"]
-                ),
-            )
-            self._write(job, owner, "checkpoint.json", checkpoint)
 
         seen = 0
         for candidate, echo in zip(candidates, echoes, strict=True):
@@ -1303,24 +1443,11 @@ class MeetingTranscribeState:
             window_utterances += 1
             window_ms += length
             if window_utterances >= CHECKPOINT_UTTERANCES or window_ms >= CHECKPOINT_AUDIO_MS:
-                persist()
+                self._persist(job, owner, durable, utterances, cursors)
                 window_utterances = window_ms = 0
             self._progress(job, "asr", candidate.end_ms, duration)
-        # Stage 5: final text (labels_final without diarization), then drop checkpoint.
+        # Stage 5: final text (labels_final without diarization) + its checkpoint,
+        # done, then the checkpoint is dropped (T-414).
         self._progress(job, "finalize", duration, duration, force=True)
-        persist(final=True)
-        self._remove_checkpoint(job, owner)
-        self._emit(
-            job,
-            {
-                "type": "meeting.job.done",
-                **identity_fields,
-                "utterances": len(utterances),
-                "speakers": len({u.speaker for u in utterances}),
-                "diar_status": "skipped",
-                "wall_ms": max(0, round((self.clock() - started) * 1000)),
-                "peak_rss_kb": _status_kb("VmHWM", self.status_path),
-                "echo_dropped": sum(echoes),
-                "transcript_revision": state["revision"],
-            },
-        )
+        final = self._persist(job, owner, durable, utterances, cursors, final=True)
+        self._finish(job, owner, final, sum(echoes), started)

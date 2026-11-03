@@ -296,11 +296,23 @@ class Rig:
         raise AssertionError(f"timeout; last events: {[e['type'] for e in self.events[-8:]]}")
 
     def finish(self, timeout: float = 20.0) -> dict[str, Any]:
-        return self.wait(
+        job = self.state.job
+        outcome = self.wait(
             lambda e: e["type"] in {"meeting.job.done", "meeting.job.failed"},
             timeout,
             auto_credit=True,
         )
+        self.settle(job)
+        return outcome
+
+    def settle(self, job: Any, timeout: float = 10.0) -> None:
+        """Wait for the executor to leave the job (post-done cleanup included)."""
+        deadline = time.monotonic() + timeout
+        while job is not None and not job.finished:
+            if time.monotonic() > deadline:
+                raise AssertionError("job did not finish")
+            self.pump()
+            time.sleep(0.005)
 
     def utterances(self) -> list[dict[str, Any]]:
         return [e for e in self.events if e["type"] == "meeting.job.utterance"]
