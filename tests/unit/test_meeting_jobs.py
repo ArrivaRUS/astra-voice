@@ -1052,3 +1052,26 @@ def test_cancel_refused_by_a_full_writer_is_retried_not_stuck_3(rig: Rig) -> Non
     rig.now += 1
     rig.jobs.tick()
     assert rig.cancelled_at_send == [True]
+
+
+def test_exit_without_role_or_jobs_is_immediate(tmp_path: Path) -> None:
+    """CI PR #65 guard: an idle queue (role never started, nothing queued, meetings off)
+    with the real writer thread ends at once and starts no role."""
+    rig = Rig(tmp_path)
+    jobs = MeetingJobs(
+        rig.store,
+        rig.factory,
+        transcribe_immediately=lambda: False,
+        audio_retention_days=lambda: 30,
+        model_probe=lambda: rig.admission,
+        admit_allowed=lambda: False,
+    )
+    jobs.recover()
+    deadline = time.monotonic() + 2.0
+    while jobs.filesystem_pending and time.monotonic() < deadline:
+        jobs.tick()
+        time.sleep(0.01)
+    started = time.monotonic()
+    assert jobs.shutdown(timeout=1.0)
+    assert time.monotonic() - started < 2.0
+    assert rig.roles == []

@@ -1645,12 +1645,26 @@ def _install_signal_handlers(app: Any) -> Any:
 
     Обработчики Python выполняются только между байт-кодами, а Qt держит поток в
     C++-цикле: пробуждаем интерпретатор таймером.
+
+    Сигнал во время старта (до ``app.exec_()``) не теряется: Qt 5 молча
+    отбрасывает quit() вне работающего цикла (exec() сбрасывает запрос), поэтому
+    такой запрос повторяем тиком таймера уже изнутри цикла (CI PR #65).
     """
     from PyQt5.QtCore import QTimer
 
+    pending = False
+
     def handler(signum: int, _frame: Any) -> None:
+        nonlocal pending
         log.info("получен сигнал %s, завершаюсь", signal.Signals(signum).name)
         app.quit()
+        pending = app.thread().loopLevel() == 0
+
+    def poll() -> None:
+        nonlocal pending
+        if pending and app.thread().loopLevel() > 0:
+            pending = False
+            app.quit()
 
     for signum in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -1659,7 +1673,7 @@ def _install_signal_handlers(app: Any) -> Any:
             log.debug("обработчик сигнала %s не установлен", signum)
     timer = QTimer()
     timer.start(SIGNAL_POLL_MS)
-    timer.timeout.connect(lambda: None)
+    timer.timeout.connect(poll)
     return timer
 
 
