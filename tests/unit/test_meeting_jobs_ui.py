@@ -466,6 +466,95 @@ def test_policy_ban_blocks_manual_transcribe_too_i3(rig: Rig) -> None:
     assert rig.meeting().state == MeetingState.RECORDED and rig.jobs.queued_ids == []
 
 
+MID2 = "2026-11-01_130000-bbbb"
+
+
+def _start_message(role: Role, mid: str) -> dict[str, Any] | None:
+    return next(
+        (m for m in role.sent if m["type"] == "meeting.job.start" and m["meeting_id"] == mid),
+        None,
+    )
+
+
+def test_policy_ban_stops_the_queue_after_the_running_job_i1(rig: Rig) -> None:
+    # Two RECORDED with «сразу»: the first runs, the second waits in the queue.
+    rig.create(MID)
+    rig.create(MID2)
+    assert rig.jobs.on_recorded(MID) and rig.jobs.on_recorded(MID2)
+    rig.start_running()
+    assert (rig.jobs.active_id, rig.jobs.queued_ids) == (MID, [MID2])
+    start = _start_message(rig.role, MID)
+    assert start is not None
+    _ban(rig)
+    # The first one finishes before the GUI noticed the ban (no tick in between).
+    rig.role.emit(
+        "meeting.job.done",
+        meeting_id=MID,
+        meeting_generation=start["meeting_generation"],
+        utterances=0,
+        speakers=0,
+        diar_status="skipped",
+        wall_ms=1,
+        peak_rss_kb=1,
+        echo_dropped=0,
+        transcript_revision=1,
+    )
+    sent = len(rig.role.sent)
+    for _ in range(3):
+        rig.recording.tick()
+    assert rig.meeting(MID).state == MeetingState.DONE
+    assert "model.load" not in {m["type"] for m in rig.role.sent[sent:]}
+    assert _start_message(rig.role, MID2) is None and len(rig.roles) == 1
+    assert rig.jobs.active_id == "" and rig.jobs.queued_ids == [MID2]
+    rig.jobs.models_changed()  # T-481 path is gated too
+    rig.recording.tick()
+    assert _start_message(rig.role, MID2) is None
+    assert rig.meeting(MID2).state == MeetingState.TRANSCRIBING  # queued, not touched
+    rig.recording.policy_allowed = lambda: True
+    rig.recording.tick()
+    assert _start_message(rig.role, MID2) is not None
+
+
+@pytest.mark.parametrize("via", ["tick", "policy_changed"])
+def test_policy_ban_stops_the_running_job_like_exit_and_resumes_after_i1(
+    rig: Rig, via: str
+) -> None:
+    rig.create(MID)
+    assert rig.jobs.on_recorded(MID)
+    rig.start_running()
+    first = rig.role
+    _ban(rig)
+    if via == "tick":
+        rig.recording.tick()
+    else:
+        rig.recording.policy_changed()
+    # Like a program exit (T-478): the role is stopped, no job.cancel, durable state.
+    assert first.stops == 1 and "meeting.job.cancel" not in first.types()
+    meeting = rig.meeting(MID)
+    assert meeting.state == MeetingState.TRANSCRIBING and not meeting.cancelled
+    assert rig.jobs.active_id == "" and rig.jobs.queued_ids == [MID]
+    rig.recording.tick()
+    assert rig.roles == [first]  # nothing restarts under the ban
+    rig.recording.policy_allowed = lambda: True
+    rig.recording.tick()
+    second = rig.role
+    assert second is not first and second.types() == ["model.load"]
+    load = second.sent[0]
+    second.emit(
+        "model.loaded",
+        req=load["req"],
+        request_type="model.load",
+        id=LOAD["id"],
+        revision=LOAD["revision"],
+        variant=LOAD["variant"],
+        load_ms=1.0,
+        engine_version="x",
+    )
+    start = _start_message(second, MID)
+    assert start is not None and start["resume"] is True
+    assert start["meeting_generation"] == meeting.meeting_generation
+
+
 def test_app_gives_the_catalog_probe_before_initialize_recovers_9(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

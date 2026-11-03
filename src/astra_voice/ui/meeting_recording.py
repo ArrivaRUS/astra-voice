@@ -273,6 +273,7 @@ class MeetingRecording(QObject):
         if self._closed or self.jobs is not None:
             return
         self.jobs = jobs
+        jobs.admit_allowed = self._jobs_allowed  # one gate for admission (I3)
         meeting = self.controller.meeting
         # A meeting saved before binding belongs to the previous program run.
         self._jobs_saved = meeting.id if meeting is not None and self.controller.saved else ""
@@ -713,6 +714,8 @@ class MeetingRecording(QObject):
             self.close_dialog()
             if self.busy:
                 self.clicks.on_stop_clicked()
+            if self.jobs is not None:
+                self.jobs.suspend()
         self._publish()
 
     def _send_query(self, kind: str) -> None:
@@ -859,6 +862,8 @@ class MeetingRecording(QObject):
     def _tick_jobs(self) -> None:
         if self.jobs is None:
             return
+        if not self._jobs_allowed():
+            self.jobs.suspend()  # a ban stops the running job; it resumes when lifted
         self._recover_jobs()
         self._queue_saved()
         self.jobs.tick()

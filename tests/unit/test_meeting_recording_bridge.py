@@ -448,6 +448,55 @@ def test_app_binds_capture_and_borrows_runtime_monitor(
     factory.return_value.initialize.assert_called_once_with()
 
 
+@pytest.mark.parametrize("broken", ["MeetingOverlay", "MeetingNotice", "MeetingJobs"])
+def test_app_keeps_running_when_meeting_parts_fail_to_build_i2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, broken: str
+) -> None:
+    from unittest.mock import Mock
+
+    from astra_voice import app
+    from astra_voice.core import meeting_jobs
+    from astra_voice.ui import (
+        meeting_notice,
+        meeting_notifications,
+        meeting_overlay,
+        meeting_recording,
+    )
+
+    bridge = MeetingBridge(
+        Settings(meetings_enabled=True), store=MeetingStore(tmp_path / "m"), session=SessionKind.KDE
+    )
+    factory = Mock()
+    monkeypatch.setattr(meeting_recording, "MeetingRecording", factory)
+    parts = {
+        "MeetingOverlay": (meeting_overlay, Mock()),
+        "MeetingNotice": (meeting_notice, Mock()),
+        "MeetingNotifications": (meeting_notifications, Mock()),
+        "MeetingJobs": (meeting_jobs, Mock()),
+    }
+    # E.g. a build where the overlay QML did not load (ui/overlay.py RuntimeError).
+    parts[broken][1].side_effect = RuntimeError("PRIVATE /path/Overlay.qml failed")
+    for name, (module, mock) in parts.items():
+        monkeypatch.setattr(module, name, mock)
+    try:
+        with caplog.at_level(logging.WARNING):
+            app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE)
+        assert "meeting-recording-unavailable" in caplog.text
+        assert "PRIVATE" not in caplog.text
+        # No half state: capture is not bound, recording stopped, nothing initialized.
+        assert bridge._capture is None and not bridge.recordingAvailable
+        factory.return_value.shutdown.assert_called_once_with()
+        factory.return_value.initialize.assert_not_called()
+        assert getattr(bridge, "_meeting_overlay", None) is None
+        for name, (_module, mock) in parts.items():
+            if name != broken and mock.called:
+                mock.return_value.deleteLater.assert_called_once_with()
+        # The rest of the section still works.
+        assert bridge.enabled and bridge.meetings == []
+    finally:
+        bridge.shutdown()
+
+
 def test_native_supervisor_launch_failure_is_visible_and_retryable(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

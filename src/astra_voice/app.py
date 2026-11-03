@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import signal
@@ -825,26 +826,26 @@ def _bind_meeting_recording(
         parent=bridge,
         **options,
     )
-    bridge.bindRecording(recording)
-    from astra_voice.ui.meeting_notice import MeetingNotice
-    from astra_voice.ui.meeting_notifications import MeetingNotifications
-    from astra_voice.ui.meeting_overlay import MeetingOverlay
+    created: list[Any] = []
+    try:
+        # Everything is built before bindRecording: a build without the overlay QML
+        # (or any other failure here) leaves meetings unavailable, never the program
+        # (dictation keeps working) and never a bound capture without its overlay.
+        from astra_voice.core.meeting_jobs import MeetingJobs, probe_gigaam_model
+        from astra_voice.ui.meeting_notice import MeetingNotice
+        from astra_voice.ui.meeting_notifications import MeetingNotifications, job_notifier
+        from astra_voice.ui.meeting_overlay import MeetingOverlay
+        from astra_voice.ui.meeting_recording import transcribe_supervisor
 
-    bridge._meeting_overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
-    bridge.overlayKeyboardRequested.connect(bridge._meeting_overlay.activate_keyboard)
-    bridge._meeting_notice = MeetingNotice(
-        recording, bridge._meeting_overlay, notice=bridge.notice, parent=bridge
-    )
-    bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
-    bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
-    from astra_voice.core.meeting_jobs import MeetingJobs, probe_gigaam_model
-    from astra_voice.ui.meeting_notifications import job_notifier
-    from astra_voice.ui.meeting_recording import transcribe_supervisor
-
-    # E13.M4: the transcription queue is bound with capture; both start only when
-    # the setting (D1 accepted) and the administrator policy allow recording.
-    recording.bind_jobs(
-        MeetingJobs(
+        overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
+        created.append(overlay)
+        notice = MeetingNotice(recording, overlay, notice=bridge.notice, parent=bridge)
+        created.append(notice)
+        notifications = MeetingNotifications(recording, parent=bridge)
+        created.append(notifications)
+        # E13.M4: the transcription queue is bound with capture; both start only when
+        # the setting (D1 accepted) and the administrator policy allow recording.
+        jobs = MeetingJobs(
             bridge._store,
             transcribe_supervisor,
             transcribe_immediately=lambda: bool(bridge.settings["meeting_transcribe_immediately"]),
@@ -853,15 +854,29 @@ def _bind_meeting_recording(
             # The catalog's min_ram_mb is known before initialize() -> recover().
             model_probe=(_meeting_model_probe(model) if model is not None else probe_gigaam_model),
         )
-    )
-    recording.bind_indicators(
-        overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
-        tray_visible=lambda: bool(
-            runtime is not None
-            and runtime.tray is not None
-            and runtime.tray.meeting_indicator_visible
-        ),
-    )
+        recording.bind_jobs(jobs)
+        recording.bind_indicators(
+            overlay_visible=lambda: overlay.indicator_visible,
+            tray_visible=lambda: bool(
+                runtime is not None
+                and runtime.tray is not None
+                and runtime.tray.meeting_indicator_visible
+            ),
+        )
+    except Exception:  # noqa: BLE001 — meetings unavailable, the program keeps running
+        log.warning("meeting-recording-unavailable")
+        for item in reversed(created):
+            with contextlib.suppress(Exception):
+                item.deleteLater()
+        with contextlib.suppress(Exception):
+            recording.shutdown()
+        return
+    bridge._meeting_overlay = overlay
+    bridge.overlayKeyboardRequested.connect(overlay.activate_keyboard)
+    bridge._meeting_notice = notice
+    bridge.noticeKeyboardRequested.connect(notice.activate_keyboard)
+    bridge._meeting_notifications = notifications
+    bridge.bindRecording(recording)
     recording.initialize()
 
 

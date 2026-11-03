@@ -271,8 +271,11 @@ class MeetingJobs:
         submit: Callable[[Callable[[], None]], None] | None = None,
         notify: Notify = lambda kind, meeting: None,
         echo_gate: bool | None = None,
+        admit_allowed: Callable[[], bool] = lambda: True,
     ) -> None:
         self.store = store
+        # Setting + administrator policy (I3): nothing is admitted while it is False.
+        self.admit_allowed = admit_allowed
         self._role_factory = role_factory
         self.transcribe_immediately = transcribe_immediately
         self.audio_retention_days = audio_retention_days
@@ -421,6 +424,8 @@ class MeetingJobs:
 
     def models_changed(self) -> None:
         """A model was installed/checked: needs_model jobs re-check now (T-481)."""
+        if not self.admit_allowed():
+            return
         for entry in self._queue:
             if entry.status == "needs_model":
                 entry.retry_at = 0.0
@@ -505,6 +510,32 @@ class MeetingJobs:
             self._schedule()
         self._drain()
 
+    def suspend(self) -> bool:
+        """Recording is banned/disabled: stop the running job like a program exit.
+
+        No job.cancel: the role is stopped, its checkpoint stays durable and the
+        meeting stays «transcribing» on disk. The job waits at the head of the queue
+        and resumes (``job.start{resume: true}``) once admission is allowed again.
+        Cancel/delete/fail in progress are left to finish. True when stopped.
+        """
+        active = self._active
+        if self._closed or active is None or active.purpose:
+            return False
+        role, self._role = self._role, None
+        self._role_serial += 1  # late events/exits of the stopped process are ignored
+        self._loaded = None
+        self._active = None
+        if role is not None:
+            try:
+                role.stop()
+            except Exception:  # noqa: BLE001 — the job resumes from its checkpoint
+                pass
+        if active.meeting_id not in self.tombstones:
+            first = min((entry.order for entry in self._queue), default=self._order + 1)
+            self._queue.append(_Entry(active.meeting_id, first - 1, resume=True))
+        self._changed()
+        return True
+
     def shutdown(self, *, timeout: float = 0.0) -> bool:
         """Program exit: no job.cancel; SIGTERM keeps the checkpoint for resume (T-478)."""
         if self._closed:
@@ -570,7 +601,7 @@ class MeetingJobs:
         self._run(work)
 
     def _schedule(self) -> None:
-        if self._admitting or not self._queue:
+        if self._admitting or not self._queue or not self.admit_allowed():
             return
         now = self.clock()
         for entry in sorted(self._queue, key=lambda item: item.order):
@@ -630,6 +661,9 @@ class MeetingJobs:
                     self._take(meeting_id)
                     self.failures[meeting_id] = "model"
                     self._notify("failed_model", updated)
+                elif not self.admit_allowed():
+                    # Banned while the probe ran: stays queued («transcribing» on disk).
+                    current.retry_at = 0.0
                 else:
                     self._take(meeting_id)
                     self._active = _Active(updated, admission, resume=current.resume)
