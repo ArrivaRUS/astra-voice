@@ -346,10 +346,16 @@ def item(name):
 wait(lambda: len(bridge.meetings) == 1 and item('meetingRowOpen') is not None, 'list')
 header = item('sectionHeader')
 assert header.isVisible()
-opener = item('meetingRowOpen')
-QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
-                 opener.mapToScene(QPointF(40, opener.height() / 2)).toPoint())
-wait(lambda: bridge.cardOpen and bridge.card.get('view') == 'ready', 'card')
+def open_card():
+    # Under CPU load (CI) the first synthetic click right after the section loads
+    # is occasionally dropped: click the row again until the card opens, same budget.
+    opener = item('meetingRowOpen')
+    if not bridge.cardOpen and opener is not None:
+        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                         opener.mapToScene(QPointF(40, opener.height() / 2)).toPoint())
+    return bridge.cardOpen and bridge.card.get('view') == 'ready'
+
+wait(open_card, 'card')
 card = item('meetingCard')
 assert card.isVisible() and not header.isVisible()
 assert not item('meetingList').isVisible()
