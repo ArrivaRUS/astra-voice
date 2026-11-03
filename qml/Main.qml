@@ -451,9 +451,36 @@ ApplicationWindow {
         Component.onCompleted: reconcile()
     }
 
+    MeetingExitDialog {
+        id: meetingExitDialog
+        texts: window.meetings && window.meetings.exitTexts !== undefined ? window.meetings.exitTexts : ({})
+        onConfirmed: if (window.meetings) window.meetings.confirmExit()
+        onCancelled: if (window.meetings) window.meetings.cancelExit()
+        function reconcile() {
+            if (window.meetings && window.meetings.exitConfirmOpen === true) {
+                if (!visible || !window.visible) {
+                    if (!window.visible) window.show()
+                    window.raise()
+                    window.requestActivate()
+                    if (!visible) open()
+                }
+            } else if (visible) {
+                // Recording ended by itself: no answer is sent.
+                close()
+            }
+        }
+        Component.onCompleted: reconcile()
+    }
+
+    // Hiding the window with the exit question open answers «Отмена».
+    onVisibleChanged: if (!visible && meetingExitDialog.visible) meetingExitDialog.reject()
+
     Connections {
         target: window.meetings
-        function onChanged() { meetingInterruptedDialog.reconcile() }
+        function onChanged() {
+            meetingInterruptedDialog.reconcile()
+            meetingExitDialog.reconcile()
+        }
     }
 
     AvDialog {

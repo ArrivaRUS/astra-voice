@@ -173,3 +173,78 @@ RESPONSIBILITY_ITEMS = (
         "warning": False,
     },
 )
+
+W2_TEXTS = {
+    "recording": "Запись встречи",
+    "paused": "Пауза",
+    "pause": "Пауза",
+    "resume": "Продолжить",
+    "stop": "Остановить",
+    "participants": "Текст для участников",
+    "collapse": "Свернуть плашку",
+    "expand": "Развернуть плашку",
+    "keyboard": "Управлять плашкой с клавиатуры…",
+    "grip": "Переместить плашку",
+    "stopping": "Сохраняю запись…",
+    "pausedLock": "Экран был заблокирован — продолжите вручную",
+    "pausedUnknown": "Состояние сеанса неизвестно — продолжите вручную",
+    "micPaused": "Ваш голос не записывается: микрофон сменился",
+    "micName": "Ваш голос не записывается: микрофон сменился на «{name}»",
+    "resumeMicrophone": "Продолжить с „{name}“",
+    "resumeOtherMicrophone": "Продолжить с другим микрофоном",
+    "appClosed": "DION закрылся — пишется только микрофон",
+    "farEnded": "Звук собеседников больше не записывается — пишется только микрофон",
+    "limitSoon": "Остановится через {remaining}",
+    "extend": "Продлить на час",
+    "pausedTimer": "На паузе {minutes} мин. Через 60 мин паузы встреча сохранится",
+    "restoredIndicator": (
+        "Запись стояла на паузе {duration}: индикатор записи не отображался. "
+        "Отметка — в расшифровке"
+    ),
+    "restoredHang": (
+        "Запись стояла на паузе {duration}: программа не отвечала. Отметка — в расшифровке"
+    ),
+    "audioError": "Запись остановлена: звуковая служба не отвечает. Записанное сохранено",
+    "trayRecording": "Идёт запись встречи",
+    "trayPaused": "Запись встречи на паузе",
+    "trayLimit": "остановится через {remaining}",
+    "trayStop": "Остановить запись встречи",
+    "trayParticipants": "Текст для участников…",
+    "trayRecord": "Записать встречу",
+    "trayMeetings": "Встречи…",
+}
+
+# W3 «Предупредите участников о записи», spec §3.6/§4.6. The notice text itself
+# is the effective `meeting_notice_text` (user or administrator), never a constant here.
+W3_TEXTS = {
+    "header": "Astra Voice",
+    "title": "Предупредите участников о записи",
+    "copy": "Скопировать для чата",
+    "copied": "Скопировано",
+    "copyFailed": "Не удалось скопировать — выделите текст и скопируйте вручную",
+    "hint": "И скажите это вслух в начале встречи.",
+    "admin": "Текст задан администратором",
+    "close": "Закрыть",
+}
+# MN-17 (T-444): the bottom line is always shown. Spec names DION; any other
+# source has no verified program name, so the line stays generic.
+W3_MUTE = (
+    "Ваш микрофон записывается всё время записи — выключенный микрофон в {app} на запись не "
+    "влияет. Чтобы не записывать, нажмите «Пауза»."
+)
+W3_APP_DION = "DION"
+W3_APP_OTHER = "программе видеосвязи"
+
+
+def notice_mute_text(app_class: str) -> str:
+    return W3_MUTE.format(app=W3_APP_DION if app_class == "dion" else W3_APP_OTHER)
+
+
+# Exit during a recording: spec §4.6, dialog §11.1, mockup 04-recording section 7.
+EXIT_TEXTS = {
+    "header": "Astra Voice",
+    "title": "Идёт запись встречи. Остановить запись и выйти?",
+    "text": "Записанное сохранится и будет расшифровано при следующем запуске.",
+    "cancel": "Отмена",
+    "confirm": "Остановить и выйти",
+}

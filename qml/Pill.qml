@@ -130,58 +130,15 @@ Item {
         }
     }
 
-    // Подложка на QImage работает и с software backend, без запроса GL-контекста.
-    // MouseArea охватывают лишь кнопки; поля тени не участвуют в обработке мыши.
-    Canvas {
-        x: -root.shadowRadius
-        y: -root.shadowRadius
-        width: root.pillWidth + root.shadowRadius * 2
-        height: root.pillHeight + root.shadowRadius * 2 + root.shadowY
-        renderTarget: Canvas.Image
-        onWidthChanged: requestPaint()
-        onHeightChanged: requestPaint()
-
-        onPaint: {
-            var ctx = getContext("2d");
-            ctx.reset();
-            ctx.clearRect(0, 0, width, height);
-            var left = root.shadowRadius;
-            var top = root.shadowRadius;
-            var right = left + root.pillWidth;
-            var bottom = top + root.pillHeight;
-            var radius = PillTheme.pillRadius;
-            ctx.beginPath();
-            ctx.moveTo(left + radius, top);
-            ctx.lineTo(right - radius, top);
-            ctx.arcTo(right, top, right, top + radius, radius);
-            ctx.lineTo(right, bottom - radius);
-            ctx.arcTo(right, bottom, right - radius, bottom, radius);
-            ctx.lineTo(left + radius, bottom);
-            ctx.arcTo(left, bottom, left, bottom - radius, radius);
-            ctx.lineTo(left, top + radius);
-            ctx.arcTo(left, top, left + radius, top, radius);
-            ctx.closePath();
-            ctx.shadowOffsetX = root.shadowX;
-            ctx.shadowOffsetY = root.shadowY;
-            ctx.shadowBlur = root.shadowRadius;
-            ctx.shadowColor = root.shadowColor;
-            ctx.fillStyle = PillTheme.pillFg;
-            ctx.fill();
-            // Убираем источник и внутреннюю часть тени, как у внешней CSS box-shadow.
-            ctx.shadowColor = "transparent";
-            ctx.globalCompositeOperation = "destination-out";
-            ctx.fill();
-        }
-    }
-
-    Rectangle {
-        id: background
-        // Корневой Item следует размеру окна с полями; рисунок — размеру контента.
+    OverlaySurface {
         width: root.pillWidth
         height: root.pillHeight
-        radius: PillTheme.pillRadius
-        color: PillTheme.pillBg
-        antialiasing: true
+        surfaceWidth: root.pillWidth
+        surfaceHeight: root.pillHeight
+        shadowX: root.shadowX
+        shadowY: root.shadowY
+        shadowRadius: root.shadowRadius
+        shadowColor: root.shadowColor
     }
 
     // Ширина подписи — contentWidth, без переноса и обрезания даже при достижении maxW.

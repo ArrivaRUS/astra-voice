@@ -106,7 +106,7 @@ def test_five_hour_lease_traffic_does_not_consume_control_ledger(
     for limit in (10800000, 14400000):
         send("extend", max_ms=limit, blocked_epoch=0, admission_mono_ms=100000)
     heartbeat = 0
-    for phase, seconds in (("recording", 7200), ("paused", 3600), ("recording", 7200)):
+    for phase, seconds in (("recording", 7200), ("paused", 3599), ("recording", 7201)):
         for second in range(seconds):
             rig.clock.now += 1
             heartbeat += 1

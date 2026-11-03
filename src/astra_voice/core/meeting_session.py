@@ -223,6 +223,8 @@ class MeetingController:
         self.meeting: Meeting | None = None
         self.pause_reasons: set[str] = set()
         self.manual_resume_required = False
+        self.indicators_visible = False
+        self.indicator_recovery: Message | None = None
         self.lock_signal_unavailable = session_kind == SessionKind.FLY
         self.far_available = False
         self.far_reason = ""
@@ -254,6 +256,15 @@ class MeetingController:
         self._last_keepalive = self._last_disk = self.clock()
         self._sequence = 0
         self._far: Message = {"kind": "none"}
+
+    @property
+    def capture_id(self) -> str:
+        return str(self._identity.get("capture_id", ""))
+
+    @property
+    def capturing_without_indicator_pause(self) -> bool:
+        """Recording/opening with no `indicators` reason: the guard must re-arm."""
+        return self.state in {"recording", "opening"} and "indicators" not in self.pause_reasons
 
     @property
     def error_text(self) -> str:
@@ -333,6 +344,8 @@ class MeetingController:
         self._recorded_ms = 0
         self._active_at = self._pause_at = None
         self.pause_reasons.clear()
+        self.indicators_visible = False
+        self.indicator_recovery = None
         self.manual_resume_required = self.limit_warning = False
         self.state = "preparing"
         self._prepare_deadline = self.clock() + 5
@@ -415,6 +428,35 @@ class MeetingController:
         self._recorded_ms = self.recorded_ms
         self._active_at = None
 
+    def set_indicators_visible(self, visible: bool) -> None:
+        """Report actual UI visibility; only capture may authorize auto-resume."""
+        visible = bool(visible)
+        if visible == self.indicators_visible:
+            return
+        self.indicators_visible = visible
+        if (
+            self._identity
+            and self.supervisor.ready
+            and not self._terminal
+            and self.state in {"recording", "paused", "opening"}
+        ):
+            if self._pause_at is not None and self.clock() - self._pause_at >= 3600:
+                self.stop("stop")
+            else:
+                # Revoke an outstanding automatic-open admission immediately;
+                # the regular one-second timer remains the only lease timer.
+                self._keepalive()
+
+    def _keepalive(self) -> None:
+        self._last_keepalive = self.clock()
+        self._sequence += 1
+        self._send(
+            "keepalive",
+            **self._admission(),
+            seq=self._sequence,
+            indicators_visible=self.indicators_visible,
+        )
+
     def pause(self, reason: str = "user") -> None:
         if self.state not in {"recording", "opening", "paused"} or reason in self.pause_reasons:
             return
@@ -424,7 +466,8 @@ class MeetingController:
             self._epoch_pending = True
         if reason not in {"lease", "indicators"}:
             self.manual_resume_required = True
-        self._pause_at = self._pause_at or self.clock()
+        if self._pause_at is None:
+            self._pause_at = self.clock()
         self.state = "paused"
         self._close_deadline = self._close_deadline or self.clock() + 1
         self._finalizing = True
@@ -435,7 +478,7 @@ class MeetingController:
         if (
             self.state == "paused"
             and self._pause_at is not None
-            and self.clock() - self._pause_at > 3600
+            and self.clock() - self._pause_at >= 3600
         ):
             self.stop()
             return False
@@ -522,18 +565,16 @@ class MeetingController:
             self._escalate()
         if self.state not in {"recording", "paused", "opening"}:
             return
+        if self._pause_at is not None and now - self._pause_at >= 3600:
+            self.stop("stop")
+            return
         if now - self._last_keepalive >= 1 and self._close_deadline is None:
-            self._last_keepalive = now
-            self._sequence += 1
-            self._send("keepalive", **self._identity, seq=self._sequence)
+            self._keepalive()
         if self.meeting is not None:
             self.limit_warning = self.recorded_ms >= self.meeting.limit_ms - 300000
             if self.recorded_ms >= self.meeting.limit_ms:
                 self.stop("limit")
                 return
-        if self._pause_at is not None and now - self._pause_at > 3600:
-            self.stop("stop")
-            return
         if now - self._last_disk >= 10 and not self._disk_pending:
             self._last_disk = now
             self._disk_pending = True
@@ -767,13 +808,15 @@ class MeetingController:
             if self.state == "recording":
                 self._persist(MeetingState.RECORDING)
         elif kind in {"paused", "autopaused"}:
-            if kind == "autopaused":
+            if kind == "autopaused" and not self._physically_closed:
                 self._finalizing = True
             self._freeze()
             self._recorded_ms = max(self._recorded_ms, event["at_recorded_ms"])
             self.pause_reasons.update(event["pause_reasons"])
             self.manual_resume_required |= event["manual_resume_required"]
-            self._pause_at = self._pause_at or self.clock()
+            if self._pause_at is None:
+                self._pause_at = self.clock()
+            self._pause_marks(event["at_recorded_ms"], event["pause_reasons"])
             if not self._terminal:
                 self.state = "paused"
                 self._persist(MeetingState.PAUSED)
@@ -786,19 +829,33 @@ class MeetingController:
             self.tracks = dict(event["tracks"])
             self._capture_epoch = event["blocked_epoch"]
             if event["state"] == "recording" and not event["manual_resume_required"]:
+                # A heartbeat sent before our local pause must not erase that
+                # intent while the closing command is in flight.
+                if self._close_deadline is not None:
+                    return
                 self.state = "recording"
+                self._finalizing = False
                 self._physically_closed = False
                 self._finalized_snapshot = None
                 self._active_at = self.clock()
                 self._pause_at = None
                 self.pause_reasons = set(event["pause_reasons"])
+                self.manual_resume_required = False
+                recovery = event.get("recovery")
+                if recovery is not None:
+                    self.indicator_recovery = {
+                        "capture_id": self.capture_id,
+                        **recovery,
+                    }
                 self._persist(MeetingState.RECORDING)
             elif event["state"] == "paused":
                 self._active_at = None
                 self.state = "paused"
-                self._pause_at = self._pause_at or self.clock()
+                if self._pause_at is None:
+                    self._pause_at = self.clock()
                 self.pause_reasons.update(event["pause_reasons"])
                 self.manual_resume_required |= event["manual_resume_required"]
+                self._pause_marks(event["recorded_ms"], event["pause_reasons"])
                 self._persist(MeetingState.PAUSED)
             elif event["state"] == "stopped":
                 self._active_at = None
@@ -825,6 +882,14 @@ class MeetingController:
                 self._finish_finalized()
             else:
                 self._persist()
+
+    def _pause_marks(self, recorded_ms: int, reasons: list[str]) -> None:
+        if self.meeting is None:
+            return
+        for reason in reasons:
+            mark = Mark(recorded_ms, "pause", reason)
+            if mark not in self.meeting.marks:
+                self.meeting.marks.append(mark)
 
     def _finish_finalized(self) -> None:
         if self._finalized_snapshot is None or self._capture_finalized:

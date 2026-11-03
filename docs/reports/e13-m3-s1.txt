@@ -1,0 +1,222 @@
+E13.M3 — шаг 1. Итоговый отчёт, 2026-11-02
+
+Область: только общий overlay, W2, rec/paused трей и клавиатура.
+PROJECT_ROOT: /home/yurka/VibeCoding2/astra-voice-wt-e13m3
+Ветка: feat/e13-m3; HEAD: 4bcfac8d52cdf9eedd19ef56f25689d62a8dd085.
+Продукт, тесты и этот отчёт — незакоммиченный дифф.
+SHA256 исходников/тестов: /tmp/e13m3-verified-diff.json. Git не изменялся:
+без add/commit/reset/checkout/push. Файлы менялись только в этом worktree;
+доказательства и PNG находятся в /tmp.
+В репозитории фактически PyQt5/QML; миграция на PySide6 в этот шаг не входит.
+
+1. Реализация (файл:строка)
+
+- src/astra_voice/ui/overlay.py:24; src/astra_voice/ui/pill.py:181; qml/components/OverlaySurface.qml:5; qml/Pill.qml:133:
+  общая загрузка/владение прозрачным окном, flags, расчёт экрана/рабочей
+  области, поверхность PillTheme и прежняя тень. Тестовые швы Pill сохранены.
+- qml/MeetingOverlay.qml:7; qml/components/MeetingOverlayButton.qml:5; src/astra_voice/ui/meeting_overlay.py:23:
+  W2 сверху по центру, отступ 12, drag с ограничением рабочей областью,
+  позиция на сеанс, full/compact, перенос второго ряда без многоточия.
+  Канонические tokens: ряд 36, ширина 340–524, compact 141.6 (округление142),
+  многострочный радиус14, отступ22, зазоры2/8/6, текстовый минимум200.
+  Ошибка — один красный ряд; terminal принудительно full.
+- src/astra_voice/ui/meeting_recording.py:516; src/astra_voice/ui/meeting_recording.py:599; src/astra_voice/ui/meeting_bridge.py:636:
+  presentation из опубликованных state/tracks/pause_reasons/лимита controller;
+  pause/resume/stop/participants/extend направлены в существующие точки входа.
+  Участники — пока сигнал. Таймер исключает паузу; лимит не выше4часов.
+  Причины не переносятся между встречами; far notice только live→ended.
+- src/astra_voice/app.py:786; src/astra_voice/app.py:818; src/astra_voice/ui/tray.py:708:
+  подключение W2 и rec/paused, приоритет диктовки, возврат meeting baseline,
+  общее меню действий и условный extend. SVG16/22 совпадают с каноном.
+  Пункт старта открывает W4, без непосредственного старта захвата.
+- src/astra_voice/ui/meeting_overlay.py:180; src/astra_voice/ui/meeting_overlay.py:201:
+  явная активация через «Управлять плашкой с клавиатуры…» в трее;
+  Tab, Enter/Space, Esc→compact; обычные клики не запрашивают активацию.
+  Native Close/Alt+F4 не скрывает показанную плашку.
+- src/astra_voice/ui/meeting_texts.py:177: все продуктовые тексты W2/действий/трея в слое текстов.
+- Dev gate ASTRA_VOICE_MEETING_CAPTURE_DEV=1 сохранён. pill_enabled=false
+  и «Индикатор: выкл» не управляют W2 и meeting rec/paused.
+  Theme.qml, PillTheme.qml, tokens.json, snapshot-файлы1.0 не менялись.
+
+2. Тесты и RED→GREEN
+
+- tests/unit/test_meeting_overlay.py:47: dev gate, выключенная pill, W4 из трея,
+  pause/stop/участники/extend, lock без автоresume, лимит4часа, mic-loss,
+  изоляция transient reasons, mic-only без ложного app-closed.
+- tests/unit/test_meeting_overlay_qml.py:372: состояния/действия QQmlApplicationEngine с fake,
+  zero QML warnings; production Qt meta API и fake-классы xvfb сверены.
+- tests/unit/test_meeting_overlay_qml.py:461: offscreen flags, drag/clamp, keyboard/Esc,
+  close() recording/paused/error, shutdown.
+- tests/unit/test_overlay_components_qml.py:73: отдельная загрузка Pill, OverlaySurface,
+  MeetingOverlayButton в QQmlApplicationEngine, zero QML warnings.
+- tests/unit/test_meeting_app_wiring.py: fake+регрессии нового подключения;
+  tests/unit/test_meeting_tray.py: кавычки названия mic приведены к spec.
+  Ожидания существующих тестов Pill не менялись.
+- Исходный QML прогон:3FAIL, в том числе настоящий font.letterSpacing
+  binding loop. После исправления — GREEN. Для transient/native Close
+  исторический RED не заявляется: тесты выполнены после исправления.
+- Полный unit выявил новый static guard Text.PlainText. Добавлены ровно
+  четыре textFormat; повтор static+QML:114PASS. Все62PNG до/после побайтно
+  равны, визуальная приёмка остаётся применима.
+- Итоговый независимый targeted:77PASS,0skip/0error. Логи/XML:
+  /tmp/e13m3-test-s1/targeted-final.log
+  /tmp/e13m3-test-s1/targeted-final.xml
+  Последний static+QML: /tmp/e13m3-dev-plaintext.log.
+- Legacy Pill:15/15 видимых состояний совпали по геометрии и SHA256 сырых
+  пикселей с HEAD. Воспроизводимый helper tests/helpers/render_pill_pixels.py
+  (--qml-dir DIR --out JSON). Результаты:
+  /tmp/e13m3-test-s1/pill-before-final.json
+  /tmp/e13m3-test-s1/pill-after-final.json
+  Это offscreen grabToImage, не живая проверка WM.
+
+3. Обязательные проверки
+
+make lint VENV=/home/yurka/.cache/yurka/m7-ci/venv-ci-lint
+  PASS: ruff check/format, mypy476source files.
+  /tmp/e13m3-lint.log
+
+env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen /home/yurka/.cache/astra-voice-dev/venv-a/bin/python -m pytest -q -p no:cacheprovider tests/unit -k "meeting or pill or tray or overlay or theme"
+  EXIT1: 124FAILED/ERROR; новых имён относительно базы0.
+  Все эти отказы есть в полном unit базы6d86763.
+  /tmp/e13m3-focused-unit.log
+  /tmp/e13m3-focused-comparison.json
+
+python scripts/gen_theme.py --check
+  PASS. В PATH подставлен venv-a/bin, поскольку системной команды python нет.
+  python scripts/gen_theme.py также выполнялся после новых QML.
+
+git diff --check
+  PASS.
+
+Полный unit базы (read-only checkout6d86763):
+  env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 /home/yurka/.cache/astra-voice-dev/venv-a/bin/python -m pytest -q -p no:cacheprovider tests/unit --junitxml=/tmp/e13m3-base-unit.xml
+  cwd=/home/yurka/VibeCoding2/astra-voice-wt-base
+  tests=12872, FAILED=513, ERROR=282, skipped=101.
+
+Полный unit финальной ветки:
+  env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen /home/yurka/.cache/astra-voice-dev/venv-a/bin/python -m pytest -q -p no:cacheprovider tests/unit --junitxml=/tmp/e13m3-final-unit.xml
+  cwd=/home/yurka/VibeCoding2/astra-voice-wt-e13m3
+  tests=13567, FAILED=513, ERROR=282, skipped=102.
+  Совпадающих FAILED/ERROR имён: 795.
+  Новых FAILED/ERROR имён: 0.
+  Только на базе: 0.
+  Сменившихся failure/error исходов: 0.
+  Поимённые списки и исходы каждого теста:
+  /tmp/e13m3-unit-comparison.json
+  XML: /tmp/e13m3-base-unit.xml, /tmp/e13m3-final-unit.xml.
+  Журналы: /tmp/e13m3-base-unit.log, /tmp/e13m3-final-unit.log.
+
+Python DeprecationWarning jsonschema прежние. QML probes/renderer warnings0.
+Xvfb не запускался (ограничение VPS). Страж потоков новых targeted-тестов прошёл.
+
+4. Разрывы spec ↔ controller и граница шага
+
+- Нет опубликованного кандидата нового микрофона и controller-команды его
+  принятия. Реально показывается mic-paused с причиной, без ложной кнопки
+  возобновления. Короткое/длинное имя и соответствующая кнопка есть только
+  в presentation/рендере до появления backend-контракта.
+- Нет опубликованного имени/точной причины завершения far. Реальный текст:
+  «Звук собеседников больше не записывается — пишется только микрофон»;
+  имя DION не выдумывается. Пример DION присутствует в рендер-матрице.
+- Нет длительности прошедшей autopause для строки восстановления8с;
+  данные IndicatorGuard/lease и история восстановления — шаг2.
+- Нет notification fallback payload/action. Его presentation показано
+  рендером, реальная доставка/дубли кнопок — шаг3.
+- W3/clipboard/mute-пояснение/exit/SIGTERM — шаг3. Capture state machine,
+  IndicatorGuard и lease в этом шаге не менялись.
+
+5. Рендер и визуальная приёмка
+
+tools/render_meeting_overlay.py:106
+python tools/render_meeting_overlay.py --out /tmp/e13m3-render-s1/
+  PASS:62PNG,scale1,zero QML warnings. PT Root UI загружен из
+  tests/fixtures/fonts/pt-root-ui. Таймер:DejaVu Sans Mono,fixed_pitch=true;
+  PT Mono отсутствует на VPS. Установка шрифтов не выполнялась.
+  Manifest: /tmp/e13m3-render-s1/manifest.json
+  contact: /tmp/e13m3-render-s1/w2-contact-light.png
+           /tmp/e13m3-render-s1/w2-contact-dark.png
+
+Независимые code/design reviews:Important0/Nit0/Pre-existing0 после фиксов.
+Дизайн проверил refs обеих тем, contact и отдельные кадры. Поверхности:
+recording489×36,paused470×36,compact142×36,multiline64–96,error480×36.
+30/30 индивидуальных пар light/dark равны; PillTheme общий.
+4/4 SVG трея16/22 совпадают с каноном.
+Разработчик, тестировщик, дизайн-ревьюер:gpt-6.1-sol/high;
+code reviewer:gpt-6-astra/high. Специалисты не делегировали дальше.
+
+Юрке проверить глазами:
+- contact light/dark рядом с refs04; особенно limit clock+действие справа,
+  paused-lock, длинный mic, строки-причины, error одним рядом и compact.
+- При отдельной живой приёмке KDE/Fly: верх активного монитора/рабочая
+  область, перетаскивание/позиция, отсутствие кражи фокуса по клику,
+  keyboard activation/Tab/Enter/Space/Esc/Alt+F4, меню и SVG16/22 в панели.
+- Живые звук/микрофон, WM, PT Astra Sans, установленная сборка не проверены.
+  Unit/offscreen не являются доказательством их работы.
+
+Начальные ограничения: GitHub PR-list недоступен по сети; rg отсутствует,
+использованы grep/find. В checkout .patches/INDEX.md заканчивается030,
+уроков044–046 нет; прямые требования пользователя соблюдались.
+
+Полный список PNG:
+  /tmp/e13m3-render-s1/w2-recording-full-light.png
+  /tmp/e13m3-render-s1/w2-recording-compact-light.png
+  /tmp/e13m3-render-s1/w2-paused-full-light.png
+  /tmp/e13m3-render-s1/w2-paused-compact-light.png
+  /tmp/e13m3-render-s1/w2-paused-lock-full-light.png
+  /tmp/e13m3-render-s1/w2-paused-lock-compact-light.png
+  /tmp/e13m3-render-s1/w2-paused-indicator-full-light.png
+  /tmp/e13m3-render-s1/w2-paused-indicator-compact-light.png
+  /tmp/e13m3-render-s1/w2-paused-hang-full-light.png
+  /tmp/e13m3-render-s1/w2-paused-hang-compact-light.png
+  /tmp/e13m3-render-s1/w2-mic-paused-full-light.png
+  /tmp/e13m3-render-s1/w2-mic-paused-compact-light.png
+  /tmp/e13m3-render-s1/w2-mic-long-name-full-light.png
+  /tmp/e13m3-render-s1/w2-mic-long-name-compact-light.png
+  /tmp/e13m3-render-s1/w2-limit-soon-full-light.png
+  /tmp/e13m3-render-s1/w2-limit-soon-compact-light.png
+  /tmp/e13m3-render-s1/w2-limit-ceiling-full-light.png
+  /tmp/e13m3-render-s1/w2-limit-ceiling-compact-light.png
+  /tmp/e13m3-render-s1/w2-app-closed-full-light.png
+  /tmp/e13m3-render-s1/w2-app-closed-compact-light.png
+  /tmp/e13m3-render-s1/w2-reason-indicator-full-light.png
+  /tmp/e13m3-render-s1/w2-reason-indicator-compact-light.png
+  /tmp/e13m3-render-s1/w2-reason-hang-full-light.png
+  /tmp/e13m3-render-s1/w2-reason-hang-compact-light.png
+  /tmp/e13m3-render-s1/w2-notify-fallback-full-light.png
+  /tmp/e13m3-render-s1/w2-notify-fallback-compact-light.png
+  /tmp/e13m3-render-s1/w2-stopping-full-light.png
+  /tmp/e13m3-render-s1/w2-stopping-compact-light.png
+  /tmp/e13m3-render-s1/w2-error-full-light.png
+  /tmp/e13m3-render-s1/w2-error-compact-light.png
+  /tmp/e13m3-render-s1/w2-recording-full-dark.png
+  /tmp/e13m3-render-s1/w2-recording-compact-dark.png
+  /tmp/e13m3-render-s1/w2-paused-full-dark.png
+  /tmp/e13m3-render-s1/w2-paused-compact-dark.png
+  /tmp/e13m3-render-s1/w2-paused-lock-full-dark.png
+  /tmp/e13m3-render-s1/w2-paused-lock-compact-dark.png
+  /tmp/e13m3-render-s1/w2-paused-indicator-full-dark.png
+  /tmp/e13m3-render-s1/w2-paused-indicator-compact-dark.png
+  /tmp/e13m3-render-s1/w2-paused-hang-full-dark.png
+  /tmp/e13m3-render-s1/w2-paused-hang-compact-dark.png
+  /tmp/e13m3-render-s1/w2-mic-paused-full-dark.png
+  /tmp/e13m3-render-s1/w2-mic-paused-compact-dark.png
+  /tmp/e13m3-render-s1/w2-mic-long-name-full-dark.png
+  /tmp/e13m3-render-s1/w2-mic-long-name-compact-dark.png
+  /tmp/e13m3-render-s1/w2-limit-soon-full-dark.png
+  /tmp/e13m3-render-s1/w2-limit-soon-compact-dark.png
+  /tmp/e13m3-render-s1/w2-limit-ceiling-full-dark.png
+  /tmp/e13m3-render-s1/w2-limit-ceiling-compact-dark.png
+  /tmp/e13m3-render-s1/w2-app-closed-full-dark.png
+  /tmp/e13m3-render-s1/w2-app-closed-compact-dark.png
+  /tmp/e13m3-render-s1/w2-reason-indicator-full-dark.png
+  /tmp/e13m3-render-s1/w2-reason-indicator-compact-dark.png
+  /tmp/e13m3-render-s1/w2-reason-hang-full-dark.png
+  /tmp/e13m3-render-s1/w2-reason-hang-compact-dark.png
+  /tmp/e13m3-render-s1/w2-notify-fallback-full-dark.png
+  /tmp/e13m3-render-s1/w2-notify-fallback-compact-dark.png
+  /tmp/e13m3-render-s1/w2-stopping-full-dark.png
+  /tmp/e13m3-render-s1/w2-stopping-compact-dark.png
+  /tmp/e13m3-render-s1/w2-error-full-dark.png
+  /tmp/e13m3-render-s1/w2-error-compact-dark.png
+  /tmp/e13m3-render-s1/w2-contact-light.png
+  /tmp/e13m3-render-s1/w2-contact-dark.png

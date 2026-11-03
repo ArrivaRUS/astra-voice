@@ -37,6 +37,7 @@ from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.x11 import XEmbedTrayProbe
 from astra_voice.ui import notify
 from astra_voice.ui.formatting import clean_display_name
+from astra_voice.ui.meeting_texts import W2_TEXTS
 from astra_voice.ui.tray_icons import TrayIconProvider
 from astra_voice.ui.tray_icons import TrayState as TrayState
 
@@ -383,12 +384,14 @@ class Tray(QObject):
         self.on_meeting_notice: Callable[[], None] | None = None
         self.on_meeting_extend: Callable[[], None] | None = None
         self.on_meeting_resume_mic: Callable[[], None] | None = None
+        self.on_meeting_keyboard: Callable[[], None] | None = None
         self._meetings_enabled = False
         self._meeting_record_entry_enabled = True
         self._meeting_state: TrayState | None = None
         self._meeting_elapsed = 0
         self._meeting_limit_soon = False
         self._meeting_can_extend = False
+        self._meeting_can_resume = True
         self._meeting_limit_remaining: int | None = None
         self._meeting_mic_name = ""
         self._provider = provider
@@ -485,17 +488,26 @@ class Tray(QObject):
         self._settings_action = settings
         self._meeting_status_action = QAction(self._menu)
         self._meeting_status_action.setEnabled(False)
-        self._meeting_record_action = QAction("Записать встречу", self._menu)
-        self._meeting_open_action = QAction("Встречи…", self._menu)
-        self._meeting_pause_action = QAction("Пауза", self._menu)
-        self._meeting_stop_action = QAction("Остановить запись встречи", self._menu)
-        self._meeting_notice_action = QAction("Текст для участников…", self._menu)
-        self._meeting_extend_action = QAction("Продлить на час", self._menu)
+        self._meeting_record_action = QAction(W2_TEXTS["trayRecord"], self._menu)
+        self._meeting_open_action = QAction(W2_TEXTS["trayMeetings"], self._menu)
+        self._meeting_pause_action = QAction(W2_TEXTS["pause"], self._menu)
+        self._meeting_stop_action = QAction(W2_TEXTS["trayStop"], self._menu)
+        self._meeting_notice_action = QAction(W2_TEXTS["trayParticipants"], self._menu)
+        self._meeting_extend_action = QAction(W2_TEXTS["extend"], self._menu)
         self._meeting_resume_mic_action = QAction(self._menu)
+        self._meeting_keyboard_action = QAction(W2_TEXTS["keyboard"], self._menu)
         for action, callback in (
+            (self._meeting_keyboard_action, lambda: self._invoke(self.on_meeting_keyboard)),
             (self._meeting_record_action, lambda: self._invoke(self.on_meeting_record)),
             (self._meeting_open_action, lambda: self._invoke(self.on_meeting_open)),
-            (self._meeting_pause_action, lambda: self._invoke(self.on_meeting_pause)),
+            (
+                self._meeting_pause_action,
+                lambda: (
+                    self._invoke(self.on_meeting_pause)
+                    if self._meeting_pause_action.isEnabled()
+                    else None
+                ),
+            ),
             (self._meeting_stop_action, lambda: self._invoke(self.on_meeting_stop)),
             (self._meeting_notice_action, lambda: self._invoke(self.on_meeting_notice)),
             (self._meeting_extend_action, lambda: self._invoke(self.on_meeting_extend)),
@@ -515,6 +527,7 @@ class Tray(QObject):
             self._meeting_notice_action,
             self._meeting_extend_action,
             self._meeting_resume_mic_action,
+            self._meeting_keyboard_action,
             self._meeting_separator,
             self._meeting_idle_separator,
         )
@@ -707,6 +720,7 @@ class Tray(QObject):
         elapsed_seconds: int = 0,
         limit_soon: bool = False,
         can_extend: bool = False,
+        can_resume: bool = True,
         mic_name: str = "",
         limit_remaining_seconds: int | None = None,
     ) -> None:
@@ -721,6 +735,7 @@ class Tray(QObject):
         self._meeting_elapsed = max(0, int(elapsed_seconds))
         self._meeting_limit_soon = bool(limit_soon)
         self._meeting_can_extend = bool(can_extend) and self._meeting_elapsed < 4 * 3600
+        self._meeting_can_resume = bool(can_resume)
         self._meeting_limit_remaining = (
             None if limit_remaining_seconds is None else max(0, int(limit_remaining_seconds))
         )
@@ -738,31 +753,41 @@ class Tray(QObject):
             clock = self._meeting_elapsed
             elapsed = f"{clock // 3600}:{clock // 60 % 60:02}:{clock % 60:02}"
             status = (
-                "Запись встречи на паузе"
+                W2_TEXTS["trayPaused"]
                 if self._meeting_state == TrayState.MEETING_PAUSED
-                else "Идёт запись встречи"
+                else W2_TEXTS["trayRecording"]
             )
             if self._meeting_limit_soon and self._meeting_limit_remaining is not None:
                 remaining = self._meeting_limit_remaining
-                elapsed += f" · остановится через {remaining // 60}:{remaining % 60:02}"
+                elapsed += " · " + W2_TEXTS["trayLimit"].format(
+                    remaining=f"{remaining // 60}:{remaining % 60:02}"
+                )
             self._meeting_status_action.setText(f"● {status} · {elapsed}")
             icon = self._provider.icon(self._meeting_state)
             if isinstance(icon, QIcon):
                 self._meeting_status_action.setIcon(icon)
             self._meeting_pause_action.setText(
-                "Продолжить" if self._meeting_state == TrayState.MEETING_PAUSED else "Пауза"
+                W2_TEXTS["resume"]
+                if self._meeting_state == TrayState.MEETING_PAUSED
+                else W2_TEXTS["pause"]
+            )
+            self._meeting_pause_action.setEnabled(
+                self._meeting_state != TrayState.MEETING_PAUSED or self._meeting_can_resume
             )
             block = [self._meeting_status_action]
             if self._meeting_limit_soon and self._meeting_can_extend:
                 block.append(self._meeting_extend_action)
             if self._meeting_mic_name:
-                self._meeting_resume_mic_action.setText(f"Продолжить с «{self._meeting_mic_name}»")
+                self._meeting_resume_mic_action.setText(
+                    W2_TEXTS["resumeMicrophone"].format(name=self._meeting_mic_name)
+                )
                 block.append(self._meeting_resume_mic_action)
             block.extend(
                 (
                     self._meeting_pause_action,
                     self._meeting_stop_action,
                     self._meeting_notice_action,
+                    self._meeting_keyboard_action,
                     self._meeting_separator,
                 )
             )
@@ -860,6 +885,15 @@ class Tray(QObject):
         ):
             self._invalidate_registration()
         return self._registered
+
+    @property
+    def meeting_indicator_visible(self) -> bool:
+        """Only a confirmed registrar and the effective meeting icon prove BL-4."""
+        return bool(
+            self._running
+            and self._state in (TrayState.MEETING_REC, TrayState.MEETING_PAUSED)
+            and self.registered
+        )
 
     @property
     def visible_for_close(self) -> bool:

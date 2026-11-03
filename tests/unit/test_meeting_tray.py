@@ -70,7 +70,7 @@ def test_conditional_actions_are_present_only_when_available(harness: Harness) -
     h.tray.set_meeting_state(
         TrayState.MEETING_REC, limit_soon=True, can_extend=True, mic_name="Встроенный микрофон"
     )
-    assert labels(h)[1:3] == ["Продлить на час", "Продолжить с «Встроенный микрофон»"]
+    assert labels(h)[1:3] == ["Продлить на час", "Продолжить с „Встроенный микрофон“"]
     h.tray.set_meeting_state(TrayState.MEETING_REC, limit_soon=True, can_extend=False)
     assert "Продлить на час" not in labels(h)
     assert not any(label.startswith("Продолжить с") for label in labels(h))
@@ -137,3 +137,73 @@ def test_limit_soon_status_and_four_hour_ceiling(harness: Harness) -> None:
         TrayState.MEETING_REC, elapsed_seconds=14400, limit_soon=True, can_extend=True
     )
     assert "Продлить на час" not in labels(h)
+
+
+@pytest.mark.parametrize(
+    "state,can_resume,enabled",
+    [
+        (TrayState.MEETING_PAUSED, False, False),
+        (TrayState.MEETING_PAUSED, True, True),
+        (TrayState.MEETING_REC, False, True),
+    ],
+)
+def test_pause_resume_menu_respects_published_admission(
+    harness: Harness, state: TrayState, can_resume: bool, enabled: bool
+) -> None:
+    h = harness
+    callback = Mock()
+    h.tray.on_meeting_pause = callback
+    h.tray.set_meeting_state(state, can_resume=can_resume)
+    label = "Продолжить" if state is TrayState.MEETING_PAUSED else "Пауза"
+    action = next(a for a in h.menu.actions() if a.text() == label)
+    assert action.isEnabled() is enabled
+    # QAction.trigger can be invoked from code even on disabled actions.
+    action.trigger()
+    if enabled:
+        callback.assert_called_once_with()
+    else:
+        callback.assert_not_called()
+
+
+@pytest.mark.parametrize("state", [TrayState.MEETING_REC, TrayState.MEETING_PAUSED])
+def test_meeting_indicator_requires_effective_meeting_icon_and_confirmed_registration(
+    harness: Harness, state: TrayState
+) -> None:
+    h = harness
+    h.tray.set_meeting_state(state)
+    h.tray.start()
+    assert h.tray.meeting_indicator_visible
+    calls = len(h.bus.calls)
+    for _ in range(100):
+        assert h.tray.meeting_indicator_visible
+    assert len(h.bus.calls) == calls  # A guard tick must not issue a bus query.
+    h.tray.set_state(TrayState.LISTENING)
+    assert not h.tray.meeting_indicator_visible
+    h.tray.set_state(TrayState.IDLE)
+    assert h.tray.meeting_indicator_visible
+    h.icon.isVisible.return_value = False
+    assert not h.tray.meeting_indicator_visible
+
+
+def test_unconfirmed_native_tray_is_not_meeting_visibility_evidence(harness: Harness) -> None:
+    h = harness
+    h.bus.host_registered = False
+    h.probe.owner.return_value = 42
+    h.tray.set_meeting_state(TrayState.MEETING_REC)
+    h.tray.start()
+    assert not h.tray.registered
+    assert h.tray.xembed_unconfirmed
+    assert not h.tray.meeting_indicator_visible
+
+
+@pytest.mark.parametrize("loss", ["stopped", "null-icon"])
+def test_meeting_indicator_rejects_stopped_or_missing_icon(harness: Harness, loss: str) -> None:
+    h = harness
+    h.tray.set_meeting_state(TrayState.MEETING_REC)
+    h.tray.start()
+    assert h.tray.meeting_indicator_visible
+    if loss == "stopped":
+        h.tray.stop()
+    else:
+        h.provider.has_icon.return_value = False
+    assert not h.tray.meeting_indicator_visible

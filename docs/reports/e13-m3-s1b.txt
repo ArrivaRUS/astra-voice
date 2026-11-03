@@ -1,0 +1,114 @@
+E13.M3 S1b — исправление пяти визуальных расхождений
+2026-11-02 · feat/e13-m3 · HEAD 4bcfac8d52cdf9eedd19ef56f25689d62a8dd085
+
+Только визуальные исправления из задания. Принятая логика, контроллер,
+Pill, shared overlay, токены и snapshot1.0 не менялись. Git-мутаций нет.
+Этот отчёт уточняет визуальную часть прежнего e13-m3-s1.txt.
+
+1. Stopping
+qml/MeetingOverlay.qml:29 — terminal-ширина по содержимому, без минимума340.
+qml/MeetingOverlay.qml:58 — ручка видима и доступна в terminal-состояниях.
+qml/MeetingOverlay.qml:27 — stopping не получает отдельный compact-вид.
+src/astra_voice/ui/meeting_texts.py:188 — «Сохраняю запись…», символ U+2026.
+Тело162×36; full/compact побайтно равны в обеих темах.
+
+2. Error
+qml/MeetingOverlay.qml:58 — ручка слева; qml/MeetingOverlay.qml:115 —
+размер подписи по содержимому. Тело480×36, full/compact равны.
+
+3. Длинное имя микрофона
+src/astra_voice/ui/meeting_texts.py:194 — «микрофон сменился на «{name}»».
+tools/render_meeting_overlay.py:125 — фикстура
+«Ваш голос не записывается: микрофон сменился на «Гарнитура Jabra Evolve2 65 USB Headset Microphone»»;
+кнопка «Продолжить с другим микрофоном». Тело482×120, четыре строки.
+Размер482×96 в задании относится к обычному mic-paused, не к длинному Jabra.
+Обычный mic-paused:482×95, в допуске±1.
+При неизвестном имени сохранена принятая generic-причина micPaused без
+выдуманного кандидата/команды принятия: контроллер этих данных не публикует.
+
+4. Notify-fallback
+Фикстура tools/render_meeting_overlay.py:165 — нейтральная строка
+«Встреча сохранена. Делаю расшифровку…», время0:51:02, без secondaryAction.
+qml/MeetingOverlay.qml:227 — pillIconMuted для notify-fallback/app-closed.
+Тело482×63, отдельной кнопки действия нет.
+
+5. Геометрия и парные эталоны
+Причина лишних7px ширины: Qt5 округляет font.pixelSize12.5 до13.
+qml/MeetingOverlay.qml:127 и qml/components/MeetingOverlayButton.qml:55 —
+текст вычисляется в25px и масштабируется0.5, что сохраняет12.5px по токену.
+Таймер остаётся13px monospace, его ширина не меняется при замене цифр.
+qml/MeetingOverlay.qml:230 — CSS line-height1.5; :30 — целая высота тела.
+Ширина по содержимому, фиксированные482/464 для нормальных состояний
+не устанавливались.
+
+tools/render_meeting_overlay.py:27 — координаты обрезок оригинальных refs.
+tools/render_meeting_overlay.py:45 — воспроизводимое извлечение QImage.copy.
+manifest.json: каждый обычный PNG имеет surface_rect без тени;
+для контактных листов surface_rects[] содержит все30 тел.
+logical_surface_size хранит исходную дробную геометрию.
+Эталонные обрезки имеют source_rect, SHA256 оригинала и compare_with.
+Масштаб итоговых PNG1. PT Root UI — fixtures, таймерDejaVu Sans Mono.
+
+Размеры без тени. В таблице используются заданные пользователем размеры;
+исходная обрезка paused-lock имеет464×64, заданный размер464×63.
+Рендер463×63 укладывается в±1 относительно обоих вариантов.
+
+Состояние	Эталон light W×H	Рендер light W×H	Эталон dark W×H	Рендер dark W×H
+recording	482×36	482×36	482×36	482×36
+paused	464×36	463×36	464×36	463×36
+compact recording	142×36	142×36	142×36	142×36
+compact paused	142×36	142×36	142×36	142×36
+limit-soon	482×71	482×71	482×71	482×71
+mic-paused	482×96	482×95	482×96	482×95
+mic-long-name (Jabra)	482×120	482×120	482×120	482×120
+app-closed	482×63	482×63	482×63	482×63
+paused-lock	464×63	463×63	464×63	463×63
+stopping	162×36	162×36	162×36	162×36
+error	480×36	480×36	480×36	480×36
+reason-indicator	482×83	482×82	482×83	482×82
+reason-hang	482×83	482×82	482×83	482×82
+notify-fallback	482×64	482×63	482×64	482×63
+
+Все приведённые пары укладываются в±1px в light и dark.
+Для ongoing paused-indicator, paused-hang и limit-ceiling отдельных
+оригинальных образцов нет. Они сохранены как дополнительные кадры;
+эталонные восстановленные записи сопоставлены с reason-indicator/hang,
+без подмены состояния. Все compact кроме двух исходных примеров —
+дополнительные кадры, отдельные эталоны не выдумывались.
+
+Проверки
+- Новый geometry-тест RED: recording488.875×36 вместо482×36; после исправлений GREEN.
+- tests/unit/test_meeting_overlay_qml.py:248 — геометрия обеих тем,
+  12.5px, все цифры таймера, terminal-ручки/full=compact, fixtures/цвет.
+- Offscreen три файла meeting_overlay_qml/overlay_components_qml/meeting_overlay:
+  24PASS; QML warnings0. Xvfb не запускался.
+- Независимые code/design review: Important0 в согласованном объёме.
+- Дизайнер независимо проверил28/28 crop на равенство original.copy(rect),
+  4/4 terminal full/compact PNG равны. Просмотрены обе темы.
+
+Валидация (команды из задания)
+make lint VENV=/home/yurka/.cache/yurka/m7-ci/venv-ci-lint
+PASS: ruff check/format, mypy476source files. /tmp/e13m3-s1b-lint.log
+
+env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen /home/yurka/.cache/astra-voice-dev/venv-a/bin/python -m pytest -q -p no:cacheprovider tests/unit -k "meeting or pill or tray or overlay or theme"
+EXIT1: те же124FAILED/ERROR, что до S1b; новых имён0, исчезнувших0.
+/tmp/e13m3-s1b-unit.log; /tmp/e13m3-s1b-unit-comparison.json
+Эти имена уже сопоставлены с базой6d86763 предыдущим полным прогоном.
+
+python scripts/gen_theme.py --check
+PASS (PATH содержит venv-a/bin: системной команды python нет).
+
+git diff --check
+PASS.
+
+python tools/render_meeting_overlay.py --out /tmp/e13m3-render-s1b/
+PASS:90PNG =60 кадров +2 контакта +28 исходных обрезок, scale1,warnings0.
+Оригиналы design/meetings/refs не менялись.
+
+Артефакты /tmp/e13m3-render-s1b/:
+manifest.json, comparison.json, comparison.tsv;
+w2-contact-light.png, w2-contact-dark.png;
+<state>-ref-light.png, <state>-ref-dark.png — 28 исходных обрезок.
+Их точные имена и связи пар перечислены в manifest.
+
+Живые KDE/Fly, звук и установленная сборка не проверялись и не менялись.

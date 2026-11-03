@@ -119,6 +119,10 @@ class Rig:
             microphone=lambda: self.microphone,
             submit=lambda job: job(),
             id_factory=lambda: MID,
+            # One exit budget incl. the metadata drain (production 3 s). Fake roles
+            # never exit by themselves: keep teardown of a live capture short; the
+            # metadata-drain tests below set the 1 s budget they measure.
+            exit_stop_timeout=0.2,
         )
         self.bridge.bindRecording(self.recording)
 
@@ -741,6 +745,7 @@ def test_unused_role_releases_borrowed_subscription_without_closing_monitor(
 def test_shutdown_drains_accepted_metadata_before_return(rig: Rig) -> None:
     entered, release, written = threading.Event(), threading.Event(), threading.Event()
     writer = rig.recording.controller._writer
+    rig.recording._exit_stop_timeout = 1.0
 
     def write() -> None:
         entered.set()
@@ -768,6 +773,7 @@ def test_shutdown_metadata_deadline_warns_once_without_waiting_for_disk(
 ) -> None:
     entered, release, written = threading.Event(), threading.Event(), threading.Event()
     writer = rig.recording.controller._writer
+    rig.recording._exit_stop_timeout = 1.0
 
     def write() -> None:
         entered.set()
@@ -802,6 +808,7 @@ def test_shutdown_drains_metadata_even_when_other_cleanup_raises(
 ) -> None:
     entered, release, written = threading.Event(), threading.Event(), threading.Event()
     writer = rig.recording.controller._writer
+    rig.recording._exit_stop_timeout = 1.0
 
     def write() -> None:
         entered.set()

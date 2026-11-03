@@ -26,6 +26,7 @@ from test_meetings_section import meetings_app as meetings_app
 from test_meetings_section import rendered as rendered
 
 from astra_voice.ui.icons import install_icon_provider
+from astra_voice.ui.meeting_texts import EXIT_TEXTS
 from helpers.snapshots import write_snapshot
 
 pytestmark = pytest.mark.xvfb
@@ -100,6 +101,8 @@ class RecordingBridge(Bridge):
         self.starts = self.retries = self.closed = self.opened_meetings = 0
         self.interrupted = False
         self.interrupted_remaining = 0
+        self.exit_confirm = False
+        self.exit_answers: list[str] = []
         self._extra_warnings: list[str] | None = None
 
     recordingDevEnabled = pyqtProperty(bool, lambda self: self.dev, notify=changed)
@@ -129,6 +132,8 @@ class RecordingBridge(Bridge):
     )
     startSpeakers = pyqtProperty(bool, lambda self: self.w4_state == "speakers", notify=changed)
     interruptedOpen = pyqtProperty(bool, lambda self: self.interrupted, notify=changed)
+    exitConfirmOpen = pyqtProperty(bool, lambda self: self.exit_confirm, notify=changed)
+    exitTexts = pyqtProperty("QVariantMap", lambda self: dict(EXIT_TEXTS), constant=True)
     interruptedText = pyqtProperty(
         str, lambda self: "Запись встречи прервалась. Сохранено 0:37:02", notify=changed
     )
@@ -209,6 +214,18 @@ class RecordingBridge(Bridge):
     def closeInterrupted(self) -> None:
         self.interrupted = self.interrupted_remaining > 0
         self.interrupted_remaining = max(0, self.interrupted_remaining - 1)
+        self.changed.emit()
+
+    @pyqtSlot()
+    def confirmExit(self) -> None:
+        self.exit_answers.append("confirm")
+        self.exit_confirm = False
+        self.changed.emit()
+
+    @pyqtSlot()
+    def cancelExit(self) -> None:
+        self.exit_answers.append("cancel")
+        self.exit_confirm = False
         self.changed.emit()
 
     @pyqtSlot()

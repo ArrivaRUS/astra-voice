@@ -10,14 +10,15 @@ from math import ceil
 from time import monotonic, perf_counter
 from typing import Any, Final
 
-from PyQt5.QtCore import QEvent, QMetaObject, QObject, QPoint, QRect, Qt, QTimer, QUrl
-from PyQt5.QtGui import QGuiApplication, QRegion, QScreen
+from PyQt5.QtCore import QEvent, QMetaObject, QObject, QRect, Qt, QTimer, QUrl
+from PyQt5.QtGui import QGuiApplication, QRegion
 from PyQt5.QtQuick import QQuickView
 
 from astra_voice.core.paths import qml_dir
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui.icons import install_icon_provider
+from astra_voice.ui.overlay import OverlayWindow
 from astra_voice.worker.ipc import PROTOCOL_MISMATCH_MESSAGE
 
 log = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ _WINDOW_FLAGS = (
 )
 
 
-class Pill(QObject):
+class Pill(OverlayWindow):
     """Владеет одним окном; не принимает и не хранит распознанную речь.
 
     Выключение подменяет запрошенное состояние на DISABLED, сохраняя его срок.
@@ -177,23 +178,12 @@ class Pill(QObject):
         self._expiry_timer.setSingleShot(True)
         self._expiry_timer.timeout.connect(self._expire_timeout)
 
-        factory = view_factory if view_factory is not None else lambda: QQuickView()
-        self._view = factory()
-        install_icon_provider(self._view.engine())
-        self._view.installEventFilter(self)
-        # QWindow.setParent принимает QWindow; здесь нужно именно владение QObject.
-        self.destroyed.connect(self._view.deleteLater)
-        self._view.setFlags(_WINDOW_FLAGS)
-        self._view.setColor(Qt.transparent)
-        # SizeViewToRootObject запускает нулевой таймер и позже срезает поля до
-        # размеров контента. Размером окна владеет Python; QML рисует по pillWidth/Height.
-        self._view.setResizeMode(QQuickView.SizeRootObjectToView)
-        self._view.setSource(
-            qml_url if qml_url is not None else QUrl.fromLocalFile(str(qml_dir() / "Pill.qml"))
+        self._load_overlay(
+            qml_url if qml_url is not None else QUrl.fromLocalFile(str(qml_dir() / "Pill.qml")),
+            view_factory=view_factory if view_factory is not None else QQuickView,
+            icon_provider=install_icon_provider,
+            window_flags=_WINDOW_FLAGS,
         )
-        self._root = self._view.rootObject()
-        if self._root is None:
-            raise RuntimeError("Не удалось загрузить QML пилюли")
         self._root.cancelClicked.connect(self._cancel_clicked)
         self._root.detailsClicked.connect(self._details_clicked)
         copy_signal = getattr(self._root, "copyClicked", None)
@@ -420,63 +410,15 @@ class Pill(QObject):
         self._update_mask()
         self._place()
 
-    def _active_screen(self) -> QScreen | None:
-        try:
-            active = self._x11.active_window()
-            geometry = self._x11.window_geometry(active) if active else None
-            if geometry is not None:
-                x, y, width, height = geometry
-                screen = QGuiApplication.screenAt(QPoint(x + width // 2, y + height // 2))
-                if screen is not None:
-                    return screen
-        except Exception as exc:
-            log.debug("Пилюля: экран активного окна недоступен: %s", exc)
-        return QGuiApplication.primaryScreen()
-
-    def _net_workarea(self) -> QRect | None:
-        # TODO: перейти на platform/x11, когда соседняя зона добавит чтение _NET_WORKAREA
-        if self._x11.d is None:
-            return None
-        try:
-            from Xlib import Xatom
-
-            conn = self._x11.d
-            atom = conn.intern_atom("_NET_WORKAREA", only_if_exists=True)
-            prop = self._x11.root.get_full_property(atom, Xatom.CARDINAL) if atom else None
-            if prop is None or prop.format != 32 or len(prop.value) < 4:
-                return None
-            desktop_atom = conn.intern_atom("_NET_CURRENT_DESKTOP", only_if_exists=True)
-            desktop = (
-                self._x11.root.get_full_property(desktop_atom, Xatom.CARDINAL)
-                if desktop_atom
-                else None
-            )
-            index = 0
-            if desktop is not None and desktop.format == 32 and len(desktop.value):
-                index = int(desktop.value[0]) * 4
-            if index < 0 or index + 4 > len(prop.value):
-                return None
-            x, y, width, height = (int(v) for v in prop.value[index : index + 4])
-            return QRect(x, y, width, height) if width > 0 and height > 0 else None
-        except Exception as exc:
-            log.debug("Пилюля: _NET_WORKAREA недоступна: %s", exc)
-            return None
+    def _screen_application(self) -> Any:
+        # Preserve the existing injectable application boundary used by pill clients.
+        return QGuiApplication
 
     def _place(self) -> None:
         # Настройки верхнего края в контракте нет: все вызовы размещают снизу.
-        screen = self._active_screen()
-        if screen is None:
+        area = self._overlay_workarea()
+        if area is None:
             return
-        area = screen.availableGeometry()
-        workarea = self._net_workarea()
-        if workarea is not None:
-            # EWMH публикует общую область рабочего стола, а не отдельного монитора.
-            workarea = workarea.intersected(screen.geometry())
-            if not workarea.isEmpty() and workarea != area:
-                log.debug(
-                    "Пилюля: availableGeometry расходится со struts, используем _NET_WORKAREA"
-                )
-                area = workarea
         y = (
             area.y()
             + area.height()

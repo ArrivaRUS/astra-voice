@@ -807,6 +807,26 @@ def _bind_meeting_recording(
         **options,
     )
     bridge.bindRecording(recording)
+    if recording.dev_enabled is True:
+        from astra_voice.ui.meeting_notice import MeetingNotice
+        from astra_voice.ui.meeting_notifications import MeetingNotifications
+        from astra_voice.ui.meeting_overlay import MeetingOverlay
+
+        bridge._meeting_overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
+        bridge.overlayKeyboardRequested.connect(bridge._meeting_overlay.activate_keyboard)
+        bridge._meeting_notice = MeetingNotice(
+            recording, bridge._meeting_overlay, notice=bridge.notice, parent=bridge
+        )
+        bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
+        bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
+        recording.bind_indicators(
+            overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
+            tray_visible=lambda: bool(
+                runtime is not None
+                and runtime.tray is not None
+                and runtime.tray.meeting_indicator_visible
+            ),
+        )
     recording.initialize()
 
 
@@ -817,19 +837,57 @@ def _wire_tray_meetings(
 
     def refresh() -> None:
         tray.set_meetings_enabled(bridge.enabled)
-        # The public recording controls and indicator guard ship together in M3.
-        tray.set_meeting_state(None)
+        presentation = bridge.overlay
+        tray.set_meeting_record_entry_enabled(bridge.recordingDevEnabled)
+        state = None
+        if presentation.get("active"):
+            from astra_voice.ui.tray import TrayState
+
+            state = (
+                TrayState.MEETING_PAUSED if presentation.get("paused") else TrayState.MEETING_REC
+            )
+        tray.set_meeting_state(
+            state,
+            elapsed_seconds=presentation.get("elapsedSeconds", 0),
+            limit_soon=presentation.get("limitSoon", False),
+            can_extend=presentation.get("canExtend", False),
+            can_resume=presentation.get("canResume", False),
+            mic_name=presentation.get("microphoneName", ""),
+            limit_remaining_seconds=presentation.get("limitRemainingSeconds"),
+        )
+
+    def pause_or_resume() -> None:
+        presentation = bridge.overlay
+        if presentation.get("paused"):
+            if presentation.get("canResume", False):
+                bridge.on_overlay_resume_clicked()
+        else:
+            bridge.on_overlay_pause_clicked()
+
+    def record_meeting() -> None:
+        show_meetings()
+        bridge.requestRecording()
 
     bridge.changed.connect(refresh)
     tray.set_meeting_record_entry_enabled(False)
-    tray.on_meeting_record = show_meetings
+    tray.on_meeting_record = record_meeting
     tray.on_meeting_open = show_meetings
+    tray.on_meeting_pause = pause_or_resume
+    tray.on_meeting_stop = bridge.on_overlay_stop_clicked
+    tray.on_meeting_notice = bridge.openNoticeWithKeyboard
+    tray.on_meeting_extend = bridge.on_overlay_extend_clicked
+    tray.on_meeting_keyboard = bridge.activateOverlayKeyboard
     refresh()
 
     def disconnect() -> None:
         bridge.changed.disconnect(refresh)
         tray.on_meeting_record = None
         tray.on_meeting_open = None
+        tray.on_meeting_pause = None
+        tray.on_meeting_stop = None
+        tray.on_meeting_notice = None
+        tray.on_meeting_extend = None
+        tray.on_meeting_keyboard = None
 
     return disconnect
 
@@ -2005,6 +2063,10 @@ def main(argv: list[str] | None = None) -> int:
                 meeting_tray_disconnect = _wire_tray_meetings(
                     runtime.tray, meeting_bridge, show_meetings
                 )
+                # T-478: tray «Выход» asks during a recording; signals still quit directly.
+                bound_bridge = meeting_bridge
+                runtime.on_quit_requested = lambda: bound_bridge.request_quit(app.quit)
+                meeting_bridge.exitConfirmed.connect(app.quit)
         # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
         settings_bridge.offlineChanged.connect(downloads.network_changed)
         about_bridge = _make_about_bridge(runtime if runtime_ready else None)

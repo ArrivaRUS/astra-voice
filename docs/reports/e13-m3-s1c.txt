@@ -1,0 +1,62 @@
+E13.M3 S1c — только два Important и спиннер остановки
+2026-11-02; feat/e13-m3; HEAD 4bcfac8d52cdf9eedd19ef56f25689d62a8dd085.
+Git-мутаций нет. Принятые S1/S1b изменения сохранены.
+
+1. Маска ввода
+src/astra_voice/ui/meeting_overlay.py:150 — прямоугольник поверхности
+(18,18,ceil(width),ceil(height)), обновление при resize/state/compact/flags.
+На X11 меняется ShapeInput с учётом DPR, без обрезки принятой тени.
+Резервный Qt-путь и оба перехода native/fallback проверены, включая рост
+после compact; в запасном Bounding-пути тень может быть обрезана.
+Общие overlay.py и Pill.py не менялись.
+RED: первоначально native/offscreen mask была пустой; повторный RED
+воспроизвёл устаревшую узкую Input-область при отказе после разворачивания.
+GREEN: регион совпадает с телом, поле тени исключено; DPR1/2, оба перехода.
+Тесты: tests/unit/test_meeting_overlay.py:388 и test_meeting_overlay_qml.py.
+
+2. Запрет Resume
+src/astra_voice/app.py:839 — canResume передаётся в can_resume трея;
+src/astra_voice/ui/tray.py:772 — неактивный пункт и защита trigger;
+src/astra_voice/ui/meeting_recording.py:609 — Python-проверка до контроллера.
+RED: при canResume=false вызывался on_resume_clicked.
+GREEN: paused-lock, прямой overlay_action и программный QAction.trigger
+не вызывают resume-обработчик; разрешённое продолжение и Пауза работают.
+Тесты: tests/unit/test_meeting_overlay.py:248,
+tests/unit/test_meeting_tray.py:150, test_meeting_app_wiring.py:216.
+
+3. Спиннер
+qml/MeetingOverlay.qml:113 — дуга без стрелки, pillIconMuted, без новых токенов.
+Анимация работает только при видимом stopping, прекращается при выходе,
+скрытии и freezeAnimations. Размер162×36 и full=compact сохранены.
+Тест: tests/unit/test_meeting_overlay_qml.py:337 — жизненный цикл анимации.
+Визуальная проверка light/dark против исходных обрезок — PASS.
+
+Итоговые целевые тесты: 56 PASS; после последней правки импорта
+затронутый файл повторно:26 PASS. QML warnings0.
+RED: /tmp/e13m3-s1c-red.log/xml; дополнительные2 RED:
+/tmp/e13m3-s1c-reverse-red.log/xml.
+GREEN: /tmp/e13m3-s1c-final-green.log/xml;
+/tmp/e13m3-s1c-overlay-final.log/xml.
+Хеши проверены: /tmp/e13m3-s1c-final-revision.sha256.
+Независимое code review: Important0; проверка дуги дизайнером: PASS.
+
+Обязательная валидация:
+make lint VENV=/home/yurka/.cache/yurka/m7-ci/venv-ci-lint
+PASS: ruff check/format, mypy476 файлов. /tmp/e13m3-s1c-lint.log
+
+env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen /home/yurka/.cache/astra-voice-dev/venv-a/bin/python -m pytest -q -p no:cacheprovider tests/unit -k "meeting or pill or tray or overlay or theme"
+EXIT1: те же124 FAILED/ERROR, что на S1b; новых0, исчезнувших0.
+/tmp/e13m3-s1c-unit.log; /tmp/e13m3-s1c-unit-comparison.json
+
+python scripts/gen_theme.py --check
+PASS; PATH дополнен venv-a/bin, поскольку системной команды python нет.
+
+git diff --check
+PASS.
+
+Рендер: /tmp/e13m3-render-s1c/, scale1,90 PNG, QML warnings0.
+Для пары: w2-stopping-full-{light,dark}.png и stopping-ref-{light,dark}.png.
+Изменились только4 кадра stopping и2 контактных листа;
+остальные84 PNG побайтно совпадают с принятым S1b.
+participantsRequested не менялся: W3 — шаг3.
+Живые X11/KDE/Fly, клики на настоящем WM, звук и xvfb не запускались.

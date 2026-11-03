@@ -31,6 +31,17 @@ def pause_microphone(rig: Rig) -> None:
     assert rig.state.track_states == {"mic": "paused", "far": "live"}
 
 
+def visible_keepalive(rig: Rig, seq: int = 1) -> list[dict[str, Any]]:
+    """M3 lease: only a fresh keepalive attesting a visible indicator may reopen."""
+    return rig.send(
+        "keepalive",
+        seq=seq,
+        indicators_visible=True,
+        blocked_epoch=rig.state.session.snapshot().blocked_epoch,
+        admission_mono_ms=int(rig.clock() * 1000),
+    )
+
+
 def test_lease_resume_preserves_microphone_device_pause(rig: Rig) -> None:
     rig.prepare()
     rig.open()
@@ -38,7 +49,7 @@ def test_lease_resume_preserves_microphone_device_pause(rig: Rig) -> None:
     rig.clock.now += 4.05
     rig.until("meeting.capture.closed")
     rig.until("meeting.capture.finalized")
-    assert rig.send("keepalive", seq=1)[0]["type"] == "meeting.ack"
+    assert visible_keepalive(rig)[0]["type"] == "meeting.ack"
     wait_until(lambda: (rig.poll(), rig.state.state == "recording")[1])
     assert len(rig.mics) == 1, "lease reopened a microphone awaiting confirmation"
     assert len(rig.backend.sources) == 2
@@ -350,7 +361,7 @@ def test_late_device_loss_is_removed_from_lease_resume_tracks(rig: Rig) -> None:
     rig.clock.now += 4.05
     rig.until("meeting.capture.closed")
     rig.until("meeting.capture.finalized")
-    rig.send("keepalive", seq=1)
+    visible_keepalive(rig)
     wait_until(lambda: (rig.poll(), rig.state.state == "recording")[1])
     assert len(rig.mics) == 1
     assert rig.state.track_states == {"mic": "paused", "far": "live"}

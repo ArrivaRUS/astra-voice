@@ -33,7 +33,13 @@ from astra_voice.meetings.settings_ext import (
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.meeting_recording import MeetingRecording
-from astra_voice.ui.meeting_texts import RESPONSIBILITY_ITEMS, TEXTS, W4_TEXTS
+from astra_voice.ui.meeting_texts import (
+    EXIT_TEXTS,
+    RESPONSIBILITY_ITEMS,
+    TEXTS,
+    W2_TEXTS,
+    W4_TEXTS,
+)
 
 SAVE_ERROR = "Не удалось сохранить настройки. Попробуйте ещё раз."
 
@@ -105,6 +111,10 @@ class MeetingBridge(QObject):
     recordingRequested = pyqtSignal()
     meetingActionRequested = pyqtSignal(str, str)
     openMeetingsRequested = pyqtSignal()
+    participantsRequested = pyqtSignal()
+    overlayKeyboardRequested = pyqtSignal()
+    noticeKeyboardRequested = pyqtSignal()
+    exitConfirmed = pyqtSignal()
 
     def __init__(
         self,
@@ -134,6 +144,7 @@ class MeetingBridge(QObject):
         self._started = 0.0
         self._responsibility_open = self._recording = self._closed = False
         self._capture: MeetingRecording | None = None
+        self._exit_confirm = False
         self._timer = QTimer(self)
         self._timer.setInterval(20)
         self._timer.timeout.connect(self._poll)
@@ -488,8 +499,17 @@ class MeetingBridge(QObject):
         self.changed.emit()
 
     def shutdown(self) -> None:
+        # No notices about our own exit; W3 first, then the ordinary stop with
+        # finalization (W2 still shows «Сохраняю запись…»), then W2.
+        for name in ("_meeting_notifications", "_meeting_notice"):
+            owner = getattr(self, name, None)
+            if owner is not None:
+                owner.shutdown()
         if self._capture is not None:
             self._capture.shutdown()
+        overlay = getattr(self, "_meeting_overlay", None)
+        if overlay is not None:
+            overlay.shutdown()
         self._closed = True
         self._timer.stop()
         self._loading = self._loading_visible = False
@@ -599,10 +619,14 @@ class MeetingBridge(QObject):
         self._capture = capture
         capture.changed.connect(self._capture_changed)
         capture.openMeetingsRequested.connect(self.openMeetingsRequested)
+        capture.participantsRequested.connect(self.participantsRequested)
         self._capture_changed()
 
     def _capture_changed(self) -> None:
         self._overlay_capture()
+        if self._exit_confirm and not self._exit_needs_confirmation():
+            # The recording ended by itself: the question no longer applies.
+            self._exit_confirm = False
         if not self._closed:
             self.changed.emit()
 
@@ -617,6 +641,99 @@ class MeetingBridge(QObject):
         if updates:
             self._documents = [row for row in self._documents if row.id not in updates]
             self._documents.extend(updates.values())
+
+    @pyqtProperty("QVariantMap", notify=changed)
+    def overlay(self) -> dict[str, Any]:
+        return self._capture.overlay if self._capture else {"visible": False, "state": "hidden"}
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def overlayTexts(self) -> dict[str, str]:
+        return dict(W2_TEXTS)
+
+    @pyqtSlot()
+    def on_overlay_pause_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("pause")
+
+    @pyqtSlot()
+    def on_overlay_resume_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("resume")
+
+    @pyqtSlot()
+    def on_overlay_stop_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("stop")
+
+    @pyqtSlot()
+    def on_overlay_participants_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("participants")
+
+    def _exit_needs_confirmation(self) -> bool:
+        overlay = self.overlay
+        return bool(overlay.get("active")) and overlay.get("state") not in {
+            "stopping",
+            "error",
+            "hidden",
+        }
+
+    def request_quit(self, quit_app: Callable[[], None]) -> None:
+        """Tray «Выход» (T-478): ask only while a recording runs; otherwise quit.
+
+        SIGTERM/SIGINT and programmatic ``app.quit()`` never come here: they stop
+        and save without a question (MeetingRecording._stop_for_exit).
+        """
+        if self._closed or not self._exit_needs_confirmation():
+            quit_app()
+            return
+        # Asked again (e.g. its window was hidden): always bring the question back.
+        self._exit_confirm = True
+        self.changed.emit()
+
+    @pyqtProperty(bool, notify=changed)
+    def exitConfirmOpen(self) -> bool:
+        return self._exit_confirm
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def exitTexts(self) -> dict[str, str]:
+        return dict(EXIT_TEXTS)
+
+    @pyqtSlot()
+    def confirmExit(self) -> None:
+        if not self._exit_confirm:
+            return
+        self._exit_confirm = False
+        self.changed.emit()
+        self.exitConfirmed.emit()
+
+    @pyqtSlot()
+    def cancelExit(self) -> None:
+        if self._exit_confirm:
+            self._exit_confirm = False
+            self.changed.emit()
+
+    @pyqtSlot()
+    def openNoticeWithKeyboard(self) -> None:
+        """Tray «Текст для участников…»: W3 with keyboard focus (spec §7)."""
+        if self._capture is not None and self.overlay.get("active"):
+            self._capture.overlay_action("participants")
+            self.noticeKeyboardRequested.emit()
+
+    def notice(self) -> tuple[str, bool]:
+        """Effective W3 text and whether the administrator set it (spec §2.7)."""
+        admin = self._parsed.meeting_notice_text.code == PolicyCode.NOTICE_ADMIN
+        return str(self.settings["meeting_notice_text"]), admin
+
+    @pyqtSlot()
+    def on_overlay_extend_clicked(self) -> None:
+        if self._capture:
+            self._capture.overlay_action("extend")
+
+    @pyqtSlot()
+    def activateOverlayKeyboard(self) -> None:
+        if self.overlay.get("visible"):
+            self.overlayKeyboardRequested.emit()
 
     @pyqtProperty(bool, notify=changed)
     def recordingDevEnabled(self) -> bool:
