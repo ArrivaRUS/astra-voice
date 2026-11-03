@@ -56,10 +56,16 @@ __all__ = [
     "notify_meeting_limit_soon",
     "notify_meeting_limit_stopped",
     "notify_meeting_lock_paused",
+    "notify_meeting_memory_wait",
     "notify_meeting_mic_paused",
+    "notify_meeting_needs_model",
     "notify_meeting_saved",
+    "notify_meeting_saved_transcribing",
+    "notify_meeting_selfcheck_failed",
     "notify_meeting_session_stopped",
     "notify_meeting_sleep_stopped",
+    "notify_meeting_transcribed",
+    "notify_meeting_transcription_failed",
     "notify_microphone_changed",
     "notify_microphone_lost",
     "notify_microphone_muted",
@@ -899,6 +905,17 @@ MEETING_SLEEP_STOPPED = "Запись встречи остановлена пе
 MEETING_SESSION_STOPPED = (
     "Запись встречи остановлена: вы переключились на другой сеанс. Записанное сохранено"
 )
+# E13.M4 transcription notices (spec §2.5, §4.6, §4.7). Constant text only: the
+# meeting title is user text and never enters a notice (or its delivery log).
+MEETING_SAVED_TRANSCRIBING = "Встреча сохранена. Делаю расшифровку…"
+MEETING_TRANSCRIBED = "Расшифровка готова"
+MEETING_MEMORY_WAIT = "Расшифровка подождёт: сейчас мало свободной памяти"
+MEETING_NEEDS_MODEL = "Для расшифровки встреч нужна модель GigaAM v3"
+MEETING_SELFCHECK_FAILED = "Распознавание на этом компьютере не работает"
+MEETING_TRANSCRIPTION_FAILED = "Ошибка расшифровки"
+_MEETING_NEEDS_MODEL_BODY = "Запись сохранена. После установки расшифровка начнётся сама."
+_MEETING_FAILED_BODY = "Запись сохранена и не удалится, пока вы её не удалите."
+_MEETING_OPEN_ONE = "Открыть"
 _MEETING_EXTEND = "Продлить на час"
 _MEETING_RESUME = "Продолжить"
 _MEETING_STOP = "Остановить запись"
@@ -974,3 +991,40 @@ def notify_meeting_sleep_stopped() -> None:
 
 def notify_meeting_session_stopped() -> None:
     notify(MEETING_SESSION_STOPPED, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)], retry=False)
+
+
+def notify_meeting_saved_transcribing() -> None:
+    notify(MEETING_SAVED_TRANSCRIBING, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)], retry=False)
+
+
+def notify_meeting_transcribed() -> None:
+    """Spec «Расшифровка готова: <название>»: notices carry constant text only."""
+    notify(MEETING_TRANSCRIBED, actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN_ONE)])
+
+
+def notify_meeting_memory_wait() -> None:
+    notify(MEETING_MEMORY_WAIT, retry=False)
+
+
+def notify_meeting_needs_model() -> None:
+    notify(
+        MEETING_NEEDS_MODEL,
+        _MEETING_NEEDS_MODEL_BODY,
+        actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)],
+    )
+
+
+def notify_meeting_selfcheck_failed() -> None:
+    notify(
+        MEETING_SELFCHECK_FAILED,
+        _MEETING_FAILED_BODY,
+        actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)],
+    )
+
+
+def notify_meeting_transcription_failed() -> None:
+    notify(
+        MEETING_TRANSCRIPTION_FAILED,
+        _MEETING_FAILED_BODY,
+        actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)],
+    )

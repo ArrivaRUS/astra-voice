@@ -819,6 +819,22 @@ def _bind_meeting_recording(
         )
         bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
         bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
+        from astra_voice.core.meeting_jobs import MeetingJobs
+        from astra_voice.ui.meeting_notifications import job_notifier
+        from astra_voice.ui.meeting_recording import transcribe_supervisor
+
+        # E13.M4: the transcription queue follows the same dev gate as capture.
+        recording.bind_jobs(
+            MeetingJobs(
+                bridge._store,
+                transcribe_supervisor,
+                transcribe_immediately=lambda: bool(
+                    bridge.settings["meeting_transcribe_immediately"]
+                ),
+                audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
+                notify=job_notifier(),
+            )
+        )
         recording.bind_indicators(
             overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
             tray_visible=lambda: bool(
@@ -828,6 +844,20 @@ def _bind_meeting_recording(
             ),
         )
     recording.initialize()
+
+
+def _meeting_model_probe(service: Any) -> Callable[[], Any]:
+    """GigaAM v3 admission with the catalog's min_ram_mb (formula of spec §8 PRD)."""
+    from astra_voice.core.meeting_jobs import probe_gigaam_model
+
+    def min_ram(model_id: str) -> int | None:
+        try:
+            entry = service.catalog.entry(model_id)
+        except Exception:  # noqa: BLE001 — unavailable catalog: conservative default
+            return None
+        return entry.min_ram_mb if entry is not None else None
+
+    return lambda: probe_gigaam_model(min_ram_mb=min_ram)
 
 
 def _wire_tray_meetings(
@@ -854,6 +884,10 @@ def _wire_tray_meetings(
             can_resume=presentation.get("canResume", False),
             mic_name=presentation.get("microphoneName", ""),
             limit_remaining_seconds=presentation.get("limitRemainingSeconds"),
+        )
+        percent = getattr(bridge, "transcriptionPercent", -1)
+        tray.set_meeting_transcription(
+            percent if isinstance(percent, int) and percent >= 0 else None
         )
 
     def pause_or_resume() -> None:
@@ -2053,6 +2087,13 @@ def main(argv: list[str] | None = None) -> int:
                 session_kind,
                 runtime if runtime_ready else None,
             )
+            meeting_capture = getattr(meeting_bridge, "_capture", None)
+            jobs = getattr(meeting_capture, "jobs", None)
+            if downloads is not None and jobs is not None:
+                # T-481: an installed/rechecked model starts needs_model jobs by itself.
+                downloads.modelsChanged.connect(jobs.models_changed)
+            if jobs is not None and model is not None:
+                jobs.model_probe = _meeting_model_probe(model)
 
             def show_meetings() -> None:
                 focuser.focus_shell()

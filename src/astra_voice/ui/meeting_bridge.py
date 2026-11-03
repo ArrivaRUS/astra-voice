@@ -384,8 +384,18 @@ class MeetingBridge(QObject):
             MeetingState.INTERRUPTED: ("Прервана", "warning", "Расшифровать", ["Удалить"]),
             MeetingState.DELETING: ("", "neutral", "", []),
         }[state]
+        jobs = self._capture.jobs if self._capture is not None else None
+        hints = jobs.row(meeting.id) if jobs is not None else None
+        progress = 0
+        if state == MeetingState.TRANSCRIBING and hints is not None:
+            progress = int(hints["percent"])
+            badge = f"Расшифровка · {progress} %"
         if state == MeetingState.RECORDING:
             subtitle = date
+        elif state == MeetingState.RECORDED and meeting.cancelled and hints is not None:
+            subtitle = str(hints["cancelledText"])
+        elif state == MeetingState.FAILED and hints is not None:
+            subtitle = str(hints["failure"])
         elif state == MeetingState.PAUSED:
             subtitle = (
                 "Экран был заблокирован — продолжите вручную"
@@ -431,7 +441,10 @@ class MeetingBridge(QObject):
             "action": action,
             "actionEnabled": bool(
                 action
-                and state not in {MeetingState.RECORDED, MeetingState.INTERRUPTED}
+                and (
+                    state not in {MeetingState.RECORDED, MeetingState.INTERRUPTED}
+                    or jobs is not None
+                )
                 and (
                     state not in {MeetingState.RECORDING, MeetingState.PAUSED}
                     or self._capture is not None
@@ -441,7 +454,7 @@ class MeetingBridge(QObject):
                 )
             ),
             "actions": actions,
-            "progress": 0,
+            "progress": progress,
             "active": not saving and state in {MeetingState.RECORDING, MeetingState.PAUSED},
             "transcribing": state == MeetingState.TRANSCRIBING,
         }
@@ -611,6 +624,8 @@ class MeetingBridge(QObject):
                 if self._capture is not None and action in {"Остановить", "Продолжить"}:
                     self._capture.action(meeting_id, action)
                     return
+                if self._capture is not None and self._capture.jobs_action(meeting_id, action):
+                    return
                 self.meetingActionRequested.emit(meeting_id, action)
                 return
 
@@ -638,9 +653,23 @@ class MeetingBridge(QObject):
         current = self._capture.current_meeting
         if current is not None:
             updates[current.id] = current
+        jobs = self._capture.jobs
+        if jobs is not None:
+            # The queue publishes the newest durable state (generation +1 after stop).
+            for meeting_id in jobs.tombstones:
+                updates.pop(meeting_id, None)
+            updates.update(jobs.meetings)
         if updates:
             self._documents = [row for row in self._documents if row.id not in updates]
             self._documents.extend(updates.values())
+        if jobs is not None and jobs.tombstones:
+            self._documents = [row for row in self._documents if row.id not in jobs.tombstones]
+
+    @pyqtProperty(int, notify=changed)
+    def transcriptionPercent(self) -> int:
+        """Running transcription for the tray hint (spec §3.9), -1 when none."""
+        percent = self._capture.transcription_percent if self._capture is not None else None
+        return -1 if percent is None else percent
 
     @pyqtProperty("QVariantMap", notify=changed)
     def overlay(self) -> dict[str, Any]:

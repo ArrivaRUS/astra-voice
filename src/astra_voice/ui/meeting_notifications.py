@@ -14,8 +14,27 @@ from typing import Any
 
 from PyQt5.QtCore import QObject
 
+from astra_voice.meetings.model import Meeting
 from astra_voice.ui import notify as notify_module
 from astra_voice.ui.meeting_recording import MeetingRecording
+
+
+def job_notifier(notices: ModuleType = notify_module) -> Callable[[str, Meeting], None]:
+    """MeetingJobs events -> fixed-text notices (spec §2.5, §4.6, §4.7)."""
+
+    def deliver(kind: str, meeting: Meeting) -> None:
+        if kind == "done":
+            notices.notify_meeting_transcribed()
+        elif kind == "waiting_memory":
+            notices.notify_meeting_memory_wait()
+        elif kind == "needs_model":
+            notices.notify_meeting_needs_model()
+        elif kind == "failed_model":
+            notices.notify_meeting_selfcheck_failed()
+        elif kind == "failed":
+            notices.notify_meeting_transcription_failed()
+
+    return deliver
 
 
 class MeetingNotifications(QObject):
@@ -124,8 +143,14 @@ class MeetingNotifications(QObject):
                 notices.notify_meeting_sleep_stopped()
             elif reason == "session":
                 notices.notify_meeting_session_stopped()
+            elif self._transcribes_now():
+                notices.notify_meeting_saved_transcribing()
             else:
                 notices.notify_meeting_saved()
+
+    def _transcribes_now(self) -> bool:
+        jobs = getattr(self.recording, "jobs", None)
+        return bool(jobs is not None and jobs.transcribe_immediately())
 
     def _act(self, key: str, action: str) -> None:
         issued = self._issued.get(key)

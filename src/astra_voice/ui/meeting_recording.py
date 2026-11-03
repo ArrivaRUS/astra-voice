@@ -27,6 +27,7 @@ from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 
 from astra_voice.core.childenv import clean_env as host_environment
 from astra_voice.core.command_mode import SessionSnapshot
+from astra_voice.core.meeting_jobs import JobRole, MeetingJobs
 from astra_voice.core.meeting_session import (
     ERROR_TEXT,
     WARNING_TEXT,
@@ -116,6 +117,13 @@ def _supervisor(event: Callable[[Message], None], exited: Callable[[int], None])
     return WorkerSupervisor(event, role="meeting-capture", auto_restart=False, on_exit=exited)
 
 
+def transcribe_supervisor(
+    event: Callable[[Message], None], exited: Callable[[int], None]
+) -> JobRole:
+    """Role meeting-transcribe: supervisor restarts it (<= 3 / 10 min), no replay."""
+    return WorkerSupervisor(event, role="meeting-transcribe", on_exit=exited)
+
+
 class MeetingRecording(QObject):
     changed = pyqtSignal()
     openMeetingsRequested = pyqtSignal()
@@ -189,6 +197,8 @@ class MeetingRecording(QObject):
         self._overlay_fallback_deadline = 0.0
         self._notice_app = ""
         self._indicator_guard: MeetingIndicatorGuard | None = None
+        self.jobs: MeetingJobs | None = None
+        self._jobs_saved = ""
         role = self._new_supervisor()
         self.controller = MeetingController(
             store,
@@ -259,6 +269,35 @@ class MeetingRecording(QObject):
         self._query_req = ""
         return self._supervisor_factory(event, exited)
 
+    def bind_jobs(self, jobs: MeetingJobs) -> None:
+        """Attach the transcription queue (E13.M4); it resumes on initialize()."""
+        if self._closed or self.jobs is not None:
+            return
+        self.jobs = jobs
+        meeting = self.controller.meeting
+        # A meeting saved before binding belongs to the previous program run.
+        self._jobs_saved = meeting.id if meeting is not None and self.controller.saved else ""
+
+    def jobs_action(self, meeting_id: str, action: str) -> bool:
+        """List actions of the transcription queue; False when not ours."""
+        jobs = self.jobs
+        if jobs is None or self._closed:
+            return False
+        if action in {"Расшифровать", "Повторить"}:
+            if not (self.enabled() and self.policy_allowed()):
+                return True
+            jobs.transcribe(meeting_id)
+        elif action == "Отменить":
+            jobs.cancel(meeting_id)
+        else:
+            return False
+        self._publish()
+        return True
+
+    @property
+    def transcription_percent(self) -> int | None:
+        return self.jobs.percent if self.jobs is not None else None
+
     def _snapshot(self) -> SessionSnapshot:
         return self._monitor.snapshot() if self._monitor is not None else SessionSnapshot()
 
@@ -266,6 +305,8 @@ class MeetingRecording(QObject):
         if self._closed:
             return
         self.controller.recover()
+        if self.jobs is not None:
+            self.jobs.recover()
         self._lease_timer.start()
         self._control_timer.start()
         self.tick()
@@ -761,6 +802,7 @@ class MeetingRecording(QObject):
             self._indicator_guard.check()
         self.controller.tick()
         self._poll_retirement()
+        self._tick_jobs()
         if (
             self.dialog_open
             and self._retire_deadline is None
@@ -786,6 +828,26 @@ class MeetingRecording(QObject):
 
                 self._submit(read)
         self._publish()
+
+    def _queue_saved(self) -> None:
+        jobs = self.jobs
+        meeting = self.controller.meeting
+        if (
+            jobs is not None
+            and meeting is not None
+            and self.controller.saved
+            and self.controller._committed
+            and meeting.id != self._jobs_saved
+        ):
+            # The final RECORDED write is durable: no GUI-lease race with capture.
+            self._jobs_saved = meeting.id
+            jobs.on_recorded(meeting.id)
+
+    def _tick_jobs(self) -> None:
+        if self.jobs is None:
+            return
+        self._queue_saved()
+        self.jobs.tick()
 
     @property
     def current_meeting(self) -> Meeting | None:
@@ -869,6 +931,7 @@ class MeetingRecording(QObject):
                 tuple(self.recovered),
                 self.controller.manual_resume_required,
                 tuple(sorted(self.controller.pause_reasons)),
+                self.jobs.revision if self.jobs is not None else -1,
             )
         )
         if signature != self._signature:
@@ -941,7 +1004,17 @@ class MeetingRecording(QObject):
             self._stop_for_exit(deadline)
         except Exception:
             log.warning("meeting-exit-stop-failed")
+        if self.jobs is not None:
+            # Exit during a recording: the saved meeting is queued durably
+            # (transcribing) and transcribed at the next start (spec §4.6).
+            self._queue_saved()
         self._closed = True
+        if self.jobs is not None:
+            try:
+                # T-478: no confirmation and no job.cancel; the checkpoint resumes.
+                self.jobs.shutdown(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                log.warning("meeting-jobs-exit-failed")
         try:
             if self._role_started:
                 # Terminal for the role; after a graceful exit it only releases IPC.

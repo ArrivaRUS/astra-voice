@@ -394,6 +394,7 @@ class Tray(QObject):
         self._meeting_can_resume = True
         self._meeting_limit_remaining: int | None = None
         self._meeting_mic_name = ""
+        self._meeting_transcription: int | None = None
         self._provider = provider
         self._hotkey = hotkey
         factory = tray_factory if tray_factory is not None else lambda: QSystemTrayIcon()
@@ -680,7 +681,18 @@ class Tray(QObject):
                 )
             else:
                 tooltip = self._provider.tooltip(self._state, hotkey=self._hotkey)
-        self._tray.setToolTip(clean_display_name(tooltip))
+        text = clean_display_name(tooltip)
+        if self._state == TrayState.IDLE and self._meeting_transcription is not None:
+            # spec §3.9: transcription in the background is a second hint line.
+            text += "\n" + f"Расшифровка встречи: {self._meeting_transcription} %"
+        self._tray.setToolTip(text)
+
+    def set_meeting_transcription(self, percent: int | None) -> None:
+        """Background meeting transcription progress (None: no job)."""
+        value = None if percent is None or percent < 0 else min(100, int(percent))
+        if value != self._meeting_transcription:
+            self._meeting_transcription = value
+            self._update_tooltip()
 
     def _done_expired(self) -> None:
         if self._state == TrayState.DONE:
