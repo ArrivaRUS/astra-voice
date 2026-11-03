@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,8 @@ class Role:
         self.sent: list[dict[str, Any]] = []
         self.kills = self.stops = 0
         self.generations: dict[str, int] = {}
+        # Synchronous answers inside send() (supervisor limit/req-conflict, ledger cache).
+        self.on_send: dict[str, Callable[[dict[str, Any]], None]] = {}
 
     def start(self) -> None:
         self.state, self.ready = "running", True
@@ -58,6 +61,9 @@ class Role:
         if message["type"] == "meeting.job.cancel":
             self.rig.cancelled_at_send.append(self.rig.meeting(message["meeting_id"]).cancelled)
         self.sent.append(message)
+        hook = self.on_send.pop(message["type"], None)
+        if hook is not None:
+            hook(message)
         return message
 
     def set_meeting_generation(self, meeting_id: str, generation: int) -> None:
@@ -712,3 +718,337 @@ def test_probe_prefers_trusted_gigaam_v3_and_reports_broken() -> None:
     assert probe(record("gigaam-v3-e2e-rnnt-int8", state="broken")).status == "broken"
     assert probe(record("gigaam-v3-e2e-rnnt-int8", recheck=True)).status == "broken"
     assert probe(record("gigaam-v3-e2e-rnnt-int8"), revoked=True).status == "broken"
+
+
+# ---- review of step 2: answers outside the expected codes (I1) ----------------------
+
+
+def _load_error(rig: Rig, code: str) -> None:
+    load = rig.role.last("model.load")
+    rig.role.emit("error", req=load["req"], request_type="model.load", code=code, message="x")
+
+
+@pytest.mark.parametrize("code", ["timeout", "limit", "req-conflict"])
+def test_unexpected_model_load_error_retries_then_fails_and_queue_moves_i1(
+    rig: Rig, code: str
+) -> None:
+    rig.create(MID)
+    rig.create(MID2)
+    rig.jobs.on_recorded(MID)
+    rig.jobs.on_recorded(MID2)
+    rig.jobs.tick()
+    for attempt in range(3):
+        _load_error(rig, code)
+        rig.jobs.tick()
+        assert rig.role.types().count("model.load") == attempt + 1  # 1 s back-off
+        rig.now += 1
+        rig.jobs.tick()
+        assert rig.role.types().count("model.load") == attempt + 2
+        assert rig.jobs.active_id == MID
+    _load_error(rig, code)  # the fourth unexpected answer in the window fails the job
+    assert rig.meeting(MID).state == MeetingState.FAILED and rig.audio_present(MID)
+    assert rig.notices == [("failed", MID)]
+    rig.jobs.tick()
+    assert rig.jobs.active_id == MID2
+    assert rig.role.types().count("model.load") == 5
+
+
+def test_not_prepared_waits_for_the_previous_load_without_failing_i1(rig: Rig) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    for _ in range(60):  # the role finishes a cancelled load/unload (<= 60 s)
+        _load_error(rig, "not-prepared")
+        rig.now += 1
+        rig.jobs.tick()
+    assert rig.meeting().state == MeetingState.TRANSCRIBING
+    rig.loaded()
+    assert rig.role.last("meeting.job.start")["meeting_id"] == MID
+    assert rig.jobs.active_id == MID
+
+
+def test_not_prepared_forever_ends_in_failure_not_a_stuck_queue_i1(rig: Rig) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    for _ in range(200):
+        if rig.jobs.active_id != MID:
+            break
+        _load_error(rig, "not-prepared")
+        rig.now += 1
+        rig.jobs.tick()
+    assert rig.jobs.active_id == "" and rig.meeting().state == MeetingState.FAILED
+
+
+@pytest.mark.parametrize("code", ["timeout", "limit", "model"])
+def test_start_error_kills_the_role_and_fails_only_after_confirmed_exit_i1(
+    rig: Rig, code: str
+) -> None:
+    rig.create(MID)
+    rig.create(MID2)
+    rig.jobs.on_recorded(MID)
+    rig.jobs.on_recorded(MID2)
+    rig.jobs.tick()
+    rig.loaded()
+    start = rig.role.last("meeting.job.start")
+    rig.role.emit(
+        "error", req=start["req"], request_type="meeting.job.start", code=code, message="x"
+    )
+    first = rig.role
+    assert first.kills == 1
+    assert rig.meeting(MID).state == MeetingState.TRANSCRIBING  # not before the exit
+    assert rig.jobs.job_snapshot(MID) is None
+    rig.jobs.tick()
+    assert rig.jobs.active_id == MID and len(rig.roles) == 1
+    first.exited = True
+    rig.jobs.tick()
+    assert rig.meeting(MID).state == MeetingState.FAILED and rig.audio_present(MID)
+    assert rig.notices == [("failed_model" if code == "model" else "failed", MID)]
+    assert rig.jobs.active_id == MID2 and len(rig.roles) == 2
+    assert rig.role.types() == ["model.load"]  # a fresh process, no `limit` from a ghost job
+
+
+def test_cancel_while_a_failed_start_is_killed_keeps_cancelled_not_failed_i1(rig: Rig) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    rig.loaded()
+    start = rig.role.last("meeting.job.start")
+    rig.role.emit(
+        "error", req=start["req"], request_type="meeting.job.start", code="timeout", message="x"
+    )
+    rig.jobs.cancel(MID)
+    rig.role.exited = True
+    rig.jobs.tick()
+    meeting = rig.meeting()
+    assert meeting.cancelled and meeting.state == MeetingState.RECORDED
+    assert rig.notices == [] and rig.jobs.active_id == ""
+
+
+def test_delete_while_a_failed_start_is_killed_releases_after_exit_i1(rig: Rig) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    rig.loaded()
+    start = rig.role.last("meeting.job.start")
+    rig.role.emit(
+        "error", req=start["req"], request_type="meeting.job.start", code="timeout", message="x"
+    )
+    released: list[str] = []
+    rig.jobs.delete(MID, lambda: released.append(MID))
+    assert released == [] and "meeting.job.cancel" not in rig.role.types()
+    rig.role.exited = True
+    rig.jobs.tick()
+    assert released == [MID] and rig.notices == []
+
+
+def _sync_error(rig: Rig, kind: str, code: str) -> None:
+    def answer(message: dict[str, Any]) -> None:
+        rig.role.emit("error", req=message["req"], request_type=kind, code=code, message="x")
+
+    rig.role.on_send[kind] = answer
+
+
+def test_synchronous_error_inside_model_load_send_is_not_lost_i1(rig: Rig) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    original = rig.factory
+
+    def factory(on_event: Any, on_exit: Any) -> Role:
+        role = original(on_event, on_exit)
+        _sync_error(rig, "model.load", "limit")
+        return role
+
+    rig.jobs._role_factory = factory
+    rig.jobs.tick()
+    assert rig.role.types() == ["model.load"]
+    assert rig.jobs._active is not None and rig.jobs._active.phase == "crashed"
+    rig.now += 1
+    rig.jobs.tick()
+    assert rig.role.types() == ["model.load", "model.load"]
+
+
+@pytest.mark.parametrize("code", ["limit", "req-conflict"])
+def test_synchronous_error_inside_job_start_send_is_not_lost_i1(rig: Rig, code: str) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    _sync_error(rig, "meeting.job.start", code)
+    rig.loaded()
+    assert rig.role.kills == 1
+    assert "meeting.job.credit" not in rig.role.types()
+    rig.role.exited = True
+    rig.jobs.tick()
+    assert rig.meeting().state == MeetingState.FAILED and rig.jobs.active_id == ""
+
+
+def test_synchronous_accept_inside_job_start_send_still_sends_credits_i1(rig: Rig) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+
+    def accept(message: dict[str, Any]) -> None:
+        rig.role.emit(
+            "meeting.job.accepted",
+            req=message["req"],
+            request_type="meeting.job.start",
+            meeting_id=MID,
+            meeting_generation=message["meeting_generation"],
+            resume_from={"mic_ms": 0, "far_ms": 0},
+        )
+
+    rig.role.on_send["meeting.job.start"] = accept
+    rig.loaded()
+    assert rig.jobs.job_snapshot(MID)["phase"] == "running"  # type: ignore[index]
+    assert rig.role.last("meeting.job.credit")["n"] == 64
+
+
+# ---- review of step 2: durable cancel only (#2), no lost completions (#3) -----------
+
+
+class BrokenWrites:
+    """meeting.json writes of the jobs queue fail while ``on`` (disk/lease trouble)."""
+
+    def __init__(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+        from astra_voice.meetings.store import MeetingStoreError
+
+        self.on = False
+        original = rig.store.write
+
+        def write(*args: Any, **kwargs: Any) -> Any:
+            if self.on:
+                raise MeetingStoreError("meeting-store-write")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(rig.store, "write", write)
+        monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+
+def test_failed_cancel_write_sends_no_cancel_and_retries_d12(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    broken = BrokenWrites(rig, monkeypatch)
+    broken.on = True
+    rig.jobs.cancel(MID)
+    assert "meeting.job.cancel" not in rig.role.types() and rig.role.kills == 0
+    assert rig.jobs.active_id == MID and not rig.meeting().cancelled
+    rig.now += 1
+    rig.jobs.tick()  # second attempt fails too: still nothing sent
+    assert "meeting.job.cancel" not in rig.role.types()
+    broken.on = False
+    rig.jobs.tick()
+    assert "meeting.job.cancel" not in rig.role.types()  # waits for its retry time
+    rig.now += 1
+    rig.jobs.tick()
+    assert rig.cancelled_at_send == [True]  # durable before meeting.job.cancel
+    rig.jobs.shutdown()
+    again = Rig(tmp_path)
+    again.jobs.recover()
+    again.jobs.tick()
+    assert again.jobs.queued_ids == [] and again.roles == []
+
+
+def test_cancel_that_cannot_be_written_ends_in_visible_error_not_silent_cancel_d12(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    broken = BrokenWrites(rig, monkeypatch)
+    broken.on = True
+    rig.jobs.cancel(MID)
+    for _ in range(meeting_jobs.CANCEL_WRITE_ATTEMPTS - 1):
+        rig.now += 1
+        rig.jobs.tick()
+    assert "meeting.job.cancel" not in rig.role.types()
+    assert rig.role.kills == 1 and rig.jobs.failures[MID] == "io"
+    broken.on = False
+    rig.role.exited = True
+    rig.jobs.tick()
+    meeting = rig.meeting()
+    assert meeting.state == MeetingState.FAILED and not meeting.cancelled
+    assert rig.notices == [("failed", MID)] and rig.audio_present()
+    rig.jobs.shutdown()
+    again = Rig(tmp_path)
+    again.jobs.recover()
+    again.jobs.tick()
+    assert again.jobs.queued_ids == [] and again.roles == []
+
+
+def test_queued_cancel_that_cannot_be_written_is_reported_d12(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create()
+    rig.memory = 10
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    broken = BrokenWrites(rig, monkeypatch)
+    broken.on = True
+    rig.jobs.cancel(MID)
+    for _ in range(meeting_jobs.CANCEL_WRITE_ATTEMPTS):
+        rig.now += 1
+        rig.jobs.tick()
+    assert rig.jobs.failures[MID] == "io"
+    assert rig.notices == [("waiting_memory", MID), ("failed", MID)]
+    assert rig.roles == []
+
+
+def test_admission_that_raises_releases_the_queue_and_retries_3(rig: Rig) -> None:
+    rig.create()
+    calls: list[int] = []
+
+    def probe() -> ModelAdmission:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("model-store")
+        return ModelAdmission("ok", dict(LOAD))
+
+    rig.jobs.model_probe = probe
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    assert rig.jobs._admitting == "" and rig.jobs.queued_ids == [MID] and rig.roles == []
+    rig.now += meeting_jobs.ADMIT_RETRY_S
+    rig.jobs.tick()
+    assert rig.role.types() == ["model.load"] and rig.jobs.active_id == MID
+
+
+def test_admission_refused_by_a_full_writer_releases_the_queue_3(rig: Rig) -> None:
+    import queue
+
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    run = rig.jobs._submit
+
+    def full(operation: Callable[[], None]) -> None:
+        rig.jobs._submit = run
+        raise queue.Full
+
+    rig.jobs._submit = full
+    rig.jobs.tick()
+    assert rig.jobs._admitting == "" and not rig.jobs.filesystem_pending
+    rig.now += meeting_jobs.ADMIT_RETRY_S
+    rig.jobs.tick()
+    assert rig.role.types() == ["model.load"]
+
+
+def test_cancel_refused_by_a_full_writer_is_retried_not_stuck_3(rig: Rig) -> None:
+    import queue
+
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    run = rig.jobs._submit
+
+    def full(operation: Callable[[], None]) -> None:
+        rig.jobs._submit = run
+        raise queue.Full
+
+    rig.jobs._submit = full
+    rig.jobs.cancel(MID)
+    assert "meeting.job.cancel" not in rig.role.types()
+    rig.now += 1
+    rig.jobs.tick()
+    assert rig.cancelled_at_send == [True]

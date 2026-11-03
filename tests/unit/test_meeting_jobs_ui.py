@@ -267,13 +267,15 @@ def test_rows_for_waiting_needs_model_failed_cancelled_and_done(rig: Rig) -> Non
     assert (need["badge"], need["action"]) == ("Нужна модель", "Установить")
     assert need["subtitle"] == "Для расшифровки встреч нужна модель GigaAM v3"
     fail = rows["2026-11-01_120000-fail"]
-    assert (fail["badge"], fail["action"]) == ("! Ошибка расшифровки", "Повторить")
+    assert (fail["badge"], fail["action"]) == ("Ошибка расшифровки", "Повторить")
+    assert (fail["badgeKind"], fail["badgeIcon"]) == ("danger", "alert")
     assert fail["subtitle"] == "Распознавание на этом компьютере не работает"
     cancelled = rows["2026-11-01_130000-canc"]
     assert (cancelled["badge"], cancelled["action"]) == ("Записана", "Расшифровать")
     assert cancelled["subtitle"] == "Расшифровка отменена. Запись сохранена — можно начать снова."
     done = rows["2026-11-01_140000-done"]
-    assert (done["badge"], done["action"]) == ("✓ Готово", "Открыть")
+    assert (done["badge"], done["action"], done["badgeIcon"]) == ("Готово", "Открыть", "check")
+    assert (need["badgeIcon"], rows["2026-11-01_100000-wait"]["badgeIcon"]) == ("alert", "clock")
 
 
 def test_cancel_from_the_list_records_cancelled_before_job_cancel(rig: Rig) -> None:
@@ -394,3 +396,108 @@ def test_recover_on_initialize_resumes_and_deleting_rows_hide(rig: Rig) -> None:
     rig.recording.tick()
     assert released == [MID]
     assert MID not in rig.refresh()
+
+
+# ---- review of step 2: exit right after «Стоп» (I2), one policy gate (I3) -----------
+
+
+def test_exit_right_after_stop_queues_even_if_final_write_is_not_drained_i2(rig: Rig) -> None:
+    """The final RECORDED write is durable, its result waits for the next 50 ms tick
+    (controller.saved still False) and the user quits: «Расшифровывать сразу» holds."""
+    rig.create()
+    controller = rig.recording.controller
+    controller.meeting, controller._committed, controller.saved = rig.meeting(), True, False
+    controller._write_results.put((MID, True, True))  # completed, not drained yet
+    rig.bridge.shutdown()
+    assert rig.meeting().state == MeetingState.TRANSCRIBING and rig.roles == []
+
+
+def test_exit_waits_for_the_final_write_still_on_the_writer_thread_i2(rig: Rig) -> None:
+    """The final write itself is still queued on the controller's writer when exit starts."""
+    import threading
+
+    rig.create()
+    controller = rig.recording.controller
+    controller.meeting, controller._committed, controller.saved = rig.meeting(), True, False
+    gate = threading.Event()
+
+    def late_write() -> None:
+        gate.wait(5)
+        controller._write_results.put((MID, True, True))
+
+    controller._writer.submit(late_write)
+    threading.Timer(0.05, gate.set).start()
+    rig.bridge.shutdown()
+    assert rig.meeting().state == MeetingState.TRANSCRIBING
+
+
+def _ban(rig: Rig) -> None:
+    rig.recording.policy_allowed = lambda: False
+
+
+def test_policy_ban_never_queues_a_saved_meeting_i3(rig: Rig) -> None:
+    rig.create()
+    _ban(rig)
+    rig.save()
+    rig.recording.tick()
+    assert rig.meeting().state == MeetingState.RECORDED and rig.roles == []
+    rig.recording.shutdown()
+    assert rig.meeting().state == MeetingState.RECORDED and rig.roles == []
+
+
+def test_policy_ban_never_resumes_after_restart_until_lifted_i3(rig: Rig) -> None:
+    rig.create(MID, MeetingState.TRANSCRIBING, meeting_generation=2)
+    _ban(rig)
+    rig.recording.initialize()
+    rig.recording.tick()
+    assert rig.roles == [] and rig.jobs.queued_ids == []
+    meeting = rig.meeting()
+    assert meeting.state == MeetingState.TRANSCRIBING and meeting.meeting_generation == 2
+    rig.recording.policy_allowed = lambda: True
+    rig.recording.tick()
+    assert rig.role.types() == ["model.load"]
+    rig.recording.tick()
+    assert rig.role.types() == ["model.load"]  # recovered once
+
+
+def test_policy_ban_blocks_manual_transcribe_too_i3(rig: Rig) -> None:
+    rig.create()
+    _ban(rig)
+    assert rig.recording.jobs_action(MID, "Расшифровать")
+    assert rig.meeting().state == MeetingState.RECORDED and rig.jobs.queued_ids == []
+
+
+def test_app_gives_the_catalog_probe_before_initialize_recovers_9(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first admission after recover() already uses the catalog's min_ram_mb."""
+    from astra_voice.core import meeting_jobs
+    from astra_voice.ui import meeting_notice, meeting_notifications, meeting_overlay
+    from astra_voice.ui import meeting_recording as recording_module
+
+    monkeypatch.setattr(
+        meeting_jobs,
+        "probe_gigaam_model",
+        lambda **kw: ModelAdmission("ok", {"min_ram_mb": kw["min_ram_mb"](LOAD["id"])}),
+    )
+    for module, name in (
+        (meeting_overlay, "MeetingOverlay"),
+        (meeting_notice, "MeetingNotice"),
+        (meeting_notifications, "MeetingNotifications"),
+    ):
+        monkeypatch.setattr(module, name, Mock())
+    recording = Mock(dev_enabled=True)
+    seen: list[int] = []
+
+    def initialize() -> None:
+        jobs = recording.bind_jobs.call_args.args[0]
+        seen.append(jobs.model_probe().min_ram_mb)
+
+    recording.initialize.side_effect = initialize
+    monkeypatch.setattr(recording_module, "MeetingRecording", Mock(return_value=recording))
+    service = Mock()
+    service.catalog.entry.return_value = SimpleNamespace(min_ram_mb=1234)
+    bridge = Mock(_store=MeetingStore(tmp_path / "meetings"))
+    app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None, service)
+    assert seen == [1234]
+    recording.bind_jobs.call_args.args[0].shutdown()

@@ -51,6 +51,7 @@ from astra_voice.worker.supervisor import WorkerSupervisor
 
 Message = dict[str, Any]
 DEV_ENV = "ASTRA_VOICE_MEETING_CAPTURE_DEV"
+EXIT_QUEUE_WRITE_S = 1.0  # floor for the exit-time «transcribing» write (one meeting.json)
 log = logging.getLogger(__name__)
 
 
@@ -199,6 +200,7 @@ class MeetingRecording(QObject):
         self._indicator_guard: MeetingIndicatorGuard | None = None
         self.jobs: MeetingJobs | None = None
         self._jobs_saved = ""
+        self._jobs_recover_pending = False  # initialize() asked, policy not yet allowed
         role = self._new_supervisor()
         self.controller = MeetingController(
             store,
@@ -284,7 +286,7 @@ class MeetingRecording(QObject):
         if jobs is None or self._closed:
             return False
         if action in {"Расшифровать", "Повторить"}:
-            if not (self.enabled() and self.policy_allowed()):
+            if not self._jobs_allowed():
                 return True
             jobs.transcribe(meeting_id)
         elif action == "Отменить":
@@ -293,6 +295,19 @@ class MeetingRecording(QObject):
             return False
         self._publish()
         return True
+
+    def _jobs_allowed(self) -> bool:
+        """One gate for every new or resumed job (I3): manual, «сразу» and restart."""
+        return bool(self.enabled() and self.policy_allowed())
+
+    def _recover_jobs(self) -> None:
+        """Resume unfinished jobs once after initialize(), and only while meetings are
+        allowed: under a policy ban the meetings stay as they are (nothing is resumed
+        or removed); a later tick resumes them when the ban is lifted."""
+        if self.jobs is None or not self._jobs_recover_pending or not self._jobs_allowed():
+            return
+        self._jobs_recover_pending = False
+        self.jobs.recover()
 
     @property
     def transcription_percent(self) -> int | None:
@@ -305,8 +320,8 @@ class MeetingRecording(QObject):
         if self._closed:
             return
         self.controller.recover()
-        if self.jobs is not None:
-            self.jobs.recover()
+        self._jobs_recover_pending = True
+        self._recover_jobs()
         self._lease_timer.start()
         self._control_timer.start()
         self.tick()
@@ -829,7 +844,8 @@ class MeetingRecording(QObject):
                 self._submit(read)
         self._publish()
 
-    def _queue_saved(self) -> None:
+    def _queue_saved(self) -> bool:
+        """Queue the just saved meeting once; True when a job was requested."""
         jobs = self.jobs
         meeting = self.controller.meeting
         if (
@@ -841,11 +857,14 @@ class MeetingRecording(QObject):
         ):
             # The final RECORDED write is durable: no GUI-lease race with capture.
             self._jobs_saved = meeting.id
-            jobs.on_recorded(meeting.id)
+            if self._jobs_allowed():  # a policy ban leaves the meeting «Записана»
+                return jobs.on_recorded(meeting.id)
+        return False
 
     def _tick_jobs(self) -> None:
         if self.jobs is None:
             return
+        self._recover_jobs()
         self._queue_saved()
         self.jobs.tick()
 
@@ -1004,15 +1023,30 @@ class MeetingRecording(QObject):
             self._stop_for_exit(deadline)
         except Exception:
             log.warning("meeting-exit-stop-failed")
+        queued = False
         if self.jobs is not None:
-            # Exit during a recording: the saved meeting is queued durably
-            # (transcribing) and transcribed at the next start (spec §4.6).
-            self._queue_saved()
+            # Exit during a recording or right after «Стоп» (I2): the final RECORDED
+            # write may still be on the writer thread or not drained into `saved`
+            # (that happens on the next 50 ms tick, which never comes). Finish the
+            # metadata writes, take their results, then queue the meeting durably
+            # (transcribing): it is transcribed at the next start (spec §4.6).
+            try:
+                if not self.controller.close(timeout=max(0.0, deadline - time.monotonic())):
+                    log.warning("meeting-metadata-close-timeout")
+                self.controller._drain_writes()
+            except Exception:
+                log.warning("meeting-exit-drain-failed")
+            queued = self._queue_saved()
         self._closed = True
         if self.jobs is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if queued:
+                # The transcribing write must land before the process ends.
+                remaining = max(remaining, EXIT_QUEUE_WRITE_S)
             try:
                 # T-478: no confirmation and no job.cancel; the checkpoint resumes.
-                self.jobs.shutdown(timeout=max(0.0, deadline - time.monotonic()))
+                if not self.jobs.shutdown(timeout=remaining):
+                    log.warning("meeting-jobs-exit-timeout")
             except Exception:
                 log.warning("meeting-jobs-exit-failed")
         try:

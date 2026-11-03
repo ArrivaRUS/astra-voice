@@ -767,6 +767,21 @@ def _set_context_property(shell: Any, name: str, obj: Any) -> None:
         root_context().setContextProperty(name, obj)
 
 
+def _meeting_model_action(focuser: Any, app_info: Any, settings_bridge: Any) -> Any:
+    """«Установить» / «Установить из файла…» / «Подробнее» → раздел «Модели» (spec §2.5)."""
+    from astra_voice.ui.meeting_card import MODEL_ACTIONS
+
+    def handle(_meeting_id: str, action: str) -> None:
+        if action not in MODEL_ACTIONS:
+            return
+        focuser.focus_shell()
+        app_info.show_section(SECTION_MODELS)
+        if action == "Установить из файла…":
+            settings_bridge.pickInstallPath()
+
+    return handle
+
+
 def _make_meeting_bridge(
     stored: settings_mod.Settings,
     effective: settings_mod.Settings,
@@ -784,7 +799,11 @@ def _make_meeting_bridge(
 
 
 def _bind_meeting_recording(
-    bridge: Any, settings_bridge: Any, session_kind: SessionKind, runtime: Any | None = None
+    bridge: Any,
+    settings_bridge: Any,
+    session_kind: SessionKind,
+    runtime: Any | None = None,
+    model: Any | None = None,
 ) -> None:
     """M2 GUI adapter; recovery is inert and capture requires the explicit dev click."""
     from astra_voice.ui.meeting_recording import MeetingRecording
@@ -819,7 +838,7 @@ def _bind_meeting_recording(
         )
         bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
         bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
-        from astra_voice.core.meeting_jobs import MeetingJobs
+        from astra_voice.core.meeting_jobs import MeetingJobs, probe_gigaam_model
         from astra_voice.ui.meeting_notifications import job_notifier
         from astra_voice.ui.meeting_recording import transcribe_supervisor
 
@@ -833,6 +852,10 @@ def _bind_meeting_recording(
                 ),
                 audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
                 notify=job_notifier(),
+                # The catalog's min_ram_mb is known before initialize() -> recover().
+                model_probe=(
+                    _meeting_model_probe(model) if model is not None else probe_gigaam_model
+                ),
             )
         )
         recording.bind_indicators(
@@ -2086,20 +2109,22 @@ def main(argv: list[str] | None = None) -> int:
                 settings_bridge,
                 session_kind,
                 runtime if runtime_ready else None,
+                model,
             )
             meeting_capture = getattr(meeting_bridge, "_capture", None)
             jobs = getattr(meeting_capture, "jobs", None)
             if downloads is not None and jobs is not None:
                 # T-481: an installed/rechecked model starts needs_model jobs by itself.
                 downloads.modelsChanged.connect(jobs.models_changed)
-            if jobs is not None and model is not None:
-                jobs.model_probe = _meeting_model_probe(model)
 
             def show_meetings() -> None:
                 focuser.focus_shell()
                 app_info.show_section(SECTION_MEETINGS)
 
             meeting_bridge.openMeetingsRequested.connect(show_meetings)
+            meeting_bridge.meetingActionRequested.connect(
+                _meeting_model_action(focuser, app_info, settings_bridge)
+            )
             if runtime_ready and runtime is not None:
                 meeting_tray_disconnect = _wire_tray_meetings(
                     runtime.tray, meeting_bridge, show_meetings

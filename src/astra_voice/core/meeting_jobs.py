@@ -32,7 +32,7 @@ from uuid import uuid4
 from astra_voice.core.meeting_session import MetadataWriter
 from astra_voice.meetings import MeetingValidationError
 from astra_voice.meetings.events import MeetingState, ProcessingStatus, transition
-from astra_voice.meetings.model import Meeting
+from astra_voice.meetings.model import FAILURE_CODES, Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, Writer
 from astra_voice.security.files import private_directory
 
@@ -46,6 +46,17 @@ MODEL_RETRY_S = 60.0
 CANCEL_TIMEOUT_S = 1.0  # worker/meeting_contract.CANCEL_TIMEOUT_S
 MAX_CRASHES = 3  # restarts per window; the fourth crash fails the job
 CRASH_WINDOW_S = 600.0
+# model.load answered by an unexpected error (timeout, limit, ...): crash path, retry later.
+LOAD_RETRY_S = 1.0
+# ``not-prepared``: the role still loads/unloads a model (a cancelled load, model.unload
+# after done). It is bounded by the supervisor's 60 s model.load deadline, so the job
+# waits that long before such answers start counting as crashes.
+NOT_PREPARED_BUDGET_S = 90.0
+# D12: cancelled=true could not be written. meeting.job.cancel waits for the durable
+# write; it is retried by tick and after the last attempt the user sees «Ошибка».
+CANCEL_WRITE_ATTEMPTS = 3
+CANCEL_RETRY_S = 1.0
+ADMIT_RETRY_S = 5.0  # admission work raised/was not accepted by the writer: retry later
 WRITE_ATTEMPTS = 3  # GUI-lease contention with the capture controller is short
 LIMITS = {"max_ms": 14_400_000, "max_utterances": 28_800, "max_blocks": 12}
 GIGAAM_LAYOUT = "onnx-asr-gigaam-v3"
@@ -67,6 +78,7 @@ TRANSCRIBABLE = frozenset(
 )
 FAILED_TEXT = {
     "model": "Распознавание на этом компьютере не работает",
+    "memory": "Расшифровка подождёт: сейчас мало свободной памяти",
 }
 FAILED_DEFAULT_TEXT = "Запись сохранена и не удалится, пока вы её не удалите."
 CANCELLED_TEXT = "Расшифровка отменена. Запись сохранена — можно начать снова."
@@ -218,12 +230,15 @@ class _Active:
     resume: bool
     phase: str = "launching"
     # launching -> loading -> starting -> running; cancelling -> exiting; crashed
-    purpose: str = ""  # "" | cancel | delete
+    purpose: str = ""  # "" | cancel | delete | fail (role killed, then «Ошибка»)
+    failure: str = ""  # code of purpose "fail"
     load_req: str = ""
     start_req: str = ""
     cancel_req: str = ""
     job_sent: bool = False
     deadline: float | None = None
+    retry_at: float = 0.0  # next model.load after an unexpected answer
+    busy_since: float | None = None  # first ``not-prepared`` of this job
     received: int = 0
     done_ms: int = 0
     total_ms: int = 0
@@ -283,6 +298,8 @@ class MeetingJobs:
         self.meetings: dict[str, Meeting] = {}
         self.tombstones: set[str] = set()
         self.cancelled: set[str] = set()
+        # meeting_id -> (failed cancel writes, retry time or None while a write is queued)
+        self._cancel_writes: dict[str, tuple[int, float | None]] = {}
         self.revision = 0
         self._closed = False
 
@@ -328,18 +345,25 @@ class MeetingJobs:
             "utterances": utterances,
         }
 
-    def row(self, meeting_id: str) -> Message:
-        """Presentation hints for a list row: percent, failure text, cancelled text."""
+    def row(self, meeting_id: str, meeting: Meeting | None = None) -> Message:
+        """Presentation hints for a list row: percent, failure text, cancelled text.
+
+        The failure code of this process wins; after a restart the durable
+        ``transcription.failure`` of ``meeting`` explains the error.
+        """
         active = self._active
         percent = (
             active.percent
             if active is not None and active.meeting_id == meeting_id and not active.purpose
             else 0
         )
-        code = self.failures.get(meeting_id, "")
+        code = self.failures.get(meeting_id) or (
+            meeting.transcription.failure if meeting is not None else None
+        )
         return {
             "percent": percent,
-            "failure": FAILED_TEXT.get(code, FAILED_DEFAULT_TEXT),
+            "failure": FAILED_TEXT.get(code or "", FAILED_DEFAULT_TEXT),
+            "failureCode": code or "",
             "cancelledText": CANCELLED_TEXT,
         }
 
@@ -392,6 +416,7 @@ class MeetingJobs:
         if meeting_id == self.active_id or meeting_id in self.queued_ids:
             return
         self.cancelled.discard(meeting_id)
+        self._cancel_writes.pop(meeting_id, None)  # a new job: the old cancel is moot
         self._enqueue(meeting_id, auto=False)
 
     def models_changed(self) -> None:
@@ -401,22 +426,32 @@ class MeetingJobs:
                 entry.retry_at = 0.0
 
     def cancel(self, meeting_id: str) -> None:
-        """D12: durable cancelled=true first, then meeting.job.cancel (<= 1 s, else kill)."""
+        """D12: durable cancelled=true first, then meeting.job.cancel (<= 1 s, else kill).
+
+        Without a confirmed write nothing is sent: the job keeps running while the
+        write is retried, and a cancel that cannot be made durable ends in «Ошибка».
+        """
         if self._closed or meeting_id in self.tombstones:
             return
         self.cancelled.add(meeting_id)
         entry = self._take(meeting_id)
         active = self._active
         if active is not None and active.meeting_id == meeting_id:
+            if active.purpose == "fail":
+                # The role is already being killed: record the cancel, no «Ошибка».
+                active.purpose = "cancel"
+                self._changed()
+                self._persist_cancel(meeting_id)
+                return
             if active.purpose:
                 return
             active.purpose = "cancel"
             active.phase = "cancelling"
             self._changed()
-            self._persist_cancel(meeting_id, then=lambda: self._send_cancel(meeting_id))
+            self._persist_cancel(meeting_id)
             return
         if entry is not None or meeting_id == self._admitting:
-            self._persist_cancel(meeting_id, then=None)
+            self._persist_cancel(meeting_id)
 
     def delete(self, meeting_id: str, released: Callable[[], None]) -> None:
         """Tombstone -> cancel the job -> confirmed exit of the role -> ``released()``.
@@ -442,7 +477,7 @@ class MeetingJobs:
                     active.released = released
                     if active.purpose == "delete":
                         return
-                    if active.purpose == "cancel" and active.phase == "exiting":
+                    if active.phase == "exiting":  # cancel/fail already killed the role
                         active.purpose = "delete"
                         return
                     active.purpose = "delete"
@@ -454,13 +489,15 @@ class MeetingJobs:
 
             return completed
 
-        self._run(tombstone)
+        # The tombstone was not written: nothing is deleted, the meeting stays usable.
+        self._run(tombstone, failed=lambda: self.tombstones.discard(meeting_id))
 
     def tick(self) -> None:
         self._drain()
         if self._closed:
             return
         self._handle_exits()
+        self._retry_cancel_writes()
         active = self._active
         if active is not None:
             self._advance(active)
@@ -512,6 +549,7 @@ class MeetingJobs:
                 meeting.meeting_generation += 1
                 meeting.cancelled = False
                 meeting.processing_status = ProcessingStatus.PENDING
+                meeting.transcription.failure = None
             self._to(meeting, MeetingState.TRANSCRIBING)
             return True
 
@@ -568,6 +606,7 @@ class MeetingJobs:
                     meeting.processing_status = ProcessingStatus.RUNNING
                 elif outcome == "failed":
                     meeting.processing_status = ProcessingStatus.FAILED
+                    meeting.transcription.failure = "model"
                 return True
 
             updated = self._update(meeting_id, mutate, require_change=True)
@@ -599,7 +638,16 @@ class MeetingJobs:
 
             return completed
 
-        self._run(work)
+        def failed() -> None:
+            # The probe/write raised or the writer refused the work: the queue must
+            # not wait for a completion that never comes (``_admitting`` cleared).
+            self._admitting = ""
+            current = next((e for e in self._queue if e.meeting_id == meeting_id), None)
+            if current is not None:
+                current.retry_at = self.clock() + ADMIT_RETRY_S
+            self._changed()
+
+        self._run(work, failed=failed)
 
     def _notify_once(self, entry: _Entry, kind: str, meeting: Meeting) -> None:
         if kind not in entry.notified:
@@ -636,11 +684,13 @@ class MeetingJobs:
                 return None
         return role
 
-    def _send(self, kind: str, **fields: Any) -> str:
+    def _send(self, kind: str, *, req: str = "", **fields: Any) -> str:
+        """``req`` given by the caller is stored before the send: the supervisor and the
+        role may answer synchronously inside ``send`` (limit, req-conflict, cache)."""
         role = self._role
         if role is None:
             return ""
-        request = uuid4().hex
+        request = req or uuid4().hex
         try:
             role.send({"type": kind, "req": request, "request_type": kind, **fields})
         except (RuntimeError, ValueError):
@@ -652,6 +702,8 @@ class MeetingJobs:
 
     def _advance(self, active: _Active) -> None:
         if active.phase in {"launching", "crashed"} and not active.purpose:
+            if active.retry_at > self.clock():
+                return
             role = self._ensure_role()
             if role is None or not role.ready:
                 return
@@ -659,9 +711,11 @@ class MeetingJobs:
             if self._loaded == (role.generation, spec):
                 self._start_job(active)
                 return
-            active.load_req = self._send("model.load", **spec)
-            if active.load_req:
-                active.phase = "loading"
+            phase, request = active.phase, uuid4().hex
+            active.load_req, active.phase = request, "loading"
+            sent = self._send("model.load", req=request, **spec)
+            if not sent and self._active is active and active.load_req == request:
+                active.load_req, active.phase = "", phase  # not sent: retried next tick
             return
         if active.phase == "cancelling" and active.deadline is not None:
             if self.clock() >= active.deadline:
@@ -683,8 +737,11 @@ class MeetingJobs:
         if not active.resume:
             active.utterances.clear()
         active.received = 0
-        active.start_req = self._send(
+        request = uuid4().hex
+        active.start_req, active.job_sent, active.phase = request, True, "starting"
+        sent = self._send(
             "meeting.job.start",
+            req=request,
             **self._identity(active),
             dir=str(self.store.root / meeting.id),
             tracks=tracks,
@@ -695,10 +752,12 @@ class MeetingJobs:
             echo_gate=bool(echo and "far" in tracks),
             limits=dict(LIMITS),
         )
-        if not active.start_req:
+        if self._active is not active or active.start_req != request or active.purpose:
+            return  # a synchronous answer inside send() already decided the job
+        if not sent:
+            active.start_req, active.job_sent = "", False
+            self._retry_load(active, "send")
             return
-        active.job_sent = True
-        active.phase = "starting"
         self._send("meeting.job.credit", **self._identity(active), n=INITIAL_CREDITS)
 
     def _send_cancel(self, meeting_id: str) -> None:
@@ -733,6 +792,9 @@ class MeetingJobs:
         """Cancel/delete completed: late events are retired by a newer generation."""
         if self._active is not active:
             return
+        if active.purpose == "fail":
+            self._fail(active, active.failure)  # the role is gone: the next job is free
+            return
         role = self._role
         if role is not None and getattr(role, "state", "running") != "stopped":
             try:
@@ -756,17 +818,48 @@ class MeetingJobs:
             # A confirmed exit ends cancel/delete, also on the supervisor's own kill.
             self._finish_stop(active)
             return
-        now = self.clock()
-        while self._crashes and now - self._crashes[0] >= CRASH_WINDOW_S:
-            self._crashes.popleft()
-        self._crashes.append(now)
-        if len(self._crashes) > MAX_CRASHES:
+        if self._count_crash():
             self._fail(active, "io")
             return
         active.phase = "crashed"
         active.resume = True
         active.job_sent = False
         self._changed()
+
+    def _count_crash(self) -> bool:
+        """One more crash in the window; True when the job has to fail (T-484)."""
+        now = self.clock()
+        while self._crashes and now - self._crashes[0] >= CRASH_WINDOW_S:
+            self._crashes.popleft()
+        self._crashes.append(now)
+        return len(self._crashes) > MAX_CRASHES
+
+    def _retry_load(self, active: _Active, code: str) -> None:
+        """model.load answered with an unexpected code (timeout, limit, req-conflict,
+        not-prepared) or meeting.job.start was not sent: crash path, never a stuck
+        ``loading`` (I1). ``not-prepared`` only waits while the role finishes a
+        previous load/unload; afterwards it counts like any other crash."""
+        active.load_req = ""
+        now = self.clock()
+        if code == "not-prepared":
+            if active.busy_since is None:
+                active.busy_since = now
+            waiting = now - active.busy_since < NOT_PREPARED_BUDGET_S
+        else:
+            waiting = False
+        if not waiting and self._count_crash():
+            self._fail(active, "io")
+            return
+        active.phase, active.retry_at = "crashed", now + LOAD_RETRY_S
+        self._changed()
+
+    def _fail_after_exit(self, active: _Active, code: str) -> None:
+        """meeting.job.start failed (timeout before accepted, limit, ...): the role may
+        still run the job and write the transcript. Kill it; «Ошибка» is published only
+        after a confirmed exit, so the next job gets a free role (I1)."""
+        active.purpose, active.failure = "fail", code
+        self._changed()
+        self._kill(active)
 
     # ---- events -----------------------------------------------------------
 
@@ -800,18 +893,20 @@ class MeetingJobs:
                 self._loaded = (role.generation, active.admission.load or {})
                 self._start_job(active)
             elif kind == "error":
-                code = event.get("code")
+                code = str(event.get("code", ""))
                 if code == "memory":
                     self._wait_memory(active)
                 elif code == "model":
                     self._fail(active, "model")
+                else:
+                    self._retry_load(active, code)
             return
         if req is not None and req == active.start_req:
             if kind == "meeting.job.accepted":
                 active.phase = "running"
                 self._changed()
             elif kind == "error":
-                self._fail(active, "model" if event.get("code") == "model" else "io")
+                self._fail_after_exit(active, "model" if event.get("code") == "model" else "io")
             return
         if req is not None or (
             event.get("meeting_id") != active.meeting_id
@@ -903,6 +998,7 @@ class MeetingJobs:
                 return False
             self._to(meeting, MeetingState.FAILED)
             meeting.processing_status = ProcessingStatus.FAILED
+            meeting.transcription.failure = code if code in FAILURE_CODES else "io"
             return True
 
         def work() -> Callable[[], None]:
@@ -1000,7 +1096,11 @@ class MeetingJobs:
 
     # ---- durable metadata ---------------------------------------------------
 
-    def _persist_cancel(self, meeting_id: str, *, then: Callable[[], None] | None) -> None:
+    def _persist_cancel(self, meeting_id: str) -> None:
+        """D12: meeting.job.cancel only after ``cancelled=true`` is on disk."""
+        attempts = self._cancel_writes.get(meeting_id, (0, None))[0]
+        self._cancel_writes[meeting_id] = (attempts, None)
+
         def mutate(meeting: Meeting) -> bool:
             meeting.cancelled = True
             meeting.processing_status = ProcessingStatus.CANCELLED
@@ -1010,19 +1110,55 @@ class MeetingJobs:
 
         def work() -> Callable[[], None]:
             updated = self._update(meeting_id, mutate)
+            if updated is None:
+                return failed
 
             def completed() -> None:
-                if updated is not None and meeting_id not in self.tombstones:
+                if meeting_id not in self.cancelled:
+                    self._cancel_writes.pop(meeting_id, None)
+                    return  # «Расшифровать» again: a new job owns the meeting
+                self._cancel_writes.pop(meeting_id, None)
+                if meeting_id not in self.tombstones:
                     self.meetings[meeting_id] = updated
-                # A failed write still stops the role: the user asked to stop and
-                # this session keeps the cancel in memory (not resumed until restart).
-                if then is not None:
-                    then()
+                self._send_cancel(meeting_id)
                 self._changed()
 
             return completed
 
-        self._run(work)
+        def failed() -> None:
+            if meeting_id in self.tombstones or meeting_id not in self.cancelled:
+                self._cancel_writes.pop(meeting_id, None)
+                return  # delete or a new job owns the meeting now
+            attempts = self._cancel_writes.get(meeting_id, (0, None))[0] + 1
+            if attempts < CANCEL_WRITE_ATTEMPTS:
+                self._cancel_writes[meeting_id] = (attempts, self.clock() + CANCEL_RETRY_S)
+                return
+            self._cancel_writes.pop(meeting_id, None)
+            self._cancel_failed(meeting_id)
+
+        self._run(work, failed=failed)
+
+    def _retry_cancel_writes(self) -> None:
+        now = self.clock()
+        for meeting_id, (_, retry_at) in list(self._cancel_writes.items()):
+            if retry_at is not None and retry_at <= now:
+                self._persist_cancel(meeting_id)
+
+    def _cancel_failed(self, meeting_id: str) -> None:
+        """The cancel cannot be made durable, so it is never sent (D12): a silent cancel
+        would come back after a restart. The user sees «Ошибка расшифровки» instead."""
+        self.failures[meeting_id] = "io"
+        active = self._active
+        if active is not None and active.meeting_id == meeting_id and active.purpose == "cancel":
+            if active.phase == "exiting":  # the role is already being killed
+                active.purpose, active.failure = "fail", "io"
+            else:
+                self._fail_after_exit(active, "io")
+            return
+        meeting = self.meetings.get(meeting_id)
+        if meeting is not None:
+            self._notify("failed", meeting)
+        self._changed()
 
     @staticmethod
     def _to(meeting: Meeting, target: MeetingState) -> bool:
@@ -1084,23 +1220,32 @@ class MeetingJobs:
 
     # ---- filesystem plumbing ------------------------------------------------
 
-    def _run(self, operation: Callable[[], Callable[[], None]]) -> None:
+    def _run(
+        self,
+        operation: Callable[[], Callable[[], None]],
+        *,
+        failed: Callable[[], None] | None = None,
+    ) -> None:
+        """Worker ``operation`` returns a GUI completion. ``failed`` runs on the GUI
+        thread instead whenever the work raised or the writer refused it, so no caller
+        waits forever for a completion that never comes."""
+        fallback = failed if failed is not None else lambda: None
         self._pending += 1
 
         def run() -> None:
+            completed = fallback
             try:
                 completed = operation()
-            except Exception:  # noqa: BLE001 — a failed write leaves the state as is
-
-                def completed() -> None:
-                    pass
-
-            self._results.put(completed)
+            except Exception:  # noqa: BLE001, S110 — the GUI side runs ``failed``
+                pass
+            finally:
+                self._results.put(completed)
 
         try:
             self._submit(run)
         except (queue.Full, RuntimeError):
             self._pending -= 1
+            fallback()
             return
         self._drain()
 
