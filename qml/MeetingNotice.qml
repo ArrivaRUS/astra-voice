@@ -53,7 +53,7 @@ FocusScope {
     function richText(value) {
         return "<div style=\"line-height:" + (PillTheme.pillMeetingNoticeTextboxSize * root.lineFactor) + "px\">"
             + String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;").replace(/\n/g, "<br>")
+                .replace(/\x22/g, "&quot;").replace(/\n/g, "<br>")
             + "</div>";
     }
 

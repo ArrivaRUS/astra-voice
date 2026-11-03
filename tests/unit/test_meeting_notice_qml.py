@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parents[2]
 QML_PROBE = r"""
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QObject, QMetaObject, Qt, QUrl
+from PyQt5.QtCore import Q_ARG, Q_RETURN_ARG, QObject, QMetaObject, Qt, QUrl, QVariant
 from PyQt5.QtGui import QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickWindow
@@ -83,6 +83,11 @@ plain = edit.getText(0, edit.property('length'))
 # <br> lays out as U+2028; everything else is the literal administrator text.
 assert plain.replace(chr(0x2028), chr(10)) == raw, plain
 assert edit.property('lineCount') >= 2
+# ИБ-12: the HTML itself escapes '"' (the QML regex is /\x22/g, no bare quote in source).
+html = QMetaObject.invokeMethod(root, 'richText', Qt.DirectConnection,
+                                Q_RETURN_ARG(QVariant), Q_ARG(QVariant, 'a "1" & <b>'))
+html = html.toVariant() if hasattr(html, 'toVariant') else html
+assert 'a &quot;1&quot; &amp; &lt;b&gt;</div>' in html, html
 
 copied = QSignalSpy(root.copyClicked)
 closed = QSignalSpy(root.closeClicked)
