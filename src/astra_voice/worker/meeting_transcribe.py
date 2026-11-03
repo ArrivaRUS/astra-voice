@@ -33,10 +33,7 @@ from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
-import numpy as np
-import numpy.typing as npt
+from typing import TYPE_CHECKING, Any
 
 from astra_voice.meetings import MeetingValidationError, echo_gate
 from astra_voice.meetings.model import (
@@ -60,10 +57,16 @@ from astra_voice.worker.engine import CancelToken, Engine, EngineError, make_eng
 from astra_voice.worker.meeting_contract import ASR_WINDOW_TIMEOUT_S, COMMAND_FIELDS, RequestLedger
 from astra_voice.worker.meeting_roles import failure
 
+if TYPE_CHECKING:
+    # numpy is a runtime dependency of the role only; importing the module must not need it.
+    import numpy as np
+    import numpy.typing as npt
+
+    Audio = npt.NDArray[np.float32]
+    Probabilities = Callable[[Audio, CancelToken], Sequence[float] | None]
+    VadFactory = Callable[[], tuple[str, Probabilities]]
+
 Message = dict[str, Any]
-Audio = npt.NDArray[np.float32]
-Probabilities = Callable[[Audio, CancelToken], Sequence[float] | None]
-VadFactory = Callable[[], tuple[str, Probabilities]]
 
 ROLE = "meeting-transcribe"
 RATE = 16000
@@ -132,6 +135,8 @@ def energy_probabilities(audio: Audio, cancel: CancelToken) -> list[float] | Non
     """Fallback when Silero is unavailable: deterministic frame RMS gate."""
     if cancel.cancelled:
         return None
+    import numpy as np
+
     count = (len(audio) + FRAME - 1) // FRAME
     padded = np.zeros(count * FRAME, dtype=np.float32)
     padded[: len(audio)] = audio
@@ -170,6 +175,8 @@ def speech_regions(
     context on both sides. Longer speech is cut at the frame with the lowest
     speech probability inside [SPLIT_FROM_MS; MAX_UTTERANCE_MS] from its start.
     """
+    import numpy as np
+
     probs = np.asarray(probabilities, dtype=np.float32)
     pause = math.ceil(MIN_PAUSE_MS * RATE / 1000 / FRAME)
     min_speech = math.ceil(MIN_SPEECH_MS * RATE / 1000 / FRAME)
@@ -378,6 +385,8 @@ class _Reader:
 
     def read(self, span: _Span, a: int, b: int) -> Audio:
         """Samples [a, b) of a span as float32; outside audio stays zero."""
+        import numpy as np
+
         out = np.zeros(max(0, b - a), dtype=np.float32)
         for piece in span.pieces:
             low, high = max(a, piece.first), min(b, piece.end)
@@ -1209,6 +1218,8 @@ class MeetingTranscribeState:
         duration: int,
         deadline: float,
     ) -> npt.NDArray[np.float32]:
+        import numpy as np
+
         samples = span.end - span.first
         frames = (samples + FRAME - 1) // FRAME
         out = np.zeros(frames, dtype=np.float32)
@@ -1242,6 +1253,8 @@ class MeetingTranscribeState:
         result = [False] * len(candidates)
         if not enabled:
             return result
+        import numpy as np
+
         # Far utterances never overlap each other: ends are sorted with starts.
         far = [c for c in candidates if c.track == "far" and not c.damaged]
         far_ends = [c.end_ms for c in far]

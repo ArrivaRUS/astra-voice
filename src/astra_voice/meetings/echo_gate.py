@@ -16,11 +16,17 @@ louder than the least-squares echo estimate (own speech integrity, S2.2).
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-import numpy as np
-import numpy.typing as npt
+if TYPE_CHECKING:
+    import numpy as np
+    import numpy.typing as npt
+
+    Audio = npt.NDArray[np.float32]
+    Signal = npt.NDArray[np.float64]
 
 ECHO_GATE_DEFAULT = False  # D7: switched by M0 block F (own-speech loss <= 2 %)
 THETA_ECHO = 0.35  # SP2 starting point; calibrated on the laptop in M0
@@ -37,12 +43,15 @@ _HALF_TAPS = 16
 _CUTOFF_HZ = 1700.0
 LAG_SAMPLES = MAX_LAG_MS * SOURCE_RATE // 1000  # far lead needed at 16 kHz
 
-Audio = npt.NDArray[np.float32]
-Signal = npt.NDArray[np.float64]
 
-
+@functools.cache
 def _taps() -> Signal:
-    """33-tap Hamming-windowed sinc, cutoff 1.7 kHz before 4:1 decimation (SP2)."""
+    """33-tap Hamming-windowed sinc, cutoff 1.7 kHz before 4:1 decimation (SP2).
+
+    Computed on first use: importing the module must not require numpy.
+    """
+    import numpy as np
+
     k = np.arange(-_HALF_TAPS, _HALF_TAPS + 1, dtype=np.float64)
     cutoff = _CUTOFF_HZ / SOURCE_RATE
     safe = np.where(k == 0, 1.0, k)
@@ -50,9 +59,6 @@ def _taps() -> Signal:
     taps = sinc * (0.54 + 0.46 * np.cos(math.pi * k / _HALF_TAPS))
     result: Signal = taps / taps.sum()
     return result
-
-
-_TAPS = _taps()
 
 
 def config() -> dict[str, float | int | bool]:
@@ -71,11 +77,13 @@ def config() -> dict[str, float | int | bool]:
 
 def decimate(audio: Audio | Signal) -> Signal:
     """Zero-padded FIR keeps the clock origin: output j <-> input 4j."""
+    import numpy as np
+
     x = np.asarray(audio, dtype=np.float64)
     if not len(x):
         return np.zeros(0, dtype=np.float64)
     padded = np.concatenate((np.zeros(_HALF_TAPS), x, np.zeros(_HALF_TAPS)))
-    filtered: Signal = np.convolve(padded, _TAPS, mode="valid")[::_DECIMATION]
+    filtered: Signal = np.convolve(padded, _taps(), mode="valid")[::_DECIMATION]
     return filtered
 
 
@@ -85,6 +93,8 @@ def ncc(mic: Signal, far: Signal, max_lag: int) -> tuple[float, int]:
     far[i] is the far sample ``max_lag`` positions before mic[i]; it must hold
     len(mic) + max_lag samples (zeros where the far track has no audio).
     """
+    import numpy as np
+
     x = np.asarray(mic, dtype=np.float64)
     n = len(x)
     if not n or len(far) != n + max_lag:
@@ -119,6 +129,8 @@ class EchoDecision:
 
 def _own_speech_ms(x: Signal, y: Signal, lag: int, max_lag: int) -> int:
     """Active mic frames >= DOUBLE_TALK_DB above the least-squares echo estimate."""
+    import numpy as np
+
     n = len(x)
     segment = y[max_lag - lag : max_lag - lag + n]
     xc = x - x.mean()
@@ -145,6 +157,8 @@ def assess(mic: Audio, far: Audio, far_overlap: float, *, enabled: bool) -> Echo
     """
     if not enabled or not len(mic):
         return EchoDecision(False, 0.0, 0.0, far_overlap, 0)
+    import numpy as np
+
     x = decimate(mic)
     max_lag = LAG_SAMPLES // _DECIMATION
     wanted = len(mic) + LAG_SAMPLES
