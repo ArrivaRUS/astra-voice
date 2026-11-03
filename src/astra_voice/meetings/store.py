@@ -191,6 +191,30 @@ class MeetingWriter:
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
 
+    def remove(self, filename: str) -> None:
+        """Transcribe drops checkpoint.json only after the final text is durable (T-414)."""
+        try:
+            if not self._active:
+                raise MeetingStoreError("Писатель встречи закрыт")
+            if filename != "checkpoint.json" or self._role != Writer.TRANSCRIBE:
+                raise MeetingStoreError("Неверный писатель файла встречи")
+            with _lock(self._directory, ".store.lock"):
+                meeting = _metadata(self._directory, self._meeting_id)
+                if meeting.state == MeetingState.DELETING:
+                    raise MeetingStoreError("Встреча удаляется")
+                if meeting.cancelled:
+                    raise MeetingStoreError("Обработка встречи отменена")
+                transcript = _read(self._directory, "transcript.json")
+                if not isinstance(transcript, Transcript) or not transcript.labels_final:
+                    raise MeetingStoreError("Текст встречи ещё не окончательный")
+                try:
+                    os.unlink(filename, dir_fd=self._directory)
+                except FileNotFoundError:
+                    return
+                os.fsync(self._directory)
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось сохранить данные встречи") from None
+
     def _write(self, filename: str, document: JsonModel) -> None:
         cls = _document_type(filename)
         allowed = (

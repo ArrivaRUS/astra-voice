@@ -1,7 +1,8 @@
 """Meetings v1 control transport and role dispatch.
 
-Capture uses MeetingCaptureState after entry-point hardening. Compute roles
-remain M1 skeletons until M4/M7; not-prepared never claims durable publication.
+Capture uses MeetingCaptureState and transcribe MeetingTranscribeState after
+entry-point hardening. Diar remains an M1 skeleton until M7; not-prepared never
+claims durable publication.
 """
 
 from __future__ import annotations
@@ -115,8 +116,13 @@ def run_role(connection: socket.socket, role: str, *, parent_pid: int) -> int:
         from astra_voice.worker.meeting_capture import MeetingCaptureState
 
         handler: Any = MeetingCaptureState()
+    elif role == "meeting-transcribe":
+        from astra_voice.worker.meeting_transcribe import MeetingTranscribeState
+
+        handler = MeetingTranscribeState()
     else:
         handler = MeetingRole(role)
+    polling = role in {"meeting-capture", "meeting-transcribe"}
     reader = ipc.FrameReader(role=role)
     outgoing = bytearray(ipc.encode(ipc.make_hello(role=role), role=role))
     terminated = False
@@ -130,7 +136,9 @@ def run_role(connection: socket.socket, role: str, *, parent_pid: int) -> int:
         previous = signal.signal(signal.SIGTERM, terminate)
         connection.setblocking(False)
         while not terminated and os.getppid() == parent_pid:
-            if role == "meeting-capture":
+            # Transcribe events wait in the role (bounded by credits) while the
+            # peer is not reading; capture keeps its own overflow policy.
+            if polling and (role == "meeting-capture" or len(outgoing) < ipc.MAX_FRAME_BYTES):
                 for event in handler.poll():
                     outgoing.extend(ipc.encode(event, role=role))
                 if len(outgoing) > MAX_SEND_BUFFER:
@@ -186,7 +194,7 @@ def run_role(connection: socket.socket, role: str, *, parent_pid: int) -> int:
     except (OSError, ValueError):
         return 2
     finally:
-        if role == "meeting-capture":
+        if polling:
             handler.cleanup()
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
