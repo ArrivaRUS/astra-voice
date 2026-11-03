@@ -105,7 +105,7 @@ class RecordingBridge(Bridge):
         self.exit_answers: list[str] = []
         self._extra_warnings: list[str] | None = None
 
-    recordingDevEnabled = pyqtProperty(bool, lambda self: self.dev, notify=changed)
+    recordingAvailable = pyqtProperty(bool, lambda self: self.dev, notify=changed)
     startDialogOpen = pyqtProperty(bool, lambda self: self.open, notify=changed)
     startState = pyqtProperty(str, lambda self: self.w4_state, notify=changed)
     startTexts = pyqtProperty("QVariantMap", lambda self: COPY, constant=True)

@@ -27,6 +27,7 @@ UINT_MAX = 2**64 - 1
 MEETING_ID_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}-[a-z0-9]{4}$"
 ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 LABEL_PATTERN = r"^(me|others|S[1-9][0-9]*)$"
+FAILURE_CODES = ("model", "memory", "limit", "damaged", "io", "restart")
 Schema = dict[str, Any]
 UINT: Schema = {"type": "integer", "minimum": 0, "maximum": UINT_MAX}
 MILLISECONDS: Schema = {"type": "integer", "minimum": 0, "maximum": MAX_MEETING_MS}
@@ -307,6 +308,9 @@ class Transcription(JsonModel):
     finished_at: str | None = None
     wall_ms: int = 0
     peak_rss_kb: int = 0
+    # Last failure reason of a ``failed`` meeting (E13.M4 card A after a restart).
+    # Additive: older meeting.json files without the key load as ``None``.
+    failure: str | None = None
     SCHEMA = obj(
         {
             "model_id": IDENTIFIER,
@@ -316,7 +320,17 @@ class Transcription(JsonModel):
             "finished_at": nullable(TIMESTAMP),
             "wall_ms": UINT,
             "peak_rss_kb": UINT,
-        }
+            "failure": nullable(choices(*FAILURE_CODES)),
+        },
+        required=[
+            "model_id",
+            "revision",
+            "diarization",
+            "diar_status",
+            "finished_at",
+            "wall_ms",
+            "peak_rss_kb",
+        ],
     )
 
 

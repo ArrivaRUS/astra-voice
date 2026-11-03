@@ -5,8 +5,10 @@ from __future__ import annotations
 import ast
 import inspect
 import logging
+import signal
 import sys
 import threading
+import time
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -54,7 +56,7 @@ def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
     bridge = SimpleNamespace(
         changed=Mock(),
         enabled=False,
-        recordingDevEnabled=False,
+        recordingAvailable=False,
         overlay={},
         requestRecording=Mock(),
         on_start_clicked=Mock(),
@@ -71,7 +73,7 @@ def test_tray_bridge_updates_effective_visibility_and_recording_flag() -> None:
     assert tray.set_meeting_state.call_args.args[0] is None
     tray.set_meeting_record_entry_enabled.assert_called_with(False)
     refresh = bridge.changed.connect.call_args.args[0]
-    bridge.enabled, bridge.recordingDevEnabled = True, True
+    bridge.enabled, bridge.recordingAvailable = True, True
     bridge.overlay = {
         "visible": True,
         "active": True,
@@ -215,7 +217,7 @@ def test_finalizer_meeting_cleanup_preserves_resource_and_lock_barriers(
 @pytest.mark.parametrize("can_resume", [False, True])
 def test_tray_wiring_forwards_resume_admission(can_resume: bool) -> None:
     tray = Mock()
-    bridge = Mock(enabled=True, recordingDevEnabled=True)
+    bridge = Mock(enabled=True, recordingAvailable=True)
     bridge.overlay = {
         "visible": True,
         "active": True,
@@ -238,3 +240,56 @@ def test_tray_wiring_forwards_resume_admission(can_resume: bool) -> None:
         bridge.on_overlay_pause_clicked.assert_called_once_with()
     finally:
         disconnect()
+
+
+def test_no_meeting_dev_gate_remains_in_product_or_admin_docs() -> None:
+    """E13.M4: recording and transcription switch on only by setting + policy + D1."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    files = [
+        *(root / "src").rglob("*.py"),
+        *(root / "qml").rglob("*.qml"),
+        root / "README.md",
+        *(path for path in (root / "docs").rglob("*.md") if "reports" not in path.parts),
+    ]
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for marker in ("ASTRA_VOICE_MEETING_CAPTURE_DEV", "recordingDevEnabled", "dev_enabled"):
+            assert marker not in text, (path.relative_to(root), marker)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_signal_during_start_still_ends_the_event_loop(signum: signal.Signals) -> None:
+    """CI PR #65: SIGTERM between the first handled event and app.exec_() hung the GUI.
+
+    Qt 5 drops quit() made outside a running event loop (exec() resets the request),
+    and the longer E13.M4 start widened that window: the smoke's SIGTERM after «--show»
+    landed there and the program ran on. The request must survive until exec_().
+    """
+    from PyQt5.QtCore import QTimer
+
+    from helpers.qt_app import get_qapplication
+
+    qt_app = get_qapplication()
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    timer = app._install_signal_handlers(qt_app)
+    safety = QTimer()
+    safety.setSingleShot(True)
+    safety.timeout.connect(lambda: qt_app.exit(99))
+    try:
+        handler = signal.getsignal(signum)
+        assert callable(handler)
+        assert qt_app.thread().loopLevel() == 0
+        handler(signum, None)  # the start is still running: no event loop yet
+        safety.start(3000)
+        started = time.monotonic()
+        code = qt_app.exec_()
+        elapsed = time.monotonic() - started
+        assert code == 0, "exec_() ran until the safety timer: the signal was lost"
+        assert elapsed < 2.0
+    finally:
+        safety.stop()
+        timer.stop()
+        for sig, value in previous.items():
+            signal.signal(sig, value)

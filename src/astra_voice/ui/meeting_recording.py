@@ -27,6 +27,7 @@ from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 
 from astra_voice.core.childenv import clean_env as host_environment
 from astra_voice.core.command_mode import SessionSnapshot
+from astra_voice.core.meeting_jobs import JobRole, MeetingJobs
 from astra_voice.core.meeting_session import (
     ERROR_TEXT,
     WARNING_TEXT,
@@ -49,7 +50,7 @@ from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
 Message = dict[str, Any]
-DEV_ENV = "ASTRA_VOICE_MEETING_CAPTURE_DEV"
+EXIT_QUEUE_WRITE_S = 1.0  # floor for the exit-time «transcribing» write (one meeting.json)
 log = logging.getLogger(__name__)
 
 
@@ -116,6 +117,13 @@ def _supervisor(event: Callable[[Message], None], exited: Callable[[int], None])
     return WorkerSupervisor(event, role="meeting-capture", auto_restart=False, on_exit=exited)
 
 
+def transcribe_supervisor(
+    event: Callable[[Message], None], exited: Callable[[int], None]
+) -> JobRole:
+    """Role meeting-transcribe: supervisor restarts it (<= 3 / 10 min), no replay."""
+    return WorkerSupervisor(event, role="meeting-transcribe", on_exit=exited)
+
+
 class MeetingRecording(QObject):
     changed = pyqtSignal()
     openMeetingsRequested = pyqtSignal()
@@ -128,7 +136,6 @@ class MeetingRecording(QObject):
         enabled: Callable[[], bool],
         policy_allowed: Callable[[], bool],
         session_kind: SessionKind,
-        dev_enabled: bool | None = None,
         session_factory: Callable[[], Any] = SessionMonitor,
         owns_session: bool = True,
         supervisor_factory: Callable[
@@ -147,7 +154,6 @@ class MeetingRecording(QObject):
         self.store, self.enabled, self.policy_allowed = store, enabled, policy_allowed
         self._exit_stop_timeout = exit_stop_timeout
         self.session_kind, self.clock = session_kind, clock
-        self.dev_enabled = os.environ.get(DEV_ENV) == "1" if dev_enabled is None else dev_enabled
         self.session_factory, self.owns_session = session_factory, owns_session
         self._monitor: Any = None
         self._supervisor_factory = supervisor_factory
@@ -189,6 +195,9 @@ class MeetingRecording(QObject):
         self._overlay_fallback_deadline = 0.0
         self._notice_app = ""
         self._indicator_guard: MeetingIndicatorGuard | None = None
+        self.jobs: MeetingJobs | None = None
+        self._jobs_saved = ""
+        self._jobs_recover_pending = False  # initialize() asked, policy not yet allowed
         role = self._new_supervisor()
         self.controller = MeetingController(
             store,
@@ -197,7 +206,7 @@ class MeetingRecording(QObject):
             session_kind=session_kind,
             clock=clock,
             storage_probe=storage_probe,
-            enabled=lambda: self.dev_enabled and enabled(),
+            enabled=enabled,
             policy_allowed=policy_allowed,
             id_factory=id_factory,
             metadata_submit=submit,
@@ -259,6 +268,49 @@ class MeetingRecording(QObject):
         self._query_req = ""
         return self._supervisor_factory(event, exited)
 
+    def bind_jobs(self, jobs: MeetingJobs) -> None:
+        """Attach the transcription queue (E13.M4); it resumes on initialize()."""
+        if self._closed or self.jobs is not None:
+            return
+        self.jobs = jobs
+        jobs.admit_allowed = self._jobs_allowed  # one gate for admission (I3)
+        meeting = self.controller.meeting
+        # A meeting saved before binding belongs to the previous program run.
+        self._jobs_saved = meeting.id if meeting is not None and self.controller.saved else ""
+
+    def jobs_action(self, meeting_id: str, action: str) -> bool:
+        """List actions of the transcription queue; False when not ours."""
+        jobs = self.jobs
+        if jobs is None or self._closed:
+            return False
+        if action in {"Расшифровать", "Повторить"}:
+            if not self._jobs_allowed():
+                return True
+            jobs.transcribe(meeting_id)
+        elif action == "Отменить":
+            jobs.cancel(meeting_id)
+        else:
+            return False
+        self._publish()
+        return True
+
+    def _jobs_allowed(self) -> bool:
+        """One gate for every new or resumed job (I3): manual, «сразу» and restart."""
+        return bool(self.enabled() and self.policy_allowed())
+
+    def _recover_jobs(self) -> None:
+        """Resume unfinished jobs once after initialize(), and only while meetings are
+        allowed: under a policy ban the meetings stay as they are (nothing is resumed
+        or removed); a later tick resumes them when the ban is lifted."""
+        if self.jobs is None or not self._jobs_recover_pending or not self._jobs_allowed():
+            return
+        self._jobs_recover_pending = False
+        self.jobs.recover()
+
+    @property
+    def transcription_percent(self) -> int | None:
+        return self.jobs.percent if self.jobs is not None else None
+
     def _snapshot(self) -> SessionSnapshot:
         return self._monitor.snapshot() if self._monitor is not None else SessionSnapshot()
 
@@ -266,12 +318,14 @@ class MeetingRecording(QObject):
         if self._closed:
             return
         self.controller.recover()
+        self._jobs_recover_pending = True
+        self._recover_jobs()
         self._lease_timer.start()
         self._control_timer.start()
         self.tick()
 
     def _activate(self) -> bool:
-        if self._closed or not self.dev_enabled or not self.enabled() or not self.policy_allowed():
+        if self._closed or not self.enabled() or not self.policy_allowed():
             return False
         if self._retire_deadline is not None:
             return False
@@ -304,7 +358,7 @@ class MeetingRecording(QObject):
         return True
 
     def open_dialog(self) -> None:
-        if self._closed or not self.dev_enabled or not self.enabled() or not self.policy_allowed():
+        if self._closed or not self.enabled() or not self.policy_allowed():
             return
         if self.busy:
             self._preview_error = "busy"
@@ -397,7 +451,6 @@ class MeetingRecording(QObject):
     def can_start(self) -> bool:
         return (
             self.dialog_open
-            and self.dev_enabled
             and self.enabled()
             and self.policy_allowed()
             and self._preview_ready
@@ -540,7 +593,7 @@ class MeetingRecording(QObject):
             return
         if action == "Остановить":
             self.clicks.on_stop_clicked()
-        elif action == "Продолжить" and self.dev_enabled and self.enabled():
+        elif action == "Продолжить" and self.enabled():
             self.clicks.on_resume_clicked()
         self._publish()
 
@@ -556,8 +609,7 @@ class MeetingRecording(QObject):
         meeting = controller.meeting
         state = controller.state
         visible = bool(
-            self.dev_enabled
-            and controller._committed
+            controller._committed
             and meeting is not None
             and (
                 state in {"recording", "paused", "stopping", "closing-unknown"}
@@ -609,7 +661,7 @@ class MeetingRecording(QObject):
             elif self.clock() < self._overlay_fallback_deadline:
                 # S17-A4: the notification service did not take the notice.
                 state, secondary = "notify-fallback", self._overlay_fallback_text
-        if self.dev_enabled and self.clock() < self._overlay_error_deadline:
+        if self.clock() < self._overlay_error_deadline:
             visible, state, secondary = True, "error", W2_TEXTS["audioError"]
         pause_minutes = (
             max(0, int((self.clock() - controller._pause_at) // 60))
@@ -637,7 +689,7 @@ class MeetingRecording(QObject):
         }
 
     def overlay_action(self, action: str) -> None:
-        if self._closed or not self.dev_enabled or not self.overlay["visible"]:
+        if self._closed or not self.overlay["visible"]:
             return
         if action == "stop":
             self.clicks.on_stop_clicked()
@@ -662,6 +714,8 @@ class MeetingRecording(QObject):
             self.close_dialog()
             if self.busy:
                 self.clicks.on_stop_clicked()
+            if self.jobs is not None:
+                self.jobs.suspend()
         self._publish()
 
     def _send_query(self, kind: str) -> None:
@@ -761,6 +815,7 @@ class MeetingRecording(QObject):
             self._indicator_guard.check()
         self.controller.tick()
         self._poll_retirement()
+        self._tick_jobs()
         if (
             self.dialog_open
             and self._retire_deadline is None
@@ -786,6 +841,32 @@ class MeetingRecording(QObject):
 
                 self._submit(read)
         self._publish()
+
+    def _queue_saved(self) -> bool:
+        """Queue the just saved meeting once; True when a job was requested."""
+        jobs = self.jobs
+        meeting = self.controller.meeting
+        if (
+            jobs is not None
+            and meeting is not None
+            and self.controller.saved
+            and self.controller._committed
+            and meeting.id != self._jobs_saved
+        ):
+            # The final RECORDED write is durable: no GUI-lease race with capture.
+            self._jobs_saved = meeting.id
+            if self._jobs_allowed():  # a policy ban leaves the meeting «Записана»
+                return jobs.on_recorded(meeting.id)
+        return False
+
+    def _tick_jobs(self) -> None:
+        if self.jobs is None:
+            return
+        if not self._jobs_allowed():
+            self.jobs.suspend()  # a ban stops the running job; it resumes when lifted
+        self._recover_jobs()
+        self._queue_saved()
+        self.jobs.tick()
 
     @property
     def current_meeting(self) -> Meeting | None:
@@ -869,6 +950,7 @@ class MeetingRecording(QObject):
                 tuple(self.recovered),
                 self.controller.manual_resume_required,
                 tuple(sorted(self.controller.pause_reasons)),
+                self.jobs.revision if self.jobs is not None else -1,
             )
         )
         if signature != self._signature:
@@ -941,7 +1023,32 @@ class MeetingRecording(QObject):
             self._stop_for_exit(deadline)
         except Exception:
             log.warning("meeting-exit-stop-failed")
+        queued = False
+        if self.jobs is not None:
+            # Exit during a recording or right after «Стоп» (I2): the final RECORDED
+            # write may still be on the writer thread or not drained into `saved`
+            # (that happens on the next 50 ms tick, which never comes). Finish the
+            # metadata writes, take their results, then queue the meeting durably
+            # (transcribing): it is transcribed at the next start (spec §4.6).
+            try:
+                if not self.controller.close(timeout=max(0.0, deadline - time.monotonic())):
+                    log.warning("meeting-metadata-close-timeout")
+                self.controller._drain_writes()
+            except Exception:
+                log.warning("meeting-exit-drain-failed")
+            queued = self._queue_saved()
         self._closed = True
+        if self.jobs is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if queued:
+                # The transcribing write must land before the process ends.
+                remaining = max(remaining, EXIT_QUEUE_WRITE_S)
+            try:
+                # T-478: no confirmation and no job.cancel; the checkpoint resumes.
+                if not self.jobs.shutdown(timeout=remaining):
+                    log.warning("meeting-jobs-exit-timeout")
+            except Exception:
+                log.warning("meeting-jobs-exit-failed")
         try:
             if self._role_started:
                 # Terminal for the role; after a graceful exit it only releases IPC.

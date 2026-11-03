@@ -16,6 +16,8 @@ Column {
     readonly property bool loading: bridge ? bridge.loading : false
     readonly property bool readError: bridge ? bridge.readError : false
     readonly property bool showList: !loading && (featureEnabled || rows.length > 0) || (bridge && bridge.loadingVisible) || readError
+    // E13.M4: карточка встречи A заменяет содержимое раздела (spec §2.6, «← Все встречи»).
+    readonly property bool cardOpen: bridge ? bridge.cardOpen === true : false
     width: parent ? parent.width : Theme.sizeContentColMax
     spacing: Theme.spaceGroupGap
     function txt(key, fallback) { return bridge && bridge.texts[key] !== undefined ? bridge.texts[key] : fallback }
@@ -24,6 +26,9 @@ Column {
     function commit(key, value) { if (bridge) bridge.setSetting(key, value) }
     readonly property bool detectorAvailable: bridge ? bridge.detectorEnabled : false
     Component.onCompleted: if (bridge) bridge.retry()
+    // Уход из раздела закрывает карточку: при возврате открывается список.
+    Component.onDestruction: if (bridge && bridge.cardOpen === true) bridge.closeMeeting()
+    onCardOpenChanged: if (cardOpen) Qt.callLater(function() { meetingCard.focusBack(Qt.OtherFocusReason) })
     Connections {
         target: root.bridge
         function onChanged() {
@@ -38,7 +43,7 @@ Column {
 
     Item {
         width: parent.width
-        visible: root.featureEnabled && root.bridge !== null && root.bridge.policyNote !== ""
+        visible: !root.cardOpen && root.featureEnabled && root.bridge !== null && root.bridge.policyNote !== ""
         height: visible ? policyNote.implicitHeight + Theme.meetingSectionPolicyNoteMarginTop + Theme.meetingSectionPolicyNoteMarginBottom : 0
         NoteBanner {
             id: policyNote
@@ -52,7 +57,7 @@ Column {
     NoteBanner {
         id: saveError
         objectName: "meetingSaveError"
-        visible: root.bridge && root.bridge.saveError !== undefined ? root.bridge.saveError !== "" : false
+        visible: !root.cardOpen && (root.bridge && root.bridge.saveError !== undefined ? root.bridge.saveError !== "" : false)
         variant: "error"
         iconName: "alert"
         body: root.bridge && root.bridge.saveError !== undefined ? root.bridge.saveError : ""
@@ -63,7 +68,7 @@ Column {
         id: entry
         objectName: "meetingOffEntry"
         width: parent.width
-        visible: !root.featureEnabled
+        visible: !root.featureEnabled && !root.cardOpen
         height: visible ? entryText.implicitHeight + Theme.meetingEntryPaddingY * 2 : 0
         radius: Theme.cardRadius
         color: Theme.bgSurface
@@ -159,7 +164,7 @@ Column {
     SettingGroup {
         objectName: "meetingList"
         width: parent.width
-        visible: root.showList
+        visible: root.showList && !root.cardOpen
         title: root.txt("recordedHeading", "ЗАПИСАННЫЕ ВСТРЕЧИ")
         Item {
             width: parent.width
@@ -230,6 +235,14 @@ Column {
                 width: parent.width
                 height: Math.max(Theme.meetingRowMinH, rowBody.implicitHeight + Theme.meetingRowPaddingTop + Theme.meetingRowPaddingBottom)
                 Rectangle { anchors.fill: parent; color: meetingRow.row.active ? Theme.meetingRowLiveBg : "transparent" }
+                // Клик по строке открывает карточку встречи (кнопки строки — поверх).
+                MouseArea {
+                    objectName: "meetingRowOpen"
+                    anchors.fill: parent
+                    enabled: meetingRow.row.openable === true
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: if (root.bridge) root.bridge.openMeeting(meetingRow.row.id)
+                }
                 Rectangle { width: parent.width; height: 1; color: Theme.borderSoft; visible: index > 0 }
                 RowLayout {
                     id: rowBody
@@ -277,52 +290,12 @@ Column {
                             renderType: Text.NativeRendering
                         }
                     }
-                    Rectangle {
-                        objectName: "meetingBadge"
-                        readonly property string kind: meetingRow.row.badgeKind
-                        readonly property string symbol: meetingRow.row.badge.indexOf("● ") === 0 ? "rec" : meetingRow.row.badge.indexOf("‖ ") === 0 ? "pause" : ""
-                        readonly property string label: symbol !== "" ? meetingRow.row.badge.slice(2) : meetingRow.row.badge
-                        readonly property int timerAt: symbol !== "" ? label.indexOf(" · ") : -1
-                        color: kind === "success" ? Theme.successBg : (kind === "danger" || kind === "error") ? Theme.dangerBg : kind === "warning" ? Theme.warningBg : kind === "primary" ? Theme.primaryBg : Theme.bgSurface2
-                        radius: Theme.badgeRadius
-                        implicitWidth: badgeLabel.implicitWidth + Theme.badgePaddingX * 2
-                        implicitHeight: badgeLabel.implicitHeight + Theme.badgePaddingY * 2
-                        Row {
-                            id: badgeLabel
-                            anchors.centerIn: parent
-                            readonly property var badge: parent
-                            readonly property color ink: badge.kind === "success" ? Theme.successInk : (badge.kind === "danger" || badge.kind === "error") ? Theme.dangerInk : badge.kind === "warning" ? Theme.warningInk : badge.kind === "primary" ? Theme.primary : Theme.fgSecondary
-                            spacing: Theme.badgeGap
-                            Accessible.name: meetingRow.row.badge
-                            Icon {
-                                objectName: "meetingBadgeSymbol"
-                                name: badgeLabel.badge.symbol
-                                size: 11 // design/meetings/tokens.md §8.2: badge glyph.
-                                strokeWidth: name === "pause" ? 2.2 : 1.5
-                                fill: name === "rec"
-                                color: badgeLabel.ink
-                                visible: name !== ""
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-                            Text {
-                                text: badgeLabel.badge.timerAt >= 0 ? badgeLabel.badge.label.slice(0, badgeLabel.badge.timerAt) : badgeLabel.badge.label
-                                textFormat: Text.PlainText
-                                color: badgeLabel.ink
-                                font.family: Theme.fontUi
-                                font.pixelSize: Theme.fontBadgeSize
-                                font.weight: Font.Medium
-                                renderType: Text.NativeRendering
-                            }
-                            Text {
-                                visible: badgeLabel.badge.timerAt >= 0
-                                text: visible ? badgeLabel.badge.label.slice(badgeLabel.badge.timerAt + 1) : ""
-                                textFormat: Text.PlainText
-                                color: badgeLabel.ink
-                                font.family: Theme.fontMono
-                                font.pixelSize: Theme.fontBadgeSize
-                                renderType: Text.NativeRendering
-                            }
-                        }
+                    MeetingBadge {
+                        readonly property string mark: meetingRow.row.badge.indexOf("● ") === 0 ? "rec" : meetingRow.row.badge.indexOf("‖ ") === 0 ? "pause" : ""
+                        text: mark !== "" ? meetingRow.row.badge.slice(2) : meetingRow.row.badge
+                        kind: meetingRow.row.badgeKind
+                        iconName: mark !== "" ? mark : (meetingRow.row.badgeIcon || "")
+                        visible: text !== ""
                     }
                     AvButton {
                         objectName: "meetingRowAction"
@@ -392,7 +365,7 @@ Column {
 
     Column {
         width: parent.width
-        visible: root.featureEnabled
+        visible: root.featureEnabled && !root.cardOpen
         spacing: Theme.spaceGroupGap
         SettingGroup {
             width: parent.width
@@ -655,6 +628,14 @@ Column {
                 renderType: Text.NativeRendering
             }
         }
+    }
+
+    MeetingCard {
+        id: meetingCard
+        width: parent.width
+        visible: root.cardOpen
+        bridge: root.bridge
+        onBackRequested: if (root.bridge) root.bridge.closeMeeting()
     }
 
     ResponsibilityDialog {

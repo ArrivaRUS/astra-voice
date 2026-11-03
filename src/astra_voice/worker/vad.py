@@ -25,6 +25,7 @@ __all__ = [
     "VADError",
     "VADUnavailableError",
     "segment",
+    "speech_probabilities",
     "trim_trailing_silence",
     "unload",
     "vad_available",
@@ -203,6 +204,20 @@ def _probabilities(
                     "Не удалось разобрать запись по паузам; она будет обработана целиком."
                 )
         return None
+
+
+def speech_probabilities(
+    audio: "npt.NDArray[np.float32]",  # noqa: UP037 — строка для ленивых типов numpy
+    cancel: CancelToken | None = None,
+) -> list[float] | None:
+    """Вероятность речи на каждые 512 отсчётов; None — модель недоступна или отмена.
+
+    Состояние модели начинается с нуля на каждом вызове: одинаковый вход даёт
+    одинаковый результат (расшифровка встреч окнами, M4).
+    """
+    if not _validate_audio(audio, _SAMPLE_RATE):
+        return None
+    return _probabilities(audio, cancel)
 
 
 def _pauses(probabilities: list[float], n: int) -> list[tuple[int, int]]:

@@ -12,7 +12,7 @@ from test_meeting_recording_bridge import rig as rig
 from astra_voice import app
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.platform.session import SessionKind
-from astra_voice.ui.meeting_recording import DEV_ENV, MeetingRecording
+from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.overlay import WINDOW_FLAGS
 from astra_voice.ui.tray_icons import TrayState
 
@@ -44,22 +44,20 @@ def finish(rig: Rig) -> None:
     rig.recording.tick()
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "true", "yes", "01", "1"])
-def test_overlay_requires_exact_dev_environment_gate(
-    monkeypatch: pytest.MonkeyPatch, value: str | None
+@pytest.mark.parametrize(
+    ("enabled", "allowed"), [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_overlay_actions_are_inert_without_a_committed_capture(
+    enabled: bool, allowed: bool
 ) -> None:
     from helpers.qt_app import get_qapplication
 
     get_qapplication()
-    if value is None:
-        monkeypatch.delenv(DEV_ENV, raising=False)
-    else:
-        monkeypatch.setenv(DEV_ENV, value)
     role = Mock(generation=1)
     recording = MeetingRecording(
         Mock(),
-        enabled=lambda: True,
-        policy_allowed=lambda: True,
+        enabled=lambda: enabled,
+        policy_allowed=lambda: allowed,
         session_kind=SessionKind.KDE,
         supervisor_factory=lambda *_: role,
         session_factory=Mock(),
@@ -67,7 +65,6 @@ def test_overlay_requires_exact_dev_environment_gate(
         storage_probe=Mock(),
     )
     try:
-        assert recording.dev_enabled is (value == "1")
         assert recording.overlay["visible"] is False
         for action in ("pause", "resume", "stop", "participants", "extend"):
             recording.overlay_action(action)

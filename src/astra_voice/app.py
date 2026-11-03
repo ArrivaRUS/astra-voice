@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import signal
@@ -767,6 +768,21 @@ def _set_context_property(shell: Any, name: str, obj: Any) -> None:
         root_context().setContextProperty(name, obj)
 
 
+def _meeting_model_action(focuser: Any, app_info: Any, settings_bridge: Any) -> Any:
+    """«Установить» / «Установить из файла…» / «Подробнее» → раздел «Модели» (spec §2.5)."""
+    from astra_voice.ui.meeting_card import MODEL_ACTIONS
+
+    def handle(_meeting_id: str, action: str) -> None:
+        if action not in MODEL_ACTIONS:
+            return
+        focuser.focus_shell()
+        app_info.show_section(SECTION_MODELS)
+        if action == "Установить из файла…":
+            settings_bridge.pickInstallPath()
+
+    return handle
+
+
 def _make_meeting_bridge(
     stored: settings_mod.Settings,
     effective: settings_mod.Settings,
@@ -784,9 +800,13 @@ def _make_meeting_bridge(
 
 
 def _bind_meeting_recording(
-    bridge: Any, settings_bridge: Any, session_kind: SessionKind, runtime: Any | None = None
+    bridge: Any,
+    settings_bridge: Any,
+    session_kind: SessionKind,
+    runtime: Any | None = None,
+    model: Any | None = None,
 ) -> None:
-    """M2 GUI adapter; recovery is inert and capture requires the explicit dev click."""
+    """Meeting recording + transcription queue; inert until setting and policy allow it."""
     from astra_voice.ui.meeting_recording import MeetingRecording
 
     options: dict[str, Any] = {}
@@ -806,28 +826,72 @@ def _bind_meeting_recording(
         parent=bridge,
         **options,
     )
-    bridge.bindRecording(recording)
-    if recording.dev_enabled is True:
+    created: list[Any] = []
+    try:
+        # Everything is built before bindRecording: a build without the overlay QML
+        # (or any other failure here) leaves meetings unavailable, never the program
+        # (dictation keeps working) and never a bound capture without its overlay.
+        from astra_voice.core.meeting_jobs import MeetingJobs, probe_gigaam_model
         from astra_voice.ui.meeting_notice import MeetingNotice
-        from astra_voice.ui.meeting_notifications import MeetingNotifications
+        from astra_voice.ui.meeting_notifications import MeetingNotifications, job_notifier
         from astra_voice.ui.meeting_overlay import MeetingOverlay
+        from astra_voice.ui.meeting_recording import transcribe_supervisor
 
-        bridge._meeting_overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
-        bridge.overlayKeyboardRequested.connect(bridge._meeting_overlay.activate_keyboard)
-        bridge._meeting_notice = MeetingNotice(
-            recording, bridge._meeting_overlay, notice=bridge.notice, parent=bridge
+        overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
+        created.append(overlay)
+        notice = MeetingNotice(recording, overlay, notice=bridge.notice, parent=bridge)
+        created.append(notice)
+        notifications = MeetingNotifications(recording, parent=bridge)
+        created.append(notifications)
+        # E13.M4: the transcription queue is bound with capture; both start only when
+        # the setting (D1 accepted) and the administrator policy allow recording.
+        jobs = MeetingJobs(
+            bridge._store,
+            transcribe_supervisor,
+            transcribe_immediately=lambda: bool(bridge.settings["meeting_transcribe_immediately"]),
+            audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
+            notify=job_notifier(),
+            # The catalog's min_ram_mb is known before initialize() -> recover().
+            model_probe=(_meeting_model_probe(model) if model is not None else probe_gigaam_model),
         )
-        bridge.noticeKeyboardRequested.connect(bridge._meeting_notice.activate_keyboard)
-        bridge._meeting_notifications = MeetingNotifications(recording, parent=bridge)
+        recording.bind_jobs(jobs)
         recording.bind_indicators(
-            overlay_visible=lambda: bridge._meeting_overlay.indicator_visible,
+            overlay_visible=lambda: overlay.indicator_visible,
             tray_visible=lambda: bool(
                 runtime is not None
                 and runtime.tray is not None
                 and runtime.tray.meeting_indicator_visible
             ),
         )
+    except Exception:  # noqa: BLE001 — meetings unavailable, the program keeps running
+        log.warning("meeting-recording-unavailable")
+        for item in reversed(created):
+            with contextlib.suppress(Exception):
+                item.deleteLater()
+        with contextlib.suppress(Exception):
+            recording.shutdown()
+        return
+    bridge._meeting_overlay = overlay
+    bridge.overlayKeyboardRequested.connect(overlay.activate_keyboard)
+    bridge._meeting_notice = notice
+    bridge.noticeKeyboardRequested.connect(notice.activate_keyboard)
+    bridge._meeting_notifications = notifications
+    bridge.bindRecording(recording)
     recording.initialize()
+
+
+def _meeting_model_probe(service: Any) -> Callable[[], Any]:
+    """GigaAM v3 admission with the catalog's min_ram_mb (formula of spec §8 PRD)."""
+    from astra_voice.core.meeting_jobs import probe_gigaam_model
+
+    def min_ram(model_id: str) -> int | None:
+        try:
+            entry = service.catalog.entry(model_id)
+        except Exception:  # noqa: BLE001 — unavailable catalog: conservative default
+            return None
+        return entry.min_ram_mb if entry is not None else None
+
+    return lambda: probe_gigaam_model(min_ram_mb=min_ram)
 
 
 def _wire_tray_meetings(
@@ -838,7 +902,7 @@ def _wire_tray_meetings(
     def refresh() -> None:
         tray.set_meetings_enabled(bridge.enabled)
         presentation = bridge.overlay
-        tray.set_meeting_record_entry_enabled(bridge.recordingDevEnabled)
+        tray.set_meeting_record_entry_enabled(bridge.recordingAvailable)
         state = None
         if presentation.get("active"):
             from astra_voice.ui.tray import TrayState
@@ -854,6 +918,10 @@ def _wire_tray_meetings(
             can_resume=presentation.get("canResume", False),
             mic_name=presentation.get("microphoneName", ""),
             limit_remaining_seconds=presentation.get("limitRemainingSeconds"),
+        )
+        percent = getattr(bridge, "transcriptionPercent", -1)
+        tray.set_meeting_transcription(
+            percent if isinstance(percent, int) and percent >= 0 else None
         )
 
     def pause_or_resume() -> None:
@@ -1577,12 +1645,26 @@ def _install_signal_handlers(app: Any) -> Any:
 
     Обработчики Python выполняются только между байт-кодами, а Qt держит поток в
     C++-цикле: пробуждаем интерпретатор таймером.
+
+    Сигнал во время старта (до ``app.exec_()``) не теряется: Qt 5 молча
+    отбрасывает quit() вне работающего цикла (exec() сбрасывает запрос), поэтому
+    такой запрос повторяем тиком таймера уже изнутри цикла (CI PR #65).
     """
     from PyQt5.QtCore import QTimer
 
+    pending = False
+
     def handler(signum: int, _frame: Any) -> None:
+        nonlocal pending
         log.info("получен сигнал %s, завершаюсь", signal.Signals(signum).name)
         app.quit()
+        pending = app.thread().loopLevel() == 0
+
+    def poll() -> None:
+        nonlocal pending
+        if pending and app.thread().loopLevel() > 0:
+            pending = False
+            app.quit()
 
     for signum in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -1591,7 +1673,7 @@ def _install_signal_handlers(app: Any) -> Any:
             log.debug("обработчик сигнала %s не установлен", signum)
     timer = QTimer()
     timer.start(SIGNAL_POLL_MS)
-    timer.timeout.connect(lambda: None)
+    timer.timeout.connect(poll)
     return timer
 
 
@@ -2052,13 +2134,22 @@ def main(argv: list[str] | None = None) -> int:
                 settings_bridge,
                 session_kind,
                 runtime if runtime_ready else None,
+                model,
             )
+            meeting_capture = getattr(meeting_bridge, "_capture", None)
+            jobs = getattr(meeting_capture, "jobs", None)
+            if downloads is not None and jobs is not None:
+                # T-481: an installed/rechecked model starts needs_model jobs by itself.
+                downloads.modelsChanged.connect(jobs.models_changed)
 
             def show_meetings() -> None:
                 focuser.focus_shell()
                 app_info.show_section(SECTION_MEETINGS)
 
             meeting_bridge.openMeetingsRequested.connect(show_meetings)
+            meeting_bridge.meetingActionRequested.connect(
+                _meeting_model_action(focuser, app_info, settings_bridge)
+            )
             if runtime_ready and runtime is not None:
                 meeting_tray_disconnect = _wire_tray_meetings(
                     runtime.tray, meeting_bridge, show_meetings

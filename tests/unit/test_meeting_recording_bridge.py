@@ -85,7 +85,6 @@ class Rig:
         self,
         root: Path,
         *,
-        dev: bool = True,
         kind: SessionKind = SessionKind.KDE,
         role_type: type[Supervisor] = Supervisor,
     ) -> None:
@@ -110,7 +109,6 @@ class Rig:
             enabled=lambda: self.bridge.enabled,
             policy_allowed=lambda: self.bridge.canEnable,
             session_kind=kind,
-            dev_enabled=dev,
             session_factory=lambda: self.session,
             supervisor_factory=factory,
             clock=lambda: self.now,
@@ -189,11 +187,18 @@ def test_bridge_w4_opens_without_prepare_and_only_start_click_records(rig: Rig) 
     assert rig.supervisor.messages[-1]["type"] == "meeting.capture.keepalive"
 
 
-def test_dev_disabled_keeps_programmatic_w4_and_start_inert(rig: Rig) -> None:
-    rig.recording.dev_enabled = False
+@pytest.mark.parametrize("gate", ["setting", "policy"])
+def test_setting_or_policy_off_keeps_programmatic_w4_and_start_inert(rig: Rig, gate: str) -> None:
+    # The only switches are the setting (D1 accepted) and the administrator policy.
+    from astra_voice.core.policy import Policy
+
+    if gate == "setting":
+        rig.recording.enabled = lambda: False
+    else:
+        rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "off"}))
     rig.bridge.requestRecording()
     rig.bridge.on_start_clicked()
-    assert not rig.bridge.recordingDevEnabled and not rig.bridge.startDialogOpen
+    assert rig.bridge.recordingAvailable and not rig.bridge.startDialogOpen
     assert not rig.supervisor.messages and rig.supervisor.starts == 0
 
 
@@ -408,20 +413,88 @@ def test_app_binds_capture_and_borrows_runtime_monitor(
     from unittest.mock import Mock
 
     from astra_voice import app
-    from astra_voice.ui import meeting_recording
+    from astra_voice.core import meeting_jobs
+    from astra_voice.ui import (
+        meeting_notice,
+        meeting_notifications,
+        meeting_overlay,
+        meeting_recording,
+    )
 
     bridge = Mock(_store=rig.store)
     runtime = Mock(_command_session=rig.session)
     factory = Mock()
     monkeypatch.setattr(meeting_recording, "MeetingRecording", factory)
+    jobs = Mock()
+    monkeypatch.setattr(meeting_jobs, "MeetingJobs", jobs)
+    for module, name in (
+        (meeting_overlay, "MeetingOverlay"),
+        (meeting_notice, "MeetingNotice"),
+        (meeting_notifications, "MeetingNotifications"),
+    ):
+        monkeypatch.setattr(module, name, Mock())
     app._bind_meeting_recording(bridge, Mock(device="chosen-mic"), SessionKind.KDE, runtime)
     options = factory.call_args.kwargs
     assert options["owns_session"] is False
     assert options["session_factory"]() is rig.session
     runtime._ensure_session_monitor.assert_called_once_with()
     assert options["microphone"]() == "chosen-mic"
+    assert "dev_enabled" not in options
     bridge.bindRecording.assert_called_once_with(factory.return_value)
+    # No dev gate: overlay, notices and the transcription queue are always bound;
+    # whether anything starts is decided by the setting and the policy (enabled).
+    factory.return_value.bind_jobs.assert_called_once_with(jobs.return_value)
+    factory.return_value.bind_indicators.assert_called_once()
     factory.return_value.initialize.assert_called_once_with()
+
+
+@pytest.mark.parametrize("broken", ["MeetingOverlay", "MeetingNotice", "MeetingJobs"])
+def test_app_keeps_running_when_meeting_parts_fail_to_build_i2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, broken: str
+) -> None:
+    from unittest.mock import Mock
+
+    from astra_voice import app
+    from astra_voice.core import meeting_jobs
+    from astra_voice.ui import (
+        meeting_notice,
+        meeting_notifications,
+        meeting_overlay,
+        meeting_recording,
+    )
+
+    bridge = MeetingBridge(
+        Settings(meetings_enabled=True), store=MeetingStore(tmp_path / "m"), session=SessionKind.KDE
+    )
+    factory = Mock()
+    monkeypatch.setattr(meeting_recording, "MeetingRecording", factory)
+    parts = {
+        "MeetingOverlay": (meeting_overlay, Mock()),
+        "MeetingNotice": (meeting_notice, Mock()),
+        "MeetingNotifications": (meeting_notifications, Mock()),
+        "MeetingJobs": (meeting_jobs, Mock()),
+    }
+    # E.g. a build where the overlay QML did not load (ui/overlay.py RuntimeError).
+    parts[broken][1].side_effect = RuntimeError("PRIVATE /path/Overlay.qml failed")
+    for name, (module, mock) in parts.items():
+        monkeypatch.setattr(module, name, mock)
+    try:
+        with caplog.at_level(logging.WARNING):
+            app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE)
+        assert "meeting-recording-unavailable" in caplog.text
+        assert "PRIVATE" not in caplog.text
+        # No half state: capture is not bound, recording stopped, nothing initialized.
+        assert bridge._capture is None and not bridge.recordingAvailable
+        factory.return_value.shutdown.assert_called_once_with()
+        factory.return_value.initialize.assert_not_called()
+        assert getattr(bridge, "_meeting_overlay", None) is None
+        for name, (_module, mock) in parts.items():
+            if name != broken and mock.called:
+                mock.return_value.deleteLater.assert_called_once_with()
+        # The rest of the section still works.
+        assert bridge.enabled and bridge.meetings == []
+    finally:
+        bridge.shutdown()
 
 
 def test_native_supervisor_launch_failure_is_visible_and_retryable(
@@ -595,12 +668,11 @@ def test_audio_preview_reads_metadata_with_clean_host_environment(
     assert calls[0][1]["timeout"] <= 1
 
 
-def test_explicit_dev_environment_only_reveals_entry_without_launch(
+def test_enabled_recording_never_launches_capture_before_a_click(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from astra_voice.ui.meeting_recording import DEV_ENV
-
-    monkeypatch.setenv(DEV_ENV, "1")
+    # The former dev variable no longer exists: it neither enables nor blocks anything.
+    monkeypatch.setenv("ASTRA_VOICE_MEETING_CAPTURE_DEV", "0")
     service = MeetingRecording(
         rig.store,
         enabled=lambda: True,
@@ -611,7 +683,7 @@ def test_explicit_dev_environment_only_reveals_entry_without_launch(
     )
     try:
         service.initialize()
-        assert service.dev_enabled
+        assert not hasattr(service, "dev_enabled")
         assert isinstance(service.controller.supervisor, Supervisor)
         assert service.controller.supervisor.starts == 0
         assert service.controller.supervisor.messages == []

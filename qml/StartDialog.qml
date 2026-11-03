@@ -85,7 +85,7 @@ ApplicationWindow {
     title: text("title", qsTr("Записать встречу"))
     color: Theme.bgApp
     font.family: Theme.fontUi
-    visible: meeting && meeting.recordingDevEnabled === true && meeting.startDialogOpen === true
+    visible: meeting && meeting.recordingAvailable === true && meeting.startDialogOpen === true
     modality: Qt.WindowModal
     onClosing: function(close) { close.accepted = false; cancel() }
     onVisibleChanged: if (visible) {

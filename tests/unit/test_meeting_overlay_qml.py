@@ -475,10 +475,16 @@ elif mode == "fake-contract":
         "Main.qml", "StartDialog.qml", "sections/Meetings.qml",
         "components/ResponsibilityDialog.qml", "MeetingOverlay.qml",
         "components/MeetingOverlayButton.qml", "components/OverlaySurface.qml",
+        "sections/MeetingCard.qml", "components/MeetingSaveDialog.qml",
+        "components/MeetingToast.qml",
     ):
         source = (repo / "qml" / filename).read_text()
         aliases = "meetings|meetingBridge" if filename == "Main.qml" else "meeting|meetingBridge"
-        if filename in ("sections/Meetings.qml", "components/ResponsibilityDialog.qml"):
+        if filename in (
+            "sections/Meetings.qml", "components/ResponsibilityDialog.qml",
+            "sections/MeetingCard.qml", "components/MeetingSaveDialog.qml",
+            "components/MeetingToast.qml",
+        ):
             aliases = "bridge|meetingBridge"
         pattern = r"(?:" + aliases + r")\.([A-Za-z_][A-Za-z_0-9]*)"
         for name in re.findall(pattern, source):

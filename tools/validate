@@ -2995,12 +2995,36 @@ def cowork_check(args: argparse.Namespace) -> int:
     return network_report(args, checks, notes)
 
 
+def meetings_transcribe(args: argparse.Namespace) -> int:
+    """Real meeting-transcribe role over a corpus: numbers only, files only under --out."""
+    from tools.meeting_transcribe_check import progress_printer, run_transcribe, text_report
+
+    code, report = run_transcribe(
+        args.transcribe,
+        minutes=args.minutes,
+        model_dir=args.model_dir,
+        threads=args.threads,
+        echo_gate=args.echo_gate,
+        out=args.out,
+        progress=(lambda stage, done, total: None) if args.json else progress_printer(),
+    )
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+    else:
+        print("\n".join(text_report(report)))
+    return code
+
+
 def meetings_stand(args: argparse.Namespace) -> int:
     """Run only the explicitly requested private audio stand, never host audio."""
+    if args.transcribe is not None:
+        return meetings_transcribe(args)
     from tools.meeting_stand import run_stand
 
     profiling = {"profile": args.profile} if args.profile is not None else {}
-    code, report = run_stand(minutes=args.minutes, server=args.server, keep=args.keep, **profiling)
+    minutes = 60.0 if args.minutes is None else args.minutes
+    server = args.server or "pipewire"
+    code, report = run_stand(minutes=minutes, server=server, keep=args.keep, **profiling)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, allow_nan=False))
     else:
@@ -3017,10 +3041,42 @@ def main(argv: list[str] | None = None) -> int:
         "cowork", help="контракт Command1 на приватных тестовых шинах"
     )
     cowork_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
-    meetings_parser = commands.add_parser("meetings", help="изолированный стенд захвата встреч")
-    meetings_parser.add_argument("--stand", action="store_true", required=True)
-    meetings_parser.add_argument("--minutes", type=positive_finite, default=60.0)
-    meetings_parser.add_argument("--server", choices=("pipewire", "pulseaudio"), default="pipewire")
+    meetings_parser = commands.add_parser(
+        "meetings", help="изолированный стенд захвата встреч или расшифровка корпуса"
+    )
+    meetings_mode = meetings_parser.add_mutually_exclusive_group(required=True)
+    meetings_mode.add_argument("--stand", action="store_true")
+    meetings_mode.add_argument(
+        "--transcribe",
+        type=Path,
+        metavar="КОРПУС",
+        help=(
+            "роль meeting-transcribe через супервизор на корпусе SP4 "
+            "(mic.wav, far.wav, transcript.json): WER, таймкоды, wall/RTF, пик RSS"
+        ),
+    )
+    meetings_parser.add_argument(
+        "--minutes",
+        type=positive_finite,
+        default=None,
+        help="минут звука: стенд — 60 по умолчанию, --transcribe — весь корпус",
+    )
+    meetings_parser.add_argument("--server", choices=("pipewire", "pulseaudio"), default=None)
+    meetings_parser.add_argument(
+        "--model-dir", type=Path, help="--transcribe: каталог GigaAM v3 e2e RNN-T"
+    )
+    meetings_parser.add_argument(
+        "--threads", type=positive_int, default=None, help="--transcribe: потоки ORT (2)"
+    )
+    meetings_parser.add_argument(
+        "--echo-gate", action="store_true", help="--transcribe: включить эхо-гейт"
+    )
+    meetings_parser.add_argument(
+        "--out",
+        type=Path,
+        metavar="DIR",
+        help="--transcribe: пустой каталог для встречи и окружения роли (иначе временный)",
+    )
     meetings_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     meetings_parser.add_argument(
         "--profile",
@@ -3136,6 +3192,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "catalog" and args.all and (args.from_ref or args.to_ref):
         parser.error("--from/--to применимы только с --switch")
+    if args.command == "meetings":
+        transcribe_only = (args.model_dir, args.threads, args.out)
+        if args.stand and (any(v is not None for v in transcribe_only) or args.echo_gate):
+            parser.error("--model-dir/--threads/--out/--echo-gate применимы только с --transcribe")
+        if args.transcribe is not None and (
+            args.server is not None or args.profile is not None or args.keep
+        ):
+            parser.error("--server/--profile/--keep применимы только со --stand")
+        if args.transcribe is not None and args.threads is None:
+            args.threads = 2
     handlers = {
         "meetings": meetings_stand,
         "cowork": cowork_check,
