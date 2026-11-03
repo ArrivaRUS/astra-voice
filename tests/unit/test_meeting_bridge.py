@@ -359,7 +359,8 @@ def test_retention_date_overflow_omits_date_for_schema_valid_meeting(
     bridge.refresh()
     drain(bridge, tasks)
     assert "звук до" not in bridge.meetings[0]["subtitle"]
-    assert bridge.meetings[0]["badge"] == "✓ Готово"
+    # tokens.md §2.4: the check is a glyph, not a text mark.
+    assert (bridge.meetings[0]["badge"], bridge.meetings[0]["badgeIcon"]) == ("Готово", "check")
 
 
 @pytest.mark.parametrize("started_at", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])

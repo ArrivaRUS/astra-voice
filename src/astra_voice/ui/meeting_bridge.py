@@ -6,12 +6,14 @@ objects; a parented timer consumes plain results and shutdown ignores late work.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -23,7 +25,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.core.settings import save as settings_save
 from astra_voice.meetings.apps import AppClass, AppDataError, AppDefinition, load_apps
 from astra_voice.meetings.events import MeetingState, PolicyCode
-from astra_voice.meetings.model import Meeting, normalize_text
+from astra_voice.meetings.model import Meeting, Transcript, normalize_text
 from astra_voice.meetings.policy import RecordMode, parse_policy, validate_endpoint
 from astra_voice.meetings.settings_ext import (
     MEETING_DEFAULTS,
@@ -31,7 +33,17 @@ from astra_voice.meetings.settings_ext import (
     effective_settings,
 )
 from astra_voice.meetings.store import MeetingStore
+from astra_voice.meetings.templates import (
+    ExportError,
+    sanitize_filename,
+    stenogram,
+    visible_utterances,
+    with_extension,
+    write_export,
+)
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui import meeting_card
+from astra_voice.ui.meeting_card import CARD_STATES, MODEL_ACTIONS, CardRows, TranscriptRows
 from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.meeting_texts import (
     EXIT_TEXTS,
@@ -90,6 +102,41 @@ def _submit(work: Callable[[], None]) -> None:
     threading.Thread(target=work, name="meeting-list", daemon=True).start()
 
 
+def _pick_save_path(suggested: str, fmt: str) -> str | None:
+    """System «Save» dialog (KDE portal / Qt in Fly) for D4; it confirms overwrite itself."""
+    from PyQt5.QtWidgets import QFileDialog
+
+    dialog = QFileDialog(None, "Сохранить как", suggested)
+    dialog.setAcceptMode(QFileDialog.AcceptSave)
+    dialog.setFileMode(QFileDialog.AnyFile)
+    dialog.setDefaultSuffix(fmt)
+    dialog.setNameFilters(["Markdown (*.md)"] if fmt == "md" else ["Текст (*.txt)"])
+    dialog.selectFile(suggested)
+    if not dialog.exec_():
+        return None
+    chosen = dialog.selectedFiles()
+    return chosen[0] if chosen else None
+
+
+def _documents_dir() -> Path:
+    from PyQt5.QtCore import QStandardPaths
+
+    location = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+    return Path(location) if location else Path.home()
+
+
+def _open_folder(path: str) -> bool:
+    from PyQt5.QtCore import QUrl
+
+    from astra_voice.platform.external import open_external
+
+    return open_external(QUrl.fromLocalFile(path).toString())
+
+
+class MeetingReader(Protocol):
+    def read(self, meeting_id: str, filename: str) -> Any: ...
+
+
 def _duration(milliseconds: int) -> str:
     seconds = milliseconds // 1000
     return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
@@ -105,6 +152,17 @@ def _count(count: int) -> str:
     return "встреча" if count % 10 == 1 else "встречи" if 2 <= count % 10 <= 4 else "встреч"
 
 
+# design/meetings/tokens.md §2.4: badge glyphs (rec/pause keep their «●»/«‖» text marks).
+_BADGE_ICONS = {
+    MeetingState.TRANSCRIBING: "clock",
+    MeetingState.WAITING_MEMORY: "clock",
+    MeetingState.NEEDS_MODEL: "alert",
+    MeetingState.DONE: "check",
+    MeetingState.FAILED: "alert",
+    MeetingState.INTERRUPTED: "alert",
+}
+
+
 class MeetingBridge(QObject):
     changed = pyqtSignal()
     enabledChanged = pyqtSignal(bool)
@@ -112,6 +170,7 @@ class MeetingBridge(QObject):
     meetingActionRequested = pyqtSignal(str, str)
     openMeetingsRequested = pyqtSignal()
     participantsRequested = pyqtSignal()
+    cardSaveRequested = pyqtSignal()
     overlayKeyboardRequested = pyqtSignal()
     noticeKeyboardRequested = pyqtSignal()
     exitConfirmed = pyqtSignal()
@@ -128,9 +187,14 @@ class MeetingBridge(QObject):
         known_apps: tuple[AppDefinition, ...] | None = None,
         submit: Callable[[Callable[[], None]], None] = _submit,
         clock: Callable[[], float] = time.monotonic,
+        pick_save_path: Callable[[str, str], str | None] = _pick_save_path,
+        documents_dir: Callable[[], Path] = _documents_dir,
+        open_folder: Callable[[str], bool] = _open_folder,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        self._pick_save_path, self._documents_dir = pick_save_path, documents_dir
+        self._open_folder = open_folder
         self._stored, self._mirror, self._save = stored, mirror, save
         self._policy = policy or Policy()
         self._parsed = parse_policy(self._policy)
@@ -148,6 +212,27 @@ class MeetingBridge(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(20)
         self._timer.timeout.connect(self._poll)
+        # Card A (E13.M4): one open meeting, its rows and the transcript reader.
+        self._card_id = ""
+        self._card_key: tuple[str, int] | None = None
+        self._card_rows = TranscriptRows(self)
+        self._card_builder: CardRows | None = None
+        self._card_loaded = self._card_error = False
+        self._card_transcript: Transcript | None = None
+        self._card_serial = 0
+        self._card_results: queue.SimpleQueue[tuple[int, Transcript | None, bool]] = (
+            queue.SimpleQueue()
+        )
+        self._card_timer = QTimer(self)
+        self._card_timer.setInterval(20)
+        self._card_timer.timeout.connect(self._card_poll)
+        self._card_save_error = ""
+        self._saved_folder = ""
+        self._toast: dict[str, Any] = {"serial": 0, "folder": "", "file": ""}
+        # The card is read by several QML bindings per change: build it once.
+        self._card_cache: dict[str, Any] | None = None
+        self._card_progress: dict[str, Any] | None = None
+        self.changed.connect(self._drop_card_cache)
 
     def _effective(self) -> EffectiveMeetingSettings:
         return effective_settings(self._stored, self._parsed)
@@ -375,17 +460,17 @@ class MeetingBridge(QObject):
             MeetingState.WAITING_MEMORY: ("Ждёт памяти", "warning", "", ["Отменить", "Удалить"]),
             MeetingState.NEEDS_MODEL: ("Нужна модель", "warning", "Установить", ["Удалить"]),
             MeetingState.DONE: (
-                "✓ Готово",
+                "Готово",
                 "success",
                 "Открыть",
                 ["Сохранить как…", "Имена участников", "Переименовать", "Удалить"],
             ),
-            MeetingState.FAILED: ("! Ошибка расшифровки", "danger", "Повторить", ["Удалить"]),
+            MeetingState.FAILED: ("Ошибка расшифровки", "danger", "Повторить", ["Удалить"]),
             MeetingState.INTERRUPTED: ("Прервана", "warning", "Расшифровать", ["Удалить"]),
             MeetingState.DELETING: ("", "neutral", "", []),
         }[state]
         jobs = self._capture.jobs if self._capture is not None else None
-        hints = jobs.row(meeting.id) if jobs is not None else None
+        hints = jobs.row(meeting.id, meeting) if jobs is not None else None
         progress = 0
         if state == MeetingState.TRANSCRIBING and hints is not None:
             progress = int(hints["percent"])
@@ -438,6 +523,8 @@ class MeetingBridge(QObject):
             "subtitle": subtitle,
             "badge": badge,
             "badgeKind": kind,
+            "badgeIcon": "" if saving else _BADGE_ICONS.get(state, ""),
+            "openable": not saving and state in CARD_STATES,
             "action": action,
             "actionEnabled": bool(
                 action
@@ -508,6 +595,7 @@ class MeetingBridge(QObject):
         if documents is not None:
             self._documents = documents
             self._overlay_capture()
+            self._sync_card()
         self._timer.stop()
         self.changed.emit()
 
@@ -525,6 +613,7 @@ class MeetingBridge(QObject):
             overlay.shutdown()
         self._closed = True
         self._timer.stop()
+        self._card_timer.stop()
         self._loading = self._loading_visible = False
         self._responsibility_open = False
 
@@ -621,6 +710,11 @@ class MeetingBridge(QObject):
             if row["id"] == meeting_id and action and action in [row["action"], *row["actions"]]:
                 if action == row["action"] and not row["actionEnabled"]:
                     return
+                if action in {"Открыть", "Сохранить как…"}:
+                    self.openMeeting(meeting_id)
+                    if action == "Сохранить как…" and self._card_id == meeting_id:
+                        self.cardSaveRequested.emit()
+                    return
                 if self._capture is not None and action in {"Остановить", "Продолжить"}:
                     self._capture.action(meeting_id, action)
                     return
@@ -639,6 +733,7 @@ class MeetingBridge(QObject):
 
     def _capture_changed(self) -> None:
         self._overlay_capture()
+        self._sync_card()
         if self._exit_confirm and not self._exit_needs_confirmation():
             # The recording ended by itself: the question no longer applies.
             self._exit_confirm = False
@@ -851,3 +946,271 @@ class MeetingBridge(QObject):
             return False
         clipboard.setText(self.settings["meeting_invite_text"])
         return True
+
+    # ---- card A «Документ» (E13.M4, spec §3.7/§4.7) -----------------------
+
+    def _card_meeting(self) -> Meeting | None:
+        if not self._card_id:
+            return None
+        return next((row for row in self._documents if row.id == self._card_id), None)
+
+    @pyqtSlot(str)
+    def openMeeting(self, meeting_id: str) -> None:
+        meeting = next((row for row in self._documents if row.id == meeting_id), None)
+        if self._closed or meeting is None or meeting.state not in CARD_STATES:
+            return
+        self._card_id = meeting_id
+        self._card_key = None
+        self._card_save_error = ""
+        self._sync_card()
+        self.changed.emit()
+
+    @pyqtSlot()
+    def closeMeeting(self) -> None:
+        if not self._card_id:
+            return
+        self._card_id = ""
+        self._card_key = None
+        self._card_builder = None
+        self._card_transcript = None
+        self._card_serial += 1  # late reads of the closed card are dropped
+        self._card_rows.reset()
+        self._card_timer.stop()
+        self.changed.emit()
+
+    @pyqtProperty(bool, notify=changed)
+    def cardOpen(self) -> bool:
+        return bool(self._card_id) and self._card_meeting() is not None
+
+    @pyqtProperty(QObject, constant=True)
+    def cardRows(self) -> QObject:
+        return self._card_rows
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def cardTexts(self) -> dict[str, str]:
+        return dict(meeting_card.TEXTS)
+
+    @pyqtProperty(str, notify=changed)
+    def cardSaveError(self) -> str:
+        return self._card_save_error
+
+    @pyqtProperty("QVariantMap", notify=changed)
+    def toast(self) -> dict[str, Any]:
+        return dict(self._toast)
+
+    def _jobs(self) -> Any:
+        return self._capture.jobs if self._capture is not None else None
+
+    def _snapshot(self, meeting: Meeting) -> dict[str, Any] | None:
+        jobs = self._jobs()
+        if jobs is None or meeting.state != MeetingState.TRANSCRIBING:
+            return None
+        snapshot = jobs.job_snapshot(meeting.id)
+        return snapshot if isinstance(snapshot, dict) else None
+
+    def _progress(self, meeting: Meeting) -> dict[str, Any] | None:
+        snapshot = self._snapshot(meeting)
+        if snapshot is None:
+            return None
+        return {key: snapshot.get(key, 0) for key in ("percent", "done_ms", "total_ms")}
+
+    def _drop_card_cache(self) -> None:
+        self._card_cache = None
+
+    @pyqtProperty("QVariantMap", notify=changed)
+    def card(self) -> dict[str, Any]:
+        if self._card_cache is None:
+            self._card_cache = self._build_card()
+        return self._card_cache
+
+    def _build_card(self) -> dict[str, Any]:
+        meeting = self._card_meeting()
+        if meeting is None:
+            return {"open": False}
+        jobs = self._jobs()
+        hints = jobs.row(meeting.id, meeting) if jobs is not None else None
+        failure = (
+            str(hints.get("failureCode", "")) if hints else (meeting.transcription.failure or "")
+        )
+        builder = self._card_builder
+        return meeting_card.presentation(
+            meeting,
+            loaded=self._card_loaded,
+            read_error=self._card_error,
+            rows=builder,
+            can_transcribe=self.enabled and jobs is not None,
+            policy_off=self.sectionState == "policy-off",
+            failure=failure,
+            snapshot=self._card_progress if meeting.state == MeetingState.TRANSCRIBING else None,
+        )
+
+    def _sync_card(self) -> None:
+        """Rows follow the open meeting: reload on a new state/generation, append live text."""
+        if not self._card_id or self._closed:
+            return
+        meeting = self._card_meeting()
+        if meeting is None:
+            self._card_id = ""  # deleted elsewhere: back to the list
+            self._card_builder = None
+            self._card_rows.reset()
+            return
+        key = (str(meeting.state), meeting.meeting_generation)
+        if key != self._card_key:
+            self._card_key = key
+            self._card_builder = CardRows(meeting, self._card_rows)
+            self._card_rows.reset()
+            self._card_loaded = self._card_error = False
+            self._card_transcript = None
+            self._card_progress = self._progress(meeting)
+            if meeting.state in {MeetingState.DONE, MeetingState.TRANSCRIBING}:
+                self._load_transcript(meeting)
+            return
+        if self._card_builder is not None:
+            self._card_builder.meeting = meeting
+        if meeting.state == MeetingState.TRANSCRIBING:
+            if self._card_loaded:
+                self._append_live(meeting)
+            else:
+                self._card_progress = self._progress(meeting)
+
+    def _append_live(self, meeting: Meeting) -> None:
+        builder = self._card_builder
+        snapshot = self._snapshot(meeting)
+        if snapshot is not None:
+            self._card_progress = {
+                key: snapshot.get(key, 0) for key in ("percent", "done_ms", "total_ms")
+            }
+        if builder is None:
+            return
+        live = meeting_card.snapshot_utterances(snapshot)
+        if live and live[-1].seq < builder.last_seq:
+            # The job started over (not a resume): show what it has now.
+            builder.load(live, complete=False)
+            return
+        builder.extend(live)
+
+    def _load_transcript(self, meeting: Meeting) -> None:
+        self._card_serial += 1
+        serial, output = self._card_serial, self._card_results
+        store, meeting_id = self._store, meeting.id
+        generation = meeting.meeting_generation
+        root = getattr(store, "root", None)
+
+        def work() -> None:
+            reader = getattr(store, "read", None)
+            transcript: Transcript | None = None
+            failed = False
+            if reader is None:
+                failed = True
+            else:
+                try:
+                    value = reader(meeting_id, "transcript.json")
+                    if isinstance(value, Transcript):
+                        transcript = value
+                except Exception:
+                    missing = root is not None and not os.path.lexists(
+                        Path(root) / meeting_id / "transcript.json"
+                    )
+                    failed = not missing  # no transcript yet is not an error
+            if transcript is not None and transcript.meeting_generation != generation:
+                transcript = None  # an older run's text never shows under a new one
+            output.put((serial, transcript, failed))
+
+        self._submit(work)
+        self._card_timer.start()
+
+    def _card_poll(self) -> None:
+        if self._closed:
+            self._card_timer.stop()
+            return
+        try:
+            serial, transcript, failed = self._card_results.get_nowait()
+        except queue.Empty:
+            return
+        if serial != self._card_serial:
+            return
+        self._card_timer.stop()
+        meeting = self._card_meeting()
+        if meeting is None or self._card_builder is None:
+            return
+        self._card_transcript = transcript
+        self._card_loaded, self._card_error = True, failed
+        utterances = visible_utterances(transcript)
+        done = meeting.state == MeetingState.DONE
+        self._card_builder.load(utterances, complete=done)
+        if meeting.state == MeetingState.TRANSCRIBING:
+            self._append_live(meeting)
+        self.changed.emit()
+
+    @pyqtSlot()
+    def retryCard(self) -> None:
+        meeting = self._card_meeting()
+        if meeting is not None:
+            self._card_key = None
+            self._sync_card()
+            self.changed.emit()
+
+    @pyqtSlot(str)
+    def cardAction(self, action: str) -> None:
+        """Panel and progress buttons: queue actions go through the row whitelist."""
+        meeting = self._card_meeting()
+        if meeting is None or self._closed:
+            return
+        if action in MODEL_ACTIONS:
+            if self.enabled or action == "Подробнее":
+                self.meetingActionRequested.emit(meeting.id, action)
+            return
+        self.requestMeetingAction(meeting.id, action)
+
+    @pyqtSlot(str, result=str)
+    def saveAs(self, fmt: str) -> str:
+        """D4 «Выбрать папку и сохранить…»: system dialog, then a 0600 file (MN-3/15).
+
+        Returns ``saved`` / ``cancelled`` / ``error``; the file is written here,
+        never from QML.
+        """
+        meeting = self._card_meeting()
+        if (
+            meeting is None
+            or self._closed
+            or fmt not in ("md", "txt")
+            or meeting.state != MeetingState.DONE
+            or not self._card_loaded
+        ):
+            return "error"
+        name = sanitize_filename(meeting.title, fmt)
+        chosen = self._pick_save_path(str(self._documents_dir() / name), fmt)
+        if not chosen:
+            return "cancelled"
+        picked = Path(chosen)
+        target = with_extension(picked, fmt)
+        # The system dialog asked before returning an existing file; a name
+        # changed after it (added extension) was never confirmed.
+        confirmed = target == picked and os.path.lexists(target)
+        try:
+            text = stenogram(meeting, self._card_transcript, fmt)
+            write_export(target, text, overwrite=confirmed)
+        except (ExportError, ValueError):
+            self._card_save_error = meeting_card.TEXTS["saveError"]
+            self.changed.emit()
+            return "error"
+        self._card_save_error = ""
+        self._saved_folder = str(target.parent)
+        self._toast = {
+            "serial": int(self._toast["serial"]) + 1,
+            "folder": target.parent.name or str(target.parent),
+            "file": target.name,
+        }
+        self.changed.emit()
+        return "saved"
+
+    @pyqtSlot()
+    def clearCardSaveError(self) -> None:
+        if self._card_save_error:
+            self._card_save_error = ""
+            self.changed.emit()
+
+    @pyqtSlot()
+    def openSavedFolder(self) -> None:
+        if self._saved_folder:
+            self._open_folder(self._saved_folder)

@@ -163,6 +163,12 @@ ApplicationWindow {
         // Шапка раздела: паддинг 12 22 8 (§1.4). Справа — действие раздела (§5.6).
         RowLayout {
             id: header
+            objectName: "sectionHeader"
+            // Карточка встречи (E13.M4) рисует свою шапку «← Все встречи» (spec §4.7).
+            readonly property bool meetingCard: window.currentSection.key === "meetings"
+                && window.meetings !== null && window.meetings.cardOpen === true
+            visible: !meetingCard
+            height: visible ? implicitHeight : 0
             anchors.top: parent.top
             anchors.horizontalCenter: parent.horizontalCenter
             width: Math.min(Theme.sizeContentColMax,
@@ -242,7 +248,7 @@ ApplicationWindow {
         Flickable {
             id: body
             anchors.top: header.bottom
-            anchors.topMargin: Theme.spaceHeadGap - content.ringOutset
+            anchors.topMargin: (header.visible ? Theme.spaceHeadGap : 0) - content.ringOutset
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
             width: Math.min(Theme.sizeContentColMax,
@@ -333,6 +339,16 @@ ApplicationWindow {
                 easing.type: Easing.Bezier
                 easing.bezierCurve: Theme.easingEnter.concat([1, 1])
             }
+        }
+
+        // «Сохранено в «Документы»: …» — по центру низа контента, отступ 14 (tokens.md §3.10).
+        MeetingToast {
+            bridge: window.meetings
+            maxWidth: Math.min(Theme.sizeContentColMax,
+                content.width - 2 * Theme.spaceWindowContentX) - Theme.toastMaxWInset
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: Theme.toastBottom
         }
     }
 
