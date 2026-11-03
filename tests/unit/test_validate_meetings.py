@@ -473,6 +473,8 @@ def test_run_transcribe_refuses_non_empty_out_and_bad_corpus(tmp_path: Path) -> 
     assert (code, report["failure"]) == (2, "corpus-unreadable")  # no mic.wav/far.wav
 
 
+# Real private store files: the owner check needs the real euid (root in CI).
+@pytest.mark.usefixtures("filesystem_euid")
 def test_build_meeting_writes_m2_segments_from_the_corpus(tmp_path: Path) -> None:
     import wave
 
