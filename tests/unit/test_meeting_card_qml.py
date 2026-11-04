@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parents[2]
 QML_PROBE = r"""
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QObject, QPointF, Qt, QUrl
+from PyQt5.QtCore import QObject, QPointF, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
@@ -36,6 +36,9 @@ app = QGuiApplication([])
 for path in (repo / 'tests/fixtures/fonts/pt-root-ui').glob('*.ttf'):
     assert QFontDatabase.addApplicationFont(str(path)) >= 0
 bridge = rc.make_bridge()
+class AsyncBridge(type(bridge)):
+    cardSaveFinished = pyqtSignal(str)
+bridge = AsyncBridge()
 engine = QQmlApplicationEngine()
 install_icon_provider(engine)
 warnings = []
@@ -223,6 +226,33 @@ QTest.qWait(80)
 assert bridge.actions[-1] == 'replace'
 assert replace.property('opened') is False and dialog.property('opened') is False
 bridge.save_result = 'saved'
+
+# Async export: pending leaves dialogs closed; only the completion signal opens
+# the replacement question / existing error flow. Successful completion stays closed.
+bridge.save_result, bridge.replace_file = 'pending', 'итог.md'
+dialog.open()
+QTest.qWait(50)
+dialog.accept()
+QTest.qWait(80)
+assert not dialog.property('opened') and not replace.property('opened')
+bridge.cardSaveFinished.emit('exists')
+QTest.qWait(80)
+assert replace.property('opened') and not dialog.property('opened')
+bridge.replace_result = 'pending'
+replace.accept()
+QTest.qWait(80)
+assert not replace.property('opened') and not dialog.property('opened')
+bridge.save_error = 'Не удалось сохранить файл: папка недоступна для записи'
+bridge.changed.emit()
+bridge.cardSaveFinished.emit('error')
+QTest.qWait(80)
+assert dialog.property('opened') and error.property('visible')
+dialog.accept()
+QTest.qWait(80)
+bridge.cardSaveFinished.emit('saved')
+QTest.qWait(80)
+assert not dialog.property('opened') and not replace.property('opened')
+bridge.save_result, bridge.replace_result, bridge.save_error = 'saved', 'saved', ''
 
 # Keyboard (spec §5.2/§7): «← Все встречи» → «Сохранить как…» → «⋯» → table (one stop, arrows).
 show('ready-1024')

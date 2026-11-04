@@ -612,7 +612,11 @@ class MeetingStore:
         try:
             with self._directory(meeting_id) as directory:
                 _metadata(directory, meeting_id)
-                return _read(directory, filename)
+                document = _read(directory, filename)
+                if isinstance(document, (Transcript, Checkpoint, SegmentSidecar, CaptureJournal)):
+                    if document.meeting_id != meeting_id:
+                        raise MeetingStoreError("meeting-document-id") from None
+                return document
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось прочитать данные встречи") from None
 

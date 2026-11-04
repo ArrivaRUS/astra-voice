@@ -680,6 +680,23 @@ Story `stories.md` US-4.7, ревизия 20 — часть «тема Fly» (Mu
 | T-449 | U/I | Публичный снимок pw-dump/pactl по whitelist: маркеры/MAC/серийники/home/мандатная метка отсутствуют, device/exe замаскированы, строки≤120 без Cc/Cf. | M0/M8; T1 №239; MJ-7 | [ ] |
 | T-450 | U/I | Сырые артефакты спайка только out/raw, 0600, O_EXCL/NOFOLLOW; внешние пути/симлинки/повторная перезапись запрещены; clean удаляет raw, Git игнорирует raw (проверка без изменения индекса). | M0; T1 №240; MJ-7, §4.0 S-3 | [ ] |
 
+### Безопасность · T2 M3+M4 · 2026-11-04
+
+| ID | Уровень | Сценарий → наблюдаемый результат | Требование / источник | Статус |
+|---|---|---|---|---|
+| T-500 | U/I | Удаление: надгробие → отмена владельцев → подтверждённый выход → rmtree; срок звука N > 0 удаляет звук на N-й день, `audio.present=false`; `meeting_retention_days` удаляет встречу, рестарт доводит операции. | T2 I-1; MN-6, MJ-14, Д6 | [ ] M5 — решение владельца, вне правок T2 |
+| T-501 | U | Название, подпись и реплика с `https://x.ru`, `http://x.ru`, `www.x.ru`, `a@b.ru`, HTML, картинками, ссылками и бэктиками → `.md` без кликабельных ссылок/картинок. Каждое недоверенное поле целиком в code span с ограждением длиннее любой серии бэктиков. Рендер markdown-it/linkify и cmark-gfm при наличии; иначе skip только рендер-части. | T2 I-2; MN-1 | [x] 2026-11-04 `test_markdown_untrusted_fields_are_whole_code_spans`, `test_markdown_untrusted_fields_render_without_links_or_images`; R2: отдельно в md-render-venv 90 рендер-проверок markdown-it + cmark-gfm PASS, в venv-a рендер-часть skipped |
+| T-502 | U | В каталоге A документ с `meeting_id` B → `MeetingStore.read` отказывает для transcript/checkpoint/sidecar/capture; карточка при чужом id → `read-error`, экспорт недоступен; старое поколение не показывается и не сбрасывает живые строки при завершении нового прогона. | T2 I-3 | [x] 2026-11-04 `test_read_rejects_document_from_another_meeting`, `test_card_rejects_transcript_identity_and_disables_export`, `test_retranscription_ignores_old_generation_without_resetting_live_rows` |
+| T-503 | I | Медленная ФС при экспорте: слот возвращается сразу, GUI и таймер аренды тикают, результат приходит сигналом; повторное сохранение отклонено, тост/ошибка/вопрос о замене сохраняются. | T2 I-4; BL-4 п. 5 | [x] 2026-11-04 `test_export_keeps_gui_and_lease_timer_alive_and_rejects_repeat` (задержка 1,2 с, offscreen), `test_meeting_card_qml_states_rows_and_keyboard`; R2: `test_unexpected_export_exception_reports_error_and_allows_next_save`, `test_shutdown_waits_for_slow_export_to_finish` (ожидание экспорта при выходе ≤2 с); живой NFS/захват не проверялись |
+| T-504 | U | Строка/inf/NaN/пропущенные ключи, типы, диапазоны и лимиты words/utterances → rc 2, `failure=corpus-transcript`, маркер корпуса не попадает в stdout/stderr, роль не запускается. | T2 I-5 | [x] 2026-11-04 `test_invalid_corpus_is_private_unavailable_before_role` |
+| T-505 | U | WAV/JSON — FIFO, симлинк или каталог → rc 2 за ≤ 1 с; разреженный `transcript.json` > 64 МиБ → rc 2 до чтения, `failure=corpus-file`. | T2 I-6 | [x] 2026-11-04 `test_unsafe_corpus_file_is_unavailable_without_blocking`, `test_oversized_corpus_transcript_is_rejected_before_read` |
+| T-506 | U | Подавленная защёлка lock, смена эпохи между lease и keepalive → авто-открытия нет; без `indicators_visible` открытия нет. | T2 N-1; BL-4/5 | [ ] долг |
+| T-507 | U | Окружение `meeting-transcribe` без `DBUS_SESSION_BUS_ADDRESS`/`DISPLAY`/`XAUTHORITY`. | T2 N-2; MJ-5 | [ ] долг |
+
+Ограничение локальной среды 2026-11-04: `unshare -r` не стартует (`/proc/self/uid_map: Operation not permitted`), поэтому root-прогон не подтверждён. В круге 1 в обычном обязательном наборе 318 тестов прошли, `test_run_role_wires_transcribe_handler` отказал из-за запрета `socketpair.send()` (`PermissionError`, errno 1); отдельная минимальная проба подтвердила запрет. Новые регрессии T-501…T-505 прошли.
+
+Круг 2: `1 failed, 340 passed, 90 skipped, 9980 warnings in 51.79s`; единственный отказ — тот же `test_run_role_wires_transcribe_handler` при запрещённом socketpair send. Все регрессии R2-1…R2-4 PASS; 90 рендер-кейсов, skipped в venv-a, отдельно PASS на markdown-it/linkify и cmark-gfm в md-render-venv. `make lint`: ruff PASS, mypy `Success: no issues found in 504 source files`.
+
 ### Дополнительные гейты §11 плана #1
 
 | ID | Уровень | Сценарий → наблюдаемый результат | Требование / источник | Статус |

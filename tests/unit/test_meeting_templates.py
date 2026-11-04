@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+import re
 import stat
 from datetime import timedelta, timezone
 from pathlib import Path
@@ -108,7 +110,7 @@ def test_stenogram_rules() -> None:
     # Literal text, one line per reply: an embedded LF cannot fake a timecode line.
     assert "Олег, <b>это</b> & *всё*?" in text
     md = stenogram(fixture_meeting(), fixture_transcript(), "md", tz=MSK)
-    assert "Олег, \\<b\\>это\\</b\\> \\& \\*всё\\*?" in md
+    assert "`Олег, <b>это</b> & *всё*?`" in md
     # Pause = recorded point + wall-clock gap of the intervals (decision 03.11: the
     # recorded axis excludes paused time, so no range); stop is not a pause.
     assert "Пауза 0:31:10 · 2 мин 52 с" in text and "0:34:02" not in text
@@ -125,12 +127,8 @@ def test_markdown_links_images_and_headings_stay_literal() -> None:
     transcript = fixture_transcript()
     transcript.utterances[0].text = "[клик](https://example.com) ![x](file:///etc/passwd)"
     md = stenogram(meeting, transcript, "md", tz=MSK)
-    assert md.startswith("# \\# заголовок \\[клик\\]\\(https://example.com\\)\n")
-    assert (
-        "[0:00:04] Я: \\[клик\\]\\(https://example.com\\) \\!\\[x\\]\\(file:///etc/passwd\\)\n"
-        in md
-    )
-    assert "](" not in md and "![" not in md
+    assert md.startswith("# `# заголовок [клик](https://example.com)`\n")
+    assert "[0:00:04] `Я`: `[клик](https://example.com) ![x](file:///etc/passwd)`\n" in md
     txt = stenogram(meeting, transcript, "txt", tz=MSK)
     assert txt.startswith("# заголовок [клик](https://example.com)\n")
     assert "[0:00:04] Я: [клик](https://example.com) ![x](file:///etc/passwd)\n" in txt
@@ -139,6 +137,95 @@ def test_markdown_links_images_and_headings_stay_literal() -> None:
 def test_stenogram_unknown_format_is_rejected() -> None:
     with pytest.raises(ValueError):
         stenogram(fixture_meeting(), fixture_transcript(), "html")
+
+
+HOSTILE_FIELDS = [
+    "https://x.ru",
+    "http://x.ru",
+    "www.x.ru",
+    "a@b.ru",
+    "example.ru",
+    "<img src=x>",
+    "![i](u)",
+    "[t](u)",
+    "`c`",
+    "`start",
+    "end`",
+    "a``b```c",
+    "```",
+    " padded ",
+    "\\<>&*_[]()!#@",
+]
+
+
+def untrusted_export(field: str, literal: str) -> tuple[str, list[str]]:
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    transcript.utterances = transcript.utterances[:1]
+    if field == "title":
+        meeting.title = literal
+    elif field == "label":
+        meeting.self_label = literal
+    else:
+        transcript.utterances[0].text = literal
+    md = stenogram(meeting, transcript, "md", tz=MSK)
+    reply = next(line for line in md.splitlines() if line.startswith("[0:00:04] "))
+    if field == "title":
+        fragments = [md.splitlines()[0].removeprefix("# ")]
+    elif field == "label":
+        names = next(
+            line.removeprefix("- Участники: ")
+            for line in md.splitlines()
+            if line.startswith("- Участники: ")
+        )
+        fragments = [names, reply.removeprefix("[0:00:04] ").rsplit(": ", 1)[0]]
+    else:
+        fragments = [reply.split(": ", 1)[1]]
+    return md, fragments
+
+
+@pytest.mark.parametrize("field", ["title", "label", "reply"])
+@pytest.mark.parametrize("literal", HOSTILE_FIELDS)
+def test_markdown_untrusted_fields_are_whole_code_spans(field: str, literal: str) -> None:
+    _md, fragments = untrusted_export(field, literal)
+    visible = " ".join(literal.split()) if field == "reply" else literal
+    longest = max((len(run) for run in re.findall(r"`+", visible)), default=0)
+    for fragment in fragments:
+        span = re.fullmatch(r"(`+)(.*?)\1", fragment)
+        assert span is not None
+        assert len(span[1]) > longest
+        assert span[2] in (visible, " " + visible + " ")
+        if visible.startswith("`") or visible.endswith("`"):
+            assert span[2] == " " + visible + " "
+
+
+@pytest.mark.parametrize("renderer", ["markdown_it", "cmarkgfm"])
+@pytest.mark.parametrize("field", ["title", "label", "reply"])
+@pytest.mark.parametrize("literal", HOSTILE_FIELDS)
+def test_markdown_untrusted_fields_render_without_links_or_images(
+    renderer: str,
+    field: str,
+    literal: str,
+) -> None:
+    from html import unescape
+
+    try:
+        module = importlib.import_module(renderer)
+        if renderer == "markdown_it":
+            importlib.import_module("linkify_it")
+    except ImportError:
+        pytest.skip("Markdown renderer unavailable")
+    md, _fragments = untrusted_export(field, literal)
+    if renderer == "markdown_it":
+        html = (
+            module.MarkdownIt("commonmark", {"linkify": True, "html": False})
+            .enable("linkify")
+            .render(md)
+        )
+    else:
+        html = module.github_flavored_markdown_to_html(md)
+    assert "<a" not in html and "<img" not in html
+    visible = " ".join(literal.split()) if field == "reply" else literal
+    assert visible in unescape("".join(re.findall(r"<code>(.*?)</code>", html)))
 
 
 def test_placeholders_match_the_role_constants() -> None:

@@ -25,20 +25,25 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
 import uuid
 import wave
 from bisect import bisect_left
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
-import numpy as np
+from typing import Any, BinaryIO
 
 RATE = 16000
+MAX_CORPUS_WORDS = 1_000_000
+MAX_CORPUS_UTTERANCES = 100_000
+MAX_CORPUS_SENTENCES = 100_000
+MAX_CORPUS_SECONDS = 4 * 60 * 60
+MAX_CORPUS_JSON_BYTES = 64 * 1024 * 1024
 SEGMENT_S = 300  # capture rotates segments every 5 min (sidecar: <= 302 knots)
 MEETING_ID = "2026-11-03_120000-e13v"
 STARTED_AT = "2026-11-03T12:00:00+03:00"
@@ -82,6 +87,8 @@ def word_errors(reference: Sequence[str], hypothesis: Sequence[str]) -> int:
     """
     if not reference or not hypothesis:
         return max(len(reference), len(hypothesis))
+    import numpy as np
+
     vocabulary: dict[str, int] = {}
     ref = [vocabulary.setdefault(word, len(vocabulary)) for word in reference]
     hyp = np.array([vocabulary.setdefault(word, len(vocabulary)) for word in hypothesis])
@@ -147,6 +154,55 @@ def track_of(speaker: str) -> str:
     return "mic" if speaker.startswith("owner") else "far"
 
 
+def _corpus_time(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise Unavailable("corpus-transcript") from None
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        raise Unavailable("corpus-transcript") from None
+    if not math.isfinite(number) or not 0 <= number <= MAX_CORPUS_SECONDS:
+        raise Unavailable("corpus-transcript") from None
+    return number
+
+
+def _validate_corpus(document: object) -> dict[str, Any]:
+    """Validate every consumed field before launching any role; fixed errors only."""
+    if not isinstance(document, dict):
+        raise Unavailable("corpus-transcript") from None
+    sentences_count = 0
+    for key, limit in (("words", MAX_CORPUS_WORDS), ("utterances", MAX_CORPUS_UTTERANCES)):
+        rows = document.get(key)
+        if not isinstance(rows, list) or len(rows) > limit:
+            raise Unavailable("corpus-transcript") from None
+        for row in rows:
+            if not isinstance(row, dict):
+                raise Unavailable("corpus-transcript") from None
+            start, end = _corpus_time(row.get("start")), _corpus_time(row.get("end"))
+            if end < start or not isinstance(row.get("speaker"), str) or not row["speaker"]:
+                raise Unavailable("corpus-transcript") from None
+            if key == "words":
+                if not isinstance(row.get("word"), str):
+                    raise Unavailable("corpus-transcript") from None
+                continue
+            if "text" in row and not isinstance(row["text"], str):
+                raise Unavailable("corpus-transcript") from None
+            sentences = row.get("sentences", [])
+            if not isinstance(sentences, list):
+                raise Unavailable("corpus-transcript") from None
+            sentences_count += len(sentences)
+            if sentences_count > MAX_CORPUS_SENTENCES:
+                raise Unavailable("corpus-transcript") from None
+            for sentence in sentences:
+                if not isinstance(sentence, dict):
+                    raise Unavailable("corpus-transcript") from None
+                onset = _corpus_time(sentence.get("start"))
+                finish = _corpus_time(sentence.get("end", end))
+                if not start <= onset <= finish <= end:
+                    raise Unavailable("corpus-transcript") from None
+    return document
+
+
 def load_reference(document: dict[str, Any], audio_ms: int) -> Reference:
     """Words whose middle is before the cut; replies with >= 1 s of sound before it.
 
@@ -154,6 +210,7 @@ def load_reference(document: dict[str, Any], audio_ms: int) -> Reference:
     ``separable`` are reply starts after >= 1 s of silence on the same track
     (turns closer than the VAD pause merge into one reply of ours).
     """
+    _validate_corpus(document)
     reference = Reference()
     words = sorted(document["words"], key=lambda w: (w["start"], w["end"]))
     for word in words:
@@ -295,14 +352,47 @@ def private_environment(root: Path) -> dict[str, str]:
     return env
 
 
+@contextmanager
+def _corpus_file(path: Path, *, limit: int | None = None) -> Iterator[BinaryIO]:
+    """Pin a regular corpus file; FIFO/device/symlink never reach a parser."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        raise  # preserve the caller's existing missing-file reason
+    except OSError:
+        raise Unavailable("corpus-file") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or (limit is not None and info.st_size > limit):
+            raise Unavailable("corpus-file") from None
+        stream = os.fdopen(descriptor, "rb")
+    except (OSError, Unavailable):
+        os.close(descriptor)
+        raise Unavailable("corpus-file") from None
+    with stream:
+        yield stream
+
+
+def _read_corpus(path: Path) -> dict[str, Any]:
+    try:
+        with _corpus_file(path, limit=MAX_CORPUS_JSON_BYTES) as stream:
+            raw = stream.read(MAX_CORPUS_JSON_BYTES + 1)
+        if len(raw) > MAX_CORPUS_JSON_BYTES:
+            raise Unavailable("corpus-file") from None
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        raise Unavailable("corpus-transcript") from None
+    return _validate_corpus(document)
+
+
 def _check_wav(path: Path) -> int:
     try:
-        with wave.open(str(path), "rb") as wav:
+        with _corpus_file(path) as stream, wave.open(stream, "rb") as wav:
             if (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) != (RATE, 1, 2):
                 raise Unavailable("corpus-format")
             return wav.getnframes()
-    except (OSError, EOFError, wave.Error) as exc:
-        raise Unavailable("corpus-unreadable") from exc
+    except (OSError, EOFError, wave.Error):
+        raise Unavailable("corpus-unreadable") from None
 
 
 def build_meeting(corpus: Path, data_home: Path, minutes: float | None) -> int:
@@ -335,7 +425,7 @@ def build_meeting(corpus: Path, data_home: Path, minutes: float | None) -> int:
     audio = store.root / MEETING_ID / "audio"
     size = SEGMENT_S * RATE
     for track, name in TRACK_FILES.items():
-        with wave.open(str(corpus / name), "rb") as source:
+        with _corpus_file(corpus / name) as stream, wave.open(stream, "rb") as source:
             sample = index = 0
             while sample < frames:
                 count = min(size, frames - sample)
@@ -581,20 +671,14 @@ def run_transcribe(
         required = LAYOUTS[str(MODEL["layout"])][str(MODEL["variant"])].required
         if not all((directory / name).is_file() for name in required):
             raise Unavailable("model-missing")
-        try:
-            document = json.loads((corpus / "transcript.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise Unavailable("corpus-transcript") from exc
-        if not isinstance(document, dict) or not all(
-            isinstance(document.get(key), list) for key in ("words", "utterances")
-        ):
-            raise Unavailable("corpus-transcript")
+        document = _read_corpus(corpus / "transcript.json")
         root, temporary = _prepare_out(out)
         report["out"] = None if temporary else str(root)
         env = private_environment(root)
         data_home = Path(env["XDG_DATA_HOME"])
         prepared = time.monotonic()
         audio_ms = build_meeting(corpus, data_home, minutes)
+        reference = load_reference(document, audio_ms)
         report["prepare_ms"] = round((time.monotonic() - prepared) * 1000)
         from astra_voice.core.paths import APP_NAME
 
@@ -612,7 +696,7 @@ def run_transcribe(
             }
         )
         metrics = evaluate(
-            load_reference(document, audio_ms),
+            reference,
             run.utterances,
             audio_ms=audio_ms,
             wall_ms=run.wall_ms,

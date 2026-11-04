@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from PyQt5.QtCore import QThread
+from PyQt5.QtTest import QSignalSpy, QTest
 from test_meeting_jobs_ui import MID, Rig
 from test_tray import qapp as qapp
 
@@ -18,7 +23,7 @@ from astra_voice.core.meeting_jobs import ModelAdmission
 from astra_voice.meetings.events import MeetingState
 from astra_voice.meetings.model import Mark, Transcript, Utterance
 from astra_voice.meetings.store import Writer
-from astra_voice.meetings.templates import DAMAGED_TEXT
+from astra_voice.meetings.templates import DAMAGED_TEXT, stenogram, write_export
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
@@ -101,6 +106,58 @@ ROWS = [
     (23_000, 25_000, "me", "эхо"),
     (2_400_000, 2_410_000, "others", DAMAGED_TEXT),
 ]
+
+
+def test_export_keeps_gui_and_lease_timer_alive_and_rejects_repeat(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.ui import meeting_bridge
+
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:1])
+    rig.open_card()
+    rig.answer = str(rig.documents / "slow.md")
+    calls: list[int] = []
+    original = write_export
+    render = stenogram
+    gui_thread = QThread.currentThread()
+
+    def background_render(*args: Any, **kwargs: Any) -> str:
+        assert QThread.currentThread() != gui_thread
+        return render(*args, **kwargs)
+
+    def slow(target: Path, text: str, *, overwrite: bool = False) -> None:
+        calls.append(threading.get_ident())
+        assert QThread.currentThread() != gui_thread
+        time.sleep(1.2)
+        original(target, text, overwrite=overwrite)
+
+    monkeypatch.setattr(meeting_bridge, "write_export", slow)
+    monkeypatch.setattr(meeting_bridge, "stenogram", background_render)
+    # Use the recording's real lease timer, with a shorter interval for this unit test.
+    ticks = QSignalSpy(rig.recording._lease_timer.timeout)
+    rig.recording._lease_timer.start(100)
+    started = time.monotonic()
+    result = rig.bridge.saveAs("md")
+    assert time.monotonic() - started < 0.3
+    assert result == "pending"
+    finished = QSignalSpy(rig.bridge.cardSaveFinished)
+    completed_on: list[QThread] = []
+    rig.bridge.cardSaveFinished.connect(
+        lambda _result: completed_on.append(QThread.currentThread())
+    )
+    assert rig.bridge.saveAs("txt") == "pending"
+    assert rig.bridge.replaceSaveTarget() == "pending"
+    assert len(rig.picked) == 1
+    assert rig.bridge._card_transcript is not None
+    rig.bridge._card_transcript.utterances[0].text = "later GUI edit"
+    QTest.qWait(350)
+    assert len(ticks) >= 2 and not finished
+    assert finished.wait(2500)
+    assert list(finished) == [["saved"]] and len(calls) == 1
+    assert completed_on == [gui_thread]
+    assert rig.bridge.toast["file"] == "slow.md"
+    assert "Коллеги, добрый день." in (rig.documents / "slow.md").read_text()
 
 
 def test_done_card_rows_hide_echo_and_empty_and_turn_placeholders_into_marks(
@@ -248,6 +305,82 @@ def finish(rig: SaveRig, generation: int) -> None:
     )
     rig.recording.tick()
     assert rig.meeting().state == MeetingState.DONE
+
+
+def test_retranscription_ignores_old_generation_without_resetting_live_rows(rig: SaveRig) -> None:
+    rig.create()
+    rig.transcript(ROWS[:1])
+    old_generation = rig.meeting().meeting_generation
+    rig.save()
+    rig.start_running()
+    generation = rig.meeting().meeting_generation
+    assert generation == old_generation + 1
+    rig.open_card()
+    opening_failed = rig.bridge._card_error
+    assert rig.bridge.cardRows.rowCount() == 0  # no text from the previous run
+    resets = QSignalSpy(rig.bridge.cardRows.modelReset)
+    rig.transcript([(0, 500, "others", "новая расшифровка")])
+    finish(rig, generation)
+    while rig.tasks:
+        rig.tasks.pop(0)()
+    rig.bridge._card_poll()
+    assert not opening_failed and not rig.bridge._card_error
+    assert not resets
+    assert rig.bridge.cardRows.rows()[0]["text"] == "новая расшифровка"
+
+
+def test_unexpected_export_exception_reports_error_and_allows_next_save(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from astra_voice.ui import meeting_bridge
+
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:1])
+    rig.open_card()
+    rig.answer = str(rig.documents / "error.md")
+    monkeypatch.setattr(meeting_bridge, "stenogram", Mock(side_effect=TypeError("PRIVATE_EXPORT")))
+    finished = QSignalSpy(rig.bridge.cardSaveFinished)
+    assert rig.bridge.saveAs("md") == "pending"
+    assert finished or finished.wait(1500)
+    assert list(finished) == [["error"]]
+    assert not rig.bridge._export_busy and rig.bridge.cardSaveError
+    rig.answer = None
+    assert rig.bridge.saveAs("md") == "cancelled"
+    assert len(rig.picked) == 2
+    captured = capsys.readouterr()
+    assert "PRIVATE_EXPORT" not in captured.out + captured.err
+
+
+def test_shutdown_waits_for_slow_export_to_finish(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.ui import meeting_bridge
+
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:1])
+    rig.open_card()
+    target = rig.documents / "shutdown.md"
+    rig.answer = str(target)
+    expected = stenogram(rig.meeting(), rig.bridge._card_transcript, "md")
+    started, completed = threading.Event(), threading.Event()
+
+    def slow(path: Path, text: str, *, overwrite: bool) -> None:
+        started.set()
+        try:
+            time.sleep(0.5)
+            write_export(path, text, overwrite=overwrite)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(meeting_bridge, "write_export", slow)
+    assert rig.bridge.saveAs("md") == "pending"
+    assert started.wait(1)
+    try:
+        rig.bridge.shutdown()
+        assert completed.is_set()
+        assert target.read_text(encoding="utf-8") == expected
+    finally:
+        assert completed.wait(2)  # also cleanly retire the worker in the RED case
 
 
 def test_done_after_live_rows_appends_the_tail_without_reset(rig: SaveRig) -> None:
@@ -429,18 +562,27 @@ def test_model_buttons_go_to_the_models_section(rig: SaveRig) -> None:
     settings.pickInstallPath.assert_called_once_with()
 
 
+def save_result(rig: SaveRig, operation: Callable[[], str]) -> str:
+    finished = QSignalSpy(rig.bridge.cardSaveFinished)
+    result = operation()
+    if result != "pending":
+        return result
+    assert finished or finished.wait(3000)
+    return str(finished[0][0])
+
+
 def test_save_as_writes_a_private_file_and_shows_the_toast(rig: SaveRig) -> None:
     rig.create(state=MeetingState.DONE, title="Планёрка / бюджет")
     rig.transcript(ROWS[:2])
     rig.open_card()
     rig.answer = None
-    assert rig.bridge.saveAs("md") == "cancelled"
+    assert save_result(rig, lambda: rig.bridge.saveAs("md")) == "cancelled"
     assert rig.picked == [(str(rig.documents / "Планёрка бюджет.md"), "md")]
     target = rig.documents / "итог"
     rig.answer = str(target)
     old = os.umask(0)
     try:
-        assert rig.bridge.saveAs("txt") == "saved"
+        assert save_result(rig, lambda: rig.bridge.saveAs("txt")) == "saved"
     finally:
         os.umask(old)
     written = rig.documents / "итог.txt"
@@ -454,22 +596,31 @@ def test_save_as_writes_a_private_file_and_shows_the_toast(rig: SaveRig) -> None
     # An existing name is never replaced on the system dialog's word: the card asks.
     written.write_text("старое", encoding="utf-8")
     rig.answer = str(written)
-    assert rig.bridge.saveAs("txt") == "exists" and rig.bridge.cardReplaceFile == "итог.txt"
+    assert (
+        save_result(rig, lambda: rig.bridge.saveAs("txt")) == "exists"
+        and rig.bridge.cardReplaceFile == "итог.txt"
+    )
     assert written.read_text(encoding="utf-8") == "старое"
-    assert rig.bridge.replaceSaveTarget() == "saved"  # «Заменить»
+    assert save_result(rig, rig.bridge.replaceSaveTarget) == "saved"  # «Заменить»
     assert rig.bridge.toast["serial"] == serial + 1 and rig.bridge.cardReplaceFile == ""
     assert "Добрый" in written.read_text(encoding="utf-8")
     assert stat.S_IMODE(written.stat().st_mode) == 0o600
-    assert rig.bridge.replaceSaveTarget() == "error"  # the answer is used once
+    assert save_result(rig, rig.bridge.replaceSaveTarget) == "error"  # the answer is used once
     # A name that only exists after the extension was added: asked as well; «Отмена» keeps it.
     (rig.documents / "новое.md").write_text("старое", encoding="utf-8")
     rig.answer = str(rig.documents / "новое")
-    assert rig.bridge.saveAs("md") == "exists" and rig.bridge.cardReplaceFile == "новое.md"
+    assert (
+        save_result(rig, lambda: rig.bridge.saveAs("md")) == "exists"
+        and rig.bridge.cardReplaceFile == "новое.md"
+    )
     rig.bridge.cancelReplace()
-    assert rig.bridge.cardReplaceFile == "" and rig.bridge.replaceSaveTarget() == "error"
+    assert (
+        rig.bridge.cardReplaceFile == ""
+        and save_result(rig, rig.bridge.replaceSaveTarget) == "error"
+    )
     assert (rig.documents / "новое.md").read_text(encoding="utf-8") == "старое"
     rig.answer = str(rig.documents / "нет" / "файл.md")
-    assert rig.bridge.saveAs("md") == "error"
+    assert save_result(rig, lambda: rig.bridge.saveAs("md")) == "error"
 
 
 def test_file_created_after_the_dialog_is_not_replaced_without_an_answer(rig: SaveRig) -> None:
@@ -484,15 +635,15 @@ def test_file_created_after_the_dialog_is_not_replaced_without_an_answer(rig: Sa
         return str(target)
 
     rig.bridge._pick_save_path = pick
-    assert rig.bridge.saveAs("md") == "exists"
+    assert save_result(rig, lambda: rig.bridge.saveAs("md")) == "exists"
     assert target.read_text(encoding="utf-8") == "чужой"
     rig.bridge.openMeeting(MID)  # another open drops the question
-    assert rig.bridge.replaceSaveTarget() == "error"
+    assert save_result(rig, rig.bridge.replaceSaveTarget) == "error"
     assert target.read_text(encoding="utf-8") == "чужой"
     rig.open_card()
     rig.bridge._card_poll()  # the first open's read is stale; this one loads the card
-    assert rig.bridge.saveAs("md") == "exists"
-    assert rig.bridge.replaceSaveTarget() == "saved"
+    assert save_result(rig, lambda: rig.bridge.saveAs("md")) == "exists"
+    assert save_result(rig, rig.bridge.replaceSaveTarget) == "saved"
     assert "Коллеги, добрый день." in target.read_text(encoding="utf-8")
 
 
@@ -500,5 +651,23 @@ def test_save_needs_a_loaded_done_meeting(rig: SaveRig) -> None:
     rig.create(state=MeetingState.NEEDS_MODEL)
     rig.open_card()
     rig.answer = str(rig.documents / "x.md")
-    assert rig.bridge.saveAs("md") == "error" and rig.picked == []
-    assert rig.bridge.saveAs("html") == "error"
+    assert save_result(rig, lambda: rig.bridge.saveAs("md")) == "error" and rig.picked == []
+    assert save_result(rig, lambda: rig.bridge.saveAs("html")) == "error"
+
+
+@pytest.mark.parametrize("source", ["disk", "reader"])
+def test_card_rejects_transcript_identity_and_disables_export(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:1])
+    document = rig.store.read(MID, "transcript.json")
+    document.meeting_id = "2026-11-01_130000-ab12"
+    # A reader seam also proves the bridge's own check, independently of the store.
+    if source == "reader":
+        monkeypatch.setattr(rig.store, "read", lambda *_args: document)
+    else:
+        (rig.store.root / MID / "transcript.json").write_text(json.dumps(document.to_dict()))
+    card = rig.open_card()
+    assert card["view"] == "read-error" and not card["showActions"]
+    assert rig.bridge.saveAs("md") == "error" and not rig.picked
