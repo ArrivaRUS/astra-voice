@@ -851,6 +851,7 @@ def _bind_meeting_recording(
             transcribe_supervisor,
             transcribe_immediately=lambda: bool(bridge.settings["meeting_transcribe_immediately"]),
             audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
+            meeting_retention_days=lambda: int(bridge.settings["meeting_retention_days"]),
             notify=job_notifier(),
             # The catalog's min_ram_mb is known before initialize() -> recover().
             model_probe=(_meeting_model_probe(model) if model is not None else probe_gigaam_model),

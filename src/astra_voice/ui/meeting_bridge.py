@@ -253,6 +253,7 @@ class MeetingBridge(QObject):
         self._export_id = ""
         self._delete_pending: dict[str, Meeting] = {}
         self._delete_waiting: set[str] = set()
+        self._release_waiting: dict[str, Callable[[], None]] = {}
         self._delete_observed: dict[str, str | None] = {}
         self._delete_timer = QTimer(self)
         self._delete_timer.setInterval(100)
@@ -774,6 +775,9 @@ class MeetingBridge(QObject):
     def bindRecording(self, capture: MeetingRecording) -> None:
         """Bind the existing section to the inert M2 adapter; no launch here."""
         self._capture = capture
+        capture.release_files = self._release_files
+        if capture.jobs is not None:
+            capture.jobs.release_files = self._release_files
         capture.changed.connect(self._capture_changed)
         capture.openMeetingsRequested.connect(self.openMeetingsRequested)
         capture.participantsRequested.connect(self.participantsRequested)
@@ -1285,12 +1289,30 @@ class MeetingBridge(QObject):
         jobs = self._jobs()
         if self._closed or jobs is None:
             return
+        for meeting_id, done in tuple(self._release_waiting.items()):
+            if self._export_busy and self._export_id == meeting_id:
+                continue
+            self._release_waiting.pop(meeting_id)
+            done()
         for meeting_id in tuple(self._delete_waiting):
             if self._export_busy and self._export_id == meeting_id:
                 continue
             self._delete_waiting.remove(meeting_id)
-            jobs.delete(meeting_id, lambda mid=meeting_id: jobs.purge_deleted(mid))
+            if meeting_id not in jobs.tombstones and jobs.deletions.get(meeting_id) not in {
+                "pending",
+                "deleting",
+                "deleted",
+                "purge_error",
+            }:
+                jobs.delete_and_purge(meeting_id)
         self._poll_deletions()
+
+    def _release_files(self, meeting_id: str, done: Callable[[], None]) -> None:
+        """Both human and age-based deletion wait for the existing export owner."""
+        if self._export_busy and self._export_id == meeting_id:
+            self._release_waiting[meeting_id] = done
+        else:
+            done()
 
     def _poll_deletions(self) -> None:
         jobs = self._jobs()
@@ -1395,6 +1417,7 @@ class MeetingBridge(QObject):
 
     def _savable_meeting(self, fmt: str) -> Meeting | None:
         meeting = self._card_meeting()
+        jobs = self._jobs()
         if (
             meeting is None
             or self._closed
@@ -1403,6 +1426,15 @@ class MeetingBridge(QObject):
             or not self._card_loaded
             or self._card_error
             or self._card_tail  # the final text is still being read
+            or meeting.id in self._delete_pending
+            or (
+                jobs is not None
+                and (
+                    meeting.id in jobs.tombstones
+                    or jobs.deletions.get(meeting.id)
+                    in {"pending", "deleting", "deleted", "purge_error"}
+                )
+            )
         ):
             return None
         return meeting

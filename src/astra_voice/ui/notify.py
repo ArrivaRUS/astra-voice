@@ -36,6 +36,8 @@ from PyQt5.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher,
 # Интерфейс не создаём: его конструктор синхронно запрашивает Introspect.
 from PyQt5.QtDBus import QDBusInterface as QDBusInterface
 
+from astra_voice.ui.meeting_texts import RETENTION_TEXT
+
 __all__ = [
     "ACTION_CHOOSE_HOTKEY",
     "ACTION_CHOOSE_MICROPHONE",
@@ -59,6 +61,7 @@ __all__ = [
     "notify_meeting_memory_wait",
     "notify_meeting_mic_paused",
     "notify_meeting_needs_model",
+    "notify_meeting_retention",
     "notify_meeting_saved",
     "notify_meeting_saved_transcribing",
     "notify_meeting_selfcheck_failed",
@@ -1028,3 +1031,9 @@ def notify_meeting_transcription_failed() -> None:
         _MEETING_FAILED_BODY,
         actions=[(ACTION_MEETING_OPEN, _MEETING_OPEN)],
     )
+
+
+def notify_meeting_retention(count: int) -> None:
+    """Spec §4.6: the number of meetings actually purged by age, no user text."""
+    if count > 0:
+        notify(RETENTION_TEXT.format(count=int(count)), retry=False)

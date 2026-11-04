@@ -195,6 +195,7 @@ class MeetingRecording(QObject):
         self._overlay_fallback_deadline = 0.0
         self._notice_app = ""
         self._indicator_guard: MeetingIndicatorGuard | None = None
+        self.release_files: Callable[[str, Callable[[], None]], None] = lambda mid, done: done()
         self.jobs: MeetingJobs | None = None
         self._jobs_saved = ""
         self._jobs_recover_pending = False  # initialize() asked, policy not yet allowed
@@ -273,6 +274,7 @@ class MeetingRecording(QObject):
         if self._closed or self.jobs is not None:
             return
         self.jobs = jobs
+        jobs.release_files = self.release_files
         jobs.admit_allowed = self._jobs_allowed  # one gate for admission (I3)
         meeting = self.controller.meeting
         # A meeting saved before binding belongs to the previous program run.
@@ -299,9 +301,7 @@ class MeetingRecording(QObject):
         return bool(self.enabled() and self.policy_allowed())
 
     def _recover_jobs(self) -> None:
-        """Resume unfinished jobs once after initialize(), and only while meetings are
-        allowed: under a policy ban no job or audio cleanup is resumed; a later tick
-        resumes them when the ban is lifted. Explicit deletions have a separate pass."""
+        """Resume unfinished jobs once when admitted; storage maintenance runs regardless."""
         if self.jobs is None or not self._jobs_recover_pending or not self._jobs_allowed():
             return
         self._jobs_recover_pending = False
@@ -318,7 +318,7 @@ class MeetingRecording(QObject):
         if self._closed:
             return
         if self.jobs is not None:
-            self.jobs.recover_deletions()
+            self.jobs.start_retention()
         self.controller.recover()
         self._jobs_recover_pending = True
         self._recover_jobs()

@@ -5,6 +5,8 @@ No user data belongs in this vocabulary.
 
 from __future__ import annotations
 
+RETENTION_TEXT = "Удалено встреч по сроку хранения: {count}"
+
 W4_TEXTS = {
     "title": "Записать встречу",
     "heading": "Что записывать",

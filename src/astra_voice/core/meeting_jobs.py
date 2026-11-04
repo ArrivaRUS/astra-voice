@@ -25,7 +25,7 @@ from collections import deque
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -46,6 +46,7 @@ MODEL_RETRY_S = 60.0
 CANCEL_TIMEOUT_S = 1.0  # worker/meeting_contract.CANCEL_TIMEOUT_S
 DELETE_PURGE_ATTEMPTS = 3
 DELETE_PURGE_RETRY_S = 0.5
+RETENTION_INTERVAL_S = 86400
 MAX_CRASHES = 3  # restarts per window; the fourth crash fails the job
 CRASH_WINDOW_S = 600.0
 # model.load answered by an unexpected error (timeout, limit, ...): crash path, retry later.
@@ -103,7 +104,8 @@ class JobRole(Protocol):
 
 
 RoleFactory = Callable[[Callable[[Message], None], Callable[[int], None]], JobRole]
-Notify = Callable[[str, Meeting], None]
+# Lifecycle events carry a Meeting; the aggregate ``retention`` event carries a count.
+Notify = Callable[[str, Meeting | int], None]
 
 
 @dataclass(frozen=True)
@@ -211,10 +213,6 @@ def remove_audio(store: MeetingStore, meeting_id: str) -> None:
         os.fsync(directory)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
 @dataclass
 class _Entry:
     meeting_id: str
@@ -267,9 +265,11 @@ class MeetingJobs:
         *,
         transcribe_immediately: Callable[[], bool] = lambda: True,
         audio_retention_days: Callable[[], int] = lambda: 0,
+        meeting_retention_days: Callable[[], int] = lambda: 0,
         model_probe: Callable[[], ModelAdmission] = probe_gigaam_model,
         mem_available: Callable[[], int | None] = mem_available_mb,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         submit: Callable[[Callable[[], None]], None] | None = None,
         notify: Notify = lambda kind, meeting: None,
         echo_gate: bool | None = None,
@@ -281,9 +281,16 @@ class MeetingJobs:
         self._role_factory = role_factory
         self.transcribe_immediately = transcribe_immediately
         self.audio_retention_days = audio_retention_days
+        self.meeting_retention_days = meeting_retention_days
         self.model_probe = model_probe
         self.mem_available = mem_available
         self.clock = clock
+        self.wall_clock = wall_clock
+        # The GUI installs its export-owner barrier here; transcribe exits first.
+        self.release_files: Callable[[str, Callable[[], None]], None] = lambda mid, done: done()
+        self._retention_at: float | None = None
+        self._retention_wall: datetime | None = None
+        self._retention_scanning = False
         self._writer = MetadataWriter()
         self._submit = submit or self._writer.submit
         self._notify = notify
@@ -374,54 +381,44 @@ class MeetingJobs:
             "cancelledText": CANCELLED_TEXT,
         }
 
+    def start_retention(self) -> None:
+        """Start storage maintenance once, independently of the processing gate."""
+        if self._retention_at is None:
+            self.recover_deletions()
+
     def recover_deletions(self) -> None:
-        """Finish human-requested deletions even when recording/resume is forbidden."""
-
-        def scan() -> Callable[[], None]:
-            try:
-                for meeting_id in self.store.pending_deletions():
-                    try:
-                        self.store.purge_deleted(meeting_id)
-                    except MeetingStoreError:
-                        pass  # durable tombstone: retry on the next startup
-                for meeting in self.store.list(include_deleting=True):
-                    if meeting.state == MeetingState.DELETING:
-                        try:
-                            self.store.begin_delete(meeting.id)
-                            self.store.purge_deleted(meeting.id)
-                        except MeetingStoreError:
-                            pass
-            except MeetingStoreError:
-                pass
-            return lambda: None
-
-        self._run(scan)
+        """Compatibility entry point: one maintenance path owns deletion recovery."""
+        self._retention_pass(recover_deletions=True)
 
     def recover(self) -> None:
-        """Resume unfinished jobs and audio cleanups; caller enforces the jobs gate."""
+        """Resume jobs only; the caller admits processing after start_retention()."""
 
         def scan() -> Callable[[], None]:
             try:
                 meetings = self.store.list()
             except MeetingStoreError:
                 meetings = []
-            resume: list[Meeting] = []
-            cleanup: list[str] = []
-            for meeting in meetings:
-                if meeting.state == MeetingState.DELETING or meeting.cancelled:
-                    continue
-                if meeting.state == MeetingState.DONE and meeting.cleanup_pending:
-                    cleanup.append(meeting.id)
-                elif meeting.state in RESUMABLE or (
-                    meeting.state == MeetingState.RECORDED and self._has_checkpoint(meeting.id)
-                ):
-                    resume.append(meeting)
+            resume = [
+                meeting
+                for meeting in meetings
+                if not meeting.cancelled
+                and meeting.id not in self.tombstones
+                and meeting.state != MeetingState.DELETING
+                and (
+                    meeting.state in RESUMABLE
+                    or (meeting.state == MeetingState.RECORDED and self._has_checkpoint(meeting.id))
+                )
+            ]
             resume.sort(key=lambda row: (row.ended_at or row.started_at, row.id))
 
             def completed() -> None:
-                for meeting_id in cleanup:
-                    self._cleanup(meeting_id)
+                if self._closed:
+                    return
                 for meeting in resume:
+                    # A preceding retention scan may have published tombstones
+                    # after this worker snapshot, before either GUI completion.
+                    if meeting.id in self.tombstones:
+                        continue
                     if meeting.state == MeetingState.RECORDED:
                         self._enqueue(meeting.id, auto=False, resume=True)
                     else:
@@ -431,6 +428,127 @@ class MeetingJobs:
             return completed
 
         self._run(scan)
+
+    @staticmethod
+    def _expired(stamp: str | None, days: int, now: datetime) -> bool:
+        if stamp is None or days <= 0:
+            return False
+        try:
+            start = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            return now >= start + timedelta(days=days)
+        except (ValueError, TypeError, OverflowError):
+            return False
+
+    @staticmethod
+    def _audio_succeeded(meeting: Meeting) -> bool:
+        # M7 must publish SUCCEEDED only after the selected diarization/Д5 pipeline.
+        return (
+            meeting.state == MeetingState.DONE
+            and meeting.processing_status == ProcessingStatus.SUCCEEDED
+            and not meeting.cancelled
+        )
+
+    def _retention_pass(self, *, recover_deletions: bool = False) -> None:
+        if self._closed or self._retention_scanning:
+            return
+        days = int(self.meeting_retention_days())
+        wall = self.wall_clock()
+        deadline = self.clock() + RETENTION_INTERVAL_S
+        self._retention_scanning = True
+        self._retention_at = deadline
+        self._retention_wall = wall
+
+        def scan() -> Callable[[], None]:
+            now = self.wall_clock()
+            if recover_deletions:
+                try:
+                    pending = self.store.pending_deletions()
+                except MeetingStoreError:
+                    pending = []
+                for meeting_id in pending:
+                    try:
+                        self.store.purge_deleted(meeting_id)
+                    except MeetingStoreError:
+                        pass  # durable remnant: retry at the next startup
+            try:
+                meetings = self.store.list(include_deleting=True)
+            except MeetingStoreError:
+                meetings = []
+            expired: list[str] = []
+            updates: list[Meeting] = []
+            for meeting in meetings:
+                try:
+                    if meeting.id in self.tombstones:
+                        continue
+                    if meeting.state == MeetingState.DELETING:
+                        if recover_deletions:
+                            self.store.begin_delete(meeting.id)
+                            self.store.purge_deleted(meeting.id)
+                        continue
+                    if meeting.state not in {MeetingState.RECORDING, MeetingState.PAUSED} and (
+                        self._expired(meeting.started_at, days, now)
+                    ):
+                        expired.append(meeting.id)
+                        continue  # delete the meeting once, without a separate audio cleanup
+                    if meeting.cleanup_pending and self._audio_succeeded(meeting):
+                        updated = self._remove_audio(meeting.id)
+                        if updated is not None:
+                            meeting = updated
+                            updates.append(updated)
+                    if (
+                        self._audio_succeeded(meeting)
+                        and meeting.audio.present
+                        and not meeting.cleanup_pending
+                        and self._expired(
+                            meeting.transcription.finished_at, meeting.audio.retain_days, now
+                        )
+                    ):
+
+                        def mark(current: Meeting) -> bool:
+                            if not self._audio_succeeded(current) or not current.audio.present:
+                                return False
+                            if not self._expired(
+                                current.transcription.finished_at, current.audio.retain_days, now
+                            ):
+                                return False
+                            current.cleanup_pending = True
+                            return True
+
+                        marked = self._update(meeting.id, mark, require_change=True)
+                        if marked is not None:
+                            updated = self._remove_audio(meeting.id)
+                            if updated is not None:
+                                updates.append(updated)
+                except (MeetingStoreError, OSError, ValueError):
+                    continue  # one private/unreadable meeting cannot stop the pass
+
+            def completed() -> None:
+                self._retention_scanning = False
+                if self._closed:
+                    return
+                for updated in updates:
+                    if updated.id not in self.tombstones:
+                        self.meetings[updated.id] = updated
+                        self._changed()
+                remaining = len(expired)
+                removed = 0
+
+                def finished(ok: bool) -> None:
+                    nonlocal remaining, removed
+                    remaining -= 1
+                    removed += int(ok)
+                    if remaining == 0 and removed and not self._closed:
+                        self._notify("retention", removed)
+
+                for meeting_id in expired:
+                    self.delete_and_purge(meeting_id, finished=finished)
+
+            return completed
+
+        def failed() -> None:
+            self._retention_scanning = False
+
+        self._run(scan, failed=failed)
 
     def on_recorded(self, meeting_id: str) -> bool:
         """Capture finalized a meeting: queue it if «Расшифровывать сразу» is on."""
@@ -485,19 +603,39 @@ class MeetingJobs:
         if entry is not None or meeting_id == self._admitting:
             self._persist_cancel(meeting_id)
 
-    def delete(self, meeting_id: str, released: Callable[[], None]) -> None:
+    def delete_and_purge(
+        self, meeting_id: str, *, finished: Callable[[bool], None] | None = None
+    ) -> None:
+        """Shared GUI/retention path: tombstone, transcribe exit, export release, purge."""
+        self.delete(
+            meeting_id,
+            lambda: self.release_files(
+                meeting_id, lambda: self.purge_deleted(meeting_id, finished=finished)
+            ),
+            failed=(lambda: finished(False)) if finished is not None else None,
+        )
+
+    def delete(
+        self,
+        meeting_id: str,
+        released: Callable[[], None],
+        *,
+        failed: Callable[[], None] | None = None,
+    ) -> None:
         """Tombstone -> cancel the job -> confirmed exit of the role -> ``released()``.
 
         M5 owns the rename/rmtree performed by ``released``. A SIGKILL without a
         confirmed exit (poll) never releases the files.
         """
         if self._closed or meeting_id in self.tombstones:
+            if failed is not None:
+                failed()
             return
         self.tombstones.add(meeting_id)
         self.deletions[meeting_id] = "pending"
         entry = self._take(meeting_id)
 
-        def failed() -> None:
+        def tombstone_failed() -> None:
             self.tombstones.discard(meeting_id)
             self.deletions[meeting_id] = "error"
             if entry is not None:
@@ -506,6 +644,8 @@ class MeetingJobs:
             self._changed()
             for event in self._delete_events.pop(meeting_id, {}).values():
                 self._event(event)
+            if failed is not None:
+                failed()
 
         def tombstone() -> Callable[[], None]:
             def mark(meeting: Meeting) -> bool:
@@ -517,7 +657,7 @@ class MeetingJobs:
 
             def completed() -> None:
                 if ok is None:
-                    failed()
+                    tombstone_failed()
                     return
                 self.deletions[meeting_id] = "deleting"
                 self._delete_events.pop(meeting_id, None)
@@ -541,9 +681,11 @@ class MeetingJobs:
             return completed
 
         # The tombstone was not written: nothing is deleted, the meeting stays usable.
-        self._run(tombstone, failed=failed)
+        self._run(tombstone, failed=tombstone_failed)
 
-    def purge_deleted(self, meeting_id: str) -> None:
+    def purge_deleted(
+        self, meeting_id: str, *, finished: Callable[[bool], None] | None = None
+    ) -> None:
         """GUI release callback schedules filesystem work after every owner has exited.
 
         The bridge first releases export; future DIAR/AI owners must also acknowledge
@@ -571,12 +713,16 @@ class MeetingJobs:
                 self.deletions[meeting_id] = "deleted"
                 self._notify("deleted", meeting)
                 self._changed()
+                if finished is not None:
+                    finished(True)
 
             return completed
 
         def failed() -> None:
             self.deletions[meeting_id] = "purge_error"
             self._changed()  # on disk DELETING/.deleting-* remains recoverable
+            if finished is not None:
+                finished(False)
 
         self._run(work, failed=failed)
 
@@ -584,6 +730,15 @@ class MeetingJobs:
         self._drain()
         if self._closed:
             return
+        if self._retention_at is not None and (
+            self.clock() >= self._retention_at
+            or (
+                self._retention_wall is not None
+                and self.wall_clock() - self._retention_wall
+                >= timedelta(seconds=RETENTION_INTERVAL_S)
+            )
+        ):
+            self._retention_pass()
         self._handle_exits()
         self._retry_cancel_writes()
         active = self._active
@@ -684,7 +839,12 @@ class MeetingJobs:
         self._run(work)
 
     def _schedule(self) -> None:
-        if self._admitting or not self._queue or not self.admit_allowed():
+        if (
+            self._retention_scanning
+            or self._admitting
+            or not self._queue
+            or not self.admit_allowed()
+        ):
             return
         now = self.clock()
         for entry in sorted(self._queue, key=lambda item: item.order):
@@ -1164,7 +1324,7 @@ class MeetingJobs:
             transcription.model_id = str(load.get("id", transcription.model_id))
             transcription.revision = str(load.get("revision", transcription.revision))
             transcription.diarization = False
-            transcription.finished_at = _now()
+            transcription.finished_at = self.wall_clock().isoformat()
             transcription.wall_ms = int(event.get("wall_ms", 0))
             transcription.peak_rss_kb = int(event.get("peak_rss_kb", 0))
             meeting.audio.retain_days = max(0, min(365, retention))
@@ -1189,21 +1349,6 @@ class MeetingJobs:
             self._unload()
         self._changed()
 
-    def _cleanup(self, meeting_id: str) -> None:
-        """D6: a durable cleanup_pending is completed after restart, no reprocessing."""
-
-        def work() -> Callable[[], None]:
-            updated = self._remove_audio(meeting_id)
-
-            def completed() -> None:
-                if updated is not None:
-                    self.meetings[meeting_id] = updated
-                    self._changed()
-
-            return completed
-
-        self._run(work)
-
     def _remove_audio(self, meeting_id: str) -> Meeting | None:
         """Worker thread: delete audio/ then publish audio.present=false, deleted_at."""
         try:
@@ -1211,7 +1356,8 @@ class MeetingJobs:
             if (
                 not isinstance(current, Meeting)
                 or not current.cleanup_pending
-                or current.state != MeetingState.DONE
+                or not self._audio_succeeded(current)
+                or meeting_id in self.tombstones
             ):
                 return None
             remove_audio(self.store, meeting_id)
@@ -1219,11 +1365,11 @@ class MeetingJobs:
             return None
 
         def mutate(meeting: Meeting) -> bool:
-            if not meeting.cleanup_pending:
+            if not meeting.cleanup_pending or not self._audio_succeeded(meeting):
                 return False
             meeting.cleanup_pending = False
             meeting.audio.present = False
-            meeting.audio.deleted_at = _now()
+            meeting.audio.deleted_at = self.wall_clock().isoformat()
             return True
 
         return self._update(meeting_id, mutate, require_change=True)

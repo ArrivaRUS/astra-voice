@@ -102,7 +102,7 @@ class Rig:
         self.retention = 30
         self.admission = ModelAdmission("ok", dict(LOAD))
         self.memory: int | None = 4000
-        self.notices: list[tuple[str, str]] = []
+        self.notices: list[tuple[str, str | int]] = []
         self.roles: list[Role] = []
         self.cancelled_at_send: list[bool] = []
         self.jobs = self.make()
@@ -117,7 +117,9 @@ class Rig:
             mem_available=lambda: self.memory,
             clock=lambda: self.now,
             submit=lambda operation: operation(),
-            notify=lambda kind, meeting: self.notices.append((kind, meeting.id)),
+            notify=lambda kind, payload: self.notices.append(
+                (kind, payload.id if isinstance(payload, Meeting) else payload)
+            ),
             echo_gate=False,
         )
 
@@ -614,7 +616,10 @@ def test_done_with_retention_zero_removes_audio_d6(rig: Rig) -> None:
 
 
 def test_cleanup_pending_is_completed_after_restart_without_reprocessing_d6(rig: Rig) -> None:
-    rig.create(MID, MeetingState.DONE, cleanup_pending=True)
+    rig.create(
+        MID, MeetingState.DONE, cleanup_pending=True, processing_status=ProcessingStatus.SUCCEEDED
+    )
+    rig.jobs.start_retention()
     rig.jobs.recover()
     rig.jobs.tick()
     meeting = rig.meeting()

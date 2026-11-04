@@ -1295,6 +1295,7 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         "notify_onboarding_ready": ('f"Зажмите {combo} и говорите."',),
         "notify_microphone_changed": (microphone_body,),
         "notify_microphone_selected": ('f"Микрофон: {name}"', microphone_body),
+        "notify_meeting_retention": ("RETENTION_TEXT.format(count=int(count))",),
     }
     allowed_templates = {
         statement.value: tuple(
@@ -1302,7 +1303,7 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         )
         for function in tree.body
         if isinstance(function, ast.FunctionDef) and function.name in templates
-        for statement in function.body
+        for statement in ast.walk(function)
         if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
     }
     # У онбординга два типизированных перехода: контроллер → host → обёртка.
@@ -1323,13 +1324,34 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         if ast.dump(node)
         == ast.dump(ast.parse(onboarding_calls[cls.name, method.name], mode="eval").body)
     }
+    # The retention bridge may pass only an integer guarded by this exact branch.
+    # All other dynamic arguments (including meeting titles) remain forbidden.
+    retention_guard = ast.dump(
+        ast.parse(
+            'kind == "retention" and isinstance(payload, int) and payload > 0', mode="eval"
+        ).body
+    )
+    retention_call = ast.dump(
+        ast.parse("notices.notify_meeting_retention(payload)", mode="eval").body
+    )
+    allowed_retention = {
+        statement.value
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef) and function.name == "job_notifier"
+        for deliver in function.body
+        if isinstance(deliver, ast.FunctionDef) and deliver.name == "deliver"
+        for branch in ast.walk(deliver)
+        if isinstance(branch, ast.If) and ast.dump(branch.test) == retention_guard
+        for statement in branch.body
+        if isinstance(statement, ast.Expr) and ast.dump(statement.value) == retention_call
+    }
     for node in nodes:
         if not isinstance(node, ast.Call):
             continue
         name = _qualified_name(node.func, aliases)
         if not _is_notification(name):
             continue
-        if not implementation and node in allowed_onboarding:
+        if not implementation and node in allowed_onboarding | allowed_retention:
             continue
         leaf = name.rsplit(".", 1)[-1]
         if (
@@ -1540,3 +1562,31 @@ def test_model_installed_message(transport: Mock) -> None:
     assert args[5].value() == []
     assert args[6]["urgency"].value() == b"\x01"
     assert "notify_model_installed" in notifications.__all__
+
+
+def test_retention_wrapper_formats_only_numeric_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    send = Mock()
+    monkeypatch.setattr(notifications, "notify", send)
+    notifications.notify_meeting_retention(3)
+    notifications.notify_meeting_retention(0)
+    send.assert_called_once_with("Удалено встреч по сроку хранения: 3", retry=False)
+
+
+@pytest.mark.parametrize(
+    "guard,argument",
+    [
+        ('kind == "retention"', "payload"),
+        ('kind == "retention" and isinstance(payload, str) and payload', "payload"),
+        ('kind == "retention" and isinstance(payload, int) and payload > 0', "meeting.title"),
+    ],
+)
+def test_retention_notification_gate_rejects_unguarded_or_text_arguments(
+    guard: str, argument: str
+) -> None:
+    source = (
+        "def job_notifier():\n"
+        "    def deliver(kind, payload):\n"
+        f"        if {guard}:\n"
+        f"            notices.notify_meeting_retention({argument})\n"
+    )
+    assert _notification_violations(source)

@@ -783,3 +783,66 @@ def test_r2_delete_poll_notifies_only_when_status_changes(
     rig.jobs.tick()
     rig.bridge._poll_deletions()
     assert len(changes) > count and rig.jobs.deletions[MID] == "deleted"
+
+
+def test_retention_deadline_and_cleanup_refresh_row_and_open_card_t407(rig: SaveRig) -> None:
+    from datetime import UTC, datetime
+
+    from astra_voice.meetings.events import ProcessingStatus
+    from astra_voice.meetings.model import Audio, Transcription
+
+    rig.create(
+        state=MeetingState.DONE,
+        processing_status=ProcessingStatus.SUCCEEDED,
+        audio=Audio(retain_days=7),
+        transcription=Transcription(finished_at="2026-11-01T12:00:00+00:00"),
+    )
+    rig.transcript(ROWS)
+    card = rig.open_card()
+    assert "звук хранится до 08.11" in card["subtitle"]["suffix"]
+    assert "звук до 08.11" in rig.bridge.meetings[0]["subtitle"]
+    rig.jobs.wall_clock = lambda: datetime(2026, 11, 9, 12, tzinfo=UTC)
+    rig.jobs.start_retention()
+    rig.recording.tick()
+    assert "звук удалён" in rig.bridge.card["subtitle"]["suffix"]
+    assert "звук удалён" in rig.bridge.meetings[0]["subtitle"]
+    assert rig.bridge.cardRows.rows()  # published text stays on the open card
+
+
+@pytest.mark.parametrize("close_card", [False, True])
+@pytest.mark.parametrize("human_delete", [False, True])
+def test_retention_waits_for_bridge_export_owner_t500(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, close_card: bool, human_delete: bool
+) -> None:
+    from datetime import UTC, datetime
+
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    monkeypatch.setattr(rig.bridge._export_writer, "submit", tasks.append)
+    rig.answer = str(rig.documents / "retained-copy.md")
+    assert rig.bridge.saveAs("md") == "pending"
+    if human_delete:
+        rig.bridge.confirmDelete(MID)
+    if close_card:
+        rig.bridge.closeMeeting()
+    rig.jobs.meeting_retention_days = lambda: 30
+    rig.jobs.wall_clock = lambda: datetime(2026, 12, 4, 12, tzinfo=UTC)
+    rig.jobs.start_retention()
+    assert MID in rig.jobs.tombstones and rig.store.root.joinpath(MID).exists()
+    assert not [item for item in rig.notices if item[0] == "retention"]
+    assert rig.bridge.saveAs("md") == "pending"
+    tasks.pop()()
+    for _ in range(100):
+        QTest.qWait(5)
+        if rig.jobs.deletions.get(MID) == "deleted":
+            break
+    assert rig.jobs.deletions[MID] == "deleted"
+    assert (rig.documents / "retained-copy.md").exists()
+    assert not rig.store.root.joinpath(MID).exists()
+    assert [item for item in rig.notices if item[0] == "retention"] == [("retention", 1)]
+    assert rig.bridge.saveAs("md") == "error"
+    rig.bridge._poll_deletions()
+    rig.recording.tick()
+    assert not rig.bridge.meetings and not rig.bridge.saveError
