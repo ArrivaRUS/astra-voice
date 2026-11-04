@@ -24,7 +24,7 @@ from PyQt5.QtCore import (
 )
 
 from astra_voice.meetings.events import MeetingState
-from astra_voice.meetings.model import Meeting, Utterance
+from astra_voice.meetings.model import Meeting, Transcript, Utterance
 from astra_voice.meetings.templates import (
     DAMAGED_LABEL,
     DAMAGED_TEXT,
@@ -35,6 +35,9 @@ from astra_voice.meetings.templates import (
     from_placeholder,
     meeting_marks,
     speaker_label,
+    statistics,
+    template_rows,
+    visible_utterances,
 )
 
 ROLES = ("kind", "time", "who", "whoKind", "num", "text", "icon", "accessibleName")
@@ -77,10 +80,14 @@ TEXTS = {
     ),
     "readError": "Не удалось прочитать папку встреч. Проверьте, что диск подключён и доступен.",
     "retry": "Повторить",
-    # D4 «Сохранить как…» (spec §4.7; M4: only «Стенограмма», .md/.txt).
+    # D4 «Сохранить как…» (spec §4.7; four local templates, .md/.txt).
     "saveTitle": "Сохранить как — ",
-    "templateTitle": "Стенограмма",
-    "templateCaption": "Реплики по порядку, с именами и временем",
+    "previewDuration": "Длительность ",
+    "previewReplies": " · реплик ",
+    "previewShares": " · сумма долей ",
+    "previewMinutes": " мин",
+    "previewMorePrefix": "…и ещё ",
+    "previewEllipsis": "…",
     "saveNote": (
         "За файлами, сохранёнными вне программы, программа не следит — удалите их сами, если "
         "нужно. Файл будет доступен только вашей учётной записи."
@@ -97,6 +104,92 @@ TEXTS = {
     "savedMiddle": "»: ",
     "openFolder": "Открыть папку",
 }
+# Positional presentation corresponds to templates.TEMPLATES; identifiers live there only.
+TEMPLATE_TEXTS = (
+    ("doc", "Стенограмма", "Реплики по порядку, с именами и временем"),
+    ("meeting", "Я и собеседники", "Только две подписи — без разделения собеседников"),
+    ("file", "Только текст", "Абзацами, без имён и времени"),
+    ("chart", "Статистика встречи", "Кто сколько говорил"),
+)
+
+
+def _accessible_name(at: str, text: str, who: str | None = None) -> str:
+    return f"{at}, {who}: {text}" if who is not None else f"{at}, {text}"
+
+
+def save_preview(template: str, meeting: Meeting, transcript: Transcript | None) -> dict[str, Any]:
+    """Bounded, format-independent view of the same structures used by render."""
+    utterances = visible_utterances(transcript)
+    if template == "stats":
+        data = statistics(meeting, utterances, limit=8)
+        summary = [
+            {"text": TEXTS["previewDuration"], "mono": False},
+            {"text": data.duration, "mono": True},
+            {"text": TEXTS["previewReplies"], "mono": False},
+            {"text": str(data.replies), "mono": True},
+        ]
+        if data.has_shares:
+            summary += [
+                {"text": TEXTS["previewShares"], "mono": False},
+                {"text": "100 %", "mono": True},
+            ]
+        return {
+            "kind": "stats",
+            "summary": summary,
+            "hasShares": data.has_shares,
+            "rows": [
+                {
+                    "who": row.label,
+                    "minutes": str(row.minutes) + TEXTS["previewMinutes"],
+                    "share": row.share,
+                    "percent": f"{row.share} %" if row.share is not None else "",
+                }
+                for row in data.speakers
+            ],
+            "moreText": TEXTS["previewMorePrefix"] + str(data.remaining) if data.remaining else "",
+        }
+    paragraphs = template == "text_only"
+    limit = 3 if paragraphs else 6
+    # One lookahead determines the final ellipsis, without rendering the remaining meeting.
+    source = template_rows(
+        template,
+        meeting,
+        utterances,
+        meeting_marks(meeting, utterances),
+        limit=limit + 1,
+        text_limit=600 if paragraphs else 240,
+    )
+    more = len(source) > limit
+    rows = []
+    for index, row in enumerate(source[:limit]):
+        text = row.text
+        if row.kind == "utterance" and (
+            row.truncated or (paragraphs and more and index == limit - 1)
+        ):
+            text = text.rstrip() + TEXTS["previewEllipsis"]
+        at = clock(row.at_ms)
+        rows.append(
+            {
+                "kind": row.kind,
+                "time": at if row.kind == "mark" else f"[{at}]",
+                "who": row.who,
+                "whoKind": row.who_kind,
+                "text": text,
+                "icon": row.icon,
+                "accessibleName": _accessible_name(
+                    at, text, row.who if row.kind == "utterance" else None
+                ),
+            }
+        )
+    return {
+        "kind": "text_only" if paragraphs else "transcript",
+        "rows": rows,
+        "moreText": TEXTS["previewEllipsis"]
+        if paragraphs and more and rows[-1]["kind"] == "mark"
+        else "",
+    }
+
+
 FAILED_MODEL_TEXT = "Распознавание на этом компьютере не работает"
 FAILED_MEMORY_TEXT = "Расшифровка подождёт: сейчас мало свободной памяти"
 FAILED_TITLE = "Ошибка расшифровки"
@@ -163,7 +256,7 @@ def mark_row(mark: MarkInfo) -> dict[str, str]:
         "num": "",
         "text": mark.line,
         "icon": "mic" if mark.kind == "mic" else mark.icon,
-        "accessibleName": f"{at}, {mark.line}",
+        "accessibleName": _accessible_name(at, mark.line),
     }
 
 
@@ -181,7 +274,7 @@ def utterance_row(meeting: Meeting, item: Utterance) -> dict[str, str]:
             "num": "",
             "text": text,
             "icon": "alert",
-            "accessibleName": f"{at}, {text}",
+            "accessibleName": _accessible_name(at, text),
         }
     who = speaker_label(meeting, item.speaker)
     return {
@@ -192,7 +285,7 @@ def utterance_row(meeting: Meeting, item: Utterance) -> dict[str, str]:
         "num": "",
         "text": item.text,
         "icon": "",
-        "accessibleName": f"{at}, {who}: {item.text}",
+        "accessibleName": _accessible_name(at, item.text, who),
     }
 
 

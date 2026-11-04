@@ -167,11 +167,15 @@ def make_bridge() -> Any:
     from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
 
     sys.path.insert(0, str(REPO / "src"))
+    from astra_voice.meetings.model import Transcript
+    from astra_voice.meetings.templates import TEMPLATES
     from astra_voice.ui import meeting_card
     from astra_voice.ui.meeting_card import CardRows, TranscriptRows
 
     class FakeBridge(QObject):
         changed = pyqtSignal()
+        saveTemplateChanged = pyqtSignal()  # noqa: N815
+        savePreviewChanged = pyqtSignal()  # noqa: N815
         cardSaveRequested = pyqtSignal()  # noqa: N815 — QML API
 
         def __init__(self) -> None:
@@ -181,6 +185,10 @@ def make_bridge() -> Any:
             self.builder: CardRows | None = None
             self.actions: list[str] = []
             self.saves: list[str] = []
+            self.saved_templates: list[str] = []
+            self._save_template = TEMPLATES[0]
+            self.utterances: list[Any] = []
+            self.preview_calls = 0
             self.save_error = ""
             self.save_result = "cancelled"
             self.replace_file = ""
@@ -211,6 +219,35 @@ def make_bridge() -> Any:
         toast = pyqtProperty("QVariantMap", _get_toast, notify=changed)
         cardReplaceFile = pyqtProperty(str, _get_replace, notify=changed)  # noqa: N815
 
+        @pyqtProperty("QVariantList", constant=True)
+        def saveTemplates(self) -> list[dict[str, str]]:  # noqa: N802
+            return [
+                {"id": key, "icon": icon, "title": title, "caption": caption}
+                for key, (icon, title, caption) in zip(
+                    TEMPLATES, meeting_card.TEMPLATE_TEXTS, strict=True
+                )
+            ]
+
+        @pyqtProperty(str, notify=saveTemplateChanged)
+        def saveTemplate(self) -> str:  # noqa: N802
+            return self._save_template
+
+        @saveTemplate.setter
+        def saveTemplate(self, value: str) -> None:  # noqa: N802
+            if value in TEMPLATES and value != self._save_template:
+                self._save_template = value
+                self.saveTemplateChanged.emit()
+                self.savePreviewChanged.emit()
+
+        @pyqtSlot(result="QVariantMap")
+        def savePreview(self) -> dict[str, Any]:  # noqa: N802
+            self.preview_calls += 1
+            return meeting_card.save_preview(
+                self._save_template,
+                self.meeting,
+                Transcript(meeting_id=self.meeting.id, utterances=self.utterances),
+            )
+
         def show(
             self,
             meeting: Any,
@@ -220,12 +257,16 @@ def make_bridge() -> Any:
             failure: str = "",
             policy_off: bool = False,
         ) -> None:
+            self._save_template = TEMPLATES[0]
+            self.utterances = list(utterances or [])
             self.builder = CardRows(meeting, self._rows)
             loaded = utterances is not None
             self.builder.load(list(utterances or []), complete=meeting.state == "done")
             self.meeting, self.snapshot = meeting, snapshot
             self.failure, self.policy_off, self.loaded = failure, policy_off, loaded
             self.refresh()
+            self.saveTemplateChanged.emit()
+            self.savePreviewChanged.emit()
 
         def refresh(self) -> None:
             builder = self.builder
@@ -249,6 +290,7 @@ def make_bridge() -> Any:
         @pyqtSlot(str, result=str)
         def saveAs(self, fmt: str) -> str:  # noqa: N802
             self.saves.append(fmt)
+            self.saved_templates.append(self._save_template)
             self.changed.emit()  # like MeetingBridge: cardSaveError is published first
             return self.save_result
 

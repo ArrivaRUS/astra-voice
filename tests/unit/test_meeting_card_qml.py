@@ -16,10 +16,11 @@ pytestmark = pytest.mark.unit
 REPO = Path(__file__).resolve().parents[2]
 
 QML_PROBE = r"""
+import re
 import sys
 from pathlib import Path
 from PyQt5.QtCore import QObject, QPointF, Qt, QUrl, pyqtSignal
-from PyQt5.QtGui import QFontDatabase, QGuiApplication
+from PyQt5.QtGui import QFont, QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
 from PyQt5.QtTest import QTest
@@ -33,6 +34,7 @@ from astra_voice.ui.icons import install_icon_provider
 rc.set_timezone()
 QQuickWindow.setSceneGraphBackend('software')
 app = QGuiApplication([])
+QFont.insertSubstitution('PT Mono', rc.MONO_SUBSTITUTE)
 for path in (repo / 'tests/fixtures/fonts/pt-root-ui').glob('*.ttf'):
     assert QFontDatabase.addApplicationFont(str(path)) >= 0
 bridge = rc.make_bridge()
@@ -199,7 +201,7 @@ QTest.qWait(20)
 assert delete_item.property('enabled') is False
 show('ready-1024')
 
-# D4 «Сохранить как — <название>» (M4: «Стенограмма», .md/.txt); the file is written in Python.
+# D4: four local templates, exact Python preview, .md/.txt and explicit save button.
 show('ready-1024')
 save = one('meetingCardSave')
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
@@ -209,13 +211,109 @@ dialog = window.findChild(QObject, 'meetingSaveDialog')
 assert dialog.property('opened') is True
 assert dialog.property('heading') == 'Сохранить как — Планёрка по бюджету'
 assert dialog.property('width') == 760
-assert dialog.property('previewRows').toVariant().__len__() == 6
+assert dialog.property('preview').toVariant() == bridge.savePreview()
+assert bridge.saveTemplate == 'stenogram'
+assert window.findChild(QObject, 'meetingSaveNote').property('lineHeight') == 18
+# Delegates live on the dialog's overlay, outside the card visual tree.
+def options():
+    return [i for i in walk(window.contentItem()) if i.objectName() == 'meetingSaveTemplate']
+items = options()
+assert len(items) == 4
+assert not any(i.property('visualFocus') for i in items)  # opening is not keyboard navigation
+for index, option in enumerate(items):
+    title = option.findChild(QObject, 'meetingSaveTemplateTitle')
+    assert title.property('font').weight() == (QFont.Medium if index == 0 else QFont.Normal)
+items[0].forceActiveFocus(Qt.TabFocusReason)
+for index in range(4):
+    QTest.keyClick(window, Qt.Key_Down if index else Qt.Key_Home)
+    QTest.qWait(20)
+    assert bridge.saveTemplate == bridge.saveTemplates[index]['id']
+    assert items[index].property('visualFocus')
+    ring = items[index].findChild(QQuickItem, 'meetingSaveTemplateFocus')
+    assert ring.property('visible') and abs(ring.width() - items[index].width() - 8) < 0.1
+    assert dialog.property('preview').toVariant() == bridge.savePreview()
+    QTest.keyClick(window, Qt.Key_Return)
+    QTest.keyClick(window, Qt.Key_Enter)
+    assert not bridge.saves and dialog.property('opened')
+for index in range(2, -1, -1):
+    QTest.keyClick(window, Qt.Key_Up)
+    assert bridge.saveTemplate == bridge.saveTemplates[index]['id']
+for index, item in enumerate(items):
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                    item.mapToScene(QPointF(item.width()/2, item.height()/2)).toPoint())
+    QTest.qWait(20)
+    assert bridge.saveTemplate == bridge.saveTemplates[index]['id']
+    assert item.property('selected')
+    assert not item.property('visualFocus')
+    assert dialog.property('preview').toVariant() == bridge.savePreview()
+assert bridge.saveTemplate == 'stats'
+def preview_nodes(name):
+    return [i for i in walk(window.contentItem()) if i.objectName() == name and i.isVisible()]
+# Each selected template has its own styled bounded preview, never raw Markdown.
+for index, item in enumerate(items):
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                    item.mapToScene(QPointF(item.width()/2, item.height()/2)).toPoint())
+    QTest.qWait(30)
+    model = bridge.savePreview()
+    if index < 2:
+        assert len(preview_nodes('meetingSavePreviewRow')) == 6
+        assert all(re.fullmatch(r'\[\d+:\d{2}:\d{2}\]', r['time'])
+                   for r in model['rows'] if r['kind'] == 'utterance')
+    elif index == 2:
+        assert len(preview_nodes('meetingSaveParagraph')) == 3
+        assert model['rows'][-1]['text'].endswith('…')
+        assert all(abs(p.property('lineHeight') - 20.8) < 0.01
+                   for p in preview_nodes('meetingSaveParagraph'))
+    else:
+        assert len(preview_nodes('meetingSaveStatRow')) == len(model['rows'])
+        labels = preview_nodes('meetingSaveStatLabel')
+        assert [i.property('text') for i in labels] == [r['who'] for r in model['rows']]
+        assert all(i.width() >= 40 and i.property('lineHeight') == 19.5 for i in labels)
+        bars = preview_nodes('meetingSaveStatBar')
+        fills = preview_nodes('meetingSaveStatFillClip')
+        assert all(b.property('radius') == 3 for b in bars)
+        for bar, fill, row in zip(bars, fills, model['rows']):
+            assert fill.property('clip')
+            assert abs(fill.width() - bar.width() * row['share'] / 100) < 0.1
+            assert abs(fill.childItems()[0].width() - bar.width()) < 0.1
+        assert all(i.height() == 8 and i.width() >= 40
+                   for i in preview_nodes('meetingSaveStatBar'))
+        assert [i.property('text') for i in preview_nodes('meetingSaveStatPercent')] == [
+            r['percent'] for r in model['rows']]
+    assert items[index].property('iconName') == ['doc', 'meeting', 'file', 'chart'][index]
+    icon = items[index].findChild(QObject, 'meetingSaveTemplateIcon')
+    assert icon.property('strokeWidth') == (1.8 if index == 3 else 1.5)
+    if len(sys.argv) > 2:
+        capture = dialog.property('contentItem').parentItem()
+        grab = capture.grabToImage()
+        for _ in range(100):
+            if not grab.image().isNull(): break
+            QTest.qWait(20)
+        assert not grab.image().isNull()
+        target = Path(sys.argv[2]) / ('save-dialog-' + bridge.saveTemplate + '.png')
+        assert grab.saveToFile(str(target))
+assert bridge.saveTemplate == 'stats'
+QTest.keyClick(window, Qt.Key_Escape)
+QTest.qWait(30)
+dialog.open()
+QTest.qWait(30)
+assert bridge.saveTemplate == 'stats'  # retained only in this open card
+# Formats and unrelated changed emissions do not reconstruct the preview.
 fmt = window.findChild(QObject, 'meetingSaveFormat')
+before_model = dialog.property('preview').toVariant()
+before_calls = bridge.preview_calls
 fmt.setProperty('currentIndex', 1)
+bridge.changed.emit()
+QTest.qWait(30)
+assert bridge.preview_calls == before_calls
+assert dialog.property('preview').toVariant() == before_model
 bridge.save_result = 'error'
 bridge.save_error = 'Не удалось сохранить файл: папка недоступна для записи'
-dialog.accept()
+confirm = window.findChild(QQuickItem, 'meetingSaveConfirm')
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                 confirm.mapToScene(QPointF(confirm.width()/2, confirm.height()/2)).toPoint())
 QTest.qWait(80)
+assert bridge.saved_templates == ['stats']
 assert bridge.saves == ['txt']
 assert dialog.property('opened') is True  # back to D4 with the error line
 error = window.findChild(QObject, 'meetingSaveError')
@@ -223,6 +321,7 @@ assert error.property('visible') and error.property('body') == bridge.save_error
 bridge.save_result = 'saved'
 dialog.accept()
 QTest.qWait(80)
+assert bridge.saved_templates == ['stats', 'stats']
 assert bridge.saves == ['txt', 'txt'] and dialog.property('opened') is False
 bridge.save_error = ''
 # The chosen file exists (K5): the card's own question, focus on «Отмена»; Esc → D4.
@@ -338,7 +437,7 @@ MAIN_PROBE = r"""
 import sys
 from pathlib import Path
 from PyQt5.QtCore import QMetaObject, QObject, QPointF, Qt, QUrl
-from PyQt5.QtGui import QFontDatabase, QGuiApplication
+from PyQt5.QtGui import QFont, QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
 from PyQt5.QtTest import QTest
@@ -429,6 +528,23 @@ wait(lambda: save_dialog.property('opened') is True, 'D4 from the list')
 assert bridge.card.get('view') == 'ready'
 QMetaObject.invokeMethod(save_dialog, 'close')
 wait(lambda: save_dialog.property('opened') is False, 'D4 closed')
+# R3: D4 opens on ready/live rows while the final read still owns the tail.
+final = bridge._card_transcript
+assert final is not None
+bridge._card_tail = True
+QMetaObject.invokeMethod(save_dialog, 'open')
+wait(lambda: save_dialog.property('opened') is True, 'D4 during tail')
+assert save_dialog.property('preview').toVariant() == {}
+final = Transcript(meeting_id=final.meeting_id, meeting_generation=final.meeting_generation,
+                   utterances=[final.utterances[0], final.utterances[-1]])
+bridge._card_results.put((bridge._card_serial, final, False))
+bridge._card_poll()
+wait(lambda: bool(save_dialog.property('preview').toVariant().get('rows')), 'tail preview updated')
+rows = save_dialog.property('preview').toVariant()['rows']
+assert any(r['kind'] == 'mark' for r in rows)
+assert all(r['time'].startswith('[') == (r['kind'] == 'utterance') for r in rows)
+QMetaObject.invokeMethod(save_dialog, 'close')
+wait(lambda: not save_dialog.property('opened'), 'tail D4 closed')
 # D2 is owned by the section, so it is reachable from both row and card.
 from astra_voice.core.meeting_jobs import MeetingJobs
 jobs = MeetingJobs(store, lambda *args: None, submit=lambda work: work())
