@@ -178,6 +178,27 @@ QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
                  install.mapToScene(QPointF(install.width() / 2, install.height() / 2)).toPoint())
 assert bridge.actions == ['Установить'], bridge.actions
 
+# R2-2: even a stale recording card must not expose an enabled delete command.
+from copy import deepcopy
+from astra_voice.meetings.events import MeetingState
+menu = one('meetingCardMenu')
+delete_item = next(node for node in menu.findChildren(QQuickItem)
+                   if 'MenuItem' in node.metaObject().className()
+                   and node.property('text') == 'Удалить встречу…')
+for state in (MeetingState.RECORDING, MeetingState.PAUSED, MeetingState.DELETING):
+    recording = deepcopy(states['ready-1024']['meeting'])
+    recording.state = state
+    bridge.show(recording)
+    QTest.qWait(20)
+    assert delete_item.property('enabled') is False, state
+show('ready-1024')
+assert delete_item.property('enabled') is True
+bridge._card['deleteEnabled'] = False  # deletion waiting for an owner (e.g. export)
+bridge.changed.emit()
+QTest.qWait(20)
+assert delete_item.property('enabled') is False
+show('ready-1024')
+
 # D4 «Сохранить как — <название>» (M4: «Стенограмма», .md/.txt); the file is written in Python.
 show('ready-1024')
 save = one('meetingCardSave')
@@ -408,6 +429,40 @@ wait(lambda: save_dialog.property('opened') is True, 'D4 from the list')
 assert bridge.card.get('view') == 'ready'
 QMetaObject.invokeMethod(save_dialog, 'close')
 wait(lambda: save_dialog.property('opened') is False, 'D4 closed')
+# D2 is owned by the section, so it is reachable from both row and card.
+from astra_voice.core.meeting_jobs import MeetingJobs
+jobs = MeetingJobs(store, lambda *args: None, submit=lambda work: work())
+bridge._jobs = lambda: jobs
+bridge.closeMeeting()
+bridge.requestMeetingAction(rc.MEETING_ID, 'Удалить')
+delete_dialog = window.findChild(QObject, 'meetingDeleteDialog')
+wait(lambda: delete_dialog.property('opened') is True, 'D2 from list')
+assert 'Удалить встречу „' in delete_dialog.property('message')
+message = delete_dialog.property('message')
+assert 'Удалятся запись звука, расшифровка и все её файлы в программе.' in message
+assert 'Файлы, которые вы сохранили в другие папки, останутся — удалите их сами.' in message
+assert delete_dialog.property('confirmVariant') == 'danger'
+assert delete_dialog.findChild(QObject, 'dialogConfirm').property('variant') == 'danger'
+cancel_button = delete_dialog.findChild(QObject, 'dialogCancel')
+wait(lambda: cancel_button.property('activeFocus'), 'D2 cancel focus')
+QTest.keyClick(window, Qt.Key_Return)
+wait(lambda: not delete_dialog.property('opened'), 'D2 cancelled by Enter')
+assert store.list() and bridge.meetings
+bridge.openMeeting(rc.MEETING_ID)
+bridge.cardAction('delete')
+wait(lambda: delete_dialog.property('opened') is True, 'D2 from card')
+QTest.keyClick(window, Qt.Key_Escape)
+wait(lambda: not delete_dialog.property('opened'), 'D2 cancelled by Escape')
+assert bridge.cardOpen and store.list()
+bridge.cardAction('delete')
+wait(lambda: delete_dialog.property('opened') is True, 'D2 reopened')
+capture = window.contentItem().grabToImage()
+wait(lambda: not capture.image().isNull(), 'D2 rendered')
+assert capture.image().save(str(root / 'meeting-delete-dialog.png'))
+QMetaObject.invokeMethod(delete_dialog, 'accept')
+wait(lambda: not bridge.cardOpen and not bridge.meetings, 'D2 deleted and back to list')
+assert store.list() == [] and not (store.root / rc.MEETING_ID).exists()
+jobs.shutdown()
 bridge.shutdown()
 window.hide()
 from PyQt5 import sip

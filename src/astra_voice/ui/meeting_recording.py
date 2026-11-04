@@ -300,8 +300,8 @@ class MeetingRecording(QObject):
 
     def _recover_jobs(self) -> None:
         """Resume unfinished jobs once after initialize(), and only while meetings are
-        allowed: under a policy ban the meetings stay as they are (nothing is resumed
-        or removed); a later tick resumes them when the ban is lifted."""
+        allowed: under a policy ban no job or audio cleanup is resumed; a later tick
+        resumes them when the ban is lifted. Explicit deletions have a separate pass."""
         if self.jobs is None or not self._jobs_recover_pending or not self._jobs_allowed():
             return
         self._jobs_recover_pending = False
@@ -317,6 +317,8 @@ class MeetingRecording(QObject):
     def initialize(self) -> None:
         if self._closed:
             return
+        if self.jobs is not None:
+            self.jobs.recover_deletions()
         self.controller.recover()
         self._jobs_recover_pending = True
         self._recover_jobs()

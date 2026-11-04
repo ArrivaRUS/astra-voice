@@ -27,7 +27,10 @@ AvDialog {
     Connections {
         target: root.bridge
         ignoreUnknownSignals: true
-        function onCardSaveFinished(result) { root.saveResult(result) }
+        function onCardSaveFinished(result) {
+            if (result !== "stale" && root.bridge && root.bridge.cardOpen !== false)
+                root.saveResult(result)
+        }
     }
     function refreshPreview() {
         var model = bridge ? bridge.cardRows : null

@@ -589,3 +589,23 @@ def test_app_gives_the_catalog_probe_before_initialize_recovers_9(
     app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None, service)
     assert seen == [1234]
     recording.bind_jobs.call_args.args[0].shutdown()
+
+
+@pytest.mark.parametrize("gate", ["setting", "policy"])
+@pytest.mark.parametrize("renamed", [False, True])
+def test_r2_startup_finishes_deletion_with_meetings_disabled(
+    rig: Rig, gate: str, renamed: bool
+) -> None:
+    rig.create(state=MeetingState.DELETING)
+    if renamed:
+        rig.store.begin_delete(MID)
+    if gate == "setting":
+        rig.settings.meetings_enabled = False
+    else:
+        _ban(rig)
+    rig.recording.initialize()
+    for _ in range(3):
+        rig.recording.tick()
+    assert not (rig.store.root / MID).exists()
+    assert rig.store.pending_deletions() == []
+    assert not rig.jobs.queued_ids and not rig.roles

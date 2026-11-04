@@ -1,6 +1,6 @@
 """Private meeting layout, typed single-writer leases and atomic JSON persistence.
 
-No capture, cleanup, retention scheduler, IPC or recursive deletion lives here.
+No capture, retention scheduler or IPC lives here. Deletion uses pinned dirfds.
 Persistent empty lease files keep flock identity stable across store instances.
 Leases coordinate trusted roles; they are not isolation from the same Unix user.
 One writer context per role/meeting: leases are non-reentrant and fail fast,
@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import string
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -608,6 +609,107 @@ class MeetingStore:
         except (OSError, MeetingStoreError):
             pass
 
+    def begin_delete(self, meeting_id: str) -> None:
+        """Rename only a durably marked meeting; repeatable after a crash."""
+        _id(meeting_id)
+        try:
+            with private_directory(self.root) as root, _lock(root, ".store.lock"):
+                name = f".deleting-{meeting_id}"
+                if name in os.listdir(root):
+                    if meeting_id in os.listdir(root):
+                        raise MeetingStoreError("Конфликт удаления встречи")
+                    return
+                with _child(root, meeting_id) as directory, _lock(directory, ".store.lock"):
+                    if _metadata(directory, meeting_id).state != MeetingState.DELETING:
+                        raise MeetingStoreError("Встреча не помечена для удаления")
+                    os.rename(meeting_id, name, src_dir_fd=root, dst_dir_fd=root)
+                    os.fsync(root)
+        except (OSError, ValueError, TypeError):
+            raise MeetingStoreError("Не удалось начать удаление встречи") from None
+
+    def pending_deletions(self) -> list[str]:
+        """Include empty crash remnants and links, without opening their targets."""
+        try:
+            with private_directory(self.root) as root:
+                return sorted(
+                    name[len(".deleting-") :]
+                    for name in os.listdir(root)
+                    if name.startswith(".deleting-")
+                    and re.fullmatch(MEETING_ID_PATTERN, name[len(".deleting-") :])
+                )
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError):
+            raise MeetingStoreError("Не удалось прочитать удаления встреч") from None
+
+    @staticmethod
+    def _erase(
+        parent: int, name: str, *, device: int, expected: os.stat_result | None = None
+    ) -> None:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if info.st_dev != device:
+            raise MeetingStoreError("Другая файловая система встречи")
+        if expected is not None and (info.st_dev, info.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise MeetingStoreError("Каталог встречи изменился")
+        if info.st_uid != os.geteuid():
+            raise MeetingStoreError("Чужой владелец файлов встречи")
+        if stat.S_ISDIR(info.st_mode):
+            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent)
+            try:
+                opened = os.fstat(descriptor)
+                if opened.st_dev != device:
+                    raise MeetingStoreError("Другая файловая система встречи")
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise MeetingStoreError("Каталог встречи изменился")
+                with os.scandir(descriptor) as iterator:
+                    entries = list(iterator)
+                for entry in entries:
+                    MeetingStore._erase(descriptor, entry.name, device=device)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise MeetingStoreError("Каталог встречи изменился")
+            os.rmdir(name, dir_fd=parent)
+        else:
+            # No file is read: 0644 remnants and symlinks are unlinked, never followed.
+            os.unlink(name, dir_fd=parent)
+
+    def purge_deleted(self, meeting_id: str) -> None:
+        """Fail fast on a live lease; unlink only beneath the pinned private root."""
+        _id(meeting_id)
+        try:
+            with private_directory(self.root) as root, _lock(root, ".store.lock"):
+                name = f".deleting-{meeting_id}"
+                try:
+                    info = os.stat(name, dir_fd=root, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                device = os.fstat(root).st_dev
+                if info.st_dev != device:
+                    raise MeetingStoreError("Другая файловая система встречи")
+                if info.st_uid != os.geteuid():
+                    raise MeetingStoreError("Чужой владелец файлов встречи")
+                if stat.S_ISLNK(info.st_mode):
+                    os.unlink(name, dir_fd=root)
+                elif stat.S_ISDIR(info.st_mode):
+                    with _child(root, name) as directory, contextlib.ExitStack() as leases:
+                        if os.fstat(directory).st_dev != device:
+                            raise MeetingStoreError("Другая файловая система встречи")
+                        # Include GUI/DIAR leases too; future AI owners must join this barrier.
+                        for role in Writer:
+                            leases.enter_context(_lease(directory, role))
+                        self._erase(root, name, device=device, expected=os.fstat(directory))
+                else:
+                    raise MeetingStoreError("Недопустимый каталог удаления встречи")
+                os.fsync(root)
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось удалить файлы встречи") from None
+
     def read(self, meeting_id: str, filename: str) -> Any:
         try:
             with self._directory(meeting_id) as directory:
@@ -620,7 +722,7 @@ class MeetingStore:
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось прочитать данные встречи") from None
 
-    def list(self) -> list[Meeting]:
+    def list(self, *, include_deleting: bool = False) -> list[Meeting]:
         """Read metadata only, newest first, without creating a data directory.
 
         Service entries and deletion tombstones are omitted. A damaged or unsafe
@@ -652,7 +754,7 @@ class MeetingStore:
                             self._reservation_children(directory)
                             continue
                         meeting = _metadata(directory, name)
-                    if meeting.state != MeetingState.DELETING:
+                    if include_deleting or meeting.state != MeetingState.DELETING:
                         result.append(meeting)
                 return sorted(
                     result,

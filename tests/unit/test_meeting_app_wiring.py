@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -293,3 +294,28 @@ def test_signal_during_start_still_ends_the_event_loop(signum: signal.Signals) -
         timer.stop()
         for sig, value in previous.items():
             signal.signal(sig, value)
+
+
+# Real private store files: the owner check needs the real euid (root in CI).
+@pytest.mark.usefixtures("filesystem_euid")
+def test_delete_is_consumed_before_application_model_action(tmp_path: Path) -> None:
+    from PyQt5.QtTest import QSignalSpy
+    from test_meeting_jobs_ui import MID, Rig
+
+    from helpers.qt_app import get_qapplication
+
+    get_qapplication()
+    rig = Rig(tmp_path)
+    try:
+        rig.create()
+        rig.refresh()
+        focus, info, settings = Mock(), Mock(), Mock()
+        rig.bridge.meetingActionRequested.connect(app._meeting_model_action(focus, info, settings))
+        forwarded = QSignalSpy(rig.bridge.meetingActionRequested)
+        dialog = QSignalSpy(rig.bridge.deleteRequested)
+        rig.bridge.requestMeetingAction(MID, "Удалить")
+        assert len(dialog) == 1 and not forwarded
+        focus.focus_shell.assert_not_called()
+        info.show_section.assert_not_called()
+    finally:
+        rig.bridge.shutdown()

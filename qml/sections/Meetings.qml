@@ -31,6 +31,12 @@ Column {
     onCardOpenChanged: if (cardOpen) Qt.callLater(function() { meetingCard.focusBack(Qt.OtherFocusReason) })
     Connections {
         target: root.bridge
+        ignoreUnknownSignals: true
+        function onDeleteRequested(meetingId, title) {
+            deleteDialog.meetingId = meetingId
+            deleteDialog.meetingTitle = title
+            deleteDialog.open()
+        }
         function onChanged() {
             if (root.bridge && root.bridge.saveError !== undefined && root.bridge.saveError !== "") {
                 Qt.callLater(function() {
@@ -636,6 +642,11 @@ Column {
         visible: root.cardOpen
         bridge: root.bridge
         onBackRequested: if (root.bridge) root.bridge.closeMeeting()
+    }
+
+    MeetingDeleteDialog {
+        id: deleteDialog
+        bridge: root.bridge
     }
 
     ResponsibilityDialog {

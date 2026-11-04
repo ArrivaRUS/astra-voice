@@ -377,8 +377,7 @@ def _button(label: str, *, primary: bool = False, enabled: bool = True) -> dict[
 
 def panel(meeting: Meeting, view: str, *, can_transcribe: bool, failure: str) -> dict[str, Any]:
     """Message panel instead of the table (06-meeting-states, spec §4.7)."""
-    # «Удалить встречу…» is D2 in M5: shown like the reference, unavailable here.
-    delete = _button("Удалить встречу…", enabled=False)
+    delete = _button("Удалить встречу…")
     transcribe = [_button("Расшифровать", primary=True)] if can_transcribe else []
     if view == "cancelled":
         title, text = "Расшифровка отменена", "Запись сохранена — можно начать снова."
@@ -426,7 +425,7 @@ def panel(meeting: Meeting, view: str, *, can_transcribe: bool, failure: str) ->
             "warning",
             "Запись встречи прервалась. Сохранено ",
             "Программа закрылась во время записи. Последние секунды могли потеряться.",
-            [*transcribe, _button("Удалить…", enabled=False)],
+            [*transcribe, _button("Удалить…")],
             mono=clock(meeting.recorded_ms),
         )
     if view == "empty":
@@ -510,6 +509,7 @@ def presentation(
     policy_off: bool,
     failure: str,
     snapshot: Mapping[str, Any] | None,
+    deleting: bool = False,
 ) -> dict[str, Any]:
     # Marks alone are not speech: a done meeting without replies is «empty» (06).
     speech = rows.speech if rows is not None else 0
@@ -547,6 +547,13 @@ def presentation(
         "showTable": table,
         "showEdit": table,
         "showActions": view == "ready",
+        "deleteEnabled": not deleting
+        and meeting.state
+        not in {
+            MeetingState.RECORDING,
+            MeetingState.PAUSED,
+            MeetingState.DELETING,
+        },
         "percent": percent,
         "progressDone": clock(done),
         "progressTotal": clock(total),

@@ -14,6 +14,7 @@ Dialog {
     property bool brandHeader: false
     property string message: ""
     property string confirmText: qsTr("Продолжить")
+    property string confirmVariant: "primary"
     property bool confirmEnabled: true
     property string cancelText: qsTr("Отмена")
     property string note: ""
@@ -238,7 +239,7 @@ Dialog {
             }
             AvButton {
                 text: root.confirmText
-                variant: "primary"
+                variant: root.confirmVariant
                 enabled: root.confirmEnabled
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: root.accept()
@@ -293,7 +294,7 @@ Dialog {
                 id: confirmButton
                 objectName: "dialogConfirm"
                 text: root.confirmText
-                variant: "primary"
+                variant: root.confirmVariant
                 enabled: root.confirmEnabled
                 x: safeFooter.width - width
                 y: safeFooter.stacked ? cancelButton.height + Theme.dialogFooterGap : 0

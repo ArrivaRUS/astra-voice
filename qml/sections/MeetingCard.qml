@@ -306,7 +306,11 @@ FocusScope {
                         MenuItem { text: root.txt("names"); enabled: false }
                         MenuSeparator {}
                         // D2 «Удалить встречу» — M5.
-                        MenuItem { text: root.txt("delete"); enabled: false }
+                        MenuItem {
+                            text: root.txt("delete")
+                            enabled: root.card.deleteEnabled === true
+                            onTriggered: if (root.bridge) root.bridge.cardAction("delete")
+                        }
                     }
                 }
             }

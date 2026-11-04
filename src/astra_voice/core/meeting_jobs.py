@@ -44,6 +44,8 @@ MEMORY_MARGIN_MB = 200  # no diarization in M4 (+900 MB arrives with M7)
 MEMORY_RETRY_S = 60.0
 MODEL_RETRY_S = 60.0
 CANCEL_TIMEOUT_S = 1.0  # worker/meeting_contract.CANCEL_TIMEOUT_S
+DELETE_PURGE_ATTEMPTS = 3
+DELETE_PURGE_RETRY_S = 0.5
 MAX_CRASHES = 3  # restarts per window; the fourth crash fails the job
 CRASH_WINDOW_S = 600.0
 # model.load answered by an unexpected error (timeout, limit, ...): crash path, retry later.
@@ -300,6 +302,8 @@ class MeetingJobs:
         self.failures: dict[str, str] = {}
         self.meetings: dict[str, Meeting] = {}
         self.tombstones: set[str] = set()
+        self.deletions: dict[str, str] = {}
+        self._delete_events: dict[str, dict[tuple[str, str], Message]] = {}
         self.cancelled: set[str] = set()
         # meeting_id -> (failed cancel writes, retry time or None while a write is queued)
         self._cancel_writes: dict[str, tuple[int, float | None]] = {}
@@ -370,8 +374,31 @@ class MeetingJobs:
             "cancelledText": CANCELLED_TEXT,
         }
 
+    def recover_deletions(self) -> None:
+        """Finish human-requested deletions even when recording/resume is forbidden."""
+
+        def scan() -> Callable[[], None]:
+            try:
+                for meeting_id in self.store.pending_deletions():
+                    try:
+                        self.store.purge_deleted(meeting_id)
+                    except MeetingStoreError:
+                        pass  # durable tombstone: retry on the next startup
+                for meeting in self.store.list(include_deleting=True):
+                    if meeting.state == MeetingState.DELETING:
+                        try:
+                            self.store.begin_delete(meeting.id)
+                            self.store.purge_deleted(meeting.id)
+                        except MeetingStoreError:
+                            pass
+            except MeetingStoreError:
+                pass
+            return lambda: None
+
+        self._run(scan)
+
     def recover(self) -> None:
-        """Start of program: resume unfinished jobs (not cancelled/deleting) and cleanups."""
+        """Resume unfinished jobs and audio cleanups; caller enforces the jobs gate."""
 
         def scan() -> Callable[[], None]:
             try:
@@ -467,15 +494,34 @@ class MeetingJobs:
         if self._closed or meeting_id in self.tombstones:
             return
         self.tombstones.add(meeting_id)
-        self._take(meeting_id)
+        self.deletions[meeting_id] = "pending"
+        entry = self._take(meeting_id)
+
+        def failed() -> None:
+            self.tombstones.discard(meeting_id)
+            self.deletions[meeting_id] = "error"
+            if entry is not None:
+                self._queue.append(entry)
+                self._queue.sort(key=lambda item: item.order)
+            self._changed()
+            for event in self._delete_events.pop(meeting_id, {}).values():
+                self._event(event)
 
         def tombstone() -> Callable[[], None]:
-            ok = self._update(meeting_id, lambda meeting: self._to(meeting, MeetingState.DELETING))
+            def mark(meeting: Meeting) -> bool:
+                meeting.state = MeetingState.DELETING
+                meeting.meeting_generation += 1
+                return True
+
+            ok = self._update(meeting_id, mark)
 
             def completed() -> None:
                 if ok is None:
-                    self.tombstones.discard(meeting_id)
+                    failed()
                     return
+                self.deletions[meeting_id] = "deleting"
+                self._delete_events.pop(meeting_id, None)
+                self._cancel_writes.pop(meeting_id, None)
                 self.meetings.pop(meeting_id, None)
                 active = self._active
                 if active is not None and active.meeting_id == meeting_id:
@@ -495,7 +541,44 @@ class MeetingJobs:
             return completed
 
         # The tombstone was not written: nothing is deleted, the meeting stays usable.
-        self._run(tombstone, failed=lambda: self.tombstones.discard(meeting_id))
+        self._run(tombstone, failed=failed)
+
+    def purge_deleted(self, meeting_id: str) -> None:
+        """GUI release callback schedules filesystem work after every owner has exited.
+
+        The bridge first releases export; future DIAR/AI owners must also acknowledge
+        release before this callback. No filesystem work runs in the GUI thread.
+        """
+
+        def work() -> Callable[[], None]:
+            meeting = self.store.read(meeting_id, "meeting.json")
+            for attempt in range(DELETE_PURGE_ATTEMPTS):
+                if meeting_id not in self.tombstones or self._closed:
+                    return lambda: None
+                try:
+                    # begin_delete is idempotent: a previous attempt may have renamed.
+                    self.store.begin_delete(meeting_id)
+                    self.store.purge_deleted(meeting_id)
+                    break
+                except MeetingStoreError:
+                    if attempt + 1 == DELETE_PURGE_ATTEMPTS:
+                        raise
+                    time.sleep(DELETE_PURGE_RETRY_S)
+
+            def completed() -> None:
+                self.meetings.pop(meeting_id, None)
+                self.tombstones.discard(meeting_id)
+                self.deletions[meeting_id] = "deleted"
+                self._notify("deleted", meeting)
+                self._changed()
+
+            return completed
+
+        def failed() -> None:
+            self.deletions[meeting_id] = "purge_error"
+            self._changed()  # on disk DELETING/.deleting-* remains recoverable
+
+        self._run(work, failed=failed)
 
     def tick(self) -> None:
         self._drain()
@@ -735,6 +818,8 @@ class MeetingJobs:
         return {"meeting_id": active.meeting_id, "meeting_generation": active.generation}
 
     def _advance(self, active: _Active) -> None:
+        if self.deletions.get(active.meeting_id) == "pending":
+            return  # pin the owner until the durable tombstone has completed
         if active.phase in {"launching", "crashed"} and not active.purpose:
             if active.retry_at > self.clock():
                 return
@@ -841,6 +926,8 @@ class MeetingJobs:
         self._changed()
 
     def _handle_exits(self) -> None:
+        if self._active is not None and self.deletions.get(self.active_id) == "pending":
+            return
         exits, self._exits = self._exits, []
         if not exits:
             return
@@ -903,9 +990,22 @@ class MeetingJobs:
             return
         kind = event.get("type")
         active = self._active
+        if active is not None and self.deletions.get(active.meeting_id) == "pending":
+            # Preserve every role event for replay if the durable write fails.
+            # Outstanding credits bound utterances; progress keeps only its latest value.
+            key = (
+                str(kind),
+                ""
+                if kind == "meeting.job.progress"
+                else str(event.get("req", event.get("seq", ""))),
+            )
+            self._delete_events.setdefault(active.meeting_id, {})[key] = event
+            return
         if kind == "error" and "req" not in event:
             if event.get("code") in {"restart-limit", "worker-start"} and active is not None:
-                if active.purpose:
+                if active.purpose == "delete":
+                    self._kill(active)  # even a supervisor error must await confirmed poll
+                elif active.purpose:
                     self._finish_stop(active)
                 else:
                     self._fail(active, "io")

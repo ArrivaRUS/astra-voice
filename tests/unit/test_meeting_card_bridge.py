@@ -536,9 +536,7 @@ def test_state_panels(
     assert card["view"] == view and not card["showTable"] and card["marks"] == []
     assert card["panel"]["title"] == title
     assert [b["label"] for b in card["panel"]["buttons"]] == buttons
-    assert [b["enabled"] for b in card["panel"]["buttons"]][-1] is (
-        view != "cancelled" and view != "interrupted"
-    )
+    assert all(b["enabled"] for b in card["panel"]["buttons"])
 
 
 def test_model_buttons_go_to_the_models_section(rig: SaveRig) -> None:
@@ -671,3 +669,117 @@ def test_card_rejects_transcript_identity_and_disables_export(
     card = rig.open_card()
     assert card["view"] == "read-error" and not card["showActions"]
     assert rig.bridge.saveAs("md") == "error" and not rig.picked
+
+
+def test_delete_from_row_and_card_confirms_only_in_d2(rig: SaveRig) -> None:
+    rig.create(title="Совещание <бюджет>")
+    rig.open_card()
+    requested = QSignalSpy(rig.bridge.deleteRequested)
+    forwarded = QSignalSpy(rig.bridge.meetingActionRequested)
+    rig.bridge.requestMeetingAction(MID, "Удалить")
+    assert list(requested) == [[MID, "Совещание <бюджет>"]]
+    assert rig.store.list() and rig.bridge.cardOpen  # cancelling D2 makes no call
+    rig.bridge.cardAction("delete")
+    assert len(requested) == 2 and not forwarded
+    rig.bridge.confirmDelete(MID)
+    assert not rig.bridge.meetings and not rig.bridge.cardOpen
+    assert rig.store.list() == []
+    assert rig.jobs.deletions[MID] == "deleted"
+    rig.recording.tick()  # stale capture recovery cannot resurrect the row
+    assert not rig.bridge.meetings
+
+
+@pytest.mark.parametrize("state", [MeetingState.RECORDING, MeetingState.PAUSED])
+def test_recording_cannot_be_deleted(rig: SaveRig, state: MeetingState) -> None:
+    rig.create(state=state)
+    rows = rig.refresh()
+    assert "Удалить" not in rows[MID]["actions"]
+    requested = QSignalSpy(rig.bridge.deleteRequested)
+    rig.bridge.requestMeetingAction(MID, "Удалить")
+    rig.bridge.confirmDelete(MID)
+    assert not requested and rig.store.list()
+
+
+@pytest.mark.parametrize("close_card", [False, True])
+def test_delete_waits_for_export_even_after_card_switch(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, close_card: bool
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    monkeypatch.setattr(rig.bridge._export_writer, "submit", tasks.append)
+    rig.answer = str(rig.documents / "copy.md")
+    assert rig.bridge.saveAs("md") == "pending"
+    if close_card:
+        rig.bridge.closeMeeting()  # export owns the original id, not the current card
+    rig.bridge.confirmDelete(MID)
+    assert MID not in rig.jobs.tombstones and rig.store.list()
+    tasks.pop()()
+    for _ in range(100):
+        QTest.qWait(5)
+        if not rig.bridge._delete_pending:
+            break
+    assert rig.jobs.deletions[MID] == "deleted"
+    assert (rig.documents / "copy.md").exists()
+    assert not rig.store.list()
+    assert rig.bridge.saveError == ""
+
+
+def test_failed_tombstone_restores_row_and_shows_fixed_error(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.meetings.store import MeetingStoreError
+
+    rig.create()
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    rig.jobs._submit = tasks.append
+    monkeypatch.setattr(rig.store, "write", Mock(side_effect=MeetingStoreError("fixed")))
+    rig.bridge.confirmDelete(MID)
+    assert not rig.bridge.meetings  # optimistic hide while the write is still pending
+    tasks.pop(0)()
+    rig.jobs.tick()
+    rig.bridge._poll_deletions()
+    assert rig.bridge.meetings[0]["id"] == MID
+    assert rig.bridge.saveError == "Не удалось удалить встречу"
+    assert rig.store.list() and not rig.jobs.tombstones
+
+
+@pytest.mark.parametrize("export_waiting", [False, True])
+def test_r2_delete_poll_notifies_only_when_status_changes(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, export_waiting: bool
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    rig.jobs._submit = tasks.append
+    if export_waiting:
+        rig.bridge._export_busy = True
+        rig.bridge._export_id = MID
+    overlay = Mock(wraps=rig.bridge._overlay_capture)
+    monkeypatch.setattr(rig.bridge, "_overlay_capture", overlay)
+    changes = QSignalSpy(rig.bridge.changed)
+    rig.bridge.confirmDelete(MID)
+    assert changes
+    assert not rig.bridge.card.get("deleteEnabled", False)
+    count, overlays = len(changes), overlay.call_count
+    for _ in range(100):
+        rig.bridge._poll_deletions()
+    assert len(changes) == count and overlay.call_count == overlays
+    if export_waiting:
+        rig.bridge._export_busy = False
+        rig.bridge.cardSaveFinished.emit("saved")
+    tasks.pop(0)()
+    rig.jobs.tick()
+    rig.bridge._poll_deletions()
+    assert len(changes) > count
+    count = len(changes)
+    for _ in range(100):
+        rig.bridge._poll_deletions()
+    assert len(changes) == count
+    tasks.pop(0)()
+    rig.jobs.tick()
+    rig.bridge._poll_deletions()
+    assert len(changes) > count and rig.jobs.deletions[MID] == "deleted"

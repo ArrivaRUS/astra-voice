@@ -770,6 +770,7 @@ def _set_context_property(shell: Any, name: str, obj: Any) -> None:
 
 def _meeting_model_action(focuser: Any, app_info: Any, settings_bridge: Any) -> Any:
     """«Установить» / «Установить из файла…» / «Подробнее» → раздел «Модели» (spec §2.5)."""
+    # D2 deletion is handled inside MeetingBridge before meetingActionRequested.
     from astra_voice.ui.meeting_card import MODEL_ACTIONS
 
     def handle(_meeting_id: str, action: str) -> None:
