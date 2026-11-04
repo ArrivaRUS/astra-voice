@@ -10,6 +10,7 @@ Marks (pauses, microphone gaps, damage) are shared with card A.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import unicodedata
 from collections.abc import Iterable, Sequence
@@ -252,12 +253,16 @@ def _one_line(text: str) -> str:
 
 
 def _md_escape(text: str) -> str:
-    """Literal text in Markdown: no HTML, emphasis, code spans, links, images or headings.
-
-    User text never starts a line (it follows «# », «[ч:мм:сс] Кто: » or a label),
-    so line-start markers (-, +, 1.) need no escaping.
-    """
-    return "".join("\\" + c if c in "\\<>&*_`[]()!#" else c for c in text)
+    """One literal code span, immune to renderer-specific GFM autolinking."""
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    # CommonMark strips one paired space unless the content is all spaces.
+    padded = (
+        text.startswith("`")
+        or text.endswith("`")
+        or (text.startswith(" ") and text.endswith(" ") and bool(text.strip(" ")))
+    )
+    content = " " + text + " " if padded else text
+    return fence + content + fence
 
 
 def _merged(meeting: Meeting, utterances: Sequence[Utterance]) -> list[tuple[int, str, str]]:
@@ -306,8 +311,8 @@ def stenogram(
     lines.append(f"{item}Длительность: {clock(meeting.recorded_ms)}")
     speakers = sorted({u.speaker for u in utterances}, key=lambda s: (s != "me", s))
     if speakers:
-        names = ", ".join(speaker_label(meeting, s) for s in speakers)
-        lines.append(f"{item}Участники: {esc(names)}")
+        names = ", ".join(esc(speaker_label(meeting, s)) for s in speakers)
+        lines.append(f"{item}Участники: {names}")
     if marks:
         lines.append(f"{item}Отметки:")
         lines.extend(("  - " if md else "  ") + mark.badge for mark in marks)

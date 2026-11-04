@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -331,6 +334,139 @@ def corpus_document() -> dict[str, Any]:
             *words("far1", 11.5, "шапку и пошёл"),
         ],
     }
+
+
+@pytest.fixture
+def corpus_model(tmp_path: Path, modules_present: None) -> tuple[Path, Path]:
+    import wave
+
+    from astra_voice.worker.engine import LAYOUTS
+
+    corpus, model = tmp_path / "corpus", tmp_path / "model"
+    corpus.mkdir()
+    model.mkdir()
+    for name in LAYOUTS[str(check.MODEL["layout"])][str(check.MODEL["variant"])].required:
+        (model / name).write_bytes(b"")
+    (corpus / "transcript.json").write_text(json.dumps(corpus_document()), encoding="utf-8")
+    for name in ("mic.wav", "far.wav"):
+        with wave.open(str(corpus / name), "wb") as wav:
+            wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            wav.writeframes(b"\0\0" * 16000)
+    return corpus, model
+
+
+@pytest.mark.parametrize("section", ["words", "utterances"])
+@pytest.mark.parametrize("bad", ["string", "inf", "speaker", "range", "type", "count", "sentence"])
+def test_invalid_corpus_is_private_unavailable_before_role(
+    cli: tuple[Callable[[list[str]], int], list[dict[str, Any]]],
+    corpus_model: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    section: str,
+    bad: str,
+) -> None:
+    corpus, model = corpus_model
+    document = corpus_document()
+    marker = "CORPUS_PRIVATE_MARKER"
+    document["words"][0]["word"] = marker
+    row = document[section][0]
+    if bad == "string":
+        row["start"] = marker
+    elif bad == "inf":
+        row["start"] = float("inf")
+    elif bad == "speaker":
+        del row["speaker"]
+    elif bad == "range":
+        row["end"] = -1
+    elif bad == "type":
+        row["speaker"] = [marker]
+    elif bad == "count":
+        limit_name = "MAX_CORPUS_WORDS" if section == "words" else "MAX_CORPUS_UTTERANCES"
+        monkeypatch.setattr(check, limit_name, 2, raising=False)
+    else:
+        document["utterances"][0]["sentences"][0]["start"] = float("nan")
+    (corpus / "transcript.json").write_text(json.dumps(document), encoding="utf-8")
+    role = Mock(return_value=check.RoleRun())
+    monkeypatch.setattr(check, "run_role", role)
+    monkeypatch.setattr(check, "build_meeting", lambda *_args: 12_000)
+    main, _calls = cli
+    assert main(["meetings", "--transcribe", str(corpus), "--model-dir", str(model), "--json"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["failure"] == "corpus-transcript"
+    assert marker not in captured.out + captured.err
+    role.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["mic.wav", "transcript.json"])
+@pytest.mark.parametrize("kind", ["fifo", "symlink", "directory"])
+def test_unsafe_corpus_file_is_unavailable_without_blocking(
+    corpus_model: tuple[Path, Path],
+    name: str,
+    kind: str,
+) -> None:
+    corpus, model = corpus_model
+    target = corpus / name
+    target.unlink()
+    if kind == "fifo":
+        os.mkfifo(target)
+    elif kind == "symlink":
+        target.symlink_to(corpus / "far.wav")
+    else:
+        target.mkdir()
+    # Child alarm bounds the RED FIFO case too; no stranded reader threads.
+    script = """
+import json, signal, sys, time
+from pathlib import Path
+from tools import meeting_transcribe_check as check
+check.missing_modules = lambda: []
+def no_role(*args, **kwargs):
+    raise AssertionError("role-started")
+check.run_role = no_role
+def timeout(*args):
+    raise TimeoutError("blocked")
+signal.signal(signal.SIGALRM, timeout)
+signal.setitimer(signal.ITIMER_REAL, 0.9)
+started = time.monotonic()
+code, report = check.run_transcribe(Path(sys.argv[1]), model_dir=Path(sys.argv[2]))
+signal.setitimer(signal.ITIMER_REAL, 0)
+print(json.dumps({"code": code, "failure": report.get("failure"),
+                  "elapsed": time.monotonic()-started}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(corpus), str(model)],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src") + os.pathsep + str(ROOT)},
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert (report["code"], report["failure"]) == (2, "corpus-file")
+    assert report["elapsed"] <= 1
+
+
+def test_oversized_corpus_transcript_is_rejected_before_read(
+    corpus_model: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus, model = corpus_model
+    target = corpus / "transcript.json"
+    with target.open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+    original = Path.read_text
+
+    def guarded(path: Path, *args: Any, **kwargs: Any) -> str:
+        assert path != target, "unbounded-corpus-read"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    fdopen = Mock(wraps=os.fdopen)
+    monkeypatch.setattr(os, "fdopen", fdopen)
+    code, report = check.run_transcribe(corpus, model_dir=model)
+    assert (code, report["failure"]) == (2, "corpus-file")
+    fdopen.assert_not_called()
 
 
 def test_reference_cut_tracks_and_separable_starts() -> None:

@@ -20,6 +20,15 @@ AvDialog {
     property var previewRows: []
 
     function txt(key) { return texts[key] !== undefined ? texts[key] : "" }
+    function saveResult(result) {
+        if (result === "exists") root.replaceDialog.open()
+        else if (result !== "saved" && result !== "pending") root.open()
+    }
+    Connections {
+        target: root.bridge
+        ignoreUnknownSignals: true
+        function onCardSaveFinished(result) { root.saveResult(result) }
+    }
     function refreshPreview() {
         var model = bridge ? bridge.cardRows : null
         var rows = []
@@ -45,8 +54,7 @@ AvDialog {
     onConfirmed: Qt.callLater(function() {
         if (!root.bridge) return
         var result = root.bridge.saveAs(root.formatIndex === 0 ? "md" : "txt")
-        if (result === "exists") root.replaceDialog.open()
-        else if (result !== "saved") root.open()
+        root.saveResult(result)
     })
 
     // Файл по выбранному пути уже есть (или появился после системного диалога):
@@ -68,7 +76,7 @@ AvDialog {
             root.open()
         }
         onConfirmed: Qt.callLater(function() {
-            if (root.bridge && root.bridge.replaceSaveTarget() !== "saved") root.open()
+            if (root.bridge) root.saveResult(root.bridge.replaceSaveTarget())
         })
     }
 

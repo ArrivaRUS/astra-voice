@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import signal
 import stat
@@ -131,6 +132,31 @@ def disk(tmp_path: Path) -> store.MeetingStore:
     result = store.MeetingStore(tmp_path / "meetings")
     result.create(model.Meeting(id=ID, started_at=STAMP))
     return result
+
+
+@pytest.mark.parametrize("kind", ["transcript", "checkpoint", "sidecar", "capture"])
+def test_read_rejects_document_from_another_meeting(disk: store.MeetingStore, kind: str) -> None:
+    other_id = "2026-10-29_130000-ab12"
+    documents = {
+        "transcript": ("transcript.json", model.Transcript(meeting_id=other_id)),
+        "checkpoint": ("checkpoint.json", model.Checkpoint(meeting_id=other_id)),
+        "sidecar": (
+            "audio/mic-0000.json",
+            segments.SegmentSidecar(meeting_id=other_id, epoch_id="e1"),
+        ),
+        "capture": (
+            "capture.json",
+            segments.CaptureJournal(meeting_id=other_id, meeting_generation=0, capture_id="c1"),
+        ),
+    }
+    name, document = documents[kind]
+    target = disk.root / ID / name
+    target.write_text(json.dumps(document.to_dict()), encoding="utf-8")
+    target.chmod(0o600)
+    with pytest.raises(store.MeetingStoreError) as caught:
+        disk.read(ID, name)
+    assert str(caught.value) == "meeting-document-id"
+    assert caught.value.__cause__ is None
 
 
 def test_layout_permissions_and_no_overwrite(disk: store.MeetingStore) -> None:
