@@ -212,6 +212,7 @@ ApplicationWindow {
                     && window.meetings.enabled && window.meetings.recordingAvailable === true
                 spacing: Theme.meetingSectionRecCaptionGap
                 AvButton {
+                    id: meetingRecordButton
                     objectName: "meetingRecord"
                     text: window.meetings && window.meetings.texts.record ? window.meetings.texts.record : qsTr("Записать встречу")
                     iconName: "rec"
@@ -296,6 +297,8 @@ ApplicationWindow {
                 source: window.sectionPages[window.currentSection.key]
 
                 onLoaded: {
+                    if (window.currentSection.key === "meetings" && page.item)
+                        page.item.sectionHeaderFocusItem = meetingRecordButton
                     if (window.focusUpdateOnLoad && window.currentSection.key === "network") {
                         window.focusUpdateOnLoad = false;
                         Qt.callLater(function() {

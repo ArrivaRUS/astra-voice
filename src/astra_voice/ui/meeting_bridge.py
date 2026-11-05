@@ -51,11 +51,14 @@ from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.meeting_texts import (
     DELETE_TEXTS,
     EXIT_TEXTS,
+    RENAME_TEXTS,
     RESPONSIBILITY_ITEMS,
     TEXTS,
     W2_TEXTS,
     W4_TEXTS,
 )
+
+RENAME_ACTION = "Переименовать"
 
 SAVE_ERROR = "Не удалось сохранить настройки. Попробуйте ещё раз."
 
@@ -188,6 +191,8 @@ class MeetingBridge(QObject):
     meetingActionRequested = pyqtSignal(str, str)
     openMeetingsRequested = pyqtSignal()
     participantsRequested = pyqtSignal()
+    renameRequested = pyqtSignal(str, str)
+    renameFinished = pyqtSignal(str)
     deleteRequested = pyqtSignal(str, str)
     cardSaveRequested = pyqtSignal()
     cardSaveFinished = pyqtSignal(str)
@@ -228,6 +233,7 @@ class MeetingBridge(QObject):
         self._apps = known_apps
         self._submit, self._clock = submit, clock
         self._documents: list[Meeting] = []
+        self._rename_pending = ""
         self._queue: queue.Queue[LoadResult] = queue.Queue(maxsize=1)
         self._loading = self._loading_visible = self._read_error = False
         self._save_error = ""
@@ -494,13 +500,13 @@ class MeetingBridge(QObject):
                 "Записана",
                 "neutral",
                 "Расшифровать",
-                ["Переименовать", "Удалить"],
+                [RENAME_ACTION, "Удалить"],
             ),
             MeetingState.TRANSCRIBING: (
                 "Расшифровка · 0 %",
                 "warning",
                 "Отменить",
-                ["Переименовать", "Удалить"],
+                [RENAME_ACTION, "Удалить"],
             ),
             MeetingState.WAITING_MEMORY: ("Ждёт памяти", "warning", "", ["Отменить", "Удалить"]),
             MeetingState.NEEDS_MODEL: ("Нужна модель", "warning", "Установить", ["Удалить"]),
@@ -508,7 +514,7 @@ class MeetingBridge(QObject):
                 "Готово",
                 "success",
                 "Открыть",
-                ["Сохранить как…", "Имена участников", "Переименовать", "Удалить"],
+                ["Сохранить как…", "Имена участников", RENAME_ACTION, "Удалить"],
             ),
             MeetingState.FAILED: ("Ошибка расшифровки", "danger", "Повторить", ["Удалить"]),
             MeetingState.INTERRUPTED: ("Прервана", "warning", "Расшифровать", ["Удалить"]),
@@ -560,6 +566,10 @@ class MeetingBridge(QObject):
             and self._capture.controller.state == "stopped"
             and state in {MeetingState.RECORDING, MeetingState.PAUSED}
         )
+        if meeting.id in self._delete_pending or (
+            jobs is not None and meeting.id in jobs.tombstones
+        ):
+            actions = [item for item in actions if item != RENAME_ACTION]
         if saving:
             badge, kind, action, actions = "Сохраняю запись…", "neutral", "", []
         return {
@@ -586,6 +596,7 @@ class MeetingBridge(QObject):
                 )
             ),
             "actions": actions,
+            "actionKeys": ["rename" if action == RENAME_ACTION else "" for action in actions],
             "progress": progress,
             "active": not saving and state in {MeetingState.RECORDING, MeetingState.PAUSED},
             "transcribing": state == MeetingState.TRANSCRIBING,
@@ -756,6 +767,13 @@ class MeetingBridge(QObject):
         for row in self.meetings:
             if row["id"] == meeting_id and action and action in [row["action"], *row["actions"]]:
                 if action == row["action"] and not row["actionEnabled"]:
+                    return
+                if action == RENAME_ACTION:
+                    meeting = next(
+                        (item for item in self._documents if item.id == meeting_id), None
+                    )
+                    if meeting is not None:
+                        self.renameRequested.emit(meeting_id, meeting.title)
                     return
                 if action == "Удалить":
                     meeting = next(
@@ -1153,6 +1171,7 @@ class MeetingBridge(QObject):
             policy_off=self.sectionState == "policy-off",
             failure=failure,
             snapshot=self._card_progress if meeting.state == MeetingState.TRANSCRIBING else None,
+            rename_allowed=RENAME_ACTION in self._row(meeting)["actions"],
             deleting=meeting.id in self._delete_pending
             or (jobs is not None and meeting.id in jobs.tombstones),
         )
@@ -1300,9 +1319,50 @@ class MeetingBridge(QObject):
             if self.enabled or action == "Подробнее":
                 self.meetingActionRequested.emit(meeting.id, action)
             return
+        if action == "rename":
+            action = RENAME_ACTION
         if action in {"delete", "Удалить встречу…", "Удалить…"}:
             action = "Удалить"
         self.requestMeetingAction(meeting.id, action)
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def renameTexts(self) -> dict[str, str]:
+        return dict(RENAME_TEXTS)
+
+    @pyqtSlot(str, str, result=str)
+    def renameMeeting(self, meeting_id: str, title: str) -> str:
+        meeting = next((row for row in self._documents if row.id == meeting_id), None)
+        jobs = self._jobs()
+        if (
+            self._closed
+            or self._rename_pending
+            or jobs is None
+            or meeting is None
+            or RENAME_ACTION not in self._row(meeting)["actions"]
+        ):
+            return "error"
+        try:
+            # Validate controls before collapsing whitespace (tabs/newlines must not disappear).
+            title = normalize_text(
+                " ".join(normalize_text(title, 1_000_000).split()), 120, minimum=1
+            )
+        except ValueError:
+            return "error"
+        self._rename_pending = meeting_id
+
+        def completed(ok: bool) -> None:
+            self._rename_pending = ""
+            if self._closed:
+                return
+            if ok:
+                self._overlay_capture()
+                self.savePreviewChanged.emit()
+                self.changed.emit()
+            self.renameFinished.emit("saved" if ok else "error")
+
+        # Even injected synchronous submitters must publish after the slot returns pending.
+        jobs.rename(meeting_id, title, lambda ok: QTimer.singleShot(0, lambda: completed(ok)))
+        return "pending"
 
     @pyqtProperty("QVariantMap", constant=True)
     def deleteTexts(self) -> dict[str, str]:

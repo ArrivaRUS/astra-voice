@@ -176,6 +176,8 @@ def make_bridge() -> Any:
         changed = pyqtSignal()
         saveTemplateChanged = pyqtSignal()  # noqa: N815
         savePreviewChanged = pyqtSignal()  # noqa: N815
+        renameRequested = pyqtSignal(str, str)  # noqa: N815
+        renameFinished = pyqtSignal(str)  # noqa: N815
         cardSaveRequested = pyqtSignal()  # noqa: N815 — QML API
 
         def __init__(self) -> None:
@@ -185,6 +187,8 @@ def make_bridge() -> Any:
             self.builder: CardRows | None = None
             self.actions: list[str] = []
             self.saves: list[str] = []
+            self.renames: list[tuple[str, str]] = []
+            self.rename_result = "pending"
             self.saved_templates: list[str] = []
             self._save_template = TEMPLATES[0]
             self.utterances: list[Any] = []
@@ -218,6 +222,17 @@ def make_bridge() -> Any:
         cardSaveError = pyqtProperty(str, _get_error, notify=changed)  # noqa: N815
         toast = pyqtProperty("QVariantMap", _get_toast, notify=changed)
         cardReplaceFile = pyqtProperty(str, _get_replace, notify=changed)  # noqa: N815
+
+        @pyqtProperty("QVariantMap", constant=True)
+        def renameTexts(self) -> dict[str, str]:  # noqa: N802
+            from astra_voice.ui.meeting_texts import RENAME_TEXTS
+
+            return dict(RENAME_TEXTS)
+
+        @pyqtSlot(str, str, result=str)
+        def renameMeeting(self, meeting_id: str, title: str) -> str:  # noqa: N802
+            self.renames.append((meeting_id, title))
+            return self.rename_result
 
         @pyqtProperty("QVariantList", constant=True)
         def saveTemplates(self) -> list[dict[str, str]]:  # noqa: N802
@@ -278,6 +293,7 @@ def make_bridge() -> Any:
                 rows=builder,
                 can_transcribe=True,
                 policy_off=self.policy_off,
+                rename_allowed=not self.policy_off,
                 failure=self.failure,
                 snapshot=self.snapshot,
             )
@@ -286,6 +302,8 @@ def make_bridge() -> Any:
         @pyqtSlot(str)
         def cardAction(self, action: str) -> None:  # noqa: N802
             self.actions.append(action)
+            if action == "rename" and self._card.get("renameEnabled"):
+                self.renameRequested.emit(self.meeting.id, self.meeting.title)
 
         @pyqtSlot(str, result=str)
         def saveAs(self, fmt: str) -> str:  # noqa: N802

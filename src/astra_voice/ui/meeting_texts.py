@@ -263,3 +263,12 @@ DELETE_TEXTS = {
     "confirm": "Удалить встречу",
     "error": "Не удалось удалить встречу",
 }
+
+
+# D3, spec §4.7; meeting titles are supplied separately by the bridge.
+RENAME_TEXTS = {
+    "heading": "Переименовать встречу",
+    "label": "Название встречи",
+    "cancel": "Отмена",
+    "confirm": "Сохранить",
+}

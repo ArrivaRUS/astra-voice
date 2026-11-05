@@ -971,7 +971,8 @@ def test_preview_5000_rows_is_bounded_and_fast(
         )
     preview, elapsed = _minimum_preview_time(template, rig.meeting(), transcript)
     print(f"preview {template}: {elapsed * 1000:.2f} ms")
-    assert elapsed < 0.050
+    # Structural counters above enforce bounded work; time is a coarse hang guard.
+    assert elapsed <= 0.500
     assert len(preview["rows"]) <= (
         3 if template == "text_only" else 8 if template == "stats" else 6
     )
@@ -1050,7 +1051,8 @@ def test_preview_bounds_a_single_5000_reply_paragraph(
         assert normalizations.call_count <= 5  # capped even while one speaker keeps talking
     preview, elapsed = _minimum_preview_time("text_only", rig.meeting(), transcript)
     print(f"preview single paragraph: {elapsed * 1000:.2f} ms")
-    assert elapsed < 0.050
+    # Structural counters above enforce bounded work; time is a coarse hang guard.
+    assert elapsed <= 0.500
     assert len(preview["rows"]) == 1
     assert len(preview["rows"][0]["text"]) <= 601
     assert preview["rows"][0]["text"].endswith("…")

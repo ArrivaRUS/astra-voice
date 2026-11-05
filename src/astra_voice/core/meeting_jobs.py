@@ -32,7 +32,7 @@ from uuid import uuid4
 from astra_voice.core.meeting_session import MetadataWriter
 from astra_voice.meetings import MeetingValidationError
 from astra_voice.meetings.events import MeetingState, ProcessingStatus, transition
-from astra_voice.meetings.model import FAILURE_CODES, Meeting
+from astra_voice.meetings.model import FAILURE_CODES, Meeting, normalize_text
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, Writer
 from astra_voice.security.files import private_directory
 
@@ -602,6 +602,36 @@ class MeetingJobs:
             return
         if entry is not None or meeting_id == self._admitting:
             self._persist_cancel(meeting_id)
+
+    def rename(self, meeting_id: str, title: str, done: Callable[[bool], None]) -> None:
+        """D3: use the same serialized RMW writer as transcription lifecycle edges.
+
+        Only the title changes; completion is drained by tick() on the GUI thread.
+        Capture owns a separate metadata copy, so recording/paused cannot be edited.
+        """
+        if self._closed or meeting_id in self.tombstones:
+            done(False)
+            return
+
+        def mutate(meeting: Meeting) -> bool:
+            if meeting.state in {MeetingState.RECORDING, MeetingState.PAUSED}:
+                return False
+            meeting.title = normalize_text(title, 120, minimum=1)
+            return bool(title.strip())
+
+        def work() -> Callable[[], None]:
+            updated = self._update(meeting_id, mutate, require_change=True)
+
+            def completed() -> None:
+                ok = updated is not None and meeting_id not in self.tombstones
+                if updated is not None and ok:
+                    self.meetings[meeting_id] = updated
+                    self._changed()
+                done(ok)
+
+            return completed
+
+        self._run(work, failed=lambda: done(False))
 
     def delete_and_purge(
         self, meeting_id: str, *, finished: Callable[[bool], None] | None = None

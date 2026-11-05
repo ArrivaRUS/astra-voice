@@ -36,6 +36,11 @@ FocusScope {
     function txt(key) { return texts[key] !== undefined ? texts[key] : "" }
     function focusBack(reason) { back.forceActiveFocus(reason === undefined ? Qt.TabFocusReason : reason) }
     function openSaveDialog() { if (root.card.showActions === true) saveDialog.open() }
+    function requestRename(origin) {
+        if (!bridge || renameDialog.pending) return
+        renameDialog.returnFocusItem = origin
+        bridge.cardAction("rename")
+    }
     function moveRow(step) {
         var count = rows.count
         if (count === 0) return
@@ -47,6 +52,12 @@ FocusScope {
     Connections {
         target: root.bridge
         ignoreUnknownSignals: true
+        function onRenameRequested(meetingId, title) {
+            if (root.card.id !== meetingId || renameDialog.pending) return
+            renameDialog.meetingId = meetingId
+            renameDialog.meetingTitle = title
+            Qt.callLater(function() { renameDialog.open() })
+        }
         function onCardSaveRequested() { Qt.callLater(root.openSaveDialog) }
     }
 
@@ -195,17 +206,30 @@ FocusScope {
                         visible: root.card.showEdit === true
                         width: Theme.meetingHeadEditIcon
                         height: titleRow.lineH
-                        // D3 «Переименовать» — M5: значок виден, но недоступен.
                         AbstractButton {
+                            id: editButton
                             objectName: "meetingCardEdit"
                             anchors.centerIn: parent
                             width: Theme.meetingHeadEditIcon
                             height: Theme.meetingHeadEditIcon
-                            enabled: false
-                            focusPolicy: Qt.NoFocus
+                            enabled: root.card.renameEnabled === true
+                            focusPolicy: Qt.StrongFocus
+                            onClicked: root.requestRename(editButton)
+                            Keys.onReturnPressed: root.requestRename(editButton)
+                            Keys.onEnterPressed: root.requestRename(editButton)
                             Accessible.name: root.txt("rename")
                             contentItem: Icon { name: "edit"; size: Theme.meetingHeadEditIcon; color: Theme.fgMuted }
-                            background: Item {}
+                            background: Item {
+                                Rectangle {
+                                    anchors.fill: parent
+                                    anchors.margins: -(Theme.focusOffset + Theme.focusWidth)
+                                    radius: Theme.focusRadius
+                                    color: "transparent"
+                                    border.width: Theme.focusWidth
+                                    border.color: Theme.stateFocusRing
+                                    visible: editButton.visualFocus
+                                }
+                            }
                         }
                     }
                     Item {
@@ -302,7 +326,12 @@ FocusScope {
                         width: Theme.popoverMinW
                         // Esc закрывает меню, фокус — обратно на «⋯» (spec §5.2).
                         onClosed: moreButton.forceActiveFocus(Qt.TabFocusReason)
-                        MenuItem { text: root.txt("rename"); enabled: false }
+                        MenuItem {
+                            objectName: "meetingCardRenameAction"
+                            text: root.txt("rename")
+                            enabled: root.card.renameEnabled === true
+                            onTriggered: root.requestRename(moreButton)
+                        }
                         MenuItem { text: root.txt("names"); enabled: false }
                         MenuSeparator {}
                         // D2 «Удалить встречу» — M5.
@@ -925,6 +954,12 @@ FocusScope {
                 }
             }
         }
+    }
+
+    MeetingRenameDialog {
+        id: renameDialog
+        bridge: root.bridge
+        fallbackFocusItem: back
     }
 
     MeetingSaveDialog {

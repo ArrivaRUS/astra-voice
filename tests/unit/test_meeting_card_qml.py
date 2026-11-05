@@ -19,7 +19,7 @@ QML_PROBE = r"""
 import re
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QObject, QPointF, Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import QMetaObject, QObject, QPointF, Qt, QUrl, pyqtProperty, pyqtSignal
 from PyQt5.QtGui import QFont, QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
@@ -45,13 +45,31 @@ engine = QQmlApplicationEngine()
 install_icon_provider(engine)
 warnings = []
 engine.warnings.connect(lambda rows: warnings.extend(row.toString() for row in rows))
+class Palette(QObject):
+    changed = pyqtSignal()
+    _dark = False
+
+    @pyqtProperty(bool, notify=changed)
+    def dark(self):
+        return self._dark
+
+    @dark.setter
+    def dark(self, value):
+        self._dark = value
+        self.changed.emit()
+
+palette = Palette()
+engine.rootContext().setContextProperty('themeSource', palette)
 engine.rootContext().setContextProperty('cardBridge', bridge)
 engine.loadData(b'''import QtQuick 2.15
 import QtQuick.Window 2.15
 import "qml"
 import "qml/sections"
 Window { width: 840; height: 900; visible: true
-    MeetingCard { objectName: "probeCard"; x: 22; y: 12; width: 796; bridge: cardBridge } }''',
+    MeetingCard { objectName: "probeCard";
+        readonly property color expectedSelectionBg: Theme.selectionBg
+        readonly property color expectedSelectionFg: Theme.selectionFg
+        x: 22; y: 12; width: 796; bridge: cardBridge } }''',
     QUrl.fromLocalFile(str(repo / '_probe-card.qml')))
 assert engine.rootObjects(), warnings
 window = engine.rootObjects()[0]
@@ -199,6 +217,107 @@ bridge._card['deleteEnabled'] = False  # deletion waiting for an owner (e.g. exp
 bridge.changed.emit()
 QTest.qWait(20)
 assert delete_item.property('enabled') is False
+show('ready-1024')
+
+# D3: pencil/card menu, selection, empty guard, Enter, failed completion and return focus.
+show('ready-1024')
+edit = one('meetingCardEdit')
+rename = window.findChild(QObject, 'meetingRenameDialog')
+rename_input = rename.findChild(QQuickItem, 'meetingRenameInput')
+rename_save = rename.findChild(QQuickItem, 'meetingRenameSave')
+rename_cancel = rename.findChild(QQuickItem, 'meetingRenameCancel')
+
+def click(node):
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                    node.mapToScene(QPointF(node.width()/2, node.height()/2)).toPoint())
+    QTest.qWait(80)
+
+click(edit)
+assert rename.property('opened') and rename.property('width') == 380
+assert rename.property('heading') == 'Переименовать встречу'
+assert rename.property('brandHeader') is True
+assert rename.findChild(QQuickItem, 'dialogHeaderBrand').isVisible()
+label = rename.findChild(QQuickItem, 'meetingRenameLabel')
+assert label.property('font').pixelSize() == 13
+assert abs(rename_input.height() - 35.5) < 0.01
+assert rename_input.property('leftPadding') == rename_input.property('rightPadding') == 11
+assert abs(rename_input.y() - label.y() - label.height() - 8) < 0.01
+# AvDialog paints its outer border inside; browser mockup adds 2 px outside.
+assert 174 <= rename.property('height') <= 178, rename.property('height')
+# Same selection palette as the existing About field, in both themes.
+for dark in (False, True):
+    palette.dark = dark
+    QTest.qWait(20)
+    assert rename_input.property('selectionColor') == card.property('expectedSelectionBg')
+    assert rename_input.property('selectedTextColor') == card.property('expectedSelectionFg')
+palette.dark = False
+QTest.qWait(20)
+assert rename_input.property('maximumLength') == 120
+assert rename_input.property('activeFocus')
+assert rename_input.property('selectedText') == bridge.meeting.title
+rename_input.setProperty('text', '   ')
+assert not rename_save.property('enabled')
+QTest.keyClick(window, Qt.Key_Return)
+assert not bridge.renames
+rename_input.setProperty('text', 'Новое название')
+QTest.keyClick(window, Qt.Key_Return)
+QTest.qWait(30)
+assert bridge.renames == [(rc.MEETING_ID, 'Новое название')]
+assert rename.property('opened') and not rename_save.property('enabled')
+bridge.renameFinished.emit('error')
+QTest.qWait(50)
+assert rename.property('opened') and rename_input.property('activeFocus')
+assert rename_input.property('text') == 'Новое название'
+QTest.keyClick(window, Qt.Key_Escape)
+QTest.qWait(80)
+assert not rename.property('opened') and edit.property('activeFocus')
+click(edit)
+bridge.rename_result = 'error'
+QTest.keyClick(window, Qt.Key_Return)
+QTest.qWait(50)
+assert rename.property('opened') and rename_input.property('activeFocus')
+click(rename_cancel)
+assert not rename.property('opened') and edit.property('activeFocus')
+bridge.rename_result = 'pending'
+# Card menu command uses the same bridge action and returns to its «⋯» button.
+more = one('meetingCardMore')
+click(more)
+rename_action = one('meetingCardRenameAction')
+assert rename_action.property('enabled')
+click(rename_action)
+assert rename.property('opened') and rename_input.property('selectedText') == bridge.meeting.title
+QTest.keyClick(window, Qt.Key_Tab)
+assert rename_cancel.property('activeFocus')
+QTest.keyClick(window, Qt.Key_Tab)
+assert rename_save.property('activeFocus')
+QTest.keyClick(window, Qt.Key_Tab)
+assert rename_input.property('activeFocus')
+if len(sys.argv) > 3:
+    QMetaObject.invokeMethod(rename_input, 'selectAll')
+    QTest.qWait(30)
+    assert rename_input.property('selectedText') == bridge.meeting.title
+    capture = rename.property('contentItem').parentItem().grabToImage()
+    for _ in range(100):
+        QTest.qWait(20)
+        if not capture.image().isNull(): break
+    assert not capture.image().isNull()
+    assert capture.image().save(sys.argv[3])
+QTest.keyClick(window, Qt.Key_Escape)
+QTest.qWait(80)
+assert not rename.property('opened') and more.property('activeFocus')
+# Successful completion closes D3 only after persistence.
+click(edit)
+QTest.keyClick(window, Qt.Key_Return)
+QTest.qWait(30)
+bridge.renameFinished.emit('saved')
+QTest.qWait(80)
+assert not rename.property('opened') and edit.property('activeFocus')
+for state in (MeetingState.RECORDING, MeetingState.PAUSED, MeetingState.DELETING):
+    recording = deepcopy(states['ready-1024']['meeting'])
+    recording.state = state
+    bridge.show(recording)
+    QTest.qWait(20)
+    assert not edit.property('enabled') and not rename_action.property('enabled')
 show('ready-1024')
 
 # D4: four local templates, exact Python preview, .md/.txt and explicit save button.
@@ -374,11 +493,13 @@ QTest.qWait(80)
 assert not dialog.property('opened') and not replace.property('opened')
 bridge.save_result, bridge.replace_result, bridge.save_error = 'saved', 'saved', ''
 
-# Keyboard (spec §5.2/§7): «← Все встречи» → «Сохранить как…» → «⋯» → table (one stop, arrows).
+# Keyboard (§5.2/§7): back → pencil → save → more → table (one stop, arrows).
 show('ready-1024')
 back = one('meetingCardBack')
 back.forceActiveFocus(Qt.TabFocusReason)
 assert back.property('activeFocus')
+QTest.keyClick(window, Qt.Key_Tab)
+assert one('meetingCardEdit').property('activeFocus')
 QTest.keyClick(window, Qt.Key_Tab)
 assert one('meetingCardSave').property('activeFocus')
 QTest.keyClick(window, Qt.Key_Tab)
@@ -436,7 +557,7 @@ def test_meeting_card_qml_states_rows_and_keyboard() -> None:
 MAIN_PROBE = r"""
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QMetaObject, QObject, QPointF, Qt, QUrl
+from PyQt5.QtCore import QMetaObject, QObject, QPointF, Qt, QUrl, pyqtProperty, pyqtSlot
 from PyQt5.QtGui import QFont, QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
@@ -463,7 +584,19 @@ QQuickWindow.setSceneGraphBackend('software')
 app = QGuiApplication([])
 for path in (repo / 'tests/fixtures/fonts/pt-root-ui').glob('*.ttf'):
     assert QFontDatabase.addApplicationFont(str(path)) >= 0
-bridge = MeetingBridge(Settings(meetings_enabled=True), store=store, known_apps=())
+class FocusBridge(MeetingBridge):
+    renames = []
+
+    @pyqtProperty(bool, constant=True)
+    def recordingAvailable(self):
+        return True  # header focus target only; no recording action is invoked
+
+    @pyqtSlot(str, str, result=str)
+    def renameMeeting(self, meeting_id, title):
+        self.renames.append((meeting_id, title))
+        return 'pending'
+
+bridge = FocusBridge(Settings(meetings_enabled=True), store=store, known_apps=())
 engine = QQmlApplicationEngine()
 warnings = []
 engine.warnings.connect(lambda rows: warnings.extend(row.toString() for row in rows))
@@ -550,6 +683,76 @@ from astra_voice.core.meeting_jobs import MeetingJobs
 jobs = MeetingJobs(store, lambda *args: None, submit=lambda work: work())
 bridge._jobs = lambda: jobs
 bridge.closeMeeting()
+# R2: Repeater delegates are recreated on changed while D3 is open or finishing.
+from copy import deepcopy
+other = deepcopy(bridge._documents[0])
+other.id = '2026-10-07_120000-bbbb'
+other.title = 'Другая встреча'
+bridge._documents.insert(0, other)  # target is the second row, not just the first button
+bridge.changed.emit()
+
+def source_more():
+    return next(n for n in walk(window.contentItem())
+                if n.objectName() == 'meetingMore'
+                and n.parentItem().parentItem().property('row').toVariant()['id'] == rc.MEETING_ID)
+
+def open_list_rename():
+    more = source_more()
+    window.requestActivate()
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                     more.mapToScene(QPointF(more.width()/2, more.height()/2)).toPoint())
+    wait(lambda: any(n.isVisible() and n.property('text') == 'Переименовать'
+                     for n in walk(window.contentItem())), 'row menu')
+    command = next(n for n in walk(window.contentItem())
+                   if n.isVisible() and 'MenuItem' in n.metaObject().className()
+                   and n.property('text') == 'Переименовать')
+    assert command.property('actionId') == 'rename'
+    command.setProperty('text', 'Переименовать…')  # stable key/dispatch survive display changes
+    QMetaObject.invokeMethod(command, 'triggered')
+    # A triggered signal alone does not dismiss a Menu as a real click does.
+    QTest.keyClick(window, Qt.Key_Escape)
+    wait(lambda: any(d.property('opened')
+                    for d in window.findChildren(QObject, 'meetingRenameDialog')), 'D3 from row')
+    dialog = next(d for d in window.findChildren(QObject, 'meetingRenameDialog')
+                  if d.property('opened'))
+    field = dialog.findChild(QObject, 'meetingRenameInput')
+    wait(lambda: field.property('activeFocus'), 'D3 list field focus')
+    assert not bridge.cardOpen and field.property('selectedText') == 'Планёрка по бюджету'
+    return dialog, field
+
+rename_dialog, rename_input = open_list_rename()
+from PyQt5 import sip
+old_more = source_more()
+other.title = 'Идёт другая расшифровка'
+bridge.changed.emit()  # unrelated ASR progress destroys the saved rowMore
+QTest.qWait(30)
+assert sip.isdeleted(old_more), 'probe must really recreate the source delegate'
+QTest.keyClick(window, Qt.Key_Escape)
+wait(lambda: not rename_dialog.property('opened') and source_more().hasActiveFocus(),
+     'D3 Escape returns to recreated source row')
+rename_dialog, rename_input = open_list_rename()
+rename_input.setProperty('text', 'Новое название из списка')
+QTest.keyClick(window, Qt.Key_Return)
+assert bridge.renames == [(rc.MEETING_ID, 'Новое название из списка')]
+old_more = source_more()
+other.title = 'Другой прогресс после сохранения'
+bridge.changed.emit()
+bridge.renameFinished.emit('saved')
+wait(lambda: not rename_dialog.property('opened') and source_more().hasActiveFocus(),
+     'D3 save returns to recreated source row')
+assert sip.isdeleted(old_more), 'save probe must really recreate the source delegate'
+assert rename_dialog.property('fallbackFocusItem') == item('meetingRecord')
+# Source disappeared entirely: use the section header rather than a destroyed item.
+rename_dialog, rename_input = open_list_rename()
+original_documents = list(bridge._documents)
+bridge._documents = [other]
+bridge.changed.emit()
+QTest.qWait(30)
+QTest.keyClick(window, Qt.Key_Escape)
+wait(lambda: not rename_dialog.property('opened') and item('meetingRecord').hasActiveFocus(),
+     'D3 missing source falls back to section header')
+bridge._documents = [row for row in original_documents if row.id != other.id]
+bridge.changed.emit()
 bridge.requestMeetingAction(rc.MEETING_ID, 'Удалить')
 delete_dialog = window.findChild(QObject, 'meetingDeleteDialog')
 wait(lambda: delete_dialog.property('opened') is True, 'D2 from list')

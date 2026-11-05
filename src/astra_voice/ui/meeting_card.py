@@ -53,6 +53,7 @@ CARD_STATES = frozenset(
         MeetingState.INTERRUPTED,
     }
 )
+RENAME_STATES = frozenset({MeetingState.RECORDED, MeetingState.TRANSCRIBING, MeetingState.DONE})
 TEXTS = {
     "back": "Все встречи",
     "save": "Сохранить как…",
@@ -603,6 +604,7 @@ def presentation(
     failure: str,
     snapshot: Mapping[str, Any] | None,
     deleting: bool = False,
+    rename_allowed: bool = True,
 ) -> dict[str, Any]:
     # Marks alone are not speech: a done meeting without replies is «empty» (06).
     speech = rows.speech if rows is not None else 0
@@ -638,7 +640,8 @@ def presentation(
             else []
         ),
         "showTable": table,
-        "showEdit": table,
+        "showEdit": rename_allowed and meeting.state in RENAME_STATES and not deleting,
+        "renameEnabled": rename_allowed and meeting.state in RENAME_STATES and not deleting,
         "showActions": view == "ready",
         "deleteEnabled": not deleting
         and meeting.state
