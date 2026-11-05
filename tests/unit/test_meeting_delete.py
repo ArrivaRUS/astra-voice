@@ -245,7 +245,7 @@ def test_purge_failure_keeps_tombstone_for_restart(
 
     monkeypatch.setattr(rig.store, "purge_deleted", fail)
     rig.jobs.delete(MID, lambda: rig.jobs.purge_deleted(MID))
-    assert rig.jobs.deletions[MID] == "purge_error" and MID in rig.jobs.tombstones
+    assert rig.jobs.deletions[MID] == "purge_error" and MID not in rig.jobs.tombstones
     assert rig.store.pending_deletions() == [MID]
     monkeypatch.setattr(rig.store, "purge_deleted", original)
     rig.jobs.recover_deletions()

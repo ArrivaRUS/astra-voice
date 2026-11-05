@@ -27,7 +27,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.core.settings import save as settings_save
 from astra_voice.meetings.apps import AppClass, AppDataError, AppDefinition, load_apps
 from astra_voice.meetings.events import MeetingState, PolicyCode
-from astra_voice.meetings.model import Meeting, Transcript, normalize_text
+from astra_voice.meetings.model import Meeting, Transcript, normalize_self_label, normalize_text
 from astra_voice.meetings.policy import RecordMode, parse_policy, validate_endpoint
 from astra_voice.meetings.settings_ext import (
     MEETING_DEFAULTS,
@@ -94,6 +94,8 @@ def _edited_setting(name: str, value: object) -> bool | int | str:
         "meeting_ai_endpoint": 2048,
         "meeting_ai_model": 128,
     }
+    if name == "meeting_self_label":
+        return normalize_self_label(value)
     normalized = normalize_text(value, limits[name])
     return validate_endpoint(normalized) if name == "meeting_ai_endpoint" else normalized
 

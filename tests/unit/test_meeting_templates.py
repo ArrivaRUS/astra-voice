@@ -157,6 +157,7 @@ HOSTILE_FIELDS = [
     "`start",
     "end`",
     "a``b```c",
+    "![x](https://evil) `x",
     "```",
     " padded ",
     "\\<>&*_[]()!#@",
@@ -173,6 +174,8 @@ def untrusted_export(field: str, literal: str, template: str) -> tuple[str, list
     elif field == "label":
         meeting.self_label = literal
     else:
+        if field == "empty_label_reply":
+            meeting.self_label = " "
         transcript.utterances[0].text = literal
     md = templates.render(template, meeting, transcript, "md", tz=MSK)
     if field == "title":
@@ -189,7 +192,7 @@ def untrusted_export(field: str, literal: str, template: str) -> tuple[str, list
         else:
             reply = next(line for line in md.splitlines() if line.startswith("[0:00:04] "))
             fragments.append(reply.removeprefix("[0:00:04] ").rsplit(": ", 1)[0])
-    elif field == "reply" and template != "stats":
+    elif field in {"reply", "empty_label_reply"} and template != "stats":
         fragments = [
             md.split("\n\n", 2)[2].splitlines()[0]
             if template == "text_only"
@@ -204,7 +207,7 @@ def untrusted_export(field: str, literal: str, template: str) -> tuple[str, list
 
 
 @pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
-@pytest.mark.parametrize("field", ["title", "label", "reply"])
+@pytest.mark.parametrize("field", ["title", "label", "reply", "empty_label_reply"])
 @pytest.mark.parametrize("literal", HOSTILE_FIELDS)
 def test_markdown_untrusted_fields_are_whole_code_spans(
     field: str, literal: str, template: str
@@ -223,7 +226,7 @@ def test_markdown_untrusted_fields_are_whole_code_spans(
 
 @pytest.mark.parametrize("renderer", ["markdown_it", "cmarkgfm"])
 @pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
-@pytest.mark.parametrize("field", ["title", "label", "reply"])
+@pytest.mark.parametrize("field", ["title", "label", "reply", "empty_label_reply"])
 @pytest.mark.parametrize("literal", HOSTILE_FIELDS)
 def test_markdown_untrusted_fields_render_without_links_or_images(
     renderer: str,
@@ -563,3 +566,37 @@ def test_empty_stats_has_no_table_and_one_final_newline() -> None:
     text = templates.render("stats", fixture_meeting(), None, "md")
     assert "|" not in text
     assert text.endswith("реплик 0\n") and not text.endswith("\n\n")
+
+
+@pytest.mark.parametrize("literal", ["", " ", "\u00a0\u2003"])
+def test_empty_markdown_field_has_no_fence_t508(literal: str) -> None:
+    assert templates._md_escape(literal) == ""
+    assert templates._field(literal, True) == ""
+
+
+@pytest.mark.parametrize("template", templates.TEMPLATES)
+def test_empty_export_names_use_fixed_defaults_t508(template: str) -> None:
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    meeting.title = meeting.self_label = " "
+    md = templates.render(template, meeting, transcript, "md", tz=MSK)
+    assert md.startswith("# `Встреча`\n")
+    if template != "text_only":
+        assert "`Я`" in md
+
+
+@pytest.mark.parametrize("label", [" ", "\u00a0\u2003"])
+def test_empty_self_label_setting_rejects_schema_accepts_t508(label: str) -> None:
+    from astra_voice.meetings.settings_ext import MEETING_DEFAULTS, validate_setting
+
+    assert validate_setting("meeting_self_label", label) == MEETING_DEFAULTS["meeting_self_label"]
+    raw = fixture_meeting().to_dict()
+    raw["self_label"] = label
+    meeting = Meeting.from_dict(raw)
+    assert meeting.self_label == label  # Legacy documents remain readable.
+    transcript = fixture_transcript()
+    transcript.utterances = transcript.utterances[:1]
+    transcript.utterances[0].text = "![x](https://evil) `x"
+    for template in ("stenogram", "me_and_others"):
+        md = templates.render(template, meeting, transcript, "md", tz=MSK)
+        assert "[0:00:04] `Я`: ``![x](https://evil) `x``" in md
+        assert templates.speaker_label(meeting, "me") == "Я"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -516,3 +518,198 @@ def test_worker_order_keeps_startup_retention_ahead_of_resume(rig: RetentionRig)
         rig.jobs.tick()
     assert not rig.roles and not rig.jobs.queued_ids
     assert not (rig.store.root / MID).exists()
+
+
+@pytest.mark.parametrize("daily", [False, True])
+@pytest.mark.parametrize("retention", [False, True])
+def test_failed_purge_retried_without_restart_t509(
+    rig: RetentionRig, monkeypatch: pytest.MonkeyPatch, daily: bool, retention: bool
+) -> None:
+    rig.create()
+    rig.age(31)
+    rig.days = 30 if retention else 0
+    purge = rig.store.purge_deleted
+    attempts: list[str] = []
+
+    def fail(mid: str) -> None:
+        attempts.append(mid)
+        raise MeetingStoreError("fixed")
+
+    monkeypatch.setattr(rig.store, "purge_deleted", fail)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    if retention or daily:
+        rig.jobs.start_retention()
+    if not retention:
+        rig.jobs.delete_and_purge(MID)
+    assert attempts == [MID] * 3
+    assert rig.jobs.deletions[MID] == "purge_error"
+    assert rig.store.pending_deletions() == [MID]
+    assert not rig.summaries()
+    monkeypatch.setattr(rig.store, "purge_deleted", purge)
+    # No eager retry before the monotonic deadline.
+    rig.now += 299
+    rig.jobs.tick()
+    assert rig.store.pending_deletions() == [MID]
+    if daily:
+        rig.wall += timedelta(days=1)  # daily path independently of monotonic retry
+    else:
+        rig.now += 1
+    rig.jobs.tick()
+    assert rig.store.pending_deletions() == []
+    assert not (rig.store.root / MID).exists()
+    assert rig.jobs.deletions[MID] == "deleted"
+    assert MID not in rig.jobs.tombstones
+    rig.now += 86400
+    rig.jobs.tick()
+    assert rig.summaries() == ([1] if retention else [])
+
+
+@pytest.mark.parametrize("renamed", [False, True])
+@pytest.mark.parametrize("guard", ["tombstone", "pending", "deleting"])
+def test_recovery_never_purges_waiting_owner_t509(
+    rig: RetentionRig, renamed: bool, guard: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create()
+    releases: list[Callable[[], None]] = []
+    rig.jobs.release_files = lambda mid, done: releases.append(done)
+    rig.jobs.delete_and_purge(MID)
+    if renamed:
+        rig.store.begin_delete(MID)
+    if guard == "tombstone":
+        rig.jobs.deletions.pop(MID)
+    else:
+        rig.jobs.tombstones.discard(MID)
+        rig.jobs.deletions[MID] = guard
+    purge = rig.store.purge_deleted
+    calls: list[str] = []
+
+    def checked(mid: str) -> None:
+        calls.append(mid)
+        purge(mid)
+
+    monkeypatch.setattr(rig.store, "purge_deleted", checked)
+    rig.jobs.recover_deletions()
+    rig.now += 86400
+    rig.jobs.tick()
+    assert not calls
+    assert rig.jobs._deletion_owned(MID)
+    rig.jobs.tombstones.add(MID)  # Restore the normal release callback's guard.
+    if not renamed:
+        releases.pop()()
+        assert calls == [MID] and not rig.store.pending_deletions()
+    else:
+        # Synthetic early rename: only probe the recovery barrier; normal owners
+        # release before begin_delete, and the regular purge reads meeting.json.
+        assert rig.store.pending_deletions() == [MID]
+
+
+def test_recovery_retry_backs_off_after_repeated_failure_t509(
+    rig: RetentionRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create(state=MeetingState.DELETING)
+    rig.store.begin_delete(MID)
+    purge = rig.store.purge_deleted
+    calls: list[str] = []
+
+    def fail(mid: str) -> None:
+        calls.append(mid)
+        raise MeetingStoreError("fixed")
+
+    monkeypatch.setattr(rig.store, "purge_deleted", fail)
+    rig.jobs.start_retention()
+    assert calls == [MID]
+    rig.now += 299
+    rig.jobs.tick()
+    assert calls == [MID]
+    rig.now += 1
+    rig.jobs.tick()
+    assert calls == [MID, MID]
+    rig.jobs.tick()
+    assert calls == [MID, MID]
+    monkeypatch.setattr(rig.store, "purge_deleted", purge)
+    rig.now += 300
+    rig.jobs.tick()
+    assert rig.store.pending_deletions() == []
+    assert not rig.jobs._purge_retry_at and not rig.summaries()
+
+
+@pytest.mark.parametrize("retention", [False, True])
+def test_purge_fsync_failure_clears_missing_retry_r2(
+    rig: RetentionRig, monkeypatch: pytest.MonkeyPatch, retention: bool
+) -> None:
+    rig.create()
+    rig.age(31)
+    rig.days = 30 if retention else 0
+    if not retention:
+        rig.jobs.start_retention()
+    root_info = rig.store.root.stat()
+    fsync = os.fsync
+    failed_syncs: list[int] = []
+
+    def fail_after_purge(descriptor: int) -> None:
+        info = os.fstat(descriptor)
+        if (
+            (info.st_dev, info.st_ino) == (root_info.st_dev, root_info.st_ino)
+            and not (rig.store.root / MID).exists()
+            and not (rig.store.root / f".deleting-{MID}").exists()
+        ):
+            failed_syncs.append(descriptor)
+            raise OSError("fixed")
+        fsync(descriptor)
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", fail_after_purge)
+        if retention:
+            rig.jobs.start_retention()
+        else:
+            rig.jobs.delete_and_purge(MID)
+    assert failed_syncs and rig.jobs.deletions[MID] == "purge_error"
+    assert rig.store.pending_deletions() == [] and rig.store.list() == []
+    assert MID in rig.jobs._purge_retry_at and not rig.summaries()
+    listing = rig.store.list
+    scans: list[bool] = []
+
+    def counted_list(*, include_deleting: bool = False) -> list[Meeting]:
+        scans.append(True)
+        return listing(include_deleting=include_deleting)
+
+    monkeypatch.setattr(rig.store, "list", counted_list)
+    rig.now += 300
+    rig.jobs.tick()
+    assert not rig.jobs._purge_retry_at
+    assert rig.jobs.deletions[MID] == "deleted"
+    rig.now += 300
+    rig.jobs.tick()
+    assert scans == [True]  # No extra full retention pass after the retry cleared.
+    assert rig.summaries() == ([1] if retention else [])
+
+
+def test_failed_retention_tombstone_then_manual_purge_is_silent_r2(
+    rig: RetentionRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create()
+    rig.age(31)
+    rig.days = 30
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            rig.store, "write", lambda *a, **kw: (_ for _ in ()).throw(MeetingStoreError("fixed"))
+        )
+        rig.jobs.start_retention()
+    assert rig.jobs.deletions[MID] == "error"
+    assert rig.meeting().state != MeetingState.DELETING
+    rig.days = 0
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            rig.store,
+            "purge_deleted",
+            lambda mid: (_ for _ in ()).throw(MeetingStoreError("fixed")),
+        )
+        rig.jobs.delete_and_purge(MID)
+    assert rig.jobs.deletions[MID] == "purge_error"
+    rig.now += 300
+    rig.jobs.tick()
+    assert rig.store.pending_deletions() == []
+    assert rig.jobs.deletions[MID] == "deleted"
+    assert not rig.summaries() and not rig.jobs._retention_deletions

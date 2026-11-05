@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from astra_voice.meetings import MeetingValidationError, events
-from astra_voice.meetings.model import normalize_text
+from astra_voice.meetings.model import DEFAULT_SELF_LABEL, normalize_self_label, normalize_text
 
 if TYPE_CHECKING:
     from astra_voice.core.settings import Settings
@@ -37,7 +37,7 @@ class MeetingSettings:
     meeting_retention_days: int = 0
     meeting_notice_text: str = NOTICE_TEXT
     meeting_invite_text: str = INVITE_TEXT
-    meeting_self_label: str = "Я"
+    meeting_self_label: str = DEFAULT_SELF_LABEL
     meeting_ai_endpoint: str = ""
     meeting_ai_model: str = ""
     meeting_ai_replace_names: bool = False
@@ -75,6 +75,8 @@ def validate_setting(name: str, value: Any) -> Any:
         "meeting_ai_model": 128,
     }
     try:
+        if name == "meeting_self_label":
+            return normalize_self_label(value)
         return normalize_text(
             value,
             limits[name],

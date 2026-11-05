@@ -373,3 +373,15 @@ def test_extreme_valid_start_dates_do_not_break_list_presentation(
     bridge._documents = [meeting]
     assert bridge.meetings[0]["title"] == meeting.title
     assert bridge.meetings[0]["subtitle"]
+
+
+@pytest.mark.parametrize("label", [" ", "\u00a0\u2003"])
+def test_empty_self_label_edit_preserves_setting_t508(
+    bridge_factory: Callable[..., MeetingBridge], label: str
+) -> None:
+    stored, mirror = Settings(meeting_self_label="Имя"), Settings(meeting_self_label="Имя")
+    save = Mock()
+    bridge = bridge_factory(settings=stored, mirror=mirror, save=save)
+    bridge.setSetting("meeting_self_label", label)
+    assert stored.meeting_self_label == mirror.meeting_self_label == "Имя"
+    save.assert_not_called()

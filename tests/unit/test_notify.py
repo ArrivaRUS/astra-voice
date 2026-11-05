@@ -1303,7 +1303,9 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         )
         for function in tree.body
         if isinstance(function, ast.FunctionDef) and function.name in templates
-        for statement in ast.walk(function)
+        for statement in (
+            ast.walk(function) if function.name == "notify_meeting_retention" else function.body
+        )
         if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
     }
     # У онбординга два типизированных перехода: контроллер → host → обёртка.
@@ -1590,3 +1592,14 @@ def test_retention_notification_gate_rejects_unguarded_or_text_arguments(
         f"            notices.notify_meeting_retention({argument})\n"
     )
     assert _notification_violations(source)
+
+
+def test_ast_rejects_nested_microphone_template_t2_n1() -> None:
+    source = (
+        "def notify_microphone_selected(name):\n"
+        "    def leak():\n"
+        "        name = meeting.title\n"
+        '        notify(f"Микрофон: {name}")\n'
+        "    leak()\n"
+    )
+    assert _notification_violations(source, implementation=True)

@@ -21,7 +21,7 @@ from itertools import islice
 from pathlib import Path
 from uuid import uuid4
 
-from astra_voice.meetings.model import Meeting, Transcript, Utterance
+from astra_voice.meetings.model import DEFAULT_SELF_LABEL, Meeting, Transcript, Utterance
 
 TEMPLATES = ("stenogram", "me_and_others", "text_only", "stats")
 FORMATS = ("md", "txt")
@@ -225,7 +225,7 @@ def visible_utterances(transcript: Transcript | None) -> list[Utterance]:
 def speaker_label(meeting: Meeting, speaker: str) -> str:
     """«Я» (the meeting's own label) / «Собеседники»; M7 adds «Спикер N»."""
     if speaker == "me":
-        return meeting.self_label
+        return meeting.self_label if meeting.self_label.strip() else DEFAULT_SELF_LABEL
     if speaker.startswith("S") and speaker[1:].isdigit():
         return f"Спикер {speaker[1:]}"
     return OTHERS_LABEL
@@ -261,6 +261,8 @@ def _one_line(text: str) -> str:
 
 def _md_escape(text: str) -> str:
     """One literal code span, immune to renderer-specific GFM autolinking."""
+    if not text.strip():
+        return ""  # Empty fences may close a neighbouring field's code span.
     fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
     # CommonMark strips one paired space unless the content is all spaces.
     padded = (
@@ -374,8 +376,8 @@ def template_rows(
     return list(rows if limit is None else islice(rows, limit))
 
 
-def _field(text: str, md: bool) -> str:
-    literal = _one_line(text)
+def _field(text: str, md: bool, *, default: str = "") -> str:
+    literal = _one_line(text) or default
     return _md_escape(literal) if md else literal
 
 
@@ -388,7 +390,7 @@ def _header(
     tz: tzinfo | None,
 ) -> list[str]:
     start = _local(meeting.started_at, tz)
-    title = _field(meeting.title, md)
+    title = _field(meeting.title, md, default=DEFAULT_NAME)
     lines = ["# " + title if md else title, ""]
     item = "- " if md else ""
     if start is not None:

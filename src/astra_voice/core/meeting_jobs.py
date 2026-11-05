@@ -45,6 +45,7 @@ MEMORY_RETRY_S = 60.0
 MODEL_RETRY_S = 60.0
 CANCEL_TIMEOUT_S = 1.0  # worker/meeting_contract.CANCEL_TIMEOUT_S
 DELETE_PURGE_ATTEMPTS = 3
+DELETE_PURGE_RETRY_LATER_S = 300.0
 DELETE_PURGE_RETRY_S = 0.5
 RETENTION_INTERVAL_S = 86400
 MAX_CRASHES = 3  # restarts per window; the fourth crash fails the job
@@ -310,6 +311,8 @@ class MeetingJobs:
         self.meetings: dict[str, Meeting] = {}
         self.tombstones: set[str] = set()
         self.deletions: dict[str, str] = {}
+        self._purge_retry_at: dict[str, float] = {}
+        self._retention_deletions: set[str] = set()
         self._delete_events: dict[str, dict[tuple[str, str], Message]] = {}
         self.cancelled: set[str] = set()
         # meeting_id -> (failed cancel writes, retry time or None while a write is queued)
@@ -388,7 +391,7 @@ class MeetingJobs:
 
     def recover_deletions(self) -> None:
         """Compatibility entry point: one maintenance path owns deletion recovery."""
-        self._retention_pass(recover_deletions=True)
+        self._retention_pass()
 
     def recover(self) -> None:
         """Resume jobs only; the caller admits processing after start_retention()."""
@@ -448,7 +451,13 @@ class MeetingJobs:
             and not meeting.cancelled
         )
 
-    def _retention_pass(self, *, recover_deletions: bool = False) -> None:
+    def _deletion_owned(self, meeting_id: str) -> bool:
+        return meeting_id in self.tombstones or self.deletions.get(meeting_id) in {
+            "pending",
+            "deleting",
+        }
+
+    def _retention_pass(self) -> None:
         if self._closed or self._retention_scanning:
             return
         days = int(self.meeting_retention_days())
@@ -457,19 +466,46 @@ class MeetingJobs:
         self._retention_scanning = True
         self._retention_at = deadline
         self._retention_wall = wall
+        # Back off even if the scan itself fails (for example on an unreadable root).
+        retrying = tuple(self._purge_retry_at)
+        for meeting_id in retrying:
+            self._purge_retry_at[meeting_id] = self.clock() + DELETE_PURGE_RETRY_LATER_S
 
         def scan() -> Callable[[], None]:
             now = self.wall_clock()
-            if recover_deletions:
+            recovered: list[str] = []
+            retry: list[str] = []
+            for meeting_id in retrying:
+                if self._deletion_owned(meeting_id):
+                    continue
+                # purge may remove everything and then fail fsync(root). Probe
+                # both names directly; a failed catalogue is not proof of absence.
                 try:
-                    pending = self.store.pending_deletions()
+                    with private_directory(self.store.root) as root:
+                        for name in (meeting_id, f".deleting-{meeting_id}"):
+                            try:
+                                os.stat(name, dir_fd=root, follow_symlinks=False)
+                            except FileNotFoundError:
+                                continue
+                            break
+                        else:
+                            recovered.append(meeting_id)
+                except FileNotFoundError:
+                    recovered.append(meeting_id)  # the entire storage root is gone
+                except (OSError, ValueError):
+                    pass  # uncertainty preserves the retry and its backoff
+            try:
+                pending = self.store.pending_deletions()
+            except MeetingStoreError:
+                pending = []
+            for meeting_id in pending:
+                if self._deletion_owned(meeting_id):
+                    continue  # active role/export still owns the release barrier
+                try:
+                    self.store.purge_deleted(meeting_id)
+                    recovered.append(meeting_id)
                 except MeetingStoreError:
-                    pending = []
-                for meeting_id in pending:
-                    try:
-                        self.store.purge_deleted(meeting_id)
-                    except MeetingStoreError:
-                        pass  # durable remnant: retry at the next startup
+                    retry.append(meeting_id)
             try:
                 meetings = self.store.list(include_deleting=True)
             except MeetingStoreError:
@@ -478,12 +514,15 @@ class MeetingJobs:
             updates: list[Meeting] = []
             for meeting in meetings:
                 try:
-                    if meeting.id in self.tombstones:
+                    if self._deletion_owned(meeting.id) or meeting.id in pending:
                         continue
                     if meeting.state == MeetingState.DELETING:
-                        if recover_deletions:
+                        try:
                             self.store.begin_delete(meeting.id)
                             self.store.purge_deleted(meeting.id)
+                            recovered.append(meeting.id)
+                        except MeetingStoreError:
+                            retry.append(meeting.id)
                         continue
                     if meeting.state not in {MeetingState.RECORDING, MeetingState.PAUSED} and (
                         self._expired(meeting.started_at, days, now)
@@ -526,6 +565,19 @@ class MeetingJobs:
                 self._retention_scanning = False
                 if self._closed:
                     return
+                for meeting_id in retry:
+                    self._purge_retry_at[meeting_id] = self.clock() + DELETE_PURGE_RETRY_LATER_S
+                retained_count = 0
+                for meeting_id in recovered:
+                    self.meetings.pop(meeting_id, None)
+                    self._purge_retry_at.pop(meeting_id, None)
+                    self.deletions[meeting_id] = "deleted"
+                    if meeting_id in self._retention_deletions:
+                        self._retention_deletions.discard(meeting_id)
+                        retained_count += 1
+                    self._changed()
+                if retained_count:
+                    self._notify("retention", retained_count)
                 for updated in updates:
                     if updated.id not in self.tombstones:
                         self.meetings[updated.id] = updated
@@ -541,7 +593,14 @@ class MeetingJobs:
                         self._notify("retention", removed)
 
                 for meeting_id in expired:
-                    self.delete_and_purge(meeting_id, finished=finished)
+                    self._retention_deletions.add(meeting_id)
+
+                    def deleted(ok: bool, mid: str = meeting_id) -> None:
+                        if ok or self.deletions.get(mid) == "error":
+                            self._retention_deletions.discard(mid)
+                        finished(ok)
+
+                    self.delete_and_purge(meeting_id, finished=deleted)
 
             return completed
 
@@ -741,6 +800,7 @@ class MeetingJobs:
                 self.meetings.pop(meeting_id, None)
                 self.tombstones.discard(meeting_id)
                 self.deletions[meeting_id] = "deleted"
+                self._purge_retry_at.pop(meeting_id, None)
                 self._notify("deleted", meeting)
                 self._changed()
                 if finished is not None:
@@ -750,6 +810,8 @@ class MeetingJobs:
 
         def failed() -> None:
             self.deletions[meeting_id] = "purge_error"
+            self.tombstones.discard(meeting_id)  # all owners have already released
+            self._purge_retry_at[meeting_id] = self.clock() + DELETE_PURGE_RETRY_LATER_S
             self._changed()  # on disk DELETING/.deleting-* remains recoverable
             if finished is not None:
                 finished(False)
@@ -760,12 +822,15 @@ class MeetingJobs:
         self._drain()
         if self._closed:
             return
-        if self._retention_at is not None and (
-            self.clock() >= self._retention_at
-            or (
-                self._retention_wall is not None
-                and self.wall_clock() - self._retention_wall
-                >= timedelta(seconds=RETENTION_INTERVAL_S)
+        if any(self.clock() >= at for at in self._purge_retry_at.values()) or (
+            self._retention_at is not None
+            and (
+                self.clock() >= self._retention_at
+                or (
+                    self._retention_wall is not None
+                    and self.wall_clock() - self._retention_wall
+                    >= timedelta(seconds=RETENTION_INTERVAL_S)
+                )
             )
         ):
             self._retention_pass()
