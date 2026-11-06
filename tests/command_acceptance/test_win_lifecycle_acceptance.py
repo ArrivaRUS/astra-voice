@@ -584,17 +584,19 @@ def test_separate_qt_gui_peer_failure_does_not_leave_held_grab_or_dispatch_old_p
         assert peer.stdout is not None
         assert select.select([peer.stdout], [], [], 2)[0], "Qt GUI peer did not become ready"
         assert peer.stdout.readline() == b"READY\n"
-        keyboard.key("Super_L", True)
-        if recording:
-            assert select.select([peer.stdout], [], [], 0.5)[0]
-            assert peer.stdout.readline() == b"START\n"
-        began = time.monotonic()
-        os.kill(peer.pid, signal.SIGSTOP if failure == "stop" else signal.SIGKILL)
-        time.sleep(0.75)
+        # Open before the press too: setup must neither consume the release budget
+        # nor let a pending (recording=False) hold become confirmed while opening X.
         with X11Display() as rival:
+            keyboard.key("Super_L", True)
+            if recording:
+                assert select.select([peer.stdout], [], [], 0.5)[0]
+                assert peer.stdout.readline() == b"START\n"
+            began = time.monotonic()
+            os.kill(peer.pid, signal.SIGSTOP if failure == "stop" else signal.SIGKILL)
+            time.sleep(0.75)
             assert rival.grab_keyboard(), "stopped Qt GUI kept keyboard unavailable"
             rival.ungrab_keyboard()
-        assert time.monotonic() - began < 1
+            assert time.monotonic() - began < 1
         if failure == "stop":
             os.kill(peer.pid, signal.SIGCONT)
             time.sleep(0.12)
