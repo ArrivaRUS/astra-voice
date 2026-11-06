@@ -20,7 +20,7 @@ AvDialog {
     safeConfirmation: true
     confirmEnabled: !pending && input.text.replace(/\s+/g, " ").trim().length > 0
 
-    function focusInput() { if (visible) input.forceActiveFocus(Qt.TabFocusReason) }
+    function focusInput() { if (visible) root.focusWithReason(input, Qt.TabFocusReason) }
     function submit() {
         if (!confirmEnabled || !bridge) return
         pending = true

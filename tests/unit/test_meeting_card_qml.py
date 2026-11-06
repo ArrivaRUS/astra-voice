@@ -355,8 +355,8 @@ for index, option in enumerate(items):
     assert title.property('font').weight() == (QFont.Medium if index == 0 else QFont.Normal)
 window.requestActivate()
 wait(window.isActive, 'active window before template keyboard navigation')
-items[0].forceActiveFocus(Qt.TabFocusReason)
-wait(lambda: items[0].property('visualFocus'), 'initial template keyboard focus')
+assert items[0].property('activeFocus')
+assert not items[0].property('visualFocus')
 for index in range(4):
     QTest.keyClick(window, Qt.Key_Down if index else Qt.Key_Home)
     wait(lambda: items[index].property('visualFocus')
@@ -364,12 +364,30 @@ for index in range(4):
          f'template {index} keyboard focus')
     assert bridge.saveTemplate == bridge.saveTemplates[index]['id']
     assert items[index].property('visualFocus')
+    assert [item for item in items if item.property('activeFocusOnTab')] == [items[index]]
     ring = items[index].findChild(QQuickItem, 'meetingSaveTemplateFocus')
     assert ring.property('visible') and abs(ring.width() - items[index].width() - 8) < 0.1
     assert dialog.property('preview').toVariant() == bridge.savePreview()
     QTest.keyClick(window, Qt.Key_Return)
     QTest.keyClick(window, Qt.Key_Enter)
     assert not bridge.saves and dialog.property('opened')
+# End must also restore the keyboard ring on the already selected last item.
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                items[-1].mapToScene(QPointF(items[-1].width()/2, items[-1].height()/2)).toPoint())
+wait(lambda: items[-1].property('activeFocus') and not items[-1].property('visualFocus'),
+     'last template pointer focus')
+QTest.keyClick(window, Qt.Key_End)
+wait(lambda: items[-1].property('visualFocus'), 'last template End keyboard focus')
+# The template group remains one Tab stop, followed by format and the footer.
+format_control = window.findChild(QQuickItem, 'meetingSaveFormat')
+cancel_control = window.findChild(QQuickItem, 'meetingSaveCancel')
+confirm_control = window.findChild(QQuickItem, 'meetingSaveConfirm')
+for target in (format_control, cancel_control, confirm_control, items[-1]):
+    QTest.keyClick(window, Qt.Key_Tab)
+    wait(lambda: target.property('activeFocus'), 'D4 forward Tab order')
+for target in (confirm_control, cancel_control, format_control, items[-1]):
+    QTest.keyClick(window, Qt.Key_Backtab)
+    wait(lambda: target.property('activeFocus'), 'D4 reverse Tab order')
 for index in range(2, -1, -1):
     QTest.keyClick(window, Qt.Key_Up)
     wait(lambda: items[index].property('visualFocus')
@@ -571,6 +589,7 @@ def test_meeting_card_qml_states_rows_and_keyboard() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "Cannot set activeFocusOnTab" not in result.stderr, result.stderr
     assert result.stdout.strip().endswith("ok")
 
 

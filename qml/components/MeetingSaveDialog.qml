@@ -30,10 +30,7 @@ AvDialog {
         var target = templateItems.itemAt(index)
         if (!target) return
         var focusReason = reason === undefined ? Qt.MouseFocusReason : reason
-        // Re-focus an already active keyboard item so a pointer click clears visualFocus.
-        if ((focusReason === Qt.MouseFocusReason || focusReason === Qt.PopupFocusReason)
-                && target.visualFocus) target.focus = false
-        target.forceActiveFocus(focusReason)
+        root.focusWithReason(target, focusReason)
         bridge.saveTemplate = templates[index].id
     }
 
@@ -67,7 +64,7 @@ AvDialog {
     onAboutToShow: refreshPreview()
     onOpened: if (templates.length) selectTemplate(templateIndex, Qt.PopupFocusReason)
     // Esc/«Отмена» возвращают фокус на «Сохранить как…» (spec §7).
-    onClosed: if (returnFocusItem && returnFocusItem.visible) returnFocusItem.forceActiveFocus(Qt.TabFocusReason)
+    onClosed: if (returnFocusItem && returnFocusItem.visible) root.focusWithReason(returnFocusItem, Qt.TabFocusReason)
     onCancelled: if (bridge) bridge.clearCardSaveError()
     // Сначала закрывается D4, потом открывается системный диалог; отмена или ошибка
     // возвращают D4 с выбранным форматом (и строкой ошибки).
@@ -171,7 +168,8 @@ AvDialog {
                         width: templateColumn.width
                         height: itemColumn.height + Theme.meetingDialogSaveItemPaddingY * 2
                         padding: 0
-                        activeFocusOnTab: selected
+                        // Keep the active item eligible until focus has actually left it.
+                        activeFocusOnTab: selected || activeFocus
                         Accessible.name: modelData.title + " · " + modelData.caption
                         Accessible.role: Accessible.RadioButton
                         Accessible.checkable: true

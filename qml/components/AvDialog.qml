@@ -41,11 +41,24 @@ Dialog {
     onAccepted: root.confirmed()
     onRejected: root.cancelled()
 
+    function focusWithReason(target, reason) {
+        if (!target) return
+        var keyboard = reason === Qt.TabFocusReason || reason === Qt.BacktabFocusReason
+            || reason === Qt.ShortcutFocusReason
+        // Qt 5.15 can keep the old reason when setFocus(true) is a no-op.
+        if ((target.focus || target.activeFocus) && target.visualFocus !== undefined
+                && keyboard !== target.visualFocus) target.focus = false
+        target.forceActiveFocus(reason)
+        // Some Qt 5.15 builds ignore PopupFocusReason even for an unfocused item.
+        if (reason === Qt.PopupFocusReason && !target.activeFocus)
+            target.forceActiveFocus(Qt.OtherFocusReason)
+    }
+
     function restoreReturnFocus() {
         if (root.visible || !root.safeConfirmation) return
         var target = root.returnFocusItem
         if (!target || !target.enabled || !target.visible) target = root.fallbackFocusItem
-        if (target && target.enabled && target.visible) target.forceActiveFocus(Qt.TabFocusReason)
+        if (target && target.enabled && target.visible) root.focusWithReason(target, Qt.TabFocusReason)
     }
 
     function scrollBody(key) {
@@ -67,7 +80,7 @@ Dialog {
         target: root
         function onOpened() {
             if (root.safeConfirmation)
-                (cancelButton.visible ? cancelButton : confirmButton).forceActiveFocus(Qt.TabFocusReason)
+                root.focusWithReason(cancelButton.visible ? cancelButton : confirmButton, Qt.TabFocusReason)
         }
         function onClosed() {
             if (root.safeConfirmation) Qt.callLater(root.restoreReturnFocus)
