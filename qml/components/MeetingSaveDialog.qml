@@ -18,15 +18,17 @@ AvDialog {
     readonly property var formats: [".md", ".txt"]
     readonly property string error: bridge && bridge.cardSaveError !== undefined ? bridge.cardSaveError : ""
     property var preview: ({ "kind": "", "rows": [] })
-    readonly property var templates: bridge ? bridge.saveTemplates : []
+    readonly property var templates: bridge && bridge.saveTemplates !== undefined ? bridge.saveTemplates : []
     readonly property int templateIndex: {
+        if (!bridge || bridge.saveTemplate === undefined) return 0
         for (var i = 0; i < templates.length; ++i)
             if (templates[i].id === bridge.saveTemplate) return i
         return 0
     }
     function selectTemplate(index, reason) {
-        if (index < 0 || index >= templates.length) return
+        if (!bridge || bridge.saveTemplate === undefined || index < 0 || index >= templates.length) return
         var target = templateItems.itemAt(index)
+        if (!target) return
         var focusReason = reason === undefined ? Qt.MouseFocusReason : reason
         // Re-focus an already active keyboard item so a pointer click clears visualFocus.
         if ((focusReason === Qt.MouseFocusReason || focusReason === Qt.PopupFocusReason)
@@ -50,7 +52,8 @@ AvDialog {
         }
     }
     function refreshPreview() {
-        preview = bridge ? bridge.savePreview() : ({ "kind": "", "rows": [] })
+        preview = bridge && typeof bridge.savePreview === "function"
+            ? bridge.savePreview() : ({ "kind": "", "rows": [] })
     }
 
     parent: Overlay.overlay

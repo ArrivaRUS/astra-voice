@@ -456,12 +456,14 @@ def test_r2_sigkill_inside_erase_is_finished_at_startup(rig: Rig) -> None:
     script = """
 import os, signal, sys
 from pathlib import Path
-from typing import Any
 from astra_voice.meetings.store import MeetingStore
+nested = (Path(sys.argv[1]) / f".deleting-{sys.argv[2]}" / "audio" / "nested").stat()
 original = os.unlink
 def kill_after_unlink(name, **kwargs):
+    parent = os.fstat(kwargs["dir_fd"])
     original(name, **kwargs)
-    if name == "remove-before-crash":
+    # Stop after the first removed file in nested, regardless of scandir order.
+    if (parent.st_dev, parent.st_ino) == (nested.st_dev, nested.st_ino):
         os.kill(os.getpid(), signal.SIGKILL)
 os.unlink = kill_after_unlink
 MeetingStore(Path(sys.argv[1])).purge_deleted(sys.argv[2])
@@ -475,8 +477,11 @@ raise AssertionError("crash boundary not reached")
         check=False,
     )
     assert result.returncode == -signal.SIGKILL, result.stderr.decode()
-    assert not (nested / "remove-before-crash").exists()
-    assert (nested / "keep-after-crash").is_file() and tombstone.is_dir()
+    remnants = [path for path in nested.iterdir() if path.is_file()]
+    assert len(remnants) == 1
+    assert remnants[0].name in {"remove-before-crash", "keep-after-crash"}
+    assert tombstone.is_dir()
     rig.jobs.recover_deletions()
     rig.jobs.tick()
+    assert not tombstone.exists() and not remnants[0].exists()
     assert not rig.store.pending_deletions() and not rig.roles

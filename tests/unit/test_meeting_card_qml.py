@@ -19,7 +19,9 @@ QML_PROBE = r"""
 import re
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QMetaObject, QObject, QPointF, Qt, QUrl, pyqtProperty, pyqtSignal
+from PyQt5.QtCore import (
+    QElapsedTimer, QMetaObject, QObject, QPointF, Qt, QUrl, pyqtProperty, pyqtSignal,
+)
 from PyQt5.QtGui import QFont, QFontDatabase, QGuiApplication
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
@@ -73,8 +75,17 @@ Window { width: 840; height: 900; visible: true
     QUrl.fromLocalFile(str(repo / '_probe-card.qml')))
 assert engine.rootObjects(), warnings
 window = engine.rootObjects()[0]
+
+def wait(check, label):
+    timer = QElapsedTimer()
+    timer.start()
+    while not check():
+        remaining = 2000 - timer.elapsed()
+        assert remaining > 0, (label, window.isActive(), window.activeFocusItem())
+        QTest.qWait(min(20, remaining))
+
 window.requestActivate()
-QTest.qWait(50)
+wait(window.isActive, 'active card window')
 card = window.findChild(QQuickItem, 'probeCard')
 states = rc.states()
 
@@ -342,10 +353,15 @@ assert not any(i.property('visualFocus') for i in items)  # opening is not keybo
 for index, option in enumerate(items):
     title = option.findChild(QObject, 'meetingSaveTemplateTitle')
     assert title.property('font').weight() == (QFont.Medium if index == 0 else QFont.Normal)
+window.requestActivate()
+wait(window.isActive, 'active window before template keyboard navigation')
 items[0].forceActiveFocus(Qt.TabFocusReason)
+wait(lambda: items[0].property('visualFocus'), 'initial template keyboard focus')
 for index in range(4):
     QTest.keyClick(window, Qt.Key_Down if index else Qt.Key_Home)
-    QTest.qWait(20)
+    wait(lambda: items[index].property('visualFocus')
+         and bridge.saveTemplate == bridge.saveTemplates[index]['id'],
+         f'template {index} keyboard focus')
     assert bridge.saveTemplate == bridge.saveTemplates[index]['id']
     assert items[index].property('visualFocus')
     ring = items[index].findChild(QQuickItem, 'meetingSaveTemplateFocus')
@@ -356,11 +372,15 @@ for index in range(4):
     assert not bridge.saves and dialog.property('opened')
 for index in range(2, -1, -1):
     QTest.keyClick(window, Qt.Key_Up)
+    wait(lambda: items[index].property('visualFocus')
+         and bridge.saveTemplate == bridge.saveTemplates[index]['id'],
+         f'template {index} reverse keyboard focus')
     assert bridge.saveTemplate == bridge.saveTemplates[index]['id']
 for index, item in enumerate(items):
     QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
                     item.mapToScene(QPointF(item.width()/2, item.height()/2)).toPoint())
-    QTest.qWait(20)
+    wait(lambda: item.property('activeFocus') and not item.property('visualFocus')
+         and item.property('selected'), f'template {index} pointer focus')
     assert bridge.saveTemplate == bridge.saveTemplates[index]['id']
     assert item.property('selected')
     assert not item.property('visualFocus')
