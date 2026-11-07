@@ -1,4 +1,4 @@
-"""Local «Стенограмма» template and the safe «Сохранить как…» write (E13.M4).
+"""Four local meeting templates and the safe «Сохранить как…» write (E13.M4).
 
 design/meetings/spec.md §4.7, arch/e13-plan-claude.md §7.1, T1 MN-3/MN-12/MN-15.
 No network and no format strings over user text (MN-12): the layout is fixed
@@ -13,14 +13,17 @@ import os
 import re
 import stat
 import unicodedata
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
+from heapq import merge
+from itertools import islice
 from pathlib import Path
 from uuid import uuid4
 
-from astra_voice.meetings.model import Meeting, Transcript, Utterance
+from astra_voice.meetings.model import DEFAULT_SELF_LABEL, Meeting, Transcript, Utterance
 
+TEMPLATES = ("stenogram", "me_and_others", "text_only", "stats")
 FORMATS = ("md", "txt")
 MERGE_GAP_MS = 2000  # adjacent replies of one speaker closer than 2 s are joined
 FILENAME_LIMIT = 120
@@ -222,10 +225,14 @@ def visible_utterances(transcript: Transcript | None) -> list[Utterance]:
 def speaker_label(meeting: Meeting, speaker: str) -> str:
     """«Я» (the meeting's own label) / «Собеседники»; M7 adds «Спикер N»."""
     if speaker == "me":
-        return meeting.self_label
+        return meeting.self_label if meeting.self_label.strip() else DEFAULT_SELF_LABEL
     if speaker.startswith("S") and speaker[1:].isdigit():
         return f"Спикер {speaker[1:]}"
     return OTHERS_LABEL
+
+
+def _minutes(milliseconds: int) -> int:
+    return max(1, round(milliseconds / 60_000)) if milliseconds else 0
 
 
 def speaker_minutes(utterances: Iterable[Utterance]) -> dict[str, int]:
@@ -235,7 +242,7 @@ def speaker_minutes(utterances: Iterable[Utterance]) -> dict[str, int]:
         if item.text in PLACEHOLDERS:
             continue
         total[item.speaker] = total.get(item.speaker, 0) + max(0, item.end_ms - item.start_ms)
-    return {key: max(1, round(value / 60_000)) if value else 0 for key, value in total.items()}
+    return {key: _minutes(value) for key, value in total.items()}
 
 
 def _local(value: str | None, tz: tzinfo | None) -> datetime | None:
@@ -254,6 +261,8 @@ def _one_line(text: str) -> str:
 
 def _md_escape(text: str) -> str:
     """One literal code span, immune to renderer-specific GFM autolinking."""
+    if not text.strip():
+        return ""  # Empty fences may close a neighbouring field's code span.
     fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
     # CommonMark strips one paired space unless the content is all spaces.
     padded = (
@@ -265,24 +274,275 @@ def _md_escape(text: str) -> str:
     return fence + content + fence
 
 
-def _merged(meeting: Meeting, utterances: Sequence[Utterance]) -> list[tuple[int, str, str]]:
-    """(start_ms, speaker label, text) with adjacent replies of one speaker joined."""
-    rows: list[tuple[int, str, str, int, bool]] = []
+@dataclass(frozen=True)
+class TemplateRow:
+    at_ms: int
+    kind: str
+    who: str
+    who_kind: str
+    text: str
+    icon: str = ""
+    truncated: bool = False
+
+
+def _merged(
+    meeting: Meeting,
+    utterances: Sequence[Utterance],
+    *,
+    binary: bool = False,
+    paragraphs: bool = False,
+    breaks: Sequence[int] = (),
+    text_limit: int | None = None,
+) -> Iterator[TemplateRow]:
+    """Lazy shared rows; bound text while collecting, never concatenate a whole preview."""
+    start = end = 0
+    speaker: str | None = None
+    placeholder = truncated = False
+    parts: list[str] = []
+    length = 0
+
+    def row() -> TemplateRow:
+        assert speaker is not None
+        return TemplateRow(
+            start,
+            "utterance",
+            speaker_label(meeting, speaker),
+            "me" if speaker == "me" else "others",
+            " ".join(parts),
+            truncated=truncated,
+        )
+
     for item in utterances:
-        text = _one_line(item.text)
-        placeholder = item.text in PLACEHOLDERS
-        if (
-            rows
+        who = ("me" if item.speaker == "me" else "others") if binary else item.speaker
+        is_placeholder = item.text in PLACEHOLDERS
+        joins = (
+            speaker is not None
+            and who == speaker
             and not placeholder
-            and not rows[-1][4]
-            and rows[-1][1] == item.speaker
-            and item.start_ms - rows[-1][3] <= MERGE_GAP_MS
-        ):
-            start, speaker, previous, _end, _ = rows[-1]
-            rows[-1] = (start, speaker, previous + " " + text, item.end_ms, False)
+            and not is_placeholder
+            and (paragraphs or item.start_ms - end <= MERGE_GAP_MS)
+            and not any(start < at <= item.start_ms for at in breaks)
+        )
+        if not joins:
+            if speaker is not None:
+                yield row()
+            start, speaker = item.start_ms, who
+            parts, length, truncated = [], 0, False
+        # A capped group may span thousands of utterances. Skip normalization once full.
+        if text_limit is None or length < text_limit:
+            text = _one_line(item.text)
+            remaining = None if text_limit is None else max(0, text_limit - length - bool(parts))
+            part = text if remaining is None else text[:remaining]
+            if part:
+                length += len(part) + bool(parts)
+                parts.append(part)
+            truncated = truncated or (remaining is not None and len(text) > remaining)
         else:
-            rows.append((item.start_ms, item.speaker, text, item.end_ms, placeholder))
-    return [(start, speaker_label(meeting, speaker), text) for start, speaker, text, _, _ in rows]
+            truncated = True
+        end, placeholder = item.end_ms, is_placeholder
+    if speaker is not None:
+        yield row()
+
+
+def template_rows(
+    template: str,
+    meeting: Meeting,
+    utterances: Sequence[Utterance],
+    marks: Sequence[MarkInfo],
+    *,
+    limit: int | None = None,
+    text_limit: int | None = None,
+) -> list[TemplateRow]:
+    """One chronology for export and preview; limits are applied during construction."""
+    paragraphs = template == "text_only"
+    timed = sorted(
+        (mark for mark in marks if mark.at_ms is not None and not from_placeholder(mark)),
+        key=lambda mark: mark.at_ms or 0,
+    )
+    mark_rows = (
+        TemplateRow(mark.at_ms, "mark", "", "", mark.line, mark.icon)
+        for mark in timed
+        if mark.at_ms is not None
+    )
+    speech = _merged(
+        meeting,
+        utterances,
+        binary=template == "me_and_others",
+        paragraphs=paragraphs,
+        breaks=[mark.at_ms for mark in timed if mark.at_ms is not None] if paragraphs else (),
+        text_limit=text_limit,
+    )
+    rows = merge(mark_rows, speech, key=lambda row: (row.at_ms, row.kind != "mark"))
+    return list(rows if limit is None else islice(rows, limit))
+
+
+def _field(text: str, md: bool, *, default: str = "") -> str:
+    literal = _one_line(text) or default
+    return _md_escape(literal) if md else literal
+
+
+def _header(
+    template: str,
+    meeting: Meeting,
+    utterances: Sequence[Utterance],
+    marks: Sequence[MarkInfo],
+    md: bool,
+    tz: tzinfo | None,
+) -> list[str]:
+    start = _local(meeting.started_at, tz)
+    title = _field(meeting.title, md, default=DEFAULT_NAME)
+    lines = ["# " + title if md else title, ""]
+    item = "- " if md else ""
+    if start is not None:
+        lines.append(f"{item}Дата: {start:%d.%m.%Y}")
+        lines.append(f"{item}Начало: {start:%H:%M}")
+    lines.append(f"{item}Длительность: {clock(meeting.recorded_ms)}")
+    speakers = sorted({u.speaker for u in utterances}, key=lambda s: (s != "me", s))
+    labels = (
+        [
+            speaker_label(meeting, group)
+            for group in ("me", "others")
+            if any((u.speaker == "me") == (group == "me") for u in utterances)
+        ]
+        if template == "me_and_others"
+        else [speaker_label(meeting, speaker) for speaker in speakers]
+    )
+    if labels and template != "text_only":
+        lines.append(f"{item}Участники: " + ", ".join(_field(label, md) for label in labels))
+    if marks:
+        lines.append(f"{item}Отметки:")
+        lines.extend(("  - " if md else "  ") + mark.badge for mark in marks)
+    lines.append("")
+    return lines
+
+
+@dataclass(frozen=True)
+class SpeakerStat:
+    label: str
+    minutes: int
+    share: int | None
+    replies: int
+
+
+@dataclass(frozen=True)
+class Statistics:
+    duration: str
+    replies: int
+    has_shares: bool
+    speakers: list[SpeakerStat]
+    remaining: int
+
+    @property
+    def summary(self) -> str:
+        text = f"Длительность {self.duration} · реплик {self.replies}"
+        return text + (" · сумма долей 100 %" if self.has_shares else "")
+
+
+def statistics(
+    meeting: Meeting,
+    utterances: Sequence[Utterance],
+    *,
+    limit: int | None = None,
+) -> Statistics:
+    """Shared millisecond arithmetic; only materialize the requested speaker rows."""
+    totals = dict.fromkeys((u.speaker for u in utterances), 0)
+    counts = dict(totals)
+    for row in utterances:
+        if row.text not in PLACEHOLDERS:
+            totals[row.speaker] += max(0, row.end_ms - row.start_ms)
+            counts[row.speaker] += 1
+    total = sum(totals.values())
+    shares = {who: 100 * ms // total if total else 0 for who, ms in totals.items()}
+    if total:
+        remainders = sorted(totals, key=lambda who: -(100 * totals[who] % total))
+        for who in remainders[: 100 - sum(shares.values())]:
+            shares[who] += 1
+    ordered = sorted(totals, key=lambda who: -totals[who])
+    selected = ordered if limit is None else ordered[:limit]
+    return Statistics(
+        clock(meeting.recorded_ms),
+        sum(counts.values()),
+        bool(total),
+        [
+            SpeakerStat(
+                speaker_label(meeting, who),
+                _minutes(totals[who]),
+                shares[who] if total else None,
+                counts[who],
+            )
+            for who in selected
+        ],
+        len(ordered) - len(selected),
+    )
+
+
+def _statistics(data: Statistics, md: bool) -> list[str]:
+    lines = [data.summary]
+    if not data.speakers:
+        return lines
+    lines.append("")
+    if md:
+        lines += [
+            "| Участник | Минуты | " + ("Доля | " if data.has_shares else "") + "Реплики |",
+            "| --- | ---: | " + ("---: | " if data.has_shares else "") + "---: |",
+        ]
+    for speaker in data.speakers:
+        label = _field(speaker.label, md)
+        minute, count, share = speaker.minutes, speaker.replies, speaker.share
+        if md:
+            label = label.replace("|", r"\|")
+            lines.append(
+                f"| {label} | {minute} | "
+                + (f"{share} % | " if share is not None else "")
+                + f"{count} |"
+            )
+        else:
+            noun = (
+                "реплик"
+                if 11 <= count % 100 <= 14
+                else {1: "реплика", 2: "реплики", 3: "реплики", 4: "реплики"}.get(
+                    count % 10, "реплик"
+                )
+            )
+            lines.append(
+                f"{label} — {minute} мин · "
+                + (f"{share} % · " if share is not None else "")
+                + f"{count} {noun}"
+            )
+    return lines
+
+
+def render(
+    template: str,
+    meeting: Meeting,
+    transcript: Transcript | None,
+    fmt: str = "md",
+    *,
+    tz: tzinfo | None = None,
+) -> str:
+    """Render the same selected local template for preview and private file export."""
+    if template not in TEMPLATES:
+        raise ValueError("Неизвестный шаблон")
+    if fmt not in FORMATS:
+        raise ValueError("Неизвестный формат")
+    md = fmt == "md"
+    utterances = visible_utterances(transcript)
+    marks = meeting_marks(meeting, utterances)
+    lines = _header(template, meeting, utterances, marks, md, tz)
+    if template == "stats":
+        return "\n".join(lines + _statistics(statistics(meeting, utterances), md)) + "\n"
+    paragraphs = template == "text_only"
+    rows = template_rows(template, meeting, utterances, marks)
+    body = [
+        "— " + row.text
+        if row.kind == "mark"
+        else _field(row.text, md)
+        if paragraphs
+        else f"[{clock(row.at_ms)}] {_field(row.who, md)}: {_field(row.text, md)}"
+        for row in rows
+    ]
+    separator = "\n\n" if md or paragraphs else "\n"
+    return "\n".join(lines) + "\n" + separator.join(body) + "\n"
 
 
 def stenogram(
@@ -292,42 +552,8 @@ def stenogram(
     *,
     tz: tzinfo | None = None,
 ) -> str:
-    """«Стенограмма»: header and replies «[ч:мм:сс] Я: …» in chronological order."""
-    if fmt not in FORMATS:
-        raise ValueError("Неизвестный формат")
-    md = fmt == "md"
-
-    def esc(text: str) -> str:
-        return _md_escape(text) if md else text
-
-    utterances = visible_utterances(transcript)
-    marks = meeting_marks(meeting, utterances)
-    start = _local(meeting.started_at, tz)
-    lines: list[str] = ["# " + esc(meeting.title) if md else meeting.title, ""]
-    item = "- " if md else ""
-    if start is not None:
-        lines.append(f"{item}Дата: {start:%d.%m.%Y}")
-        lines.append(f"{item}Начало: {start:%H:%M}")
-    lines.append(f"{item}Длительность: {clock(meeting.recorded_ms)}")
-    speakers = sorted({u.speaker for u in utterances}, key=lambda s: (s != "me", s))
-    if speakers:
-        names = ", ".join(esc(speaker_label(meeting, s)) for s in speakers)
-        lines.append(f"{item}Участники: {names}")
-    if marks:
-        lines.append(f"{item}Отметки:")
-        lines.extend(("  - " if md else "  ") + mark.badge for mark in marks)
-    lines.append("")
-    timed = [(mark.at_ms, 0, mark) for mark in marks if mark.at_ms is not None]
-    body: list[tuple[int, int, str]] = [
-        (at, 0, "— " + mark.line) for at, _, mark in timed if not from_placeholder(mark)
-    ]
-    body.extend(
-        (at, 1, f"[{clock(at)}] {esc(who)}: {esc(text)}")
-        for at, who, text in _merged(meeting, utterances)
-    )
-    body.sort(key=lambda row: (row[0], row[1]))
-    separator = "\n\n" if md else "\n"
-    return "\n".join(lines) + "\n" + separator.join(text for _, _, text in body) + "\n"
+    """Compatibility entry for the original default template."""
+    return render(TEMPLATES[0], meeting, transcript, fmt, tz=tz)
 
 
 def sanitize_filename(title: str, fmt: str) -> str:

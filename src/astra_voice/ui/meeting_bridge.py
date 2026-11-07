@@ -27,7 +27,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.core.settings import save as settings_save
 from astra_voice.meetings.apps import AppClass, AppDataError, AppDefinition, load_apps
 from astra_voice.meetings.events import MeetingState, PolicyCode
-from astra_voice.meetings.model import Meeting, Transcript, normalize_text
+from astra_voice.meetings.model import Meeting, Transcript, normalize_self_label, normalize_text
 from astra_voice.meetings.policy import RecordMode, parse_policy, validate_endpoint
 from astra_voice.meetings.settings_ext import (
     MEETING_DEFAULTS,
@@ -36,9 +36,10 @@ from astra_voice.meetings.settings_ext import (
 )
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.meetings.templates import (
+    TEMPLATES,
     ExportExists,
+    render,
     sanitize_filename,
-    stenogram,
     visible_utterances,
     with_extension,
     write_export,
@@ -48,12 +49,16 @@ from astra_voice.ui import meeting_card
 from astra_voice.ui.meeting_card import CARD_STATES, MODEL_ACTIONS, CardRows, TranscriptRows
 from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.meeting_texts import (
+    DELETE_TEXTS,
     EXIT_TEXTS,
+    RENAME_TEXTS,
     RESPONSIBILITY_ITEMS,
     TEXTS,
     W2_TEXTS,
     W4_TEXTS,
 )
+
+RENAME_ACTION = "Переименовать"
 
 SAVE_ERROR = "Не удалось сохранить настройки. Попробуйте ещё раз."
 
@@ -89,6 +94,8 @@ def _edited_setting(name: str, value: object) -> bool | int | str:
         "meeting_ai_endpoint": 2048,
         "meeting_ai_model": 128,
     }
+    if name == "meeting_self_label":
+        return normalize_self_label(value)
     normalized = normalize_text(value, limits[name])
     return validate_endpoint(normalized) if name == "meeting_ai_endpoint" else normalized
 
@@ -176,6 +183,7 @@ class _ExportResult:
     target: Path
     fmt: str
     status: str
+    template: str
 
 
 class MeetingBridge(QObject):
@@ -185,8 +193,13 @@ class MeetingBridge(QObject):
     meetingActionRequested = pyqtSignal(str, str)
     openMeetingsRequested = pyqtSignal()
     participantsRequested = pyqtSignal()
+    renameRequested = pyqtSignal(str, str)
+    renameFinished = pyqtSignal(str)
+    deleteRequested = pyqtSignal(str, str)
     cardSaveRequested = pyqtSignal()
     cardSaveFinished = pyqtSignal(str)
+    saveTemplateChanged = pyqtSignal()
+    savePreviewChanged = pyqtSignal()
     _exportCompleted = pyqtSignal(object)
     # QML bindings run before ordinary slots of the same signal: «card» is notified by
     # its own signal, emitted after the cache is dropped (a stale cache never reaches QML).
@@ -222,6 +235,7 @@ class MeetingBridge(QObject):
         self._apps = known_apps
         self._submit, self._clock = submit, clock
         self._documents: list[Meeting] = []
+        self._rename_pending = ""
         self._queue: queue.Queue[LoadResult] = queue.Queue(maxsize=1)
         self._loading = self._loading_visible = self._read_error = False
         self._save_error = ""
@@ -247,10 +261,21 @@ class MeetingBridge(QObject):
         self._card_timer.setInterval(20)
         self._card_timer.timeout.connect(self._card_poll)
         self._card_save_error = ""
+        self._save_template = TEMPLATES[0]
         self._export_busy = False
+        self._export_id = ""
+        self._delete_pending: dict[str, Meeting] = {}
+        self._delete_waiting: set[str] = set()
+        self._release_waiting: dict[str, Callable[[], None]] = {}
+        self._delete_observed: dict[str, str | None] = {}
+        self._delete_timer = QTimer(self)
+        self._delete_timer.setInterval(100)
+        self._delete_timer.timeout.connect(self._poll_deletions)
+        self.cardSaveFinished.connect(self._resume_deletes)
         self._export_writer = MetadataWriter()
         self._exportCompleted.connect(self._export_completed, Qt.QueuedConnection)
-        self._replace_target: tuple[Path, str] | None = None  # (path, fmt) awaiting «Заменить»
+        # (path, fmt, template) awaiting «Заменить».
+        self._replace_target: tuple[Path, str, str] | None = None
         # «Сохранить как…» from the list waits until the opened card has loaded (D4 needs «ready»).
         self._card_save_pending = False
         # TRANSCRIBING → DONE of one generation: the live rows stay, the final text adds its tail.
@@ -477,13 +502,13 @@ class MeetingBridge(QObject):
                 "Записана",
                 "neutral",
                 "Расшифровать",
-                ["Переименовать", "Удалить"],
+                [RENAME_ACTION, "Удалить"],
             ),
             MeetingState.TRANSCRIBING: (
                 "Расшифровка · 0 %",
                 "warning",
                 "Отменить",
-                ["Переименовать", "Удалить"],
+                [RENAME_ACTION, "Удалить"],
             ),
             MeetingState.WAITING_MEMORY: ("Ждёт памяти", "warning", "", ["Отменить", "Удалить"]),
             MeetingState.NEEDS_MODEL: ("Нужна модель", "warning", "Установить", ["Удалить"]),
@@ -491,7 +516,7 @@ class MeetingBridge(QObject):
                 "Готово",
                 "success",
                 "Открыть",
-                ["Сохранить как…", "Имена участников", "Переименовать", "Удалить"],
+                ["Сохранить как…", "Имена участников", RENAME_ACTION, "Удалить"],
             ),
             MeetingState.FAILED: ("Ошибка расшифровки", "danger", "Повторить", ["Удалить"]),
             MeetingState.INTERRUPTED: ("Прервана", "warning", "Расшифровать", ["Удалить"]),
@@ -543,6 +568,10 @@ class MeetingBridge(QObject):
             and self._capture.controller.state == "stopped"
             and state in {MeetingState.RECORDING, MeetingState.PAUSED}
         )
+        if meeting.id in self._delete_pending or (
+            jobs is not None and meeting.id in jobs.tombstones
+        ):
+            actions = [item for item in actions if item != RENAME_ACTION]
         if saving:
             badge, kind, action, actions = "Сохраняю запись…", "neutral", "", []
         return {
@@ -569,6 +598,7 @@ class MeetingBridge(QObject):
                 )
             ),
             "actions": actions,
+            "actionKeys": ["rename" if action == RENAME_ACTION else "" for action in actions],
             "progress": progress,
             "active": not saving and state in {MeetingState.RECORDING, MeetingState.PAUSED},
             "transcribing": state == MeetingState.TRANSCRIBING,
@@ -640,6 +670,7 @@ class MeetingBridge(QObject):
         if overlay is not None:
             overlay.shutdown()
         self._closed = True
+        self._delete_timer.stop()
         self._export_writer.close(timeout=2.0)
         self._timer.stop()
         self._card_timer.stop()
@@ -739,6 +770,20 @@ class MeetingBridge(QObject):
             if row["id"] == meeting_id and action and action in [row["action"], *row["actions"]]:
                 if action == row["action"] and not row["actionEnabled"]:
                     return
+                if action == RENAME_ACTION:
+                    meeting = next(
+                        (item for item in self._documents if item.id == meeting_id), None
+                    )
+                    if meeting is not None:
+                        self.renameRequested.emit(meeting_id, meeting.title)
+                    return
+                if action == "Удалить":
+                    meeting = next(
+                        (item for item in self._documents if item.id == meeting_id), None
+                    )
+                    if meeting is not None:
+                        self.deleteRequested.emit(meeting_id, meeting.title)
+                    return
                 if action in {"Открыть", "Сохранить как…"}:
                     self.openMeeting(meeting_id)
                     if action == "Сохранить как…" and self._card_id == meeting_id:
@@ -756,6 +801,9 @@ class MeetingBridge(QObject):
     def bindRecording(self, capture: MeetingRecording) -> None:
         """Bind the existing section to the inert M2 adapter; no launch here."""
         self._capture = capture
+        capture.release_files = self._release_files
+        if capture.jobs is not None:
+            capture.jobs.release_files = self._release_files
         capture.changed.connect(self._capture_changed)
         capture.openMeetingsRequested.connect(self.openMeetingsRequested)
         capture.participantsRequested.connect(self.participantsRequested)
@@ -787,8 +835,13 @@ class MeetingBridge(QObject):
         if updates:
             self._documents = [row for row in self._documents if row.id not in updates]
             self._documents.extend(updates.values())
-        if jobs is not None and jobs.tombstones:
-            self._documents = [row for row in self._documents if row.id not in jobs.tombstones]
+        if jobs is not None:
+            hidden = jobs.tombstones | {
+                mid
+                for mid, status in jobs.deletions.items()
+                if status in {"deleted", "purge_error"}
+            }
+            self._documents = [row for row in self._documents if row.id not in hidden]
 
     @pyqtProperty(int, notify=changed)
     def transcriptionPercent(self) -> int:
@@ -990,12 +1043,15 @@ class MeetingBridge(QObject):
         meeting = next((row for row in self._documents if row.id == meeting_id), None)
         if self._closed or meeting is None or meeting.state not in CARD_STATES:
             return
+        self._save_template = TEMPLATES[0]
         self._card_id = meeting_id
         self._card_key = None
         self._card_save_error = ""
         self._card_save_pending = False
         self._replace_target = None  # a question of another card never applies here
         self._sync_card()
+        self.saveTemplateChanged.emit()
+        self.savePreviewChanged.emit()
         self.changed.emit()
 
     def _flush_card_save(self) -> None:
@@ -1022,6 +1078,7 @@ class MeetingBridge(QObject):
         self._card_serial += 1  # late reads of the closed card are dropped
         self._card_rows.reset()
         self._card_timer.stop()
+        self.savePreviewChanged.emit()
         self.changed.emit()
 
     @pyqtProperty(bool, notify=changed)
@@ -1035,6 +1092,33 @@ class MeetingBridge(QObject):
     @pyqtProperty("QVariantMap", constant=True)
     def cardTexts(self) -> dict[str, str]:
         return dict(meeting_card.TEXTS)
+
+    @pyqtProperty("QVariantList", constant=True)
+    def saveTemplates(self) -> list[dict[str, str]]:
+        return [
+            {"id": key, "icon": icon, "title": title, "caption": caption}
+            for key, (icon, title, caption) in zip(
+                TEMPLATES, meeting_card.TEMPLATE_TEXTS, strict=True
+            )
+        ]
+
+    @pyqtProperty(str, notify=saveTemplateChanged)
+    def saveTemplate(self) -> str:
+        return self._save_template
+
+    @saveTemplate.setter  # type: ignore[no-redef]
+    def saveTemplate(self, template: str) -> None:
+        if template in TEMPLATES and template != self._save_template:
+            self._save_template = template
+            self.saveTemplateChanged.emit()
+            self.savePreviewChanged.emit()
+
+    @pyqtSlot(result="QVariantMap")
+    def savePreview(self) -> dict[str, Any]:
+        meeting = self._savable_meeting("txt")
+        if meeting is None:
+            return {}
+        return meeting_card.save_preview(self._save_template, meeting, self._card_transcript)
 
     @pyqtProperty(str, notify=changed)
     def cardSaveError(self) -> str:
@@ -1089,6 +1173,9 @@ class MeetingBridge(QObject):
             policy_off=self.sectionState == "policy-off",
             failure=failure,
             snapshot=self._card_progress if meeting.state == MeetingState.TRANSCRIBING else None,
+            rename_allowed=RENAME_ACTION in self._row(meeting)["actions"],
+            deleting=meeting.id in self._delete_pending
+            or (jobs is not None and meeting.id in jobs.tombstones),
         )
 
     def _sync_card(self) -> None:
@@ -1100,6 +1187,7 @@ class MeetingBridge(QObject):
             self._card_id = ""  # deleted elsewhere: back to the list
             self._card_builder = None
             self._card_rows.reset()
+            self.savePreviewChanged.emit()
             return
         key = (str(meeting.state), meeting.meeting_generation)
         if key != self._card_key:
@@ -1117,6 +1205,7 @@ class MeetingBridge(QObject):
                 self._card_progress = None
                 self._card_tail = True
                 self._load_transcript(meeting)
+                self.savePreviewChanged.emit()
                 return
             self._card_tail = False
             self._card_builder = CardRows(meeting, self._card_rows)
@@ -1126,6 +1215,7 @@ class MeetingBridge(QObject):
             self._card_progress = self._progress(meeting)
             if meeting.state in {MeetingState.DONE, MeetingState.TRANSCRIBING}:
                 self._load_transcript(meeting)
+            self.savePreviewChanged.emit()
             return
         if self._card_builder is not None:
             self._card_builder.meeting = meeting
@@ -1209,6 +1299,7 @@ class MeetingBridge(QObject):
             self._card_builder.load(utterances, complete=done)
         if meeting.state == MeetingState.TRANSCRIBING:
             self._append_live(meeting)
+        self.savePreviewChanged.emit()
         self.changed.emit()
         self._flush_card_save()
 
@@ -1230,7 +1321,138 @@ class MeetingBridge(QObject):
             if self.enabled or action == "Подробнее":
                 self.meetingActionRequested.emit(meeting.id, action)
             return
+        if action == "rename":
+            action = RENAME_ACTION
+        if action in {"delete", "Удалить встречу…", "Удалить…"}:
+            action = "Удалить"
         self.requestMeetingAction(meeting.id, action)
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def renameTexts(self) -> dict[str, str]:
+        return dict(RENAME_TEXTS)
+
+    @pyqtSlot(str, str, result=str)
+    def renameMeeting(self, meeting_id: str, title: str) -> str:
+        meeting = next((row for row in self._documents if row.id == meeting_id), None)
+        jobs = self._jobs()
+        if (
+            self._closed
+            or self._rename_pending
+            or jobs is None
+            or meeting is None
+            or RENAME_ACTION not in self._row(meeting)["actions"]
+        ):
+            return "error"
+        try:
+            # Validate controls before collapsing whitespace (tabs/newlines must not disappear).
+            title = normalize_text(
+                " ".join(normalize_text(title, 1_000_000).split()), 120, minimum=1
+            )
+        except ValueError:
+            return "error"
+        self._rename_pending = meeting_id
+
+        def completed(ok: bool) -> None:
+            self._rename_pending = ""
+            if self._closed:
+                return
+            if ok:
+                self._overlay_capture()
+                self.savePreviewChanged.emit()
+                self.changed.emit()
+            self.renameFinished.emit("saved" if ok else "error")
+
+        # Even injected synchronous submitters must publish after the slot returns pending.
+        jobs.rename(meeting_id, title, lambda ok: QTimer.singleShot(0, lambda: completed(ok)))
+        return "pending"
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def deleteTexts(self) -> dict[str, str]:
+        return dict(DELETE_TEXTS)
+
+    @pyqtSlot(str)
+    def confirmDelete(self, meeting_id: str) -> None:
+        meeting = next((item for item in self._documents if item.id == meeting_id), None)
+        jobs = self._jobs()
+        if (
+            self._closed
+            or jobs is None
+            or meeting is None
+            or meeting_id in self._delete_pending
+            or meeting.state in {MeetingState.RECORDING, MeetingState.PAUSED}
+        ):
+            return
+        self._save_error = ""
+        self._delete_pending[meeting_id] = deepcopy(meeting)
+        self._delete_waiting.add(meeting_id)
+        self._delete_timer.start()
+        self._resume_deletes()
+
+    def _resume_deletes(self, _result: str = "") -> None:
+        jobs = self._jobs()
+        if self._closed or jobs is None:
+            return
+        for meeting_id, done in tuple(self._release_waiting.items()):
+            if self._export_busy and self._export_id == meeting_id:
+                continue
+            self._release_waiting.pop(meeting_id)
+            done()
+        for meeting_id in tuple(self._delete_waiting):
+            if self._export_busy and self._export_id == meeting_id:
+                continue
+            self._delete_waiting.remove(meeting_id)
+            if meeting_id not in jobs.tombstones and jobs.deletions.get(meeting_id) not in {
+                "pending",
+                "deleting",
+                "deleted",
+                "purge_error",
+            }:
+                jobs.delete_and_purge(meeting_id)
+        self._poll_deletions()
+
+    def _release_files(self, meeting_id: str, done: Callable[[], None]) -> None:
+        """Both human and age-based deletion wait for the existing export owner."""
+        if self._export_busy and self._export_id == meeting_id:
+            self._release_waiting[meeting_id] = done
+        else:
+            done()
+
+    def _poll_deletions(self) -> None:
+        jobs = self._jobs()
+        if self._closed or jobs is None:
+            return
+        changed = False
+        for meeting_id, original in tuple(self._delete_pending.items()):
+            status = (
+                "waiting_export"
+                if meeting_id in self._delete_waiting
+                else jobs.deletions.get(meeting_id)
+            )
+            if meeting_id in self._delete_observed and self._delete_observed[meeting_id] == status:
+                continue
+            self._delete_observed[meeting_id] = status
+            changed = True
+            if status == "waiting_export":
+                continue
+            if status == "error":
+                self._documents = [row for row in self._documents if row.id != meeting_id]
+                self._documents.append(original)
+                self._save_error = DELETE_TEXTS["error"]
+            elif status in {"deleting", "deleted", "purge_error"}:
+                self._documents = [row for row in self._documents if row.id != meeting_id]
+                if self._card_id == meeting_id:
+                    self.closeMeeting()
+                    self.openMeetingsRequested.emit()
+                if status == "purge_error":
+                    self._save_error = DELETE_TEXTS["error"]
+            if status in {"error", "deleted", "purge_error"}:
+                self._delete_pending.pop(meeting_id)
+                self._delete_observed.pop(meeting_id, None)
+        if not self._delete_pending:
+            self._delete_timer.stop()
+        if changed:
+            self._overlay_capture()
+            self.changed.emit()
 
     @pyqtSlot(str, result=str)
     def saveAs(self, fmt: str) -> str:
@@ -1245,25 +1467,31 @@ class MeetingBridge(QObject):
         meeting = self._savable_meeting(fmt)
         if meeting is None:
             return "error"
+        self._export_id = meeting.id
         self._export_busy = True  # also guard the system dialog's nested event loop
-        serial = self._card_serial
+        serial, template = self._card_serial, self._save_template
         name = sanitize_filename(meeting.title, fmt)
         try:
             chosen = self._pick_save_path(str(self._documents_dir() / name), fmt)
         except Exception:
             self._export_busy = False
+            self.cardSaveFinished.emit("error")
             raise
         if not chosen:
             self._export_busy = False
+            self.cardSaveFinished.emit("cancelled")
             return "cancelled"
         # The nested dialog may have closed/switched the card. Snapshot only now.
         meeting = self._savable_meeting(fmt)
         if meeting is None or serial != self._card_serial:
             self._export_busy = False
+            self.cardSaveFinished.emit("error")
             return "error"
         # Never derived from «exists after the dialog»: another process may have
         # created the file meanwhile. O_EXCL first, replacing needs the person's «Заменить».
-        return self._write_card(meeting, with_extension(Path(chosen), fmt), fmt, overwrite=False)
+        return self._write_card(
+            meeting, with_extension(Path(chosen), fmt), fmt, template, overwrite=False
+        )
 
     @pyqtProperty(str, notify=changed)
     def cardReplaceFile(self) -> str:
@@ -1277,13 +1505,14 @@ class MeetingBridge(QObject):
         pending, self._replace_target = self._replace_target, None
         if pending is None:
             return "error"
-        target, fmt = pending
+        target, fmt, template = pending
         meeting = self._savable_meeting(fmt)
         if meeting is None:
             self.changed.emit()
             return "error"
+        self._export_id = meeting.id
         self._export_busy = True
-        return self._write_card(meeting, target, fmt, overwrite=True)
+        return self._write_card(meeting, target, fmt, template, overwrite=True)
 
     @pyqtSlot()
     def cancelReplace(self) -> None:
@@ -1293,6 +1522,7 @@ class MeetingBridge(QObject):
 
     def _savable_meeting(self, fmt: str) -> Meeting | None:
         meeting = self._card_meeting()
+        jobs = self._jobs()
         if (
             meeting is None
             or self._closed
@@ -1301,11 +1531,22 @@ class MeetingBridge(QObject):
             or not self._card_loaded
             or self._card_error
             or self._card_tail  # the final text is still being read
+            or meeting.id in self._delete_pending
+            or (
+                jobs is not None
+                and (
+                    meeting.id in jobs.tombstones
+                    or jobs.deletions.get(meeting.id)
+                    in {"pending", "deleting", "deleted", "purge_error"}
+                )
+            )
         ):
             return None
         return meeting
 
-    def _write_card(self, meeting: Meeting, target: Path, fmt: str, *, overwrite: bool) -> str:
+    def _write_card(
+        self, meeting: Meeting, target: Path, fmt: str, template: str, *, overwrite: bool
+    ) -> str:
         # Plain detached values only: the worker never reads card/bridge state.
         snapshot, transcript = deepcopy(meeting), deepcopy(self._card_transcript)
         serial, emit = self._card_serial, self._exportCompleted.emit
@@ -1313,7 +1554,7 @@ class MeetingBridge(QObject):
         def work() -> None:
             status = "saved"
             try:
-                text = stenogram(snapshot, transcript, fmt)
+                text = render(template, snapshot, transcript, fmt)
                 write_export(target, text, overwrite=overwrite)
             except ExportExists:
                 status = "exists"
@@ -1321,25 +1562,29 @@ class MeetingBridge(QObject):
                 status = "error"
             finally:
                 try:
-                    emit(_ExportResult(serial, target, fmt, status))
+                    emit(_ExportResult(serial, target, fmt, status, template))
                 except RuntimeError:
                     pass  # QObject already destroyed during application shutdown
 
         try:
             self._export_writer.submit(work)
         except (RuntimeError, queue.Full):
-            self._export_completed(_ExportResult(serial, target, fmt, "error"))
+            self._export_completed(_ExportResult(serial, target, fmt, "error", template))
         return "pending"
 
     @pyqtSlot(object)
     def _export_completed(self, result: object) -> None:
         assert isinstance(result, _ExportResult)
         self._export_busy = False
-        if self._closed or result.serial != self._card_serial:
+        if self._closed:
+            return
+        if result.serial != self._card_serial:
+            # Release deletion waiters without opening D4 for a different card.
+            self.cardSaveFinished.emit("stale")
             return
         target = result.target
         if result.status == "exists":
-            self._replace_target = (target, result.fmt)
+            self._replace_target = (target, result.fmt, result.template)
         elif result.status == "error":
             self._card_save_error = meeting_card.TEXTS["saveError"]
         else:

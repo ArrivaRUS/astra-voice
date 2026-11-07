@@ -833,3 +833,14 @@ def test_foreign_owner_is_refused(
             disk.read(ID, "audio/mic-0000.json" if location == "audio" else "meeting.json")
     assert str(caught.value) and str(target) not in str(caught.value)
     assert target.stat() == before
+
+
+@pytest.mark.parametrize("label", [" ", "\u00a0\u2003"])
+def test_legacy_blank_self_label_does_not_break_catalogue_t508(
+    disk: store.MeetingStore, label: str
+) -> None:
+    meeting = disk.read(ID, "meeting.json")
+    meeting.self_label = label
+    disk.write(ID, "meeting.json", meeting, writer=store.Writer.GUI)
+    assert disk.read(ID, "meeting.json").self_label == label
+    assert [(item.id, item.self_label) for item in disk.list()] == [(ID, label)]

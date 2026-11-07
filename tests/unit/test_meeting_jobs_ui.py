@@ -20,7 +20,7 @@ from astra_voice.core.meeting_session import StorageStatus
 from astra_voice.core.settings import Settings
 from astra_voice.meetings.events import MeetingState
 from astra_voice.meetings.model import Meeting
-from astra_voice.meetings.store import MeetingStore
+from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui import notify
 from astra_voice.ui.meeting_bridge import MeetingBridge
@@ -125,7 +125,7 @@ class Rig:
         self.immediately = True
         self.admission = ModelAdmission("ok", dict(LOAD))
         self.memory: int | None = 4000
-        self.notices: list[tuple[str, str]] = []
+        self.notices: list[tuple[str, str | int]] = []
         self.roles: list[Role] = []
 
         def factory(event: Callable[[dict[str, Any]], None], exited: Callable[[int], None]) -> Role:
@@ -141,7 +141,9 @@ class Rig:
             model_probe=lambda: self.admission,
             mem_available=lambda: self.memory,
             submit=lambda operation: operation(),
-            notify=lambda kind, meeting: self.notices.append((kind, meeting.id)),
+            notify=lambda kind, payload: self.notices.append(
+                (kind, payload.id if isinstance(payload, Meeting) else payload)
+            ),
             echo_gate=False,
         )
         self.recording.bind_jobs(self.jobs)
@@ -585,7 +587,75 @@ def test_app_gives_the_catalog_probe_before_initialize_recovers_9(
     monkeypatch.setattr(recording_module, "MeetingRecording", Mock(return_value=recording))
     service = Mock()
     service.catalog.entry.return_value = SimpleNamespace(min_ram_mb=1234)
-    bridge = Mock(_store=MeetingStore(tmp_path / "meetings"))
+    bridge = Mock(
+        _store=MeetingStore(tmp_path / "meetings"),
+        settings={"meeting_retention_days": 90, "meeting_audio_retention_days": 7},
+    )
     app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None, service)
     assert seen == [1234]
-    recording.bind_jobs.call_args.args[0].shutdown()
+    jobs = recording.bind_jobs.call_args.args[0]
+    assert jobs.meeting_retention_days() == 90
+    assert jobs.audio_retention_days() == 7
+    bridge.settings["meeting_retention_days"] = 365
+    assert jobs.meeting_retention_days() == 365
+    jobs.shutdown()
+
+
+@pytest.mark.parametrize("gate", ["setting", "policy"])
+@pytest.mark.parametrize("renamed", [False, True])
+def test_r2_startup_finishes_deletion_with_meetings_disabled(
+    rig: Rig, gate: str, renamed: bool
+) -> None:
+    rig.create(state=MeetingState.DELETING)
+    if renamed:
+        rig.store.begin_delete(MID)
+    if gate == "setting":
+        rig.settings.meetings_enabled = False
+    else:
+        _ban(rig)
+    rig.recording.initialize()
+    for _ in range(3):
+        rig.recording.tick()
+    assert not (rig.store.root / MID).exists()
+    assert rig.store.pending_deletions() == []
+    assert not rig.jobs.queued_ids and not rig.roles
+
+
+def test_retention_notice_contains_only_meeting_count() -> None:
+    notices = SimpleNamespace(notify_meeting_retention=Mock())
+    deliver = job_notifier(notices)  # type: ignore[arg-type]
+    deliver("retention", 3)
+    deliver("retention", 0)
+    notices.notify_meeting_retention.assert_called_once_with(3)
+
+
+@pytest.mark.parametrize("gate", ["setting", "policy"])
+def test_retention_starts_with_meetings_disabled_or_policy_banned(rig: Rig, gate: str) -> None:
+    from datetime import UTC, datetime
+
+    from astra_voice.meetings.events import ProcessingStatus
+    from astra_voice.meetings.model import Audio, Transcription
+
+    rig.create(
+        state=MeetingState.DONE,
+        processing_status=ProcessingStatus.SUCCEEDED,
+        audio=Audio(retain_days=7),
+        transcription=Transcription(finished_at="2026-10-01T12:00:00+00:00"),
+    )
+    rig.create(MID2, state=MeetingState.TRANSCRIBING)
+    old = rig.meeting(MID2)
+    old.started_at = "2026-09-01T12:00:00+00:00"
+    rig.store.write(MID2, "meeting.json", old, writer=Writer.GUI)
+    rig.jobs.wall_clock = lambda: datetime(2026, 11, 4, 12, tzinfo=UTC)
+    rig.jobs.meeting_retention_days = lambda: 30
+    if gate == "setting":
+        rig.settings.meetings_enabled = False
+    else:
+        _ban(rig)
+    rig.recording.initialize()
+    rig.recording.tick()
+    assert not rig.meeting().audio.present
+    assert not (rig.store.root / MID2).exists()
+    assert rig.jobs._retention_at is not None
+    assert not rig.roles and not rig.jobs.queued_ids
+    assert [notice for notice in rig.notices if notice[0] == "retention"] == [("retention", 1)]

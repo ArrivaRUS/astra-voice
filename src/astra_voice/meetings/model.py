@@ -84,6 +84,14 @@ def normalize_text(value: str, limit: int, *, multiline: bool = False, minimum: 
     return normalized
 
 
+DEFAULT_SELF_LABEL = "Я"
+
+
+def normalize_self_label(value: str) -> str:
+    """Validate controls before collapsing whitespace, as for meeting titles."""
+    return normalize_text(" ".join(normalize_text(value, 1_000_000).split()), 40, minimum=1)
+
+
 def _normalize(value: Any, *, speech: bool = False) -> Any:
     if isinstance(value, str):
         return normalize_text(value, 1_000_000, multiline=speech)
@@ -386,7 +394,7 @@ class Meeting(JsonModel):
     tracks: Tracks = field(default_factory=Tracks)
     audio: Audio = field(default_factory=Audio)
     transcription: Transcription = field(default_factory=Transcription)
-    self_label: str = "Я"
+    self_label: str = DEFAULT_SELF_LABEL
     warnings: Warnings = field(default_factory=Warnings)
     ai: AiHistory = field(default_factory=AiHistory)
     size_bytes: int = 0

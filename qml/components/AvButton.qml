@@ -1,5 +1,5 @@
 // Кнопка — design/spec.md §4.1. Варианты: secondary (по умолчанию), primary, ghost;
-// размер sm. Разрушающего варианта нет (решение В5). disabled — только цветом, opacity 1.
+// размер sm; danger для D2 встреч (§4.7). disabled — только цветом, opacity 1.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
@@ -8,16 +8,17 @@ import ".."
 Button {
     id: control
 
-    // "secondary" | "primary" | "ghost"
+    // "secondary" | "primary" | "ghost" | "danger"
     property string variant: "secondary"
     property bool small: false
     property string iconName: ""
     property bool iconFill: false
 
+    readonly property bool danger: variant === "danger"
     readonly property bool ghost: variant === "ghost"
     readonly property bool primary: variant === "primary"
     readonly property color fgColor: !enabled ? Theme.fgDisabled
-        : (primary ? Theme.primaryFg : (ghost ? Theme.primary : Theme.fg))
+        : (danger ? Theme.dangerInk : primary ? Theme.primaryFg : (ghost ? Theme.primary : Theme.fg))
 
     padding: 0
     leftPadding: small ? Theme.buttonSmPaddingX : (ghost ? Theme.buttonGhostPaddingX : Theme.buttonPaddingX)
@@ -39,6 +40,9 @@ Button {
         color: {
             if (!control.enabled)
                 return Theme.bgSurface2;
+            if (control.danger)
+                return control.pressed ? Qt.darker(Theme.dangerBg, 1.15)
+                     : (control.hovered ? Qt.darker(Theme.dangerBg, 1.07) : Theme.dangerBg);
             if (control.primary)
                 return control.pressed ? Theme.statePrimaryPressed
                      : (control.hovered ? Theme.statePrimaryHover : Theme.primary);
@@ -56,7 +60,7 @@ Button {
             radius: parent.radius
             antialiasing: true
             border.width: control.ghost && control.enabled ? 0 : Theme.buttonBorder
-            border.color: control.enabled ? (control.primary ? Theme.primary : Theme.border) : Theme.border
+            border.color: control.enabled ? (control.danger ? Theme.dangerInk : control.primary ? Theme.primary : Theme.border) : Theme.border
         }
 
         // Кольцо фокуса: 2 px снаружи, зазор 2, радиус 8 (сквозное правило 1).

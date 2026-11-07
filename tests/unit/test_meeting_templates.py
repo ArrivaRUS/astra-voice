@@ -45,7 +45,7 @@ def fixture_meeting() -> Meeting:
         id=MEETING_ID,
         started_at="2026-10-09T07:00:00Z",
         ended_at="2026-10-09T08:12:40Z",
-        title="Планёрка по бюджету",
+        title="Планёрка `бюджет` https://example.ru a@b.ru",
         state=MeetingState.DONE,
         variant="app_stream",
         app_class="dion",
@@ -75,6 +75,10 @@ def fixture_transcript() -> Transcript:
         ("mic", 35_000, 38_000, "Это эхо собеседника", "me", True),
         ("mic", 39_000, 44_000, "Олег, <b>это</b> & *всё*?", "me", False),
         ("far", 2_400_000, 2_410_000, templates.DAMAGED_TEXT, "others", False),
+        ("far", 40_000, 41_000, "Ссылка `код` https://x.ru a@b.ru", "S2", False),
+        ("far", 43_000, 44_000, "На границе склейки.", "S2", False),
+        ("far", 46_001, 47_000, "После разрыва.", "S2", False),
+        ("far", 48_000, 49_000, templates.UNRECOGNIZED_TEXT, "S3", False),
         ("mic", 2_500_000, 2_503_000, "Я вернулся.", "me", False),
     ]
     return Transcript(
@@ -96,10 +100,11 @@ def fixture_transcript() -> Transcript:
     )
 
 
+@pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
 @pytest.mark.parametrize("fmt", ["md", "txt"])
-def test_stenogram_golden(fmt: str) -> None:
-    text = stenogram(fixture_meeting(), fixture_transcript(), fmt, tz=MSK)
-    assert text == (GOLDEN / f"stenogram.{fmt}").read_text(encoding="utf-8")
+def test_stenogram_golden(template: str, fmt: str) -> None:
+    text = templates.render(template, fixture_meeting(), fixture_transcript(), fmt, tz=MSK)
+    assert text == (GOLDEN / f"{template}.{fmt}").read_text(encoding="utf-8")
 
 
 def test_stenogram_rules() -> None:
@@ -152,42 +157,63 @@ HOSTILE_FIELDS = [
     "`start",
     "end`",
     "a``b```c",
+    "![x](https://evil) `x",
     "```",
     " padded ",
     "\\<>&*_[]()!#@",
+    "строка\nhttps://x.ru `код`",
 ]
 
 
-def untrusted_export(field: str, literal: str) -> tuple[str, list[str]]:
+def untrusted_export(field: str, literal: str, template: str) -> tuple[str, list[str]]:
     meeting, transcript = fixture_meeting(), fixture_transcript()
+    meeting.title = "Встреча"  # isolate the one hostile field under test
     transcript.utterances = transcript.utterances[:1]
     if field == "title":
         meeting.title = literal
     elif field == "label":
         meeting.self_label = literal
     else:
+        if field == "empty_label_reply":
+            meeting.self_label = " "
         transcript.utterances[0].text = literal
-    md = stenogram(meeting, transcript, "md", tz=MSK)
-    reply = next(line for line in md.splitlines() if line.startswith("[0:00:04] "))
+    md = templates.render(template, meeting, transcript, "md", tz=MSK)
     if field == "title":
         fragments = [md.splitlines()[0].removeprefix("# ")]
-    elif field == "label":
-        names = next(
+    elif field == "label" and template != "text_only":
+        header = next(
             line.removeprefix("- Участники: ")
             for line in md.splitlines()
             if line.startswith("- Участники: ")
         )
-        fragments = [names, reply.removeprefix("[0:00:04] ").rsplit(": ", 1)[0]]
+        fragments = [header.removesuffix(", `Собеседники`")]
+        if template == "stats":
+            fragments.append(md.splitlines()[-1].removeprefix("| ").split(" | ", 1)[0])
+        else:
+            reply = next(line for line in md.splitlines() if line.startswith("[0:00:04] "))
+            fragments.append(reply.removeprefix("[0:00:04] ").rsplit(": ", 1)[0])
+    elif field in {"reply", "empty_label_reply"} and template != "stats":
+        fragments = [
+            md.split("\n\n", 2)[2].splitlines()[0]
+            if template == "text_only"
+            else next(line for line in md.splitlines() if line.startswith("[0:00:04] ")).split(
+                ": ", 1
+            )[1]
+        ]
     else:
-        fragments = [reply.split(": ", 1)[1]]
+        fragments = []
+        assert literal not in md
     return md, fragments
 
 
-@pytest.mark.parametrize("field", ["title", "label", "reply"])
+@pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
+@pytest.mark.parametrize("field", ["title", "label", "reply", "empty_label_reply"])
 @pytest.mark.parametrize("literal", HOSTILE_FIELDS)
-def test_markdown_untrusted_fields_are_whole_code_spans(field: str, literal: str) -> None:
-    _md, fragments = untrusted_export(field, literal)
-    visible = " ".join(literal.split()) if field == "reply" else literal
+def test_markdown_untrusted_fields_are_whole_code_spans(
+    field: str, literal: str, template: str
+) -> None:
+    _md, fragments = untrusted_export(field, literal, template)
+    visible = " ".join(literal.split())
     longest = max((len(run) for run in re.findall(r"`+", visible)), default=0)
     for fragment in fragments:
         span = re.fullmatch(r"(`+)(.*?)\1", fragment)
@@ -199,10 +225,12 @@ def test_markdown_untrusted_fields_are_whole_code_spans(field: str, literal: str
 
 
 @pytest.mark.parametrize("renderer", ["markdown_it", "cmarkgfm"])
-@pytest.mark.parametrize("field", ["title", "label", "reply"])
+@pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
+@pytest.mark.parametrize("field", ["title", "label", "reply", "empty_label_reply"])
 @pytest.mark.parametrize("literal", HOSTILE_FIELDS)
 def test_markdown_untrusted_fields_render_without_links_or_images(
     renderer: str,
+    template: str,
     field: str,
     literal: str,
 ) -> None:
@@ -214,7 +242,7 @@ def test_markdown_untrusted_fields_render_without_links_or_images(
             importlib.import_module("linkify_it")
     except ImportError:
         pytest.skip("Markdown renderer unavailable")
-    md, _fragments = untrusted_export(field, literal)
+    md, _fragments = untrusted_export(field, literal, template)
     if renderer == "markdown_it":
         html = (
             module.MarkdownIt("commonmark", {"linkify": True, "html": False})
@@ -224,8 +252,8 @@ def test_markdown_untrusted_fields_render_without_links_or_images(
     else:
         html = module.github_flavored_markdown_to_html(md)
     assert "<a" not in html and "<img" not in html
-    visible = " ".join(literal.split()) if field == "reply" else literal
-    assert visible in unescape("".join(re.findall(r"<code>(.*?)</code>", html)))
+    visible = " ".join(literal.split())
+    assert not _fragments or visible in unescape("".join(re.findall(r"<code>(.*?)</code>", html)))
 
 
 def test_placeholders_match_the_role_constants() -> None:
@@ -386,3 +414,189 @@ def test_pause_marks_show_point_and_real_length_ranges_stay() -> None:
     # Microphone gaps and damage are on the recorded axis: ranges stay.
     assert marks["mic"].line == "Ваш микрофон не записывался: 0:12:03–0:12:40"
     assert marks["damaged"].badge == "Кусок записи повреждён 0:40:00–0:40:10"
+
+
+@pytest.mark.parametrize("template,fmt", [("unknown", "md"), ("stats", "html")])
+def test_render_rejects_unknown_template_or_format(template: str, fmt: str) -> None:
+    with pytest.raises(ValueError):
+        templates.render(template, fixture_meeting(), fixture_transcript(), fmt)
+
+
+@pytest.mark.parametrize(
+    "durations,expected",
+    [
+        ([1, 1, 1], [34, 33, 33]),
+        ([50, 50], [50, 50]),
+        ([199, 1], [100, 0]),
+        ([1, 199], [1, 99]),
+        ([1], [100]),
+        ([0, 0], [None, None]),
+        ([0, 1], [0, 100]),
+        ([], []),
+    ],
+)
+def test_stats_largest_remainders(durations: list[int], expected: list[int | None]) -> None:
+    transcript = fixture_transcript()
+    transcript.utterances = [
+        Utterance(
+            id=f"u{i}",
+            seq=i,
+            start_ms=i * 1000,
+            end_ms=i * 1000 + ms,
+            text="речь" if ms else templates.UNRECOGNIZED_TEXT,
+            speaker=f"S{i + 1}",
+        )
+        for i, ms in enumerate(durations)
+    ]
+    text = templates.render("stats", fixture_meeting(), transcript, "txt", tz=MSK)
+    for i, percent in enumerate(expected):
+        row = next(line for line in text.splitlines() if line.startswith(f"Спикер {i + 1} —"))
+        assert (f" · {percent} % ·" in row) if percent is not None else "%" not in row
+        assert row.endswith("0 реплик" if durations[i] == 0 else "1 реплика")
+    shares = [int(n) for n in re.findall(r"— .*? · (\d+) % ·", text)]
+    assert sum(shares) == (100 if any(durations) else 0)
+    assert ("сумма долей 100 %" in text) == any(durations)
+
+
+def test_stats_placeholders_echo_and_zero_speakers() -> None:
+    text = templates.render("stats", fixture_meeting(), fixture_transcript(), "txt", tz=MSK)
+    assert "реплик 8 · сумма долей 100 %" in text
+    assert "Спикер 3 — 0 мин · 0 % · 0 реплик" in text
+    assert text.index("Собеседники —") < text.index("Я —") < text.index("Спикер 2 —")
+
+
+def test_binary_merge_uses_track_group_and_text_paragraphs_use_original_speaker() -> None:
+    transcript = fixture_transcript()
+    transcript.utterances = [
+        Utterance(
+            id=f"u{i}",
+            seq=i,
+            start_ms=i * 2000,
+            end_ms=i * 2000 + 1000,
+            speaker=who,
+            text=f"слово{i}",
+        )
+        for i, who in enumerate(["me", "S2", "S3", "me"])
+    ]
+    meeting = fixture_meeting()
+    binary = templates.render("me_and_others", meeting, transcript, "txt")
+    assert "[0:00:02] Собеседники: слово1 слово2" in binary
+    assert "Спикер" not in binary
+    assert "Участники: Я, Собеседники" in binary
+    assert "слово1 слово2" not in stenogram(meeting, transcript, "txt")
+    text = templates.render("text_only", meeting, transcript, "txt")
+    assert "Участники:" not in text and "[0:" not in text
+    assert "слово0\n\nслово1\n\nслово2\n\nслово3" in text
+    transcript.utterances[2].speaker = "S2"
+    transcript.utterances[2].start_ms = 7000
+    transcript.utterances[2].end_ms = 8000
+    transcript.utterances.pop()
+    assert "слово1 слово2" in templates.render("text_only", meeting, transcript, "txt")
+
+
+def test_text_only_marks_split_same_speaker_paragraphs() -> None:
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    transcript.utterances = transcript.utterances[:1] + transcript.utterances[-1:]
+    text = templates.render("text_only", meeting, transcript, "txt")
+    assert "добрый день.\n\n— Ваш микрофон" in text
+    assert "— Пауза 0:31:10 · 2 мин 52 с\n\nЯ вернулся." in text
+
+
+@pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
+def test_txt_fields_are_one_line(template: str) -> None:
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    meeting.title = "title\nforged"
+    meeting.self_label = "label\nforged"
+    text = templates.render(template, meeting, transcript, "txt")
+    assert text.startswith("title forged\n")
+    assert "label\nforged" not in text
+
+
+def test_stats_tied_times_follow_first_appearance_not_speaker_id() -> None:
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    transcript.utterances = [
+        Utterance(
+            id=f"u{i}", seq=i, start_ms=i * 2000, end_ms=i * 2000 + 1000, text="речь", speaker=who
+        )
+        for i, who in enumerate(["S3", "me", "S2"])
+    ]
+    text = templates.render("stats", meeting, transcript, "txt")
+    assert "Спикер 3 — 1 мин · 34 % · 1 реплика" in text
+    assert text.index("Спикер 3 —") < text.index("Я —") < text.index("Спикер 2 —")
+
+
+@pytest.mark.parametrize("renderer", ["markdown_it", "cmarkgfm"])
+def test_stats_gfm_table_keeps_pipes_and_code_in_one_cell(renderer: str) -> None:
+    from html import unescape
+
+    module = pytest.importorskip(renderer)
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    meeting.self_label = r"a|`b`\|https://x.ru a@b.ru"
+    transcript.utterances = transcript.utterances[:1]
+    md = templates.render("stats", meeting, transcript, "md")
+    if renderer == "markdown_it":
+        html = module.MarkdownIt("commonmark").enable("table").render(md)
+    else:
+        html = module.github_flavored_markdown_to_html(md)
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", html)
+    assert len(cells) == 4
+    assert unescape(cells[0]) == "<code>" + meeting.self_label + "</code>"
+    assert "<a" not in html and "<img" not in html
+
+
+@pytest.mark.parametrize("speakers,expected", [(["me"], "Участники: Я"), ([], None)])
+def test_binary_header_only_lists_present_groups(speakers: list[str], expected: str | None) -> None:
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    transcript.utterances = [
+        Utterance(
+            id=f"u{i}", seq=i, speaker=who, text="речь", start_ms=i * 2000, end_ms=i * 2000 + 1000
+        )
+        for i, who in enumerate(speakers)
+    ]
+    for fmt in ("md", "txt"):
+        text = templates.render("me_and_others", meeting, transcript, fmt)
+        if expected is None:
+            assert "Участники:" not in text
+        else:
+            assert ("Участники: `Я`" if fmt == "md" else expected) in text
+            assert "Собеседники" not in text
+
+
+def test_empty_stats_has_no_table_and_one_final_newline() -> None:
+    text = templates.render("stats", fixture_meeting(), None, "md")
+    assert "|" not in text
+    assert text.endswith("реплик 0\n") and not text.endswith("\n\n")
+
+
+@pytest.mark.parametrize("literal", ["", " ", "\u00a0\u2003"])
+def test_empty_markdown_field_has_no_fence_t508(literal: str) -> None:
+    assert templates._md_escape(literal) == ""
+    assert templates._field(literal, True) == ""
+
+
+@pytest.mark.parametrize("template", templates.TEMPLATES)
+def test_empty_export_names_use_fixed_defaults_t508(template: str) -> None:
+    meeting, transcript = fixture_meeting(), fixture_transcript()
+    meeting.title = meeting.self_label = " "
+    md = templates.render(template, meeting, transcript, "md", tz=MSK)
+    assert md.startswith("# `Встреча`\n")
+    if template != "text_only":
+        assert "`Я`" in md
+
+
+@pytest.mark.parametrize("label", [" ", "\u00a0\u2003"])
+def test_empty_self_label_setting_rejects_schema_accepts_t508(label: str) -> None:
+    from astra_voice.meetings.settings_ext import MEETING_DEFAULTS, validate_setting
+
+    assert validate_setting("meeting_self_label", label) == MEETING_DEFAULTS["meeting_self_label"]
+    raw = fixture_meeting().to_dict()
+    raw["self_label"] = label
+    meeting = Meeting.from_dict(raw)
+    assert meeting.self_label == label  # Legacy documents remain readable.
+    transcript = fixture_transcript()
+    transcript.utterances = transcript.utterances[:1]
+    transcript.utterances[0].text = "![x](https://evil) `x"
+    for template in ("stenogram", "me_and_others"):
+        md = templates.render(template, meeting, transcript, "md", tz=MSK)
+        assert "[0:00:04] `Я`: ``![x](https://evil) `x``" in md
+        assert templates.speaker_label(meeting, "me") == "Я"

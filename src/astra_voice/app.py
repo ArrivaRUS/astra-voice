@@ -770,6 +770,7 @@ def _set_context_property(shell: Any, name: str, obj: Any) -> None:
 
 def _meeting_model_action(focuser: Any, app_info: Any, settings_bridge: Any) -> Any:
     """«Установить» / «Установить из файла…» / «Подробнее» → раздел «Модели» (spec §2.5)."""
+    # D2 deletion is handled inside MeetingBridge before meetingActionRequested.
     from astra_voice.ui.meeting_card import MODEL_ACTIONS
 
     def handle(_meeting_id: str, action: str) -> None:
@@ -850,6 +851,7 @@ def _bind_meeting_recording(
             transcribe_supervisor,
             transcribe_immediately=lambda: bool(bridge.settings["meeting_transcribe_immediately"]),
             audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
+            meeting_retention_days=lambda: int(bridge.settings["meeting_retention_days"]),
             notify=job_notifier(),
             # The catalog's min_ram_mb is known before initialize() -> recover().
             model_probe=(_meeting_model_probe(model) if model is not None else probe_gigaam_model),

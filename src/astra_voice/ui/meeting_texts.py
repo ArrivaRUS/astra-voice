@@ -5,6 +5,8 @@ No user data belongs in this vocabulary.
 
 from __future__ import annotations
 
+RETENTION_TEXT = "Удалено встреч по сроку хранения: {count}"
+
 W4_TEXTS = {
     "title": "Записать встречу",
     "heading": "Что записывать",
@@ -247,4 +249,26 @@ EXIT_TEXTS = {
     "text": "Записанное сохранится и будет расшифровано при следующем запуске.",
     "cancel": "Отмена",
     "confirm": "Остановить и выйти",
+}
+
+
+# D2, spec §4.7; sent-to-AI notice belongs to M9.
+DELETE_TEXTS = {
+    "heading": "Удалить встречу",
+    "prefix": "Удалить встречу „",
+    "suffix": "“?",
+    "text": "Удалятся запись звука, расшифровка и все её файлы в программе. "
+    "Файлы, которые вы сохранили в другие папки, останутся — удалите их сами.",
+    "cancel": "Отмена",
+    "confirm": "Удалить встречу",
+    "error": "Не удалось удалить встречу",
+}
+
+
+# D3, spec §4.7; meeting titles are supplied separately by the bridge.
+RENAME_TEXTS = {
+    "heading": "Переименовать встречу",
+    "label": "Название встречи",
+    "cancel": "Отмена",
+    "confirm": "Сохранить",
 }

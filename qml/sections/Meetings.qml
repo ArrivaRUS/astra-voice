@@ -17,10 +17,25 @@ Column {
     readonly property bool readError: bridge ? bridge.readError : false
     readonly property bool showList: !loading && (featureEnabled || rows.length > 0) || (bridge && bridge.loadingVisible) || readError
     // E13.M4: карточка встречи A заменяет содержимое раздела (spec §2.6, «← Все встречи»).
+    property Item sectionHeaderFocusItem: null
     readonly property bool cardOpen: bridge ? bridge.cardOpen === true : false
     width: parent ? parent.width : Theme.sizeContentColMax
     spacing: Theme.spaceGroupGap
     function txt(key, fallback) { return bridge && bridge.texts[key] !== undefined ? bridge.texts[key] : fallback }
+    function restoreRenameFocus() {
+        if (renameDialog.visible || root.cardOpen) return
+        var target = renameDialog.fallbackFocusItem
+        for (var i = 0; i < meetingRows.count; ++i) {
+            var row = meetingRows.itemAt(i)
+            if (row && row.row.id === renameDialog.meetingId) {
+                if (row.moreButton.visible && row.moreButton.enabled) target = row.moreButton
+                break
+            }
+        }
+        // AvDialog's deferred restore may run before or after this one: both use the fresh item.
+        renameDialog.returnFocusItem = target
+        if (target && target.visible && target.enabled) target.forceActiveFocus(Qt.TabFocusReason)
+    }
     function value(key, fallback) { return bridge && bridge.settings[key] !== undefined ? bridge.settings[key] : fallback }
     function editable(key) { return bridge ? bridge.locked[key] !== true : true }
     function commit(key, value) { if (bridge) bridge.setSetting(key, value) }
@@ -31,6 +46,18 @@ Column {
     onCardOpenChanged: if (cardOpen) Qt.callLater(function() { meetingCard.focusBack(Qt.OtherFocusReason) })
     Connections {
         target: root.bridge
+        ignoreUnknownSignals: true
+        function onRenameRequested(meetingId, title) {
+            if (root.cardOpen || renameDialog.pending) return
+            renameDialog.meetingId = meetingId
+            renameDialog.meetingTitle = title
+            Qt.callLater(function() { renameDialog.open() })
+        }
+        function onDeleteRequested(meetingId, title) {
+            deleteDialog.meetingId = meetingId
+            deleteDialog.meetingTitle = title
+            deleteDialog.open()
+        }
         function onChanged() {
             if (root.bridge && root.bridge.saveError !== undefined && root.bridge.saveError !== "") {
                 Qt.callLater(function() {
@@ -228,10 +255,12 @@ Column {
             }
         }
         Repeater {
+            id: meetingRows
             model: !root.loading && !root.readError ? root.rows : []
             delegate: Item {
                 id: meetingRow
                 readonly property var row: modelData
+                readonly property Item moreButton: rowMore
                 width: parent.width
                 height: Math.max(Theme.meetingRowMinH, rowBody.implicitHeight + Theme.meetingRowPaddingTop + Theme.meetingRowPaddingBottom)
                 Rectangle { anchors.fill: parent; color: meetingRow.row.active ? Theme.meetingRowLiveBg : "transparent" }
@@ -308,6 +337,7 @@ Column {
                         onClicked: if (root.bridge) root.bridge.requestMeetingAction(meetingRow.row.id, text)
                     }
                     AvButton {
+                        id: rowMore
                         objectName: "meetingMore"
                         width: Theme.meetingRowMoreButton
                         height: Theme.meetingRowMoreButton
@@ -326,8 +356,14 @@ Column {
                             Instantiator {
                                 model: meetingRow.row.actions
                                 delegate: MenuItem {
-                                    text: modelData
-                                    onTriggered: if (root.bridge) root.bridge.requestMeetingAction(meetingRow.row.id, text)
+                                    readonly property string actionId: meetingRow.row.actionKeys !== undefined
+                                        ? meetingRow.row.actionKeys[index] : ""
+                                    readonly property string actionText: modelData
+                                    text: actionText
+                                    onTriggered: if (root.bridge) {
+                                        if (actionId === "rename") renameDialog.returnFocusItem = rowMore
+                                        root.bridge.requestMeetingAction(meetingRow.row.id, actionText)
+                                    }
                                 }
                                 onObjectAdded: rowMenu.insertItem(index, object)
                                 onObjectRemoved: rowMenu.removeItem(object)
@@ -636,6 +672,18 @@ Column {
         visible: root.cardOpen
         bridge: root.bridge
         onBackRequested: if (root.bridge) root.bridge.closeMeeting()
+    }
+
+    MeetingRenameDialog {
+        id: renameDialog
+        bridge: root.bridge
+        fallbackFocusItem: root.sectionHeaderFocusItem
+        onClosed: Qt.callLater(root.restoreRenameFocus)
+    }
+
+    MeetingDeleteDialog {
+        id: deleteDialog
+        bridge: root.bridge
     }
 
     ResponsibilityDialog {

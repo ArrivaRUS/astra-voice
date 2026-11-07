@@ -19,10 +19,10 @@ from astra_voice.ui import notify as notify_module
 from astra_voice.ui.meeting_recording import MeetingRecording
 
 
-def job_notifier(notices: ModuleType = notify_module) -> Callable[[str, Meeting], None]:
+def job_notifier(notices: ModuleType = notify_module) -> Callable[[str, Meeting | int], None]:
     """MeetingJobs events -> fixed-text notices (spec §2.5, §4.6, §4.7)."""
 
-    def deliver(kind: str, meeting: Meeting) -> None:
+    def deliver(kind: str, payload: Meeting | int) -> None:
         if kind == "done":
             notices.notify_meeting_transcribed()
         elif kind == "waiting_memory":
@@ -33,6 +33,8 @@ def job_notifier(notices: ModuleType = notify_module) -> Callable[[str, Meeting]
             notices.notify_meeting_selfcheck_failed()
         elif kind == "failed":
             notices.notify_meeting_transcription_failed()
+        elif kind == "retention" and isinstance(payload, int) and payload > 0:
+            notices.notify_meeting_retention(payload)
 
     return deliver
 

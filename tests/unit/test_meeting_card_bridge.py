@@ -20,10 +20,12 @@ from test_tray import qapp as qapp
 
 from astra_voice import app
 from astra_voice.core.meeting_jobs import ModelAdmission
+from astra_voice.meetings import templates
 from astra_voice.meetings.events import MeetingState
-from astra_voice.meetings.model import Mark, Transcript, Utterance
+from astra_voice.meetings.model import Mark, Meeting, Transcript, Utterance
 from astra_voice.meetings.store import Writer
-from astra_voice.meetings.templates import DAMAGED_TEXT, stenogram, write_export
+from astra_voice.meetings.templates import DAMAGED_TEXT, TEMPLATES, render, stenogram, write_export
+from astra_voice.ui import meeting_card
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
@@ -119,12 +121,12 @@ def test_export_keeps_gui_and_lease_timer_alive_and_rejects_repeat(
     rig.answer = str(rig.documents / "slow.md")
     calls: list[int] = []
     original = write_export
-    render = stenogram
+    render_template = render
     gui_thread = QThread.currentThread()
 
     def background_render(*args: Any, **kwargs: Any) -> str:
         assert QThread.currentThread() != gui_thread
-        return render(*args, **kwargs)
+        return render_template(*args, **kwargs)
 
     def slow(target: Path, text: str, *, overwrite: bool = False) -> None:
         calls.append(threading.get_ident())
@@ -133,7 +135,7 @@ def test_export_keeps_gui_and_lease_timer_alive_and_rejects_repeat(
         original(target, text, overwrite=overwrite)
 
     monkeypatch.setattr(meeting_bridge, "write_export", slow)
-    monkeypatch.setattr(meeting_bridge, "stenogram", background_render)
+    monkeypatch.setattr(meeting_bridge, "render", background_render)
     # Use the recording's real lease timer, with a shorter interval for this unit test.
     ticks = QSignalSpy(rig.recording._lease_timer.timeout)
     rig.recording._lease_timer.start(100)
@@ -338,7 +340,7 @@ def test_unexpected_export_exception_reports_error_and_allows_next_save(
     rig.transcript(ROWS[:1])
     rig.open_card()
     rig.answer = str(rig.documents / "error.md")
-    monkeypatch.setattr(meeting_bridge, "stenogram", Mock(side_effect=TypeError("PRIVATE_EXPORT")))
+    monkeypatch.setattr(meeting_bridge, "render", Mock(side_effect=TypeError("PRIVATE_EXPORT")))
     finished = QSignalSpy(rig.bridge.cardSaveFinished)
     assert rig.bridge.saveAs("md") == "pending"
     assert finished or finished.wait(1500)
@@ -536,9 +538,7 @@ def test_state_panels(
     assert card["view"] == view and not card["showTable"] and card["marks"] == []
     assert card["panel"]["title"] == title
     assert [b["label"] for b in card["panel"]["buttons"]] == buttons
-    assert [b["enabled"] for b in card["panel"]["buttons"]][-1] is (
-        view != "cancelled" and view != "interrupted"
-    )
+    assert all(b["enabled"] for b in card["panel"]["buttons"])
 
 
 def test_model_buttons_go_to_the_models_section(rig: SaveRig) -> None:
@@ -671,3 +671,452 @@ def test_card_rejects_transcript_identity_and_disables_export(
     card = rig.open_card()
     assert card["view"] == "read-error" and not card["showActions"]
     assert rig.bridge.saveAs("md") == "error" and not rig.picked
+
+
+def test_delete_from_row_and_card_confirms_only_in_d2(rig: SaveRig) -> None:
+    rig.create(title="Совещание <бюджет>")
+    rig.open_card()
+    requested = QSignalSpy(rig.bridge.deleteRequested)
+    forwarded = QSignalSpy(rig.bridge.meetingActionRequested)
+    rig.bridge.requestMeetingAction(MID, "Удалить")
+    assert list(requested) == [[MID, "Совещание <бюджет>"]]
+    assert rig.store.list() and rig.bridge.cardOpen  # cancelling D2 makes no call
+    rig.bridge.cardAction("delete")
+    assert len(requested) == 2 and not forwarded
+    rig.bridge.confirmDelete(MID)
+    assert not rig.bridge.meetings and not rig.bridge.cardOpen
+    assert rig.store.list() == []
+    assert rig.jobs.deletions[MID] == "deleted"
+    rig.recording.tick()  # stale capture recovery cannot resurrect the row
+    assert not rig.bridge.meetings
+
+
+@pytest.mark.parametrize("state", [MeetingState.RECORDING, MeetingState.PAUSED])
+def test_recording_cannot_be_deleted(rig: SaveRig, state: MeetingState) -> None:
+    rig.create(state=state)
+    rows = rig.refresh()
+    assert "Удалить" not in rows[MID]["actions"]
+    requested = QSignalSpy(rig.bridge.deleteRequested)
+    rig.bridge.requestMeetingAction(MID, "Удалить")
+    rig.bridge.confirmDelete(MID)
+    assert not requested and rig.store.list()
+
+
+@pytest.mark.parametrize("close_card", [False, True])
+def test_delete_waits_for_export_even_after_card_switch(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, close_card: bool
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    monkeypatch.setattr(rig.bridge._export_writer, "submit", tasks.append)
+    rig.answer = str(rig.documents / "copy.md")
+    assert rig.bridge.saveAs("md") == "pending"
+    if close_card:
+        rig.bridge.closeMeeting()  # export owns the original id, not the current card
+    rig.bridge.confirmDelete(MID)
+    assert MID not in rig.jobs.tombstones and rig.store.list()
+    tasks.pop()()
+    for _ in range(100):
+        QTest.qWait(5)
+        if not rig.bridge._delete_pending:
+            break
+    assert rig.jobs.deletions[MID] == "deleted"
+    assert (rig.documents / "copy.md").exists()
+    assert not rig.store.list()
+    assert rig.bridge.saveError == ""
+
+
+def test_failed_tombstone_restores_row_and_shows_fixed_error(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.meetings.store import MeetingStoreError
+
+    rig.create()
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    rig.jobs._submit = tasks.append
+    monkeypatch.setattr(rig.store, "write", Mock(side_effect=MeetingStoreError("fixed")))
+    rig.bridge.confirmDelete(MID)
+    assert not rig.bridge.meetings  # optimistic hide while the write is still pending
+    tasks.pop(0)()
+    rig.jobs.tick()
+    rig.bridge._poll_deletions()
+    assert rig.bridge.meetings[0]["id"] == MID
+    assert rig.bridge.saveError == "Не удалось удалить встречу"
+    assert rig.store.list() and not rig.jobs.tombstones
+
+
+@pytest.mark.parametrize("export_waiting", [False, True])
+def test_r2_delete_poll_notifies_only_when_status_changes(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, export_waiting: bool
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    rig.jobs._submit = tasks.append
+    if export_waiting:
+        rig.bridge._export_busy = True
+        rig.bridge._export_id = MID
+    overlay = Mock(wraps=rig.bridge._overlay_capture)
+    monkeypatch.setattr(rig.bridge, "_overlay_capture", overlay)
+    changes = QSignalSpy(rig.bridge.changed)
+    rig.bridge.confirmDelete(MID)
+    assert changes
+    assert not rig.bridge.card.get("deleteEnabled", False)
+    count, overlays = len(changes), overlay.call_count
+    for _ in range(100):
+        rig.bridge._poll_deletions()
+    assert len(changes) == count and overlay.call_count == overlays
+    if export_waiting:
+        rig.bridge._export_busy = False
+        rig.bridge.cardSaveFinished.emit("saved")
+    tasks.pop(0)()
+    rig.jobs.tick()
+    rig.bridge._poll_deletions()
+    assert len(changes) > count
+    count = len(changes)
+    for _ in range(100):
+        rig.bridge._poll_deletions()
+    assert len(changes) == count
+    tasks.pop(0)()
+    rig.jobs.tick()
+    rig.bridge._poll_deletions()
+    assert len(changes) > count and rig.jobs.deletions[MID] == "deleted"
+
+
+def test_retention_deadline_and_cleanup_refresh_row_and_open_card_t407(rig: SaveRig) -> None:
+    from datetime import UTC, datetime
+
+    from astra_voice.meetings.events import ProcessingStatus
+    from astra_voice.meetings.model import Audio, Transcription
+
+    rig.create(
+        state=MeetingState.DONE,
+        processing_status=ProcessingStatus.SUCCEEDED,
+        audio=Audio(retain_days=7),
+        transcription=Transcription(finished_at="2026-11-01T12:00:00+00:00"),
+    )
+    rig.transcript(ROWS)
+    card = rig.open_card()
+    assert "звук хранится до 08.11" in card["subtitle"]["suffix"]
+    assert "звук до 08.11" in rig.bridge.meetings[0]["subtitle"]
+    rig.jobs.wall_clock = lambda: datetime(2026, 11, 9, 12, tzinfo=UTC)
+    rig.jobs.start_retention()
+    rig.recording.tick()
+    assert "звук удалён" in rig.bridge.card["subtitle"]["suffix"]
+    assert "звук удалён" in rig.bridge.meetings[0]["subtitle"]
+    assert rig.bridge.cardRows.rows()  # published text stays on the open card
+
+
+@pytest.mark.parametrize("close_card", [False, True])
+@pytest.mark.parametrize("human_delete", [False, True])
+def test_retention_waits_for_bridge_export_owner_t500(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch, close_card: bool, human_delete: bool
+) -> None:
+    from datetime import UTC, datetime
+
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    tasks: list[Callable[[], None]] = []
+    monkeypatch.setattr(rig.bridge._export_writer, "submit", tasks.append)
+    rig.answer = str(rig.documents / "retained-copy.md")
+    assert rig.bridge.saveAs("md") == "pending"
+    if human_delete:
+        rig.bridge.confirmDelete(MID)
+    if close_card:
+        rig.bridge.closeMeeting()
+    rig.jobs.meeting_retention_days = lambda: 30
+    rig.jobs.wall_clock = lambda: datetime(2026, 12, 4, 12, tzinfo=UTC)
+    rig.jobs.start_retention()
+    assert MID in rig.jobs.tombstones and rig.store.root.joinpath(MID).exists()
+    assert not [item for item in rig.notices if item[0] == "retention"]
+    assert rig.bridge.saveAs("md") == "pending"
+    tasks.pop()()
+    for _ in range(100):
+        QTest.qWait(5)
+        if rig.jobs.deletions.get(MID) == "deleted":
+            break
+    assert rig.jobs.deletions[MID] == "deleted"
+    assert (rig.documents / "retained-copy.md").exists()
+    assert not rig.store.root.joinpath(MID).exists()
+    assert [item for item in rig.notices if item[0] == "retention"] == [("retention", 1)]
+    assert rig.bridge.saveAs("md") == "error"
+    rig.bridge._poll_deletions()
+    rig.recording.tick()
+    assert not rig.bridge.meetings and not rig.bridge.saveError
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+@pytest.mark.parametrize("fmt", ["md", "txt"])
+def test_selected_template_preview_export_and_confirmed_replacement(
+    rig: SaveRig, template: str, fmt: str
+) -> None:
+    rig.create(state=MeetingState.DONE, title="Планёрка / бюджет")
+    rig.transcript(ROWS + [(40_000, 41_000, "S2", "Третий голос")])
+    rig.open_card()
+    assert rig.bridge.saveTemplate == "stenogram"
+    before = rig.bridge.savePreview()
+    assert rig.bridge.setProperty("saveTemplate", template)
+    expected = render(template, rig.meeting(), rig.bridge._card_transcript, fmt)
+    preview = rig.bridge.savePreview()
+    assert preview["rows"]
+    plain = render(template, rig.meeting(), rig.bridge._card_transcript, "txt")
+    for row in preview["rows"]:
+        if template == "stats":
+            assert f"{row['who']} — {row['minutes']} · {row['percent']}" in plain
+        else:
+            assert row["text"].removesuffix("…") in plain
+            if template != "text_only" and row["kind"] != "mark":
+                assert f"{row['time']} {row['who']}:" in plain
+    if template == "stats":
+        assert "".join(part["text"] for part in preview["summary"]) in plain
+    assert (before != preview) == (template != "stenogram")
+    rig.answer = str(rig.documents / f"итог.{fmt}")
+    target = Path(rig.answer)
+    assert save_result(rig, lambda: rig.bridge.saveAs(fmt)) == "saved"
+    assert target.read_text() == expected
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert rig.picked[-1] == (str(rig.documents / f"Планёрка бюджет.{fmt}"), fmt)
+    target.write_text("старый")
+    assert save_result(rig, lambda: rig.bridge.saveAs(fmt)) == "exists"
+    assert target.read_text() == "старый"
+    # Even a programmatic selection change cannot change the pending replacement's template.
+    assert rig.bridge.setProperty(
+        "saveTemplate", "text_only" if template != "text_only" else "stats"
+    )
+    assert save_result(rig, rig.bridge.replaceSaveTarget) == "saved"
+    assert target.read_text() == expected
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_save_template_lives_only_in_open_card_and_rejects_unknown(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    assert rig.bridge.setProperty("saveTemplate", "stats")
+    rig.bridge.clearCardSaveError()  # D4 cancellation/reopening does not reset selection.
+    assert rig.bridge.saveTemplate == "stats"
+    assert rig.bridge.setProperty("saveTemplate", "unknown")
+    assert rig.bridge.saveTemplate == "stats"
+    rig.bridge.closeMeeting()
+    rig.open_card()
+    assert rig.bridge.saveTemplate == "stenogram"
+    assert rig.bridge.savePreview()["kind"] == "transcript"
+
+
+def test_template_change_inside_native_picker_keeps_original_export(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    expected = render("stenogram", rig.meeting(), rig.bridge._card_transcript, "txt")
+    target = rig.documents / "nested.txt"
+
+    def pick(_suggested: str, _fmt: str) -> str:
+        rig.bridge.setProperty("saveTemplate", "stats")
+        return str(target)
+
+    rig.bridge._pick_save_path = pick
+    assert save_result(rig, lambda: rig.bridge.saveAs("txt")) == "saved"
+    assert target.read_text() == expected
+
+
+def _minimum_preview_time(
+    template: str,
+    meeting: Meeting,
+    transcript: Transcript,
+) -> tuple[dict[str, Any], float]:
+    timings = []
+    preview = {}
+    for _ in range(3):
+        begin = time.perf_counter()
+        preview = meeting_card.save_preview(template, meeting, transcript)
+        timings.append(time.perf_counter() - begin)
+    return preview, min(timings)
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+def test_preview_5000_rows_is_bounded_and_fast(
+    rig: SaveRig, template: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:1])
+    rig.open_card()
+    rig.bridge._card_transcript = Transcript(
+        meeting_id=MID,
+        utterances=[
+            Utterance(
+                id=f"u{i}",
+                seq=i,
+                start_ms=i * 2400,
+                end_ms=i * 2400 + 1000,
+                speaker="me" if i % 2 else "S2",
+                text="слово " * 30,
+            )
+            for i in range(5000)
+        ],
+    )
+    rig.bridge.setProperty("saveTemplate", template)
+    transcript = rig.bridge._card_transcript
+    assert transcript is not None
+    with monkeypatch.context() as patch:
+        normalizations = Mock(wraps=templates._one_line)
+        patch.setattr(templates, "_one_line", normalizations)
+        meeting_card.save_preview(template, rig.meeting(), transcript)
+        assert normalizations.call_count <= (
+            0 if template == "stats" else 4 if template == "text_only" else 7
+        )
+    preview, elapsed = _minimum_preview_time(template, rig.meeting(), transcript)
+    print(f"preview {template}: {elapsed * 1000:.2f} ms")
+    # Structural counters above enforce bounded work; time is a coarse hang guard.
+    assert elapsed <= 0.500
+    assert len(preview["rows"]) <= (
+        3 if template == "text_only" else 8 if template == "stats" else 6
+    )
+    assert all(len(row.get("text", "")) <= 601 for row in preview["rows"])
+
+
+def test_preview_ignores_general_changed_and_template_signal_is_specific(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    changed = QSignalSpy(rig.bridge.saveTemplateChanged)
+    previews = QSignalSpy(rig.bridge.savePreviewChanged)
+    rig.bridge.clearCardSaveError()
+    assert not changed and not previews
+    rig.bridge.setProperty("saveTemplate", "stats")
+    assert len(changed) == len(previews) == 1
+    rig.bridge.setProperty("saveTemplate", "stats")
+    assert len(changed) == len(previews) == 1
+
+
+def test_preview_stats_bounds_speakers_and_omits_absent_shares(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:1])
+    rig.open_card()
+    rig.bridge._card_transcript = Transcript(
+        meeting_id=MID,
+        utterances=[
+            Utterance(
+                id=f"u{i}",
+                seq=i,
+                start_ms=i * 2000,
+                end_ms=i * 2000 + 1000,
+                speaker=f"S{i}",
+                text="речь",
+            )
+            for i in range(20)
+        ],
+    )
+    rig.bridge.setProperty("saveTemplate", "stats")
+    preview = rig.bridge.savePreview()
+    assert len(preview["rows"]) == 8 and preview["moreText"] == "…и ещё 12"
+    for row in rig.bridge._card_transcript.utterances:
+        row.text = DAMAGED_TEXT
+    preview = rig.bridge.savePreview()
+    assert not preview["hasShares"]
+    assert all(row["share"] is None and row["percent"] == "" for row in preview["rows"])
+
+
+def test_preview_bounds_a_single_5000_reply_paragraph(
+    rig: SaveRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS[:1])
+    rig.open_card()
+    rig.bridge._card_transcript = Transcript(
+        meeting_id=MID,
+        utterances=[
+            Utterance(
+                id=f"u{i}",
+                seq=i,
+                start_ms=i * 2000,
+                end_ms=i * 2000 + 1000,
+                speaker="me",
+                text="слово " * 30,
+            )
+            for i in range(5000)
+        ],
+    )
+    rig.bridge.setProperty("saveTemplate", "text_only")
+    transcript = rig.bridge._card_transcript
+    assert transcript is not None
+    with monkeypatch.context() as patch:
+        normalizations = Mock(wraps=templates._one_line)
+        patch.setattr(templates, "_one_line", normalizations)
+        meeting_card.save_preview("text_only", rig.meeting(), transcript)
+        assert normalizations.call_count <= 5  # capped even while one speaker keeps talking
+    preview, elapsed = _minimum_preview_time("text_only", rig.meeting(), transcript)
+    print(f"preview single paragraph: {elapsed * 1000:.2f} ms")
+    # Structural counters above enforce bounded work; time is a coarse hang guard.
+    assert elapsed <= 0.500
+    assert len(preview["rows"]) == 1
+    assert len(preview["rows"][0]["text"]) <= 601
+    assert preview["rows"][0]["text"].endswith("…")
+
+
+def test_preview_notifies_when_final_tail_finishes_without_template_change(rig: SaveRig) -> None:
+    rig.create()
+    rig.transcript(ROWS[:1])
+    rig.save()
+    rig.start_running()
+    rig.open_card()
+    start = next(m for m in rig.role.sent if m["type"] == "meeting.job.start")
+    rig.role.emit(
+        "meeting.job.utterance",
+        meeting_id=MID,
+        meeting_generation=start["meeting_generation"],
+        seq=0,
+        id="u00000",
+        track="mic",
+        start_ms=4000,
+        end_ms=9000,
+        text=ROWS[0][3],
+        speaker="me",
+    )
+    rig.recording.tick()
+    rig.transcript(ROWS[:2])
+    finish(rig, start["meeting_generation"])
+    assert rig.bridge.card["view"] == "ready" and rig.bridge._card_tail
+    assert rig.bridge.savePreview() == {}  # D4 opens before the final read completes.
+    previews = QSignalSpy(rig.bridge.savePreviewChanged)
+    selections = QSignalSpy(rig.bridge.saveTemplateChanged)
+    while rig.tasks:
+        rig.tasks.pop(0)()
+    rig.bridge._card_poll()
+    assert previews and not selections
+    assert not rig.bridge._card_tail and len(rig.bridge.savePreview()["rows"]) == 2
+
+
+def test_preview_times_and_accessible_names_match_card_rows(rig: SaveRig) -> None:
+    from astra_voice.ui import meeting_card
+
+    rig.create(state=MeetingState.DONE, marks=[Mark(10_000, "pause", "user")])
+    rig.transcript(ROWS[:2])
+    rig.open_card()
+    preview = rig.bridge.savePreview()
+    speech = [r for r in preview["rows"] if r["kind"] == "utterance"]
+    marks = [r for r in preview["rows"] if r["kind"] == "mark"]
+    assert speech[0]["time"] == "[0:00:04]"
+    assert marks[0]["time"] == "0:00:10"
+    assert rig.bridge._card_transcript is not None
+    reference = meeting_card.utterance_row(rig.meeting(), rig.bridge._card_transcript.utterances[0])
+    assert speech[0]["accessibleName"] == reference["accessibleName"]
+    mark = meeting_card.table_marks(rig.meeting())[0]
+    assert marks[0]["accessibleName"] == meeting_card.mark_row(mark)["accessibleName"]
+
+
+def test_preview_continuation_never_attaches_to_a_recording_mark(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE, marks=[Mark(3_000, "pause", "user")])
+    rig.transcript(
+        [(0, 1000, "me", "раз"), (1500, 2500, "others", "два"), (4000, 5000, "me", "три")]
+    )
+    rig.open_card()
+    rig.bridge.setProperty("saveTemplate", "text_only")
+    preview = rig.bridge.savePreview()
+    assert preview["rows"][-1]["kind"] == "mark"
+    assert not preview["rows"][-1]["text"].endswith("…")
+    assert preview["moreText"] == "…"

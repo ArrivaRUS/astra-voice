@@ -87,7 +87,7 @@ def sent(module: SimpleNamespace) -> list[str]:
 def test_wrappers_have_fixed_spec_texts() -> None:
     assert notify.MEETING_LIMIT_SOON == "Запись остановится через 5 минут"
     assert notify.MEETING_SAVED == "Встреча сохранена."
-    assert len(WRAPPERS) == 16  # +6 transcription notices (E13.M4)
+    assert len(WRAPPERS) == 17  # +6 transcription notices (M4), +1 retention (M5)
 
 
 def test_each_edge_notifies_once_and_new_capture_starts_clean(notices: SimpleNamespace) -> None:
