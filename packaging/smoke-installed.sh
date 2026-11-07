@@ -121,6 +121,11 @@ for f in NOTICE PRIVACY.md; do
 	done
 done
 
+say "смоук документа администратора о встречах"
+test -f "$ROOTDIR/usr/share/doc/astra-voice/admin/meetings.md" ||
+	test -f "$ROOTDIR/usr/share/doc/astra-voice/admin/meetings.md.gz" ||
+	die "нет документа admin/meetings.md (или .gz)"
+
 say "смоук app --version"
 python3 -I "$LIB/bootstrap.py" app --version ||
 	die "bootstrap.py app --version завершился с ошибкой: $LIB"
