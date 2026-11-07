@@ -167,6 +167,7 @@ Column {
                 width: parent.width
                 visible: root.bridge ? root.bridge.policyInvalidText !== "" : false
                 height: visible ? implicitHeight : 0
+                objectName: "meetingPolicyInvalidText"
                 text: root.bridge ? root.bridge.policyInvalidText : ""
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
@@ -400,6 +401,7 @@ Column {
     }
 
     Column {
+        objectName: "meetingSettingsGroups"
         width: parent.width
         visible: root.featureEnabled && !root.cardOpen
         spacing: Theme.spaceGroupGap
@@ -485,7 +487,7 @@ Column {
                 sub: root.txt("diarizationCaption", "Собеседники станут «Спикер 1, 2…». Голоса не запоминаются — ни между встречами, ни внутри встречи")
                 rowEnabled: root.editable("meeting_diarization")
                 toggle: diarToggle
-                AvToggle { id: diarToggle; checked: root.value("meeting_diarization", true); locked: !root.editable("meeting_diarization"); onToggled: root.commit("meeting_diarization", checked) }
+                AvToggle { id: diarToggle; objectName: "meetingDiarization"; checked: root.value("meeting_diarization", true); locked: !root.editable("meeting_diarization"); onToggled: root.commit("meeting_diarization", checked) }
             }
             MeetingSettingField {
                 width: parent.width
@@ -548,6 +550,7 @@ Column {
                 divider: false
                 visible: root.bridge ? root.bridge.aiDisabled : false
                 height: visible ? implicitHeight : 0
+                objectName: "meetingAiOff"
                 label: root.txt("aiOff", "Шаблоны с ИИ отключены администратором")
                 rowEnabled: false
             }
@@ -561,6 +564,7 @@ Column {
                 }
                 MeetingSettingField {
                     width: parent.width
+                    objectName: "meetingAiEndpoint"
                     label: root.txt("aiEndpoint", "Адрес сервиса ИИ")
                     value: root.value("meeting_ai_endpoint", "")
                     placeholder: "https://…/v1"
@@ -575,6 +579,7 @@ Column {
                     visible: root.bridge ? root.bridge.endpointCaption !== "" : false
                     height: visible ? implicitHeight + Theme.meetingSectionAiClassMarginTop : 0
                     spacing: Theme.meetingSectionAiClassMarginTop
+                    objectName: "meetingEndpointCaption"
                     readonly property string kind: root.bridge && root.bridge.endpointKind !== undefined ? root.bridge.endpointKind : "muted"
                     readonly property color ink: kind === "loopback" || kind === "internal" ? Theme.successInk
                         : kind === "external" || kind === "external-admin" || kind === "plaintext" ? Theme.warningInk
@@ -602,6 +607,7 @@ Column {
                     color: Theme.bgSurface2
                     RowLayout {
                         id: adminLine
+                        objectName: "meetingAiAdminAddress"
                         x: Theme.meetingSectionAdminRowPaddingX
                         y: Theme.meetingSectionAdminRowPaddingY
                         width: parent.width - x * 2
@@ -622,6 +628,7 @@ Column {
                 MeetingSettingField {
                     width: parent.width
                     stacked: false
+                    objectName: "meetingAiModel"
                     label: root.txt("aiModel", "Модель")
                     value: root.value("meeting_ai_model", "")
                     maximumLength: 128
@@ -631,6 +638,7 @@ Column {
                 MeetingSettingField {
                     width: parent.width
                     stacked: false
+                    objectName: "meetingAiKey"
                     label: root.txt("aiKey", "Ключ доступа")
                     sub: root.txt("aiKeyCaption", "Хранится в системном хранилище паролей")
                     placeholder: root.txt("aiKeyOptional", "необязательно")

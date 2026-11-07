@@ -469,6 +469,10 @@ debian_doc=()
 python3 "$HERE/collect_licenses.py" --appdir "$APPDIR" --root "$ROOT" "${debian_doc[@]}" \
     $(lockq debs | awk '{print "--deb", $1}')
 
+install -d "$APPDIR/usr/share/doc/astra-voice/admin/templates"
+install -m 644 "$ROOT/docs/admin/meetings.md" "$APPDIR/usr/share/doc/astra-voice/admin/"
+install -m 644 "$ROOT"/docs/admin/templates/*.md "$APPDIR/usr/share/doc/astra-voice/admin/templates/"
+
 # Воспроизводимость: байт-код и кэши не попадают в образ, время файлов — из changelog.
 find "$APPDIR" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$APPDIR" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete

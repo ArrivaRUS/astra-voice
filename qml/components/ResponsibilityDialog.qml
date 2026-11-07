@@ -170,6 +170,7 @@ AvDialog {
                         }
                         Text {
                             width: parent.width
+                            objectName: "meetingResponsibilityDetectorCaption"
                             text: root.bridge ? root.bridge.detectorCaption : root.txt("d1OfferCaption", "Программа только спросит — запись сама не начнётся")
                             textFormat: Text.PlainText
                             wrapMode: Text.WordWrap
