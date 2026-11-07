@@ -57,7 +57,6 @@ from astra_voice.core import (  # noqa: E402
     settings,
 )
 from astra_voice.core.model_source import smoke_matches, smoke_wav_path  # noqa: E402
-from astra_voice.core.stats import Stats, percentile  # noqa: E402
 from astra_voice.models.catalog import (  # noqa: E402
     ID_RE,
     Catalog,
@@ -557,6 +556,8 @@ def delay_ms(raw: str) -> float:
 
 def stats(args: argparse.Namespace) -> int:
     """Оценивает Ц2 по прогретым диктовкам, при необходимости только после --since."""
+    from astra_voice.core.stats import Stats, percentile
+
     explanation = ""
     try:
         events = Stats().events()
@@ -3017,6 +3018,14 @@ def meetings_transcribe(args: argparse.Namespace) -> int:
 
 def meetings_stand(args: argparse.Namespace) -> int:
     """Run only the explicitly requested private audio stand, never host audio."""
+    if args.policy_matrix:
+        from tools.meeting_policy_check import run_matrix, text_report
+
+        report = run_matrix()
+        print(
+            json.dumps(report, ensure_ascii=False) if args.json else "\n".join(text_report(report))
+        )
+        return 0 if report["ok"] else 1
     if args.transcribe is not None:
         return meetings_transcribe(args)
     from tools.meeting_stand import run_stand
@@ -3046,6 +3055,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     meetings_mode = meetings_parser.add_mutually_exclusive_group(required=True)
     meetings_mode.add_argument("--stand", action="store_true")
+    meetings_mode.add_argument("--policy-matrix", action="store_true", help="офлайн-матрица F18.11")
     meetings_mode.add_argument(
         "--transcribe",
         type=Path,
@@ -3193,6 +3203,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "catalog" and args.all and (args.from_ref or args.to_ref):
         parser.error("--from/--to применимы только с --switch")
     if args.command == "meetings":
+        if args.policy_matrix and (
+            any(
+                value is not None
+                for value in (
+                    args.model_dir,
+                    args.threads,
+                    args.out,
+                    args.minutes,
+                    args.server,
+                    args.profile,
+                )
+            )
+            or args.echo_gate
+            or args.keep
+        ):
+            parser.error("--policy-matrix принимает только --json")
         transcribe_only = (args.model_dir, args.threads, args.out)
         if args.stand and (any(v is not None for v in transcribe_only) or args.echo_gate):
             parser.error("--model-dir/--threads/--out/--echo-gate применимы только с --transcribe")

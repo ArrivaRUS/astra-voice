@@ -356,7 +356,11 @@ class MeetingBridge(QObject):
 
     @pyqtProperty(str, notify=changed)
     def policyNote(self) -> str:
-        return TEXTS["policyNote"] if self._organization() else ""
+        return (
+            TEXTS["policyNote"]
+            if any(decision.locked for decision in self._effective().controls.values())
+            else ""
+        )
 
     @pyqtProperty(str, notify=changed)
     def policyInvalidText(self) -> str:
