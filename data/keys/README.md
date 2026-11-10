@@ -1,7 +1,8 @@
 # Связка релизных ключей
 
 `release.gpg` — связка ключей, по которой `astra_voice.security.verify` проверяет
-подпись `SHA256SUMS.asc` у релизов и `.deb` «из файла». Файл попадает в пакет как
+подпись `SHA256SUMS.asc` у релизов и `.deb` «из файла», а также двоичную
+отсоединённую подпись `catalog.json.sig` каталога моделей. Файл попадает в пакет как
 `/usr/share/astra-voice/data/keys/release.gpg`, root-owned, и отпечатки в коде
 (`PINNED_FINGERPRINTS`) едут в том же пакете — подменить одно без другого нельзя
 (`docs/threat-model.md` §4.2 «б»).
@@ -30,3 +31,15 @@ uid: `Astra Voice Release <alekovalev@astralinux.ru>`.
 3. в `src/astra_voice/security/verify.py` заменить `PINNED_FINGERPRINTS` на отпечаток
    нового мастера;
 4. отпечаток нового мастера — в `README.md` и `docs/INSTALL-ADMIN.md` (раздел 2).
+
+## Подпись каталога в GitHub
+
+По решению владельца от 10.11.2026 S1 используется также в ручном
+`.github/workflows/catalog-sign.yml`: запуск на `main` с коммитом и полной SHA256,
+проверка кандидата как данных без секрета, затем Approve владельца в Environment
+`release`. Окружению разрешены теги `v*` и ветка `main`; required reviewer сохраняется.
+Секрет доступен только шагу импорта в `ci.yml:release` и `catalog-sign.yml:sign`.
+Связка и проверяющий код берутся из main, кандидатное дерево не извлекается.
+Результат — артефакт `catalog.json.sig` (7 дней), который сопровождающий добавляет
+в PR вместе с теми же байтами каталога. Автоматической публикации нет.
+Порядок и угрозы: [SECURITY.md §1](../../docs/SECURITY.md#1-что-и-чем-подписывается).
