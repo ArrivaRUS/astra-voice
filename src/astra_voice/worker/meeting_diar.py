@@ -11,9 +11,12 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import fcntl
+import hashlib
+import hmac
 import math
 import os
 import queue
+import re
 import stat
 import threading
 import time
@@ -48,14 +51,22 @@ REQUIRED_SEALS = 0x000F
 MODEL_SNAPSHOT_LIMITS = (16 * 1024**2, 64 * 1024**2)
 MODEL_COPY_BYTES = 1024 * 1024
 MODEL_FILES = (
-    ("segmentation.onnx",),
-    ("embedder.onnx", "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"),
+    ("model.onnx",),
+    ("3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",),
 )
 Message = dict[str, Any]
 
 
 class Cancelled(Exception):
     """Private control flow; never serialized."""
+
+
+class ModelUntrusted(ValueError):
+    """A required catalog digest is absent or differs from the sealed image."""
+
+
+class ExternalData(ValueError):
+    """A diarization graph references external tensors."""
 
 
 def check_cancel(cancel: threading.Event) -> None:
@@ -108,7 +119,9 @@ def _model_snapshot(source: int, maximum: int) -> int:
 
 
 @contextlib.contextmanager
-def checked_models(directories: Sequence[str]) -> Iterator[list[str]]:
+def checked_models(
+    directories: Sequence[str], expected_sha256: Sequence[str | None] = ()
+) -> Iterator[list[str]]:
     """No symlink source paths; validate immutable snapshots before sessions.
 
     collect_external_locations is the protobuf scanner used by scan_model_dir;
@@ -116,10 +129,15 @@ def checked_models(directories: Sequence[str]) -> Iterator[list[str]]:
     it can scan a /proc/self/fd image without relying on a .onnx suffix. ANY
     external tensor is refused. Both sealed images outlive session creation.
     """
+    if len(expected_sha256) != 2 or any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in expected_sha256
+    ):
+        raise ModelUntrusted("model-untrusted")
     with contextlib.ExitStack() as stack:
         paths = []
-        for directory, names, maximum in zip(
-            directories, MODEL_FILES, MODEL_SNAPSHOT_LIMITS, strict=True
+        for directory, names, maximum, expected in zip(
+            directories, MODEL_FILES, MODEL_SNAPSHOT_LIMITS, expected_sha256, strict=True
         ):
             path = Path(directory)
             if not path.is_absolute() or ".." in path.parts:
@@ -134,6 +152,14 @@ def checked_models(directories: Sequence[str]) -> Iterator[list[str]]:
                 )
                 stack.callback(os.close, descriptor)
             pinned = Path(f"/proc/self/fd/{descriptor}")
+            allowed = {
+                name
+                for other, other_names in zip(directories, MODEL_FILES, strict=True)
+                if other == directory
+                for name in other_names
+            }
+            if {child.name for child in pinned.iterdir()} != allowed:
+                raise ModelUntrusted("diar-model-layout")
             selected = [name for name in names if (pinned / name).exists()]
             if len(selected) != 1:
                 raise ValueError("diar-model-layout")
@@ -148,8 +174,14 @@ def checked_models(directories: Sequence[str]) -> Iterator[list[str]]:
                 os.close(source)
             stack.callback(os.close, snapshot)
             model_path = Path(f"/proc/self/fd/{snapshot}")
+            digest = hashlib.sha256()
+            with model_path.open("rb") as stream:
+                while chunk := stream.read(MODEL_COPY_BYTES):
+                    digest.update(chunk)
+            if not hmac.compare_digest(digest.hexdigest(), expected or ""):
+                raise ModelUntrusted("model-untrusted")
             if collect_external_locations(model_path):
-                raise ValueError("diar-model-external")
+                raise ExternalData("diar-model-external")
             paths.append(str(model_path))
         yield paths
 
@@ -382,7 +414,10 @@ class SherpaEngine:
 
     def __init__(self, message: Message) -> None:
         self.profile = DIAR_PROFILES["3dspeaker-campplus"]
-        with checked_models([message["segmentation_dir"], message["embedder_dir"]]) as paths:
+        with checked_models(
+            [message["segmentation_dir"], message["embedder_dir"]],
+            [message.get("segmentation_sha256"), message.get("embedder_sha256")],
+        ) as paths:
             self.native = _NativeSherpa(paths, message["threads"], self.profile.seed_threshold)
 
     def process(
@@ -637,7 +672,11 @@ class MeetingDiarState:
                 pass
             except Exception as error:
                 code = (
-                    "limit"
+                    "model-untrusted"
+                    if isinstance(error, ModelUntrusted)
+                    else "external-data"
+                    if isinstance(error, ExternalData)
+                    else "limit"
                     if isinstance(error, LimitError)
                     else "memory"
                     if isinstance(error, MemoryError)

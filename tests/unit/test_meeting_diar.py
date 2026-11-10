@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import hashlib
 import importlib
 import itertools
 import os
@@ -315,9 +316,9 @@ def test_pcm_uses_received_fd_not_peer_integer_and_requires_seals() -> None:
 def test_model_scans_both_before_import_and_rejects_external_or_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    model = tmp_path / "segmentation.onnx"
+    model = tmp_path / "model.onnx"
     model.write_bytes(b"\x08\x01")
-    embedder = tmp_path / "embedder.onnx"
+    embedder = tmp_path / "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
     embedder.write_bytes(b"\x08\x01")
     calls = []
     parser = collect_external_locations
@@ -327,25 +328,43 @@ def test_model_scans_both_before_import_and_rejects_external_or_symlink(
         return parser(path)
 
     monkeypatch.setattr(diar, "collect_external_locations", scan)
-    with diar.checked_models([str(tmp_path), str(tmp_path)]) as paths:
+    with diar.checked_models(
+        [str(tmp_path), str(tmp_path)],
+        [
+            hashlib.sha256((tmp_path / names[0]).read_bytes()).hexdigest()
+            for names in diar.MODEL_FILES
+        ],
+    ) as paths:
         assert len(paths) == 2 and len(calls) == 2
     embedder.unlink()
     embedder.symlink_to(model)
     with pytest.raises(OSError):
-        with diar.checked_models([str(tmp_path), str(tmp_path)]):
+        with diar.checked_models(
+            [str(tmp_path), str(tmp_path)],
+            [
+                hashlib.sha256((tmp_path / names[0]).read_bytes()).hexdigest()
+                for names in diar.MODEL_FILES
+            ],
+        ):
             pytest.fail("symlink accepted")
     embedder.unlink()
     embedder.write_bytes(b"\x08\x01")
     monkeypatch.setattr(diar, "collect_external_locations", lambda p: ["../escape"])
     with pytest.raises(ValueError, match="external"):
-        with diar.checked_models([str(tmp_path), str(tmp_path)]):
+        with diar.checked_models(
+            [str(tmp_path), str(tmp_path)],
+            [
+                hashlib.sha256((tmp_path / names[0]).read_bytes()).hexdigest()
+                for names in diar.MODEL_FILES
+            ],
+        ):
             pytest.fail("external accepted")
 
 
 def test_invalid_onnx_fails_load_before_runtime_import(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in ["segmentation.onnx", "embedder.onnx"]:
+    for name in ["model.onnx", "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"]:
         (tmp_path / name).write_bytes(b"bad protobuf")
     original = importlib.import_module
 
@@ -359,6 +378,8 @@ def test_invalid_onnx_fails_load_before_runtime_import(
         command(
             "diar.load",
             segmentation_dir=str(tmp_path),
+            segmentation_sha256=hashlib.sha256(b"bad protobuf").hexdigest(),
+            embedder_sha256=hashlib.sha256(b"bad protobuf").hexdigest(),
             embedder_dir=str(tmp_path),
             threshold=0.3,
             tau=0.45,
@@ -519,7 +540,7 @@ def test_measure_json_includes_final_speakers_and_block_births(
         def __exit__(self, *args: Any) -> None:
             pass
 
-        def load(self, *args: Any) -> None:
+        def load(self, *args: Any, **kwargs: Any) -> None:
             pass
 
         def sample_rss(self) -> None:

@@ -2620,7 +2620,7 @@ def catalog(args: argparse.Namespace) -> int:
                 }
                 return catalog_report(args, 2, facts)
             locked = True
-        entries = load_catalog().entries
+        entries = load_catalog().dictation_entries
         store = ModelStore(args.store if args.store is not None else paths.model_store_dir())
         code, facts = (
             catalog_all(args, entries, store) if args.all else catalog_switch(args, entries, store)

@@ -625,9 +625,11 @@ def test_model_fingerprint_is_sensitive_to_bytes_not_just_directory(tmp_path: Pa
     from astra_voice.worker.meeting_diar_client import model_fingerprint
 
     models = {"segmentation_dir": str(tmp_path), "embedder_dir": str(tmp_path)}
-    (tmp_path / "segmentation.onnx").write_bytes(b"model-v1")
-    (tmp_path / "embedder.onnx").write_bytes(b"embedder-v1")
+    (tmp_path / "model.onnx").write_bytes(b"model-v1")
+    (tmp_path / "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx").write_bytes(
+        b"embedder-v1"
+    )
     before = model_fingerprint(models)
-    (tmp_path / "segmentation.onnx").write_bytes(b"model-v2")
+    (tmp_path / "model.onnx").write_bytes(b"model-v2")
     assert model_fingerprint(models) != before
     assert_plain(before)

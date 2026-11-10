@@ -3087,7 +3087,7 @@ def test_model_service_uses_existing_modules(
         policy_mod.Policy(values={"ca_bundle": "/fake/ca", "corp_base": corp_base}),
     )
     entry = FakeModelPort().entry
-    catalog = Mock(entries=[entry])
+    catalog = Mock(entries=[entry], dictation_entries=[entry])
     catalog.is_revoked.return_value = False
     factories = {}
     for name in (
@@ -3437,7 +3437,7 @@ def test_model_shutdown_cancels_active_smoke_check(
     store.records.return_value = []
     gate = Mock()
     gate.allowed.return_value = (True, "")
-    catalog = Mock(entries=[port.entry])
+    catalog = Mock(entries=[port.entry], dictation_entries=[port.entry])
     catalog.is_revoked.return_value = False
     monkeypatch.setattr(model_downloads, "load_effective", Mock(return_value=catalog))
     monkeypatch.setattr(model_downloads, "Verifier", Mock())

@@ -81,10 +81,14 @@ def remember_verified_snapshot(key: tuple[str, str, Path, str], catalog: Catalog
         _remember_verified_snapshot(key, catalog)
 
 
-def read_revocation_marker() -> tuple[catalog_state.CatalogState | None, bool]:
+def read_revocation_marker(
+    *, read_only: bool = False
+) -> tuple[catalog_state.CatalogState | None, bool]:
     """Читает отметку отзывов: отсутствие допустимо, повреждение — неизвестность."""
     try:
-        marker_path = catalog_state.state_path(paths.state_dir())
+        marker_path = catalog_state.state_path(
+            paths.state_dir_path() if read_only else paths.state_dir()
+        )
         try:
             marker_path.lstat()
         except FileNotFoundError:
@@ -128,6 +132,8 @@ class _SnapshotVerifier(Verifier):
 
 def _pending_snapshot(
     marker: catalog_state.CatalogState | None,
+    *,
+    read_only: bool = False,
 ) -> tuple[Catalog | None, bool]:
     """Проверяет только снимок, который нельзя считать старее JSON-отметки.
 
@@ -138,7 +144,9 @@ def _pending_snapshot(
     неудача проверки означает «отзывы неизвестны»: активация отказывает.
     """
     global _snapshot_cache, _snapshot_rejection_cache
-    directory = paths.state_dir() / "model-catalog-updates"
+    directory = (
+        paths.state_dir_path() if read_only else paths.state_dir()
+    ) / "model-catalog-updates"
     try:
         raw, signature = read_snapshot(directory)
     except FileNotFoundError:
@@ -211,6 +219,7 @@ def check_revoked(
     catalog: Catalog | None,
     *,
     include_snapshot: bool = False,
+    read_only: bool = False,
 ) -> None:
     """Объединяет отзывы памяти и отметки; активации также учитывают новый снимок.
 
@@ -225,7 +234,9 @@ def check_revoked(
     with CATALOG_LOCK:
         if catalog is not None and catalog.is_revoked(model_id, revision):
             raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
-        marker, marker_error = read_revocation_marker()
+        marker, marker_error = (
+            read_revocation_marker(read_only=True) if read_only else read_revocation_marker()
+        )
         if marker is not None and marker.revoked is None:
             marker, marker_error = None, True
         if marker is not None and marker.revoked is not None:
@@ -236,7 +247,11 @@ def check_revoked(
             raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         snapshot_error = False
         if include_snapshot:
-            snapshot, snapshot_error = _pending_snapshot(marker)
+            snapshot, snapshot_error = (
+                _pending_snapshot(marker, read_only=True)
+                if read_only
+                else _pending_snapshot(marker)
+            )
             if snapshot is not None and snapshot.is_revoked(model_id, revision):
                 raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         if marker_error:
@@ -271,6 +286,9 @@ def activate_revision(
         with CATALOG_LOCK:
             if catalog_peek is not None and catalog_peek() is not current_catalog:
                 continue
+            entry = current_catalog.entry(model_id) if current_catalog is not None else None
+            if entry is not None and entry.kind != "dictation":
+                raise StoreError("bad-id", "Эта модель не предназначена для диктовки.")
             check_revoked(model_id, revision, current_catalog, include_snapshot=True)
             if previous_revision is None:
                 store.set_current(model_id, revision)
@@ -346,8 +364,13 @@ def load_effective(
     snapshot_dir: Path | None = None,
     state_path: Path | None = None,
     require_schema: bool | None = None,
+    persist: bool = True,
 ) -> Catalog:
-    """Загружает действующий каталог, сериализуя принятие с remote source."""
+    """Загружает действующий каталог, сериализуя принятие с remote source.
+
+    persist=False проверяет тот же анти-откат без записи watermark или
+    создания каталога состояния: для read-only поставщика установленных моделей.
+    """
     with CATALOG_LOCK:
         return _load_effective(
             verifier,
@@ -355,6 +378,7 @@ def load_effective(
             snapshot_dir=snapshot_dir,
             state_path=state_path,
             require_schema=require_schema,
+            persist=persist,
         )
 
 
@@ -365,6 +389,7 @@ def _load_effective(
     snapshot_dir: Path | None,
     state_path: Path | None,
     require_schema: bool | None,
+    persist: bool = True,
 ) -> Catalog:
     """Выбирает старший проверенный каталог и применяет глобальный анти-откат.
 
@@ -375,10 +400,11 @@ def _load_effective(
     выбирается встроенный. apply_state запрещает конфликт с третьим SHA.
     """
     root = paths.data_dir_static() if builtin_root is None else builtin_root
+    state_directory = paths.state_dir if persist else paths.state_dir_path
     directory = (
-        paths.state_dir() / "model-catalog-updates" if snapshot_dir is None else snapshot_dir
+        state_directory() / "model-catalog-updates" if snapshot_dir is None else snapshot_dir
     )
-    state = catalog_state.state_path(paths.state_dir()) if state_path is None else state_path
+    state = catalog_state.state_path(state_directory()) if state_path is None else state_path
     try:
         state.lstat()
     except FileNotFoundError:
@@ -434,8 +460,11 @@ def _load_effective(
                     "выбор ограничен глобальной отметкой принятого каталога."
                 )
     try:
-        state.parent.mkdir(parents=True, exist_ok=True)
-        catalog_state.apply_state(state, candidate)
+        if persist:
+            state.parent.mkdir(parents=True, exist_ok=True)
+            catalog_state.apply_state(state, candidate)
+        elif not catalog_state.is_newer(candidate, catalog_state.read_state(state)):
+            raise ValueError(catalog_state.STALE_MESSAGE)
     except ValueError as error:
         raise CatalogError("stale-catalog", str(error)) from None
     except OSError:

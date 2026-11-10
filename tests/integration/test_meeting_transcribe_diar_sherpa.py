@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 
 import pytest
+from tools.meeting_diar_check import model_paths
 from tools.meeting_transcribe_diar_check import prepare_meeting, run_job
 
 from astra_voice.meetings.model import Transcript
@@ -24,7 +25,7 @@ def inputs() -> tuple[dict[str, str], Path]:
     if any(not os.environ.get(name) for name in names):
         pytest.skip("Задайте ASTRA_VOICE_DIAR_MODELS и ASTRA_VOICE_DIAR_CORPUS")
     models, corpus = (Path(os.environ[name]) for name in names)
-    files = [models / name for name in ("segmentation.onnx", "embedder.onnx")]
+    files = list(model_paths(models))
     files += [corpus / name / "far.wav" for name in ("dion", "synth")]
     if any(not path.is_file() for path in files):
         pytest.skip("Неполный комплект моделей или корпуса диаризации")

@@ -207,7 +207,19 @@ OPTIONAL: dict[str, dict[str, Any]] = {
         "admission_mono_ms": UINT,
     },
     "meeting.capture.resume": {"mic_device": S, "tracks": TRACKS},
-    "meeting.job.start": {"diar_models": obj({"segmentation_dir": S, "embedder_dir": S})},
+    # Missing digests reach the role and fail as model-untrusted, never load.
+    "meeting.job.start": {
+        "diar_models": obj(
+            {
+                "segmentation_dir": S,
+                "embedder_dir": S,
+                "segmentation_sha256": S,
+                "embedder_sha256": S,
+            },
+            required=["segmentation_dir", "embedder_dir"],
+        )
+    },
+    "diar.load": {"segmentation_sha256": S, "embedder_sha256": S},
 }
 # Reply -> allowed request_type. Not every correlated receipt is a final ACK.
 REPLIES: dict[str, dict[str, tuple[str, ...]]] = {
@@ -468,6 +480,8 @@ ERROR_CODES = choices(
     "dir-unwritable",
     "limit",
     "model",
+    "model-untrusted",
+    "external-data",
     "memory",
     "io",
     "timeout",

@@ -1202,6 +1202,7 @@ def _catalog_entries() -> list[CatalogEntry]:
     document = json.loads((Path(__file__).resolve().parents[2] / "data/catalog.json").read_bytes())
     return [
         CatalogEntry(
+            kind=model.get("kind", "dictation"),
             id=model["id"],
             revision=model["revision"],
             name=model["name"],
@@ -1229,7 +1230,9 @@ def test_every_catalog_entry_passes_contents_and_layout(
     directory = tmp_path / entry.id
     directory.mkdir()
     for file in entry.files:
-        inst._make_parents(directory, file.path).write_bytes(b"")
+        inst._make_parents(directory, file.path).write_bytes(
+            b"\x08\x01" if file.path.endswith(".onnx") else b""
+        )
 
     inst._check_contents(directory, entry, allow_parts=False)
     inst._check_model_layout(directory, entry)

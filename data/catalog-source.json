@@ -8,7 +8,8 @@
     "поэтому у каждой записи стоит ram_estimated: true — это оценка, а не замер на этом компьютере.",
     "files[] перечисляет ровно те файлы, которые нужны рантайму onnx-asr; лишнее не скачивается.",
     "mirrors[] (необязательно) — запасные источники ТЕХ ЖЕ url_path по порядку: hf → github → корпоративный;",
-    "загрузчик берёт следующий только при сетевой ошибке, sha256 и размер проверяются одинаково."
+    "загрузчик берёт следующий только при сетевой ошибке, sha256 и размер проверяются одинаково.",
+    "Для kind=diarization min_ram_mb — общий бюджет процесса пары (900 МБ при замере до 816 МБ), не сумма двух записей."
   ],
   "publisher": "astra-voice",
   "manifest_version": 1,
@@ -392,6 +393,60 @@
         "wer_ru": 13.1,
         "rtfx": 70.6
       }
+    },
+    {
+      "id": "sherpa-onnx-pyannote-segmentation-3-0",
+      "kind": "diarization",
+      "name": "Сегментация pyannote 3.0",
+      "description": "Разделение собеседников по голосам; устанавливается вместе со второй моделью.",
+      "repo": "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0",
+      "revision": "9403a6902bb58e3d5ae8c7e77c3422de279db2e0",
+      "host": "huggingface.co",
+      "layout": "sherpa-onnx-pyannote-segmentation",
+      "variant": "pyannote-segmentation-3.0",
+      "recommended": false,
+      "files": [
+        "model.onnx"
+      ],
+      "vendor": "pyannote (экспорт sherpa-onnx)",
+      "vendor_short": "pyannote",
+      "languages": [
+        "multi"
+      ],
+      "language_tag": "Много языков",
+      "punctuation": false,
+      "license": "MIT",
+      "domestic": false,
+      "ram_estimated": true,
+      "min_ram_mb": 900,
+      "metrics": {}
+    },
+    {
+      "id": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced",
+      "kind": "diarization",
+      "name": "Эмбеддер 3D-Speaker CAM++",
+      "description": "Разделение собеседников по голосам; устанавливается вместе со второй моделью.",
+      "repo": "csukuangfj/speaker-embedding-models",
+      "revision": "0743f301363dec56491a490f6d6cbc9d67f9a3bf",
+      "host": "huggingface.co",
+      "layout": "sherpa-onnx-campplus",
+      "variant": "3dspeaker-campplus",
+      "recommended": false,
+      "files": [
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+      ],
+      "vendor": "3D-Speaker, Alibaba (экспорт sherpa-onnx)",
+      "vendor_short": "3D-Speaker",
+      "languages": [
+        "multi"
+      ],
+      "language_tag": "Много языков",
+      "punctuation": false,
+      "license": "Apache-2.0",
+      "domestic": false,
+      "ram_estimated": true,
+      "min_ram_mb": 900,
+      "metrics": {}
     }
   ]
 }

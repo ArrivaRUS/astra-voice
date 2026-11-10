@@ -14,6 +14,8 @@
 Правило оперативной памяти — из `research/catalog-numbers.md`: сумма байт
 `.onnx`-файлов рантайма, умноженная на 1,85 и округлённая вверх до целых МБ.
 Это оценка, а не замер, поэтому у записи стоит `ram_estimated: true`.
+Для diarization источник задаёт общий бюджет процесса пары (900 МБ),
+основанный на замере до 816 МБ; эти два значения не суммируются.
 
 Веса моделей скрипт не качает: размеры и sha256 LFS-файлов отдаёт само API.
 Мелкие не-LFS файлы (конфиги, словари) API отдаёт только с git-sha1, поэтому
@@ -174,7 +176,9 @@ def _entry(model: dict[str, Any], cache: dict[str, Any], sources: dict[str, str]
         "name": model["name"],
         "description": model["description"],
         "size_bytes": sum(file["size"] for file in files),
-        "min_ram_mb": _min_ram_mb(files),
+        "min_ram_mb": model["min_ram_mb"]
+        if model.get("kind") == "diarization"
+        else _min_ram_mb(files),
         "ram_estimated": bool(model["ram_estimated"]),
         "layout": model["layout"],
         "variant": model["variant"],
@@ -188,6 +192,8 @@ def _entry(model: dict[str, Any], cache: dict[str, Any], sources: dict[str, str]
         "license": model["license"],
         "domestic": bool(model["domestic"]),
     }
+    if "kind" in model:
+        entry["kind"] = model["kind"]
     mirrors = [str(host) for host in model.get("mirrors", [])]
     if mirrors:
         # Порядок источников берём из таблицы как есть: hf → github → корпоративный.

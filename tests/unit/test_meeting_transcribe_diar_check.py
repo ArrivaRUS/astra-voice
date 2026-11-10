@@ -37,8 +37,9 @@ def test_prepare_rejects_wrong_wav_format(tmp_path: Path) -> None:
         prepare_meeting(tmp_path / "run", {"mic": path})
 
 
+@pytest.mark.parametrize("explicit", [False, True])
 def test_complete_cli_job_summary_with_scripted_role(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit: bool
 ) -> None:
     from typing import Any
 
@@ -51,7 +52,8 @@ def test_complete_cli_job_summary_with_scripted_role(
         overall_deadline = float("inf")
 
         def load(self, models: Any) -> None:
-            pass
+            assert models["segmentation_sha256"] == "0" * 64
+            assert models["embedder_sha256"] == "0" * 64
 
         def block(self, audio: Any, index: int, offset: int) -> list[list[Any]]:
             return [[offset, offset + len(audio) // 16, "S1"]]
@@ -73,9 +75,15 @@ def test_complete_cli_job_summary_with_scripted_role(
         wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
         wav.writeframes(b"\x00\x40" * 16000)
     store, mid = prepare_meeting(tmp_path / "run", {"mic": path})
-    result = check.run_job(
-        store, mid, {"segmentation_dir": "/seg", "embedder_dir": "/emb"}, fake_asr=True
-    )
+    hashes = {"segmentation_sha256": "0" * 64, "embedder_sha256": "0" * 64}
+    models = {"segmentation_dir": "/seg", "embedder_dir": "/emb"}
+    if explicit:
+        models.update(hashes)
+    else:
+        from astra_voice.models import diarization
+
+        monkeypatch.setattr(diarization, "catalog_diarization_hashes", lambda: hashes)
+    result = check.run_job(store, mid, models, fake_asr=True)
     assert result["diar_status"] == "done" and result["labels_final"]
     assert result["speakers"] == result["utterances"] == result["blocks"] == 1
     assert result["diar_peak_rss_kb"] == 1234

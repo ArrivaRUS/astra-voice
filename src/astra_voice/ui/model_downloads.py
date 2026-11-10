@@ -315,7 +315,10 @@ def _card_memory(entry: Any, merged: dict[str, Any]) -> dict[str, Any]:
 def catalog_best(entries: Iterable[Any]) -> float:
     """Наибольшая опубликованная скорость каталога для шкалы карточки."""
     rtfx_values = [
-        value for entry in entries if (value := getattr(_metric(entry, "rtfx"), "value", 0.0)) > 0
+        value
+        for entry in entries
+        if getattr(entry, "kind", "dictation") == "dictation"
+        and (value := getattr(_metric(entry, "rtfx"), "value", 0.0)) > 0
     ]
     return max(rtfx_values) if rtfx_values else 0.0
 
@@ -610,6 +613,17 @@ class ModelService:
             raise error
         return self._catalog
 
+    def diarization_service(self) -> Any:
+        """Парная установка с теми же HTTP-политикой и источниками."""
+        from astra_voice.models.diarization import DiarizationService
+
+        return DiarizationService(
+            self._store,
+            self._downloader._http,
+            catalog_provider=lambda: self.catalog,
+            corp_base=self._downloader._corp_base,
+        )
+
     def revision_updater(self, *, on_state: Callable[[str, str], None]) -> ModelRevisionUpdater:
         """Переиспользует загрузчик и установщик службы для явного обновления."""
         return ModelRevisionUpdater(
@@ -646,7 +660,7 @@ class ModelService:
         return next(
             (
                 entry
-                for entry in catalog.entries
+                for entry in catalog.dictation_entries
                 if entry.recommended and not catalog.is_revoked(entry.id, entry.revision)
             ),
             None,
@@ -673,7 +687,7 @@ class ModelService:
 
     def catalog_rtfx(self, model_id: str) -> float | None:
         """Опубликованная скорость модели (RTFx) или None, если её нет в каталоге."""
-        return _catalog_rtfx(self.catalog.entries, model_id)
+        return _catalog_rtfx(self.catalog.dictation_entries, model_id)
 
     def entries(self) -> tuple[CatalogEntry, ...]:
         if self.catalog_unavailable:
@@ -689,12 +703,14 @@ class ModelService:
         installed = {(record.id, record.revision) for record in records}
         entries = tuple(
             entry
-            for entry in catalog.entries
+            for entry in catalog.dictation_entries
             if not catalog.is_revoked(entry.id, entry.revision)
             or (entry.id, entry.revision) in installed
         )
-        catalog_ids = {entry.id for entry in catalog.entries}
-        conservative_ram_mb = max((entry.min_ram_mb for entry in catalog.entries), default=768)
+        catalog_ids = {entry.id for entry in catalog.dictation_entries}
+        conservative_ram_mb = max(
+            (entry.min_ram_mb for entry in catalog.dictation_entries), default=768
+        )
         try:
             current = self._store.current()
         except (OSError, StoreError):

@@ -193,7 +193,8 @@ def test_builtin_catalog() -> None:
     assert result.serial >= 2
     assert result.trust_epoch == 1
     assert result.revoked == ()
-    assert len(result.entries) == 12
+    assert len(result.entries) == 14
+    assert len(result.dictation_entries) == 12
     entry = result.entries[0]
     assert result.entry(MODEL_ID) == entry
     assert entry.id == MODEL_ID
@@ -214,7 +215,7 @@ def test_builtin_catalog_descriptions() -> None:
     """Все двенадцать записей несут поля карточки и ровно одну рекомендацию."""
     result = load_builtin(Verifier("catalog", keyring=KEYRING), root=DATA_ROOT)
     assert [entry.recommended for entry in result.entries].count(True) == 1
-    assert len({entry.id for entry in result.entries}) == 12
+    assert len({entry.id for entry in result.entries}) == 14
     for entry in result.entries:
         assert entry.vendor and entry.vendor_short and entry.language_tag
         assert entry.license and entry.languages
@@ -281,6 +282,8 @@ def test_optional_fields_absent(catalog_root: Path, document: dict[str, Any]) ->
             "ram_estimated",
             "metrics",
         ):
+            if field == "license" and model.get("kind") == "diarization":
+                continue
             model.pop(field, None)
     write_document(catalog_root, document)
     result = load_builtin(StubVerifier(), root=catalog_root)

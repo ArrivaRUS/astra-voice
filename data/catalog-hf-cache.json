@@ -290,6 +290,28 @@
           "lfs": true
         }
       }
+    },
+    "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0@9403a6902bb58e3d5ae8c7e77c3422de279db2e0": {
+      "repo": "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0",
+      "revision": "9403a6902bb58e3d5ae8c7e77c3422de279db2e0",
+      "files": {
+        "model.onnx": {
+          "size": 5992913,
+          "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+          "lfs": true
+        }
+      }
+    },
+    "csukuangfj/speaker-embedding-models@0743f301363dec56491a490f6d6cbc9d67f9a3bf": {
+      "repo": "csukuangfj/speaker-embedding-models",
+      "revision": "0743f301363dec56491a490f6d6cbc9d67f9a3bf",
+      "files": {
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": {
+          "size": 28281164,
+          "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+          "lfs": true
+        }
+      }
     }
   }
 }

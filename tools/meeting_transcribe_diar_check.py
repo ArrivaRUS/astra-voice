@@ -132,6 +132,13 @@ def run_job(
 ) -> dict[str, Any]:
     from astra_voice.worker.engine import make_engine
 
+    models = dict(models)
+    fields = ("segmentation_sha256", "embedder_sha256")
+    if any(field not in models for field in fields):
+        from astra_voice.models.diarization import catalog_diarization_hashes
+
+        for field, value in catalog_diarization_hashes().items():
+            models.setdefault(field, value)
     meeting = store.read(meeting_id, "meeting.json")
     assert isinstance(meeting, Meeting)
     tracks = [
@@ -250,6 +257,8 @@ def main() -> int:
     parser.add_argument("--mic", type=Path)
     parser.add_argument("--segmentation-dir", type=Path, required=True)
     parser.add_argument("--embedder-dir", type=Path, required=True)
+    parser.add_argument("--segmentation-sha256")
+    parser.add_argument("--embedder-sha256")
     parser.add_argument("--asr-model-dir", type=Path)
     parser.add_argument("--fake-asr", action="store_true")
     parser.add_argument("--duration-s", type=float)
@@ -281,6 +290,9 @@ def main() -> int:
         "segmentation_dir": str(args.segmentation_dir.absolute()),
         "embedder_dir": str(args.embedder_dir.absolute()),
     }
+    for field in ("segmentation_sha256", "embedder_sha256"):
+        if (value := getattr(args, field)) is not None:
+            models[field] = value
     result = run_job(
         store, mid, models, asr_model=args.asr_model_dir, fake_asr=args.fake_asr, resume=args.resume
     )
