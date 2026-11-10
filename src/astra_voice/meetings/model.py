@@ -460,7 +460,7 @@ class Utterance(JsonModel):
             "echo": BOOL,
             "multiple_speakers": BOOL,
         },
-        required=["id", "seq", "track", "start_ms", "end_ms", "text", "speaker", "final", "echo"],
+        required=["id", "seq", "track", "start_ms", "end_ms", "text", "speaker", "final"],
     )
 
 

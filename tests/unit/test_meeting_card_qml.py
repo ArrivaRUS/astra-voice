@@ -142,7 +142,7 @@ assert one('meetingCardNames').property('enabled') is False
 card.setProperty('width', 796)
 QTest.qWait(30)
 
-# MN-1: reply text is literal; echo and empty replies never become rows.
+# MN-1 / D7: reply text is literal; echo is visible, empty replies stay hidden.
 raw = '<b>Жирный</b> & <img src="file:///etc/passwd"> <a href="x">ссылка</a>'
 utterances = [
     Utterance(id='u00000', seq=0, start_ms=1000, end_ms=2000, text=raw, speaker='others',
@@ -157,7 +157,7 @@ texts = [item for item in named('meetingCardText') if item.property('visible')]
 literal = [item for item in texts if item.property('text') == raw]
 assert len(literal) == 1 and literal[0].property('textFormat') == 0  # Text.PlainText
 assert literal[0].property('lineCount') >= 1
-assert [item.property('text') for item in texts] == [raw, 'Я тут.']
+assert [item.property('text') for item in texts] == [raw, 'эхо', 'Я тут.']
 assert not visible('meetingCardTail')
 
 # Transcribing (В4): progress card, tail row, no save/menu, names later; rows appended in place.

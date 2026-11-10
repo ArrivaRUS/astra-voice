@@ -565,3 +565,24 @@ def test_r2_b_diar_rejects_blocks_beyond_grid_ceiling(seconds: float) -> None:
     message["block_s"] = seconds
     with pytest.raises(ipc.FrameError):
         ipc.encode(message, role="meeting-diar")
+
+
+def test_echo_mark_socket_subprocess_t516_t520() -> None:
+    """Real socket transport; run outside the sandbox together with role integration."""
+    import socket
+
+    event = {"type": "meeting.job.utterance", **IDENTITY, "seq": 1, **UTT, "echo": True}
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sender.settimeout(3)
+        receiver.settimeout(3)
+        sender.sendall(ipc.encode(event, role="meeting-transcribe"))
+        reader = ipc.FrameReader(role="meeting-transcribe")
+        restored: list[dict[str, Any]] = []
+        while not restored:
+            restored.extend(reader.feed(receiver.recv(65536)))
+        assert restored == [event]
+        assert restored[0]["echo"] and restored[0]["text"] == UTT["text"]
+    finally:
+        sender.close()
+        receiver.close()

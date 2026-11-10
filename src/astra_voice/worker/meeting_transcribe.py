@@ -1164,6 +1164,7 @@ class MeetingTranscribeState:
             },
             "split": {"max_ms": MAX_UTTERANCE_MS, "from_ms": SPLIT_FROM_MS},
             "echo_gate": bool(request["echo_gate"]),
+            "echo_behavior": "recognize-and-mark-v1",
             "echo": echo_gate.config(),
             "tracks": sorted(request["tracks"]),
             "self_track": request["self_track"],
@@ -1271,7 +1272,6 @@ class MeetingTranscribeState:
         self.outbox.put(("reply", (request, job), reply))
         if resume.complete is not None:
             # The final text of this configuration is durable: no VAD/ASR, no rewrite.
-            # echo_dropped of the original run is not durable; it is reported as 0.
             if request["diarization"]:
                 job.diar_status = "done"
                 self._labels(job, resume.complete.utterances, final=True)
@@ -1305,7 +1305,7 @@ class MeetingTranscribeState:
         candidates.sort(key=lambda c: c.key)
         # Stage 2: echo gate (mic only, only when far is part of the job).
         echoes = self._echo(job, candidates, spans, reader)
-        transcribable = [c for c, echo in zip(candidates, echoes, strict=True) if not echo]
+        transcribable = candidates
         if len(transcribable) > capacity:
             raise _Failed("limit")
         if any(
@@ -1501,7 +1501,8 @@ class MeetingTranscribeState:
                 "reconcile_failed": transcript.reconcile.failed,
                 "wall_ms": max(0, round((self.clock() - started) * 1000)),
                 "peak_rss_kb": _status_kb("VmHWM", self.status_path),
-                "echo_dropped": echo_dropped,
+                "echo_dropped": 0,  # compatibility: D7 never drops replies
+                "echo_utterances": sum(u.echo for u in transcript.utterances),
                 "transcript_revision": transcript.transcript_revision,
             },
         )
@@ -1537,11 +1538,6 @@ class MeetingTranscribeState:
         seen = 0
         for candidate, echo in zip(candidates, echoes, strict=True):
             length = candidate.end_ms - candidate.start_ms
-            if echo:
-                if candidate.end_ms > cursors[candidate.track]:
-                    cursors[candidate.track] = candidate.end_ms
-                    window_ms += length
-                continue
             seen += 1
             if seen <= len(kept):
                 continue
@@ -1562,6 +1558,7 @@ class MeetingTranscribeState:
                 end_ms=candidate.end_ms,
                 text=text,
                 speaker="me" if candidate.track == "mic" and self_track == "mic" else "others",
+                echo=echo,
             )
             utterances.append(utterance)
             self._emit(
@@ -1576,6 +1573,7 @@ class MeetingTranscribeState:
                     "end_ms": utterance.end_ms,
                     "text": utterance.text,
                     "speaker": utterance.speaker,
+                    "echo": utterance.echo,
                     "provisional": True,
                 },
             )

@@ -193,7 +193,7 @@ def run_job(
             diar_models=models,
             self_track="mic" if "far" in tracks else "none",
             resume=resume,
-            echo_gate=False,
+            echo_gate=True,
             limits={"max_ms": 14_400_000, "max_utterances": 9000, "max_blocks": 12},
         )
         send("meeting.job.credit", **identity, n=64)
@@ -236,6 +236,7 @@ def run_job(
         assert isinstance(transcript, Transcript)
         return {
             "utterances": len(transcript.utterances),
+            "echo_utterances": sum(u.echo for u in transcript.utterances),
             "speakers": len(
                 {u.speaker for u in transcript.utterances if u.speaker.startswith("S")}
             ),
@@ -303,7 +304,8 @@ def main() -> int:
     print(
         json.dumps(result, sort_keys=True)
         if args.json
-        else f"Реплик: {result['utterances']}; дикторов: {result['speakers']}; "
+        else f"Реплик: {result['utterances']}; возможное эхо: {result['echo_utterances']}; "
+        f"дикторов: {result['speakers']}; "
         f"diar_status={result['diar_status']}; время: {result['wall_s']:.2f} с; "
         f"RSS transcribe/diar: {result['transcriber_peak_rss_kb']}/"
         f"{result['diar_peak_rss_kb']} КиБ; фазы: {result['phase_s']}; "

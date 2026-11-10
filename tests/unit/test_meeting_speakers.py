@@ -133,7 +133,9 @@ def test_all_templates_names_headers_canonical_merge_and_escaping(template: str,
             or templates._md_escape("Спикер 1 (" + name + ")") in text
         )
     if template != "stats":
-        assert "слово1 слово2" in text
+        assert "слово1 слово2" not in text  # §Д.5: multi never joins, even after merging names
+        assert "слово1" in text and "слово2" in text
+        assert ("(несколько говорящих)" in text) == (template == "stenogram")
     else:
         stats = templates.statistics(meeting, transcript.utterances, speakers=names)
         assert sum(row.share or 0 for row in stats.speakers) == 100

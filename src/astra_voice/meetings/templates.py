@@ -24,6 +24,7 @@ from uuid import uuid4
 from astra_voice.meetings.model import Meeting, SpeakerMap, Transcript, Utterance
 from astra_voice.meetings.speakers import canonical_speaker, speaker_map, validated_map
 from astra_voice.meetings.speakers import speaker_label as speaker_label
+from astra_voice.ui.meeting_texts import MARK_TEXTS, echo_label, reply_count
 
 TEMPLATES = ("stenogram", "me_and_others", "text_only", "stats")
 FORMATS = ("md", "txt")
@@ -137,6 +138,7 @@ class MarkInfo:
             "remote": "alert",
             "far": "info",
             "whole": "speaker",
+            "echo": "speaker",
         }[self.kind]
 
 
@@ -217,11 +219,38 @@ def from_placeholder(mark: MarkInfo) -> bool:
 
 
 def visible_utterances(transcript: Transcript | None) -> list[Utterance]:
-    """Chronological replies without echo and without empty text (spec §3.7)."""
+    """Chronological nonempty replies, including possible echo (D7)."""
     if transcript is None:
         return []
-    rows = [u for u in transcript.utterances if not u.echo and u.text.strip()]
+    rows = [u for u in transcript.utterances if u.text.strip()]
     return sorted(rows, key=lambda u: (u.start_ms, u.seq))
+
+
+def utterance_flag(item: Utterance) -> str:
+    """Echo wins malformed dual flags; placeholders never carry reply marks."""
+    if not item.text.strip() or item.text in PLACEHOLDERS:
+        return ""
+    return "echo" if item.echo else "multi" if item.multiple_speakers else ""
+
+
+def echo_count(utterances: Iterable[Utterance]) -> int:
+    return sum(utterance_flag(item) == "echo" for item in utterances)
+
+
+def selected_utterances(
+    transcript: Transcript | None, *, exclude_echo: bool = False
+) -> list[Utterance]:
+    return [u for u in visible_utterances(transcript) if not (exclude_echo and u.echo)]
+
+
+def echo_statistics(utterances: Iterable[Utterance]) -> str:
+    rows = [u for u in utterances if utterance_flag(u) == "echo"]
+    if not rows:
+        return ""
+    return MARK_TEXTS["statistics"].format(
+        minutes=_minutes(sum(max(0, u.end_ms - u.start_ms) for u in rows)),
+        replies=reply_count(len(rows)),
+    )
 
 
 def _minutes(milliseconds: int) -> int:
@@ -236,15 +265,14 @@ def speaker_totals(
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Shared duration/reply arithmetic for the panel and statistics.
 
-    Step 6 may supply its selection predicate; the existing visible_utterances filter
-    remains unchanged here.
+    Echo is excluded before alias resolution, duration and reply counting.
     """
     utterances = list(utterances)
     speakers = speaker_map(utterances, speakers) if speakers is not None else None
     totals: dict[str, int] = {}
     counts: dict[str, int] = {}
     for item in utterances:
-        if not item.text.strip() or (include is not None and not include(item)):
+        if item.echo or not item.text.strip() or (include is not None and not include(item)):
             continue
         who = canonical_speaker(item.speaker, speakers)
         totals.setdefault(who, 0)
@@ -317,6 +345,7 @@ class TemplateRow:
     text: str
     icon: str = ""
     truncated: bool = False
+    flag: str = ""
 
 
 def _merged(
@@ -334,6 +363,7 @@ def _merged(
     start = end = 0
     speaker: str | None = None
     placeholder = truncated = False
+    flag = ""
     parts: list[str] = []
     length = 0
 
@@ -346,6 +376,7 @@ def _merged(
             "me" if speaker == "me" else "others",
             " ".join(parts),
             truncated=truncated,
+            flag=flag,
         )
 
     for item in utterances:
@@ -355,12 +386,15 @@ def _merged(
             else canonical_speaker(item.speaker, speakers)
         )
         is_placeholder = item.text in PLACEHOLDERS
+        item_flag = utterance_flag(item)
         joins = (
             speaker is not None
             and who == speaker
+            and flag == item_flag
+            and flag != "multi"
             and not placeholder
             and not is_placeholder
-            and (paragraphs or item.start_ms - end <= MERGE_GAP_MS)
+            and item.start_ms - end <= MERGE_GAP_MS
             and not any(start < at <= item.start_ms for at in breaks)
         )
         if not joins:
@@ -379,7 +413,7 @@ def _merged(
             truncated = truncated or (remaining is not None and len(text) > remaining)
         else:
             truncated = True
-        end, placeholder = item.end_ms, is_placeholder
+        end, placeholder, flag = item.end_ms, is_placeholder, item_flag
     if speaker is not None:
         yield row()
 
@@ -426,7 +460,7 @@ def _field(text: str, md: bool, *, default: str = "") -> str:
     return _md_escape(literal) if md else literal
 
 
-def _header(
+def template_header(
     template: str,
     meeting: Meeting,
     utterances: Sequence[Utterance],
@@ -435,6 +469,9 @@ def _header(
     tz: tzinfo | None,
     speakers: SpeakerMap | None = None,
 ) -> list[str]:
+    if template == "stats":
+        # Only the participant list uses this subset; marks/statistics retain the source.
+        utterances = [u for u in utterances if not u.echo]
     start = _local(meeting.started_at, tz)
     title = _field(meeting.title, md, default=DEFAULT_NAME)
     lines = ["# " + title if md else title, ""]
@@ -459,7 +496,7 @@ def _header(
             for label in labels_seen
         ]
     )
-    if labels and (template != "text_only" or speakers is not None):
+    if labels:
         lines.append(f"{item}Участники: " + ", ".join(_field(label, md) for label in labels))
     if marks:
         lines.append(f"{item}Отметки:")
@@ -483,6 +520,7 @@ class Statistics:
     has_shares: bool
     speakers: list[SpeakerStat]
     remaining: int
+    excluded_echo: str = ""
 
     @property
     def summary(self) -> str:
@@ -524,13 +562,14 @@ def statistics(
             for who in selected
         ],
         len(ordered) - len(selected),
+        echo_statistics(utterances),
     )
 
 
 def _statistics(data: Statistics, md: bool) -> list[str]:
     lines = [data.summary]
     if not data.speakers:
-        return lines
+        return lines + (["", data.excluded_echo] if data.excluded_echo else [])
     lines.append("")
     if md:
         lines += [
@@ -548,18 +587,13 @@ def _statistics(data: Statistics, md: bool) -> list[str]:
                 + f"{count} |"
             )
         else:
-            noun = (
-                "реплик"
-                if 11 <= count % 100 <= 14
-                else {1: "реплика", 2: "реплики", 3: "реплики", 4: "реплики"}.get(
-                    count % 10, "реплик"
-                )
-            )
             lines.append(
                 f"{label} — {minute} мин · "
                 + (f"{share} % · " if share is not None else "")
-                + f"{count} {noun}"
+                + reply_count(count)
             )
+    if data.excluded_echo:
+        lines += ["", data.excluded_echo]
     return lines
 
 
@@ -571,6 +605,7 @@ def render(
     *,
     tz: tzinfo | None = None,
     speakers: SpeakerMap | None = None,
+    exclude_echo: bool = False,
 ) -> str:
     """Render the same selected local template for preview and private file export."""
     if template not in TEMPLATES:
@@ -583,9 +618,14 @@ def render(
         else None
     )
     md = fmt == "md"
-    utterances = visible_utterances(transcript)
+    exclude_echo = exclude_echo and template != "stats"
+    all_utterances = visible_utterances(transcript)
+    utterances = selected_utterances(transcript, exclude_echo=exclude_echo)
     marks = meeting_marks(meeting, utterances)
-    lines = _header(template, meeting, utterances, marks, md, tz, speakers)
+    count = echo_count(all_utterances)
+    if count:
+        marks.append(MarkInfo("echo", echo_label(count, excluded=exclude_echo)))
+    lines = template_header(template, meeting, utterances, marks, md, tz, speakers)
     if template == "stats":
         return (
             "\n".join(lines + _statistics(statistics(meeting, utterances, speakers=speakers), md))
@@ -598,9 +638,17 @@ def render(
     body = [
         "— " + row.text
         if row.kind == "mark"
-        else _field(row.text, md)
+        else (f"({MARK_TEXTS['echo']}) " if row.flag == "echo" else "") + _field(row.text, md)
         if paragraphs
-        else f"[{clock(row.at_ms)}] {_field(row.who, md)}: {_field(row.text, md)}"
+        else (
+            f"[{clock(row.at_ms)}] {_field(row.who, md)}"
+            + (
+                f" ({MARK_TEXTS[row.flag]})"
+                if row.flag == "echo" or (row.flag == "multi" and template == "stenogram")
+                else ""
+            )
+            + f": {_field(row.text, md)}"
+        )
         for row in rows
     ]
     separator = "\n\n" if md or paragraphs else "\n"

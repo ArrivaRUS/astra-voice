@@ -452,10 +452,10 @@ OPTIONAL.update(
             ),
         },
         "meeting.job.progress": {"block": UINT, "blocks": UINT},
-        "meeting.job.utterance": {"multiple_speakers": BOOL},
+        "meeting.job.utterance": {"multiple_speakers": BOOL, "echo": BOOL},
         "meeting.job.labels": {"transcript_revision": UINT},
         "meeting.job.accepted": {"transcript_revision": UINT},
-        "meeting.job.done": {"reconcile_failed": BOOL},
+        "meeting.job.done": {"reconcile_failed": BOOL, "echo_utterances": UINT},
     }
 )
 ERROR_CODES = choices(

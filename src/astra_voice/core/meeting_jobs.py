@@ -1396,6 +1396,7 @@ class MeetingJobs:
                     "text",
                     "speaker",
                     "multiple_speakers",
+                    "echo",
                 )
                 if key in event
             }
@@ -1475,6 +1476,7 @@ class MeetingJobs:
                         "text": u.text,
                         "speaker": u.speaker,
                         "multiple_speakers": u.multiple_speakers,
+                        "echo": u.echo,
                     }
                     for u in transcript.utterances
                 }

@@ -94,6 +94,7 @@ def fixture_transcript() -> Transcript:
                 speaker=speaker,
                 final=True,
                 echo=echo,
+                multiple_speakers=index == 9,
             )
             for index, (track, start, end, text, speaker, echo) in enumerate(rows)
         ],
@@ -102,15 +103,21 @@ def fixture_transcript() -> Transcript:
 
 @pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
 @pytest.mark.parametrize("fmt", ["md", "txt"])
-def test_stenogram_golden(template: str, fmt: str) -> None:
-    text = templates.render(template, fixture_meeting(), fixture_transcript(), fmt, tz=MSK)
-    assert text == (GOLDEN / f"{template}.{fmt}").read_text(encoding="utf-8")
+@pytest.mark.parametrize("exclude_echo", [False, True])
+def test_stenogram_golden_t537_t538_t539_t540_t548(
+    template: str, fmt: str, exclude_echo: bool
+) -> None:
+    text = templates.render(
+        template, fixture_meeting(), fixture_transcript(), fmt, tz=MSK, exclude_echo=exclude_echo
+    )
+    suffix = "-without-echo" if exclude_echo else ""
+    assert text == (GOLDEN / f"{template}{suffix}.{fmt}").read_text(encoding="utf-8")
 
 
 def test_stenogram_rules() -> None:
     text = stenogram(fixture_meeting(), fixture_transcript(), "txt", tz=MSK)
-    # Echo and empty replies are hidden; adjacent replies (gap ≤ 2 s) are joined.
-    assert "эхо собеседника" not in text
+    # D7: echo is marked; empty replies are hidden; adjacent replies are joined.
+    assert "Я (возможное эхо): Это эхо собеседника" in text
     assert "[0:00:12] Собеседники: Добрый день. Тогда начнём с бюджета." in text
     # Literal text, one line per reply: an embedded LF cannot fake a timecode line.
     assert "Олег, <b>это</b> & *всё*?" in text
@@ -180,7 +187,7 @@ def untrusted_export(field: str, literal: str, template: str) -> tuple[str, list
     md = templates.render(template, meeting, transcript, "md", tz=MSK)
     if field == "title":
         fragments = [md.splitlines()[0].removeprefix("# ")]
-    elif field == "label" and template != "text_only":
+    elif field == "label":
         header = next(
             line.removeprefix("- Участники: ")
             for line in md.splitlines()
@@ -189,7 +196,7 @@ def untrusted_export(field: str, literal: str, template: str) -> tuple[str, list
         fragments = [header.removesuffix(", `Собеседники`")]
         if template == "stats":
             fragments.append(md.splitlines()[-1].removeprefix("| ").split(" | ", 1)[0])
-        else:
+        elif template != "text_only":
             reply = next(line for line in md.splitlines() if line.startswith("[0:00:04] "))
             fragments.append(reply.removeprefix("[0:00:04] ").rsplit(": ", 1)[0])
     elif field in {"reply", "empty_label_reply"} and template != "stats":
@@ -485,13 +492,13 @@ def test_binary_merge_uses_track_group_and_text_paragraphs_use_original_speaker(
     assert "Участники: Я, Собеседники" in binary
     assert "слово1 слово2" not in stenogram(meeting, transcript, "txt")
     text = templates.render("text_only", meeting, transcript, "txt")
-    assert "Участники:" not in text and "[0:" not in text
+    assert "Участники: Я, Спикер 2, Спикер 3" in text and "[0:" not in text
     assert "слово0\n\nслово1\n\nслово2\n\nслово3" in text
     transcript.utterances[2].speaker = "S2"
     transcript.utterances[2].start_ms = 7000
     transcript.utterances[2].end_ms = 8000
     transcript.utterances.pop()
-    assert "слово1 слово2" in templates.render("text_only", meeting, transcript, "txt")
+    assert "слово1\n\nслово2" in templates.render("text_only", meeting, transcript, "txt")
 
 
 def test_text_only_marks_split_same_speaker_paragraphs() -> None:
@@ -604,9 +611,13 @@ def test_empty_self_label_setting_rejects_schema_accepts_t508(label: str) -> Non
 
 @pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
 @pytest.mark.parametrize("fmt", ["md", "txt"])
-def test_multiple_speakers_marker_does_not_change_export(template: str, fmt: str) -> None:
+def test_multiple_speakers_marker_changes_only_stenogram_t537_t538_t539_t540(
+    template: str, fmt: str
+) -> None:
     transcript = fixture_transcript()
     before = templates.render(template, fixture_meeting(), transcript, fmt, tz=MSK)
     for u in transcript.utterances:
         u.multiple_speakers = True
-    assert templates.render(template, fixture_meeting(), transcript, fmt, tz=MSK) == before
+    after = templates.render(template, fixture_meeting(), transcript, fmt, tz=MSK)
+    assert ("(несколько говорящих)" in after) == (template == "stenogram")
+    assert "Это эхо собеседника" in after if template != "stats" else after == before

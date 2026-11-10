@@ -272,3 +272,31 @@ RENAME_TEXTS = {
     "cancel": "Отмена",
     "confirm": "Сохранить",
 }
+
+
+# Reply marks, spec §Д.4/Д.8. Only constants define marks; meeting text is data.
+MARK_TEXTS = {
+    "echo": "возможное эхо",
+    "multi": "несколько говорящих",
+    "badge": "Возможное эхо",
+    "excluded": "Возможное эхо не включено в файл",
+    "statistics": "Не учтено в статистике: возможное эхо — {minutes} мин · {replies}",
+    "excludeEcho": "Не включать реплики с пометкой „возможное эхо“",
+    "excludeEchoDescription": (
+        "Похожи на голоса собеседников из колонок, но среди них может быть и ваша речь."
+    ),
+}
+
+
+def reply_count(count: int) -> str:
+    noun = (
+        "реплик"
+        if 11 <= count % 100 <= 14
+        else {1: "реплика", 2: "реплики", 3: "реплики", 4: "реплики"}.get(count % 10, "реплик")
+    )
+    return f"{count} {noun}"
+
+
+def echo_label(count: int, *, excluded: bool = False, live: bool = False) -> str:
+    label = MARK_TEXTS["excluded" if excluded else "badge"]
+    return label if live else f"{label}: {reply_count(count)}"

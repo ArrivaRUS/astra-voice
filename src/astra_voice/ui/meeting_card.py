@@ -38,16 +38,34 @@ from astra_voice.meetings.templates import (
     PLACEHOLDERS,
     MarkInfo,
     clock,
+    echo_count,
     from_placeholder,
     meeting_marks,
     minutes_from_totals,
+    selected_utterances,
     speaker_label,
     statistics,
+    template_header,
     template_rows,
+    utterance_flag,
     visible_utterances,
 )
+from astra_voice.ui.meeting_texts import MARK_TEXTS, echo_label
 
-ROLES = ("kind", "time", "who", "whoKind", "num", "text", "icon", "accessibleName")
+ROLES = (
+    "kind",
+    "time",
+    "who",
+    "whoKind",
+    "num",
+    "text",
+    "icon",
+    "accessibleName",
+    "flag",
+    "flagText",
+    "flagIcon",
+    "textMuted",
+)
 MODEL_ACTIONS = ("Установить", "Установить из файла…", "Подробнее")
 CARD_STATES = frozenset(
     {
@@ -62,6 +80,7 @@ CARD_STATES = frozenset(
 )
 RENAME_STATES = frozenset({MeetingState.RECORDED, MeetingState.TRANSCRIBING, MeetingState.DONE})
 TEXTS = {
+    **MARK_TEXTS,
     "back": "Все встречи",
     "save": "Сохранить как…",
     "rename": "Переименовать…",
@@ -121,8 +140,18 @@ TEMPLATE_TEXTS = (
 )
 
 
-def _accessible_name(at: str, text: str, who: str | None = None) -> str:
-    return f"{at}, {who}: {text}" if who is not None else f"{at}, {text}"
+def _accessible_name(at: str, text: str, who: str | None = None, flag: str = "") -> str:
+    suffix = f", {MARK_TEXTS[flag]}" if flag else ""
+    return f"{at}, {who}{suffix}: {text}" if who is not None else f"{at}, {text}"
+
+
+def flag_roles(flag: str) -> dict[str, Any]:
+    return {
+        "flag": flag,
+        "flagText": MARK_TEXTS[flag] if flag else "",
+        "flagIcon": {"echo": "speaker", "multi": "people"}.get(flag, ""),
+        "textMuted": flag == "echo",
+    }
 
 
 def save_preview(
@@ -130,9 +159,18 @@ def save_preview(
     meeting: Meeting,
     transcript: Transcript | None,
     speakers: SpeakerMap | None = None,
+    *,
+    exclude_echo: bool = False,
 ) -> dict[str, Any]:
     """Bounded, format-independent view of the same structures used by render."""
-    utterances = visible_utterances(transcript)
+    utterances = selected_utterances(transcript, exclude_echo=exclude_echo and template != "stats")
+    marks = meeting_marks(meeting, utterances)
+    count = echo_count(visible_utterances(transcript))
+    if count:
+        marks.append(
+            MarkInfo("echo", echo_label(count, excluded=exclude_echo and template != "stats"))
+        )
+    header = template_header(template, meeting, utterances, marks, False, None, speakers)
     if template == "stats":
         data = statistics(meeting, utterances, limit=8, speakers=speakers)
         summary = [
@@ -148,6 +186,8 @@ def save_preview(
             ]
         return {
             "kind": "stats",
+            "header": header,
+            "excludedEcho": data.excluded_echo,
             "summary": summary,
             "hasShares": data.has_shares,
             "rows": [
@@ -185,18 +225,29 @@ def save_preview(
         rows.append(
             {
                 "kind": row.kind,
+                **flag_roles(row.flag if row.flag == "echo" or template == "stenogram" else ""),
+                "fileMark": (
+                    f"({MARK_TEXTS[row.flag]}) " if paragraphs else f" ({MARK_TEXTS[row.flag]})"
+                )
+                if row.flag == "echo" or (row.flag == "multi" and template == "stenogram")
+                else "",
+                "markPosition": "start" if paragraphs else "after-name",
                 "time": at if row.kind == "mark" else f"[{at}]",
                 "who": row.who,
                 "whoKind": row.who_kind,
                 "text": text,
                 "icon": row.icon,
                 "accessibleName": _accessible_name(
-                    at, text, row.who if row.kind == "utterance" else None
+                    at,
+                    text,
+                    row.who if row.kind == "utterance" else None,
+                    row.flag if row.flag == "echo" or template == "stenogram" else "",
                 ),
             }
         )
     return {
         "kind": "text_only" if paragraphs else "transcript",
+        "header": header,
         "rows": rows,
         "moreText": TEXTS["previewEllipsis"]
         if paragraphs and more and rows[-1]["kind"] == "mark"
@@ -217,7 +268,7 @@ class TranscriptRows(QAbstractListModel):
 
     def __init__(self, parent: Any = None) -> None:
         super().__init__(parent)
-        self._rows: list[dict[str, str]] = []
+        self._rows: list[dict[str, Any]] = []
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N802
         return 0 if parent.isValid() else len(self._rows)
@@ -233,7 +284,9 @@ class TranscriptRows(QAbstractListModel):
             key = ROLES[offset]
             row = self._rows[index.row()]
             if key == "accessibleName" and row.get("kind") == "utterance":
-                return _accessible_name(row["time"].strip("[]"), row["text"], row["who"])
+                return _accessible_name(
+                    row["time"].strip("[]"), row["text"], row["who"], row.get("flag", "")
+                )
             return row.get(key, "")
         return None
 
@@ -242,20 +295,20 @@ class TranscriptRows(QAbstractListModel):
         return len(self._rows)
 
     @pyqtSlot(int, result="QVariantMap")
-    def get(self, row: int) -> dict[str, str]:
+    def get(self, row: int) -> dict[str, Any]:
         if not 0 <= row < len(self._rows):
             return {}
         result = dict(self._rows[row])
         if result.get("kind") == "utterance":
             result["accessibleName"] = _accessible_name(
-                result["time"].strip("[]"), result["text"], result["who"]
+                result["time"].strip("[]"), result["text"], result["who"], result.get("flag", "")
             )
         return result
 
-    def rows(self) -> list[dict[str, str]]:
+    def rows(self) -> list[dict[str, Any]]:
         return [self.get(index) for index in range(len(self._rows))]
 
-    def reset(self, rows: Iterable[dict[str, str]] = ()) -> None:
+    def reset(self, rows: Iterable[dict[str, Any]] = ()) -> None:
         self.beginResetModel()
         self._rows = list(rows)
         self.endResetModel()
@@ -277,7 +330,21 @@ class TranscriptRows(QAbstractListModel):
         if start >= 0:
             self.dataChanged.emit(self.index(start), self.index(previous), roles)
 
-    def append(self, rows: list[dict[str, str]]) -> None:
+    def update(self, rows: list[dict[str, Any]]) -> None:
+        """Refresh roles in place when reply identities/order are unchanged."""
+        assert len(rows) == len(self._rows)
+        for index, row in enumerate(rows):
+            previous = self.get(index)
+            roles = [
+                Qt.UserRole + 1 + offset
+                for offset, name in enumerate(ROLES)
+                if row.get(name, "") != previous.get(name, "")
+            ]
+            if roles:
+                self._rows[index] = row
+                self.dataChanged.emit(self.index(index), self.index(index), roles)
+
+    def append(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
         first = len(self._rows)
@@ -287,9 +354,10 @@ class TranscriptRows(QAbstractListModel):
         self.countChanged.emit()
 
 
-def mark_row(mark: MarkInfo) -> dict[str, str]:
+def mark_row(mark: MarkInfo) -> dict[str, Any]:
     at = clock(mark.at_ms or 0)
     return {
+        **flag_roles(""),
         "kind": "mark",
         "time": at,
         "who": "",
@@ -303,13 +371,14 @@ def mark_row(mark: MarkInfo) -> dict[str, str]:
 
 def utterance_row(
     meeting: Meeting, item: Utterance, speakers: SpeakerMap | None = None
-) -> dict[str, str]:
+) -> dict[str, Any]:
     at = clock(item.start_ms)
     if item.text in PLACEHOLDERS:
         text = item.text
         if item.text == DAMAGED_TEXT:
             text = f"{DAMAGED_LABEL} {at}–{clock(item.end_ms)}"
         return {
+            **flag_roles(""),
             "kind": "mark",
             "time": at,
             "who": "",
@@ -320,7 +389,17 @@ def utterance_row(
             "accessibleName": _accessible_name(at, text),
         }
     who = speaker_label(meeting, item.speaker, speakers)
+    flag = utterance_flag(item)
+    if flag == "echo" and meeting.variant == "mic_only":
+        flag = ""
+    if flag == "multi" and (
+        meeting.state == MeetingState.TRANSCRIBING
+        or not meeting.transcription.diarization
+        or meeting.transcription.diar_status == "failed"
+    ):
+        flag = ""
     return {
+        **flag_roles(flag),
         "kind": "utterance",
         "time": f"[{at}]",
         "who": who,
@@ -328,7 +407,7 @@ def utterance_row(
         "num": str(speaker_number(item.speaker, speakers) or ""),
         "text": item.text,
         "icon": "",
-        "accessibleName": _accessible_name(at, item.text, who),
+        "accessibleName": _accessible_name(at, item.text, who, flag),
     }
 
 
@@ -344,16 +423,24 @@ def table_marks(meeting: Meeting, utterances: Iterable[Utterance] = ()) -> list[
     )
 
 
-def _same(a: Utterance, b: Utterance) -> bool:
-    return (a.id, a.seq, a.track, a.start_ms, a.end_ms, a.speaker, a.text, a.multiple_speakers) == (
+def _same(a: Utterance, b: Utterance, *, content_only: bool = False) -> bool:
+    return (
+        a.id,
+        a.seq,
+        a.track,
+        a.start_ms,
+        a.end_ms,
+        a.text,
+    ) == (
         b.id,
         b.seq,
         b.track,
         b.start_ms,
         b.end_ms,
-        b.speaker,
         b.text,
-        b.multiple_speakers,
+    ) and (
+        content_only
+        or (a.speaker, a.multiple_speakers, a.echo) == (b.speaker, b.multiple_speakers, b.echo)
     )
 
 
@@ -372,8 +459,10 @@ class CardRows:
         # Kept incrementally: a running job adds one reply at a time (≤ 9000), and the
         # card's header must not rescan every reply on each of them.
         self.utterances: list[Utterance] = []
+        self.utterance_rows: dict[str, int] = {}
         self.placeholders: list[Utterance] = []
         self.speech = 0
+        self.echoes = 0
         self.speaker_ms: dict[str, int] = {}
         self.speaker_rows: dict[str, list[int]] = {}
         self.first_utterances: dict[str, Utterance] = {}
@@ -408,26 +497,57 @@ class CardRows:
         """Apply a validated complete live snapshot, including atomic D5 edits."""
         if not self.continues(utterances):
             self.load(utterances, complete=False)
-        else:
-            self.extend(utterances)
+            return
+        if any(not _same(a, b) for a, b in zip(self.utterances, utterances, strict=False)):
+            self._refresh(utterances[: len(self.utterances)])
+        self.extend(utterances)
 
     def extend(self, utterances: list[Utterance]) -> None:
         fresh = [item for item in utterances if item.seq > self.last_seq]
         self.model.append(self._rows(fresh, complete=False))
 
     def continues(self, utterances: Sequence[Utterance]) -> bool:
-        """The shown replies are the start of ``utterances`` (the finished run's text)."""
+        """Stable reply identities/content; marks and speaker labels may arrive later."""
         shown = self.utterances
         return len(shown) <= len(utterances) and all(
-            _same(a, b) for a, b in zip(shown, utterances, strict=False)
+            _same(a, b, content_only=True) for a, b in zip(shown, utterances, strict=False)
         )
 
+    def _refresh(self, utterances: Sequence[Utterance]) -> None:
+        """Update existing rows by id, retaining timed marks and the pending mark queue."""
+        updated = self.model.rows()
+        indices = self.utterance_rows
+        self._reset_stats()
+        self.last_seq = -1
+        for item in utterances:
+            index = indices[item.id]
+            updated[index] = utterance_row(self.meeting, item, self.speakers)
+            self._remember(item, index)
+        self.model.update(updated)
+
     def finish(self, utterances: Sequence[Utterance]) -> None:
-        """Append the replies after the shown ones and the remaining marks (no reset)."""
+        """Publish late marks/labels in place, then append the final tail and marks."""
+        self._refresh(utterances[: len(self.utterances)])
         self.model.append(self._rows(list(utterances[len(self.utterances) :]), complete=True))
 
-    def _rows(self, utterances: list[Utterance], *, complete: bool) -> list[dict[str, str]]:
-        rows: list[dict[str, str]] = []
+    def _remember(self, item: Utterance, index: int) -> None:
+        self.utterance_rows[item.id] = index
+        if item.text not in PLACEHOLDERS:
+            self.speaker_rows.setdefault(item.speaker, []).append(index)
+            self.first_utterances.setdefault(item.speaker, item)
+        self.utterances.append(item)
+        self.echoes += utterance_flag(item) == "echo"
+        if item.text in PLACEHOLDERS:
+            self.placeholders.append(item)
+        else:
+            self.speech += 1
+            if not item.echo:
+                length = max(0, item.end_ms - item.start_ms)
+                self.speaker_ms[item.speaker] = self.speaker_ms.get(item.speaker, 0) + length
+        self.last_seq = max(self.last_seq, item.seq)
+
+    def _rows(self, utterances: list[Utterance], *, complete: bool) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
         offset = self.model.rowCount()
         # load() resets the model only after constructing its new rows.
         if not self.utterances:
@@ -435,18 +555,8 @@ class CardRows:
         for item in utterances:
             while self._marks and (self._marks[0].at_ms or 0) <= item.start_ms:
                 rows.append(mark_row(self._marks.pop(0)))
-            if item.text not in PLACEHOLDERS:
-                self.speaker_rows.setdefault(item.speaker, []).append(offset + len(rows))
-                self.first_utterances.setdefault(item.speaker, item)
+            self._remember(item, offset + len(rows))
             rows.append(utterance_row(self.meeting, item, self.speakers))
-            self.utterances.append(item)
-            if item.text in PLACEHOLDERS:
-                self.placeholders.append(item)
-            else:
-                self.speech += 1
-                length = max(0, item.end_ms - item.start_ms)
-                self.speaker_ms[item.speaker] = self.speaker_ms.get(item.speaker, 0) + length
-            self.last_seq = max(self.last_seq, item.seq)
         if complete:
             rows.extend(mark_row(mark) for mark in self._marks)
             self._marks = []
@@ -468,6 +578,7 @@ def snapshot_utterances(snapshot: Mapping[str, Any] | None) -> list[Utterance]:
                     text=str(item.get("text", "")),
                     speaker=str(item.get("speaker", "others")),
                     multiple_speakers=bool(item.get("multiple_speakers", False)),
+                    echo=bool(item.get("echo", False)),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -500,7 +611,7 @@ def place(meeting: Meeting) -> str:
     return "Звонок"
 
 
-def subtitle(meeting: Meeting, view: str) -> dict[str, str]:
+def subtitle(meeting: Meeting, view: str) -> dict[str, Any]:
     """«09.10.2026 · 10:00–11:12 · <mono>1:12:40</mono> · Звонок в DION · звук удалён»."""
     start = _local(meeting.started_at)
     end = _local(meeting.ended_at)
@@ -527,7 +638,7 @@ def subtitle(meeting: Meeting, view: str) -> dict[str, str]:
     return {"prefix": f"{span} · " if span else "", "mono": duration, "suffix": suffix}
 
 
-def badge(meeting: Meeting, percent: int) -> dict[str, str]:
+def badge(meeting: Meeting, percent: int) -> dict[str, Any]:
     state = meeting.state
     if state == MeetingState.TRANSCRIBING:
         return {"text": f"Расшифровка · {percent} %", "kind": "warning", "icon": "clock"}
@@ -750,6 +861,23 @@ def participants(
     return rows
 
 
+def echo_badge(count: int, *, live: bool = False) -> list[dict[str, Any]]:
+    if not count:
+        return []
+    text = echo_label(count, live=live)
+    return [
+        {
+            "text": text,
+            "label": MARK_TEXTS["badge"] if live else MARK_TEXTS["badge"] + ":",
+            "mono": "" if live else str(count),
+            "suffix": "" if live else " " + text.split(" ", 3)[-1],
+            "tone": "neutral",
+            "icon": "speaker",
+            "accessibleName": text,
+        }
+    ]
+
+
 def presentation(
     meeting: Meeting,
     *,
@@ -795,6 +923,10 @@ def presentation(
                 }
                 for mark in meeting_marks(meeting, placeholders)
             ]
+            + echo_badge(
+                rows.echoes if rows and meeting.variant != "mic_only" else 0,
+                live=live,
+            )
             if table
             else []
         ),

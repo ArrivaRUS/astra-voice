@@ -193,6 +193,7 @@ class _ExportResult:
     fmt: str
     status: str
     template: str
+    exclude_echo: bool = False
 
 
 @dataclass
@@ -224,6 +225,7 @@ class MeetingBridge(QObject):
     cardSaveFinished = pyqtSignal(str)
     saveTemplateChanged = pyqtSignal()
     savePreviewChanged = pyqtSignal()
+    saveEchoChanged = pyqtSignal()
     _exportCompleted = pyqtSignal(object)
     # QML bindings run before ordinary slots of the same signal: «card» is notified by
     # its own signal, emitted after the cache is dropped (a stale cache never reaches QML).
@@ -270,6 +272,7 @@ class MeetingBridge(QObject):
         self._speaker_timer.setInterval(10)
         self._speaker_timer.timeout.connect(self._speaker_poll)
         self._save_preview_open = False
+        self._save_exclude_echo = False
         self._speakers_error = False
         self._speaker_operation: dict[str, Any] = {"ok": False, "code": "", "text": ""}
         self._pick_save_path, self._documents_dir = pick_save_path, documents_dir
@@ -320,8 +323,8 @@ class MeetingBridge(QObject):
         self.cardSaveFinished.connect(self._resume_deletes)
         self._export_writer = MetadataWriter()
         self._exportCompleted.connect(self._export_completed, Qt.QueuedConnection)
-        # (path, fmt, template) awaiting «Заменить».
-        self._replace_target: tuple[Path, str, str] | None = None
+        # (path, fmt, template, exclude_echo) awaiting «Заменить».
+        self._replace_target: tuple[Path, str, str, bool] | None = None
         # «Сохранить как…» from the list waits until the opened card has loaded (D4 needs «ready»).
         self._card_save_pending = False
         # TRANSCRIBING → DONE of one generation: the live rows stay, the final text adds its tail.
@@ -1102,6 +1105,7 @@ class MeetingBridge(QObject):
         if self._card_id and not self.flushSpeakerWrites():
             return
         self._save_template = TEMPLATES[0]
+        self.setSaveExcludeEcho(False)
         self._card_id = meeting_id
         self._card_key = None
         self._card_save_error = ""
@@ -1134,6 +1138,7 @@ class MeetingBridge(QObject):
         if self._save_preview_open:
             self._save_preview_open = False
             self.savePreviewOpenChanged.emit()
+        self.setSaveExcludeEcho(False)
         self._card_id = ""
         self._card_key = None
         self._card_builder = None
@@ -1177,6 +1182,7 @@ class MeetingBridge(QObject):
         if template in TEMPLATES and template != self._save_template:
             self._save_template = template
             self.saveTemplateChanged.emit()
+            self.saveEchoChanged.emit()
             self.savePreviewChanged.emit()
 
     @pyqtSlot(result="QVariantMap")
@@ -1185,7 +1191,55 @@ class MeetingBridge(QObject):
         if meeting is None:
             return {}
         return meeting_card.save_preview(
-            self._save_template, meeting, self._card_transcript, self._display_speakers()
+            self._save_template,
+            meeting,
+            self._card_transcript,
+            self._display_speakers(),
+            exclude_echo=self._save_exclude_echo,
+        )
+
+    @pyqtProperty(bool, notify=saveEchoChanged)
+    def saveExcludeEcho(self) -> bool:
+        return self._save_exclude_echo
+
+    @pyqtSlot(bool)
+    def setSaveExcludeEcho(self, checked: bool) -> None:
+        if self._save_exclude_echo != checked:
+            self._save_exclude_echo = checked
+            self.saveEchoChanged.emit()
+            self.savePreviewChanged.emit()
+
+    @pyqtProperty(int, notify=savePreviewChanged)
+    def saveEchoCount(self) -> int:
+        from astra_voice.meetings.templates import echo_count
+
+        return echo_count(visible_utterances(self._card_transcript))
+
+    @pyqtProperty(bool, notify=savePreviewChanged)
+    def saveEchoVisible(self) -> bool:
+        return self._save_template != "stats" and self.saveEchoCount > 0
+
+    @pyqtProperty(str, notify=savePreviewChanged)
+    def saveEchoAccessibleName(self) -> str:
+        return f"{meeting_card.TEXTS['excludeEcho']}, {self.saveEchoCount}"
+
+    @pyqtProperty(str, constant=True)
+    def saveEchoDescription(self) -> str:
+        return meeting_card.TEXTS["excludeEchoDescription"]
+
+    @pyqtSlot(str, result=str)
+    def savePreviewText(self, fmt: str) -> str:
+        """Full literal content, identical to the selected export; bounded UI rows stay separate."""
+        meeting = self._savable_meeting(fmt)
+        if meeting is None:
+            return ""
+        return render(
+            self._save_template,
+            meeting,
+            self._card_transcript,
+            fmt,
+            speakers=self._display_speakers(),
+            exclude_echo=self._save_exclude_echo,
         )
 
     @pyqtProperty(str, notify=changed)
@@ -1461,6 +1515,7 @@ class MeetingBridge(QObject):
             self._save_preview_open = opened
             self.savePreviewOpenChanged.emit()
             if opened:
+                self.setSaveExcludeEcho(False)
                 self.savePreviewChanged.emit()
 
     def bind_window(self, window: QObject | None) -> None:
@@ -1872,6 +1927,7 @@ class MeetingBridge(QObject):
         self._export_id = meeting.id
         self._export_busy = True  # also guard the system dialog's nested event loop
         serial, template = self._card_serial, self._save_template
+        exclude_echo = self._save_exclude_echo
         name = sanitize_filename(meeting.title, fmt)
         try:
             chosen = self._pick_save_path(str(self._documents_dir() / name), fmt)
@@ -1892,7 +1948,12 @@ class MeetingBridge(QObject):
         # Never derived from «exists after the dialog»: another process may have
         # created the file meanwhile. O_EXCL first, replacing needs the person's «Заменить».
         return self._write_card(
-            meeting, with_extension(Path(chosen), fmt), fmt, template, overwrite=False
+            meeting,
+            with_extension(Path(chosen), fmt),
+            fmt,
+            template,
+            overwrite=False,
+            exclude_echo=exclude_echo,
         )
 
     @pyqtProperty(str, notify=changed)
@@ -1907,14 +1968,16 @@ class MeetingBridge(QObject):
         pending, self._replace_target = self._replace_target, None
         if pending is None:
             return "error"
-        target, fmt, template = pending
+        target, fmt, template, exclude_echo = pending
         meeting = self._savable_meeting(fmt)
         if meeting is None:
             self.changed.emit()
             return "error"
         self._export_id = meeting.id
         self._export_busy = True
-        return self._write_card(meeting, target, fmt, template, overwrite=True)
+        return self._write_card(
+            meeting, target, fmt, template, overwrite=True, exclude_echo=exclude_echo
+        )
 
     @pyqtSlot()
     def cancelReplace(self) -> None:
@@ -1947,7 +2010,14 @@ class MeetingBridge(QObject):
         return meeting
 
     def _write_card(
-        self, meeting: Meeting, target: Path, fmt: str, template: str, *, overwrite: bool
+        self,
+        meeting: Meeting,
+        target: Path,
+        fmt: str,
+        template: str,
+        *,
+        overwrite: bool,
+        exclude_echo: bool = False,
     ) -> str:
         # Plain detached values only: the worker never reads card/bridge state.
         snapshot, transcript = deepcopy(meeting), deepcopy(self._card_transcript)
@@ -1957,7 +2027,14 @@ class MeetingBridge(QObject):
         def work() -> None:
             status = "saved"
             try:
-                text = render(template, snapshot, transcript, fmt, speakers=speakers)
+                text = render(
+                    template,
+                    snapshot,
+                    transcript,
+                    fmt,
+                    speakers=speakers,
+                    exclude_echo=exclude_echo,
+                )
                 write_export(target, text, overwrite=overwrite)
             except ExportExists:
                 status = "exists"
@@ -1965,14 +2042,16 @@ class MeetingBridge(QObject):
                 status = "error"
             finally:
                 try:
-                    emit(_ExportResult(serial, target, fmt, status, template))
+                    emit(_ExportResult(serial, target, fmt, status, template, exclude_echo))
                 except RuntimeError:
                     pass  # QObject already destroyed during application shutdown
 
         try:
             self._export_writer.submit(work)
         except (RuntimeError, queue.Full):
-            self._export_completed(_ExportResult(serial, target, fmt, "error", template))
+            self._export_completed(
+                _ExportResult(serial, target, fmt, "error", template, exclude_echo)
+            )
         return "pending"
 
     @pyqtSlot(object)
@@ -1987,7 +2066,7 @@ class MeetingBridge(QObject):
             return
         target = result.target
         if result.status == "exists":
-            self._replace_target = (target, result.fmt, result.template)
+            self._replace_target = (target, result.fmt, result.template, result.exclude_echo)
         elif result.status == "error":
             self._card_save_error = meeting_card.TEXTS["saveError"]
         else:

@@ -297,17 +297,17 @@ def test_template_examples_and_untrusted_map(template: str, fmt: str) -> None:
     if template == "me_and_others":
         assert "Ирина Соколова" not in text and "Спикер" not in text
         assert "Я" in text and "Собеседники" in text
-        assert "слово1 слово2 слово3" in text
+        assert "слово1 слово2" not in text and all(f"слово{i}" in text for i in (1, 2, 3))
     else:
         assert "Ирина Соколова" in text and "Спикер 3" not in text
     if template == "stenogram":
         assert (
-            "[0:01:00] `Ирина Соколова`: `слово1 слово2`"
+            "[0:01:00] `Ирина Соколова`: `слово1`"
             if fmt == "md"
-            else "[0:01:00] Ирина Соколова: слово1 слово2"
+            else "[0:01:00] Ирина Соколова: слово1"
         ) in text
     if template == "text_only":
-        assert "Участники:" in text and "слово1 слово2" in text
+        assert "Участники:" in text and "слово1 слово2" not in text
         assert "[0:" not in text
     names.labels["me"] = Speaker(merged_into="S1")
     names.labels["S9"] = Speaker(name="GHOST")
