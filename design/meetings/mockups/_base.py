@@ -448,4 +448,4 @@ def page(title, heading, lead, body, nav):
 
 NAV = [('index.html', 'Оглавление'), ('01-section.html', '01 Раздел'), ('02-responsibility.html', '02 Ответственность'),
        ('03-offer.html', '03 Предложение'), ('04-recording.html', '04 Запись'), ('05-meeting-A.html', '05 Карточка'), ('06-meeting-states.html', '06 Состояния'),
-       ('07-templates.html', '07 Шаблоны')]
+       ('07-templates.html', '07 Шаблоны'), ('08-marks.html', '08 Пометки')]
