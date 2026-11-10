@@ -477,3 +477,201 @@ def test_der_collar_overlap_assignment_and_miss() -> None:
     assert der(ref, [(0.0, 4.0, "S1")]) == 50
     assert der(ref, []) == 100
     assert der([(0, 2, "a"), (0, 2, "b")], [(0, 2, "S1")]) == 50
+
+
+def test_measure_breakdown_final_speech_and_provisional_births() -> None:
+    from tools.meeting_diar_check import speaker_breakdown
+
+    speakers, births = speaker_breakdown(
+        [
+            [[0, 700, "S1"], [800, 1300, "S2"]],
+            [[1500, 1600, "S3"], [1600, 2000, "S1"]],
+            [],
+        ],
+        {"S1": "S1", "S2": "S2", "S3": "S1"},
+    )
+    assert speakers == {
+        "S1": {"speech_s": 1.2, "intervals": 3, "first_block": 0},
+        "S2": {"speech_s": 0.5, "intervals": 1, "first_block": 0},
+    }
+    assert [b["new_global_speakers"] for b in births] == [2, 1, 0]
+    assert [b["new_labels"] for b in births] == [["S1", "S2"], ["S3"], []]
+    assert [b["provisional_speakers_total"] for b in births] == [2, 3, 3]
+
+
+def test_measure_json_includes_final_speakers_and_block_births(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    from tools import meeting_diar_check as check
+
+    class FakeRole:
+        peak_rss_kb = 123
+
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def load(self, *args: Any) -> None:
+            pass
+
+        def sample_rss(self) -> None:
+            pass
+
+        def send(self, *args: Any) -> str:
+            return "finish"
+
+        def block(self, audio: Any, index: int, offset: int) -> list[list[Any]]:
+            return (
+                [[0, 400, "S1"], [500, 700, "S2"]]
+                if index == 0
+                else [[1000, 1100, "S3"], [1200, 1400, "S1"]]
+            )
+
+        def wait(self, *args: Any) -> dict[str, Any]:
+            return {"speakers_total": 2, "label_map": {"S1": "S1", "S2": "S2", "S3": "S1"}}
+
+    monkeypatch.setattr(check, "RoleProcess", FakeRole)
+    monkeypatch.setattr(check, "wav_blocks", lambda *args: [np.zeros(16000), np.zeros(16000)])
+    assert (
+        check.main(
+            ["unused.wav", "--models", "/models", "--duration", "2", "--block-s", "1", "--json"]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["speaker_stats"] == {
+        "S1": {"speech_s": 0.7, "intervals": 3, "first_block": 0},
+        "S2": {"speech_s": 0.2, "intervals": 1, "first_block": 0},
+    }
+    assert [block["new_global_speakers"] for block in result["blocks"]] == [2, 1]
+
+
+def six_block_scene(
+    *, short_guest: bool = False, voices: int = 4
+) -> tuple[link.SpeakerLinker, list[list[list[Any]]]]:
+    """Independent brief outliers around one stable voice, plus a repeat guest."""
+    linker = link.SpeakerLinker(link.DIAR_PROFILES["3dspeaker-campplus"])
+    blocks = []
+    for index in range(6):
+        vectors = {}
+        turns = []
+        for speaker in range(voices):
+            vector = np.zeros(16)
+            vector[speaker] = 1
+            vectors[speaker] = link.Centroid(vector, 200)
+            turns.append((speaker * 200000, (speaker + 1) * 200000, speaker))
+        vector = np.zeros(16)
+        vector[0], vector[5 + index] = 0.5, np.sqrt(0.75)
+        vectors[10] = link.Centroid(vector, 0.3)
+        turns.append((1100000, 1100300, 10))
+        if short_guest and index in (1, 4):
+            vector = np.zeros(16)
+            vector[1], vector[12] = 0.3, np.sqrt(0.91)
+            vectors[11] = link.Centroid(vector, 0.3)
+            turns.append((1101000, 1101300, 11))
+        blocks.append(linker.link(turns, vectors, index * 1200000))
+    return linker, blocks
+
+
+def test_six_blocks_short_outliers_do_not_multiply_speakers() -> None:
+    linker, blocks = six_block_scene()
+    mapping, count = linker.finish()
+    assert count == 4
+    assert {mapping[rows[-1][2]] for rows in blocks} == {"S1"}
+    assert mapping == linker.finish()[0]  # consolidation is deterministic and read-only
+
+
+def test_short_distant_guest_repeated_in_two_blocks_survives() -> None:
+    linker, blocks = six_block_scene(short_guest=True)
+    mapping, count = linker.finish()
+    guest = blocks[1][-1][2]
+    assert blocks[4][-1][2] == guest
+    assert mapping[guest] == guest
+    assert count == 5
+    assert guest not in {mapping[row[2]] for row in blocks[0]}
+
+
+def test_support_consolidation_does_not_assume_four_speakers() -> None:
+    linker, _ = six_block_scene(voices=5)
+    assert linker.finish()[1] == 5
+
+
+def test_weak_first_voice_merge_keeps_earlier_number_and_holes() -> None:
+    linker = link.SpeakerLinker(link.DIAR_PROFILES["3dspeaker-campplus"])
+    vectors = {0: link.Centroid([0.5, 0, 0, 0, np.sqrt(0.75)], 0.3)}
+    turns = [(0, 300, 0)]
+    for i in range(4):
+        vector = np.zeros(5)
+        vector[i] = 1
+        vectors[i + 1] = link.Centroid(vector, 200)
+        turns.append((1000 + i * 200000, 201000 + i * 200000, i + 1))
+    rows = linker.link(turns, vectors, 0)
+    assert [row[2] for row in rows] == ["S1", "S2", "S3", "S4", "S5"]
+    mapping, count = linker.finish()
+    assert count == 4
+    assert mapping == {"S1": "S1", "S2": "S1", "S3": "S3", "S4": "S4", "S5": "S5"}
+
+
+def test_short_orthogonal_singleton_is_not_forced_into_known_voice() -> None:
+    linker = link.SpeakerLinker(link.DIAR_PROFILES["3dspeaker-campplus"])
+    vectors = {0: link.Centroid([1, 0], 200), 1: link.Centroid([0, 1], 0.3)}
+    linker.link([(0, 200000, 0), (201000, 201300, 1)], vectors, 0)
+    assert linker.finish() == ({"S1": "S1", "S2": "S2"}, 2)
+
+
+def test_repeat_guest_is_preserved_but_does_not_absorb_uncertain_noise() -> None:
+    linker = link.SpeakerLinker(link.DIAR_PROFILES["3dspeaker-campplus"])
+    for index in range(2):
+        vectors = {
+            0: link.Centroid([1, 0, 0], 200),
+            1: link.Centroid([0.3, np.sqrt(0.91), 0], 0.3),
+        }
+        linker.link([(0, 200000, 0), (201000, 201300, 1)], vectors, index * 1200000)
+    noise = link.Centroid([0.5, 0.4, np.sqrt(0.59)], 0.3)
+    assert link.distance(noise, linker.globals[2]) < link.distance(noise, linker.globals[1])
+    rows = linker.link([(0, 300, 0)], {0: noise}, 2400000)
+    assert rows[0][2] == "S3"
+    assert linker.finish() == ({"S1": "S1", "S2": "S2", "S3": "S1"}, 2)
+
+
+def test_two_intervals_in_one_block_are_not_independent_block_evidence() -> None:
+    linker = link.SpeakerLinker(link.DIAR_PROFILES["3dspeaker-campplus"])
+    linker.link(
+        [(0, 200000, 0), (201000, 201300, 1), (202000, 202300, 1)],
+        {0: link.Centroid([1, 0], 200), 1: link.Centroid([0.5, np.sqrt(0.75)], 0.6)},
+        0,
+    )
+    assert linker.finish() == ({"S1": "S1", "S2": "S1"}, 1)
+
+
+def test_no_supported_voice_means_no_relaxed_merge() -> None:
+    linker = link.SpeakerLinker(link.DIAR_PROFILES["3dspeaker-campplus"])
+    linker.link(
+        [(0, 300, 0), (1000, 1300, 1)],
+        {0: link.Centroid([1, 0], 0.3), 1: link.Centroid([0.5, np.sqrt(0.75)], 0.3)},
+        0,
+    )
+    assert linker.finish() == ({"S1": "S1", "S2": "S2"}, 2)
+
+
+def test_supported_one_block_guest_keeps_ordinary_distance_cut() -> None:
+    profile = link.DIAR_PROFILES["3dspeaker-campplus"]
+    linker = link.SpeakerLinker(profile)
+    duration_ms = round(profile.min_support_s * 1000)
+    linker.link(
+        [(0, 200000, 0), (201000, 201000 + duration_ms, 1)],
+        {
+            0: link.Centroid([1, 0], 200),
+            1: link.Centroid([0.5, np.sqrt(0.75)], profile.min_support_s),
+        },
+        0,
+    )
+    assert linker.finish() == ({"S1": "S1", "S2": "S2"}, 2)

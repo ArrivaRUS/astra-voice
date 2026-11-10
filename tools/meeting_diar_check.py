@@ -324,6 +324,41 @@ def wav_blocks(path: Path, start: float, duration: float | None, block_s: float)
             count -= frames
 
 
+def speaker_breakdown(
+    blocks: Sequence[Sequence[list[Any]]], label_map: dict[str, str]
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Final-label interval sums and provisional births, without voice features.
+
+    speech_s is the sum of interval durations, not elapsed meeting time.
+    Birth counts use the labels BEFORE final consolidation, so a later merge
+    cannot conceal the block in which an extra provisional identity appeared.
+    """
+    speakers: dict[str, dict[str, Any]] = {}
+    births: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, turns in enumerate(blocks):
+        labels = {label for _, _, label in turns}
+        new = sorted(labels - seen, key=lambda label: int(label[1:]))
+        seen.update(labels)
+        births.append(
+            {
+                "new_global_speakers": len(new),
+                "new_labels": new,
+                "provisional_speakers_total": len(seen),
+            }
+        )
+        for start, end, label in turns:
+            canonical = label_map[label]
+            stats = speakers.setdefault(
+                canonical, {"speech_ms": 0, "intervals": 0, "first_block": index}
+            )
+            stats["speech_ms"] += end - start
+            stats["intervals"] += 1
+    for stats in speakers.values():
+        stats["speech_s"] = stats.pop("speech_ms") / 1000
+    return dict(sorted(speakers.items(), key=lambda item: int(item[0][1:]))), births
+
+
 def measure(
     wav: Path,
     models: Path,
@@ -344,13 +379,16 @@ def measure(
         raise ValueError("wav-interval-invalid")
     started = time.monotonic()
     turns: list[list[Any]] = []
+    turn_blocks: list[list[list[Any]]] = []
     blocks = []
     samples = 0
     with RoleProcess(trace=trace) as role:
         role.load(models)
         for index, audio in enumerate(wav_blocks(wav, start, duration, block_s)):
             block_started = time.monotonic()
-            turns.extend(role.block(audio, index, round(samples * 1000 / RATE)))
+            block_turns = role.block(audio, index, round(samples * 1000 / RATE))
+            turn_blocks.append(block_turns)
+            turns.extend(block_turns)
             if len(turns) > MAX_SEGMENTS:
                 raise ValueError("diar-segments-limit")
             samples += len(audio)
@@ -372,8 +410,11 @@ def measure(
     ):
         raise ValueError("diar-final-map-incomplete")
     hypothesis = [(a / 1000, b / 1000, label_map[k]) for a, b, k in turns]
+    speakers, births = speaker_breakdown(turn_blocks, label_map)
+    blocks = [{**block, **birth} for block, birth in zip(blocks, births, strict=True)]
     result = {
         "speakers_total": final["speakers_total"],
+        "speaker_stats": speakers,
         "segments": len(turns),
         "audio_s": samples / RATE,
         "wall_s": time.monotonic() - started,

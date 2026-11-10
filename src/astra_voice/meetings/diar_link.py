@@ -10,7 +10,7 @@ import math
 from collections.abc import Sequence
 from typing import Any, NamedTuple
 
-DIAR_ALGORITHM = "sherpa-pyannote3+3dspeaker-campplus+adaptive-centroid-v1"
+DIAR_ALGORITHM = "sherpa-pyannote3+3dspeaker-campplus+adaptive-centroid-support-v2"
 MAX_BLOCKS = 12
 MAX_SEGMENTS = 28800
 MAX_LOCAL_SPEAKERS = 128  # bounded oversegmentation before the adaptive merge
@@ -18,21 +18,32 @@ MAX_SPEAKERS = 64  # cumulative, including provisional identities subsequently m
 
 
 class Profile(NamedTuple):
-    """Two profile constants, both in the embedder's distance space.
+    """Three calibrated constants; none depends on a target speaker count.
 
-    seed_threshold: sherpa fast-clustering threshold; deliberately oversegments
-    in ONE inference pass. merge_ceiling: largest admissible cosine distance
-    (1-cos) for own centroid merges. The largest absolute gap in the bounded
-    agglomeration distances selects its midpoint, without reference labels.
-    Zero and the ceiling are included: homogeneous speech can become one cluster;
-    two sufficiently different voices need no extra 'minimum speakers' rule.
+    seed_threshold oversegments sherpa in ONE inference pass. merge_ceiling
+    bounds ordinary centroid clustering in cosine distance (1-cos); the largest
+    absolute gap inside [0, ceiling] chooses the data-derived meeting scale.
+    Including both endpoints permits a homogeneous block to have one speaker.
+
+    min_support_s is the speech-duration scale for a one-block voice estimate:
+    very brief clips have less phonetic coverage and noisier centroids. Below
+    this scale, final consolidation linearly relaxes the admissible distance
+    from merge_ceiling toward orthogonality (distance 1). It uses only the
+    nearest supported voice, without contaminating that voice's centroid.
+    Evidence in two distinct blocks independently supports even a brief identity;
+    such voices retain the ordinary meeting cut, but their short estimates do
+    not become targets for relaxed merging. Thus a singleton may lose its
+    separate identity for LESS THAN min_support_s seconds, but a returning
+    distant guest is preserved. This is an uncertainty rule, not a minimum
+    speaking time or a prescribed number of participants.
     """
 
     seed_threshold: float
     merge_ceiling: float
+    min_support_s: float = 8.0
 
 
-DIAR_PROFILES = {"3dspeaker-campplus": Profile(0.5, 0.45)}
+DIAR_PROFILES = {"3dspeaker-campplus": Profile(0.5, 0.45, 8.0)}
 
 
 class LimitError(ValueError):
@@ -180,6 +191,7 @@ class SpeakerLinker:
         self.end_ms = 0
         self.cut = profile.merge_ceiling / 2
         self.cut_weight = 0.0
+        self.observations: dict[int, set[int]] = {}
 
     def link(
         self, turns: Sequence[tuple[int, int, int]], centroids: dict[int, Centroid], offset_ms: int
@@ -242,13 +254,53 @@ class SpeakerLinker:
         output = [[a + offset_ms, b + offset_ms, f"S{local_map[k]}"] for a, b, k in ordered]
         self.globals = updated
         self.cut, self.cut_weight = cut, cut_weight
+        for label in set(local_map.values()):
+            self.observations.setdefault(label, set()).add(self.blocks)
         self.blocks += 1
         self.segments += len(turns)
         self.end_ms = max((b + offset_ms for _, b, _ in turns), default=offset_ms)
         return output
 
     def finish(self) -> tuple[dict[str, str], int]:
+        """Ordinary consolidation, then distance-gated uncertain singletons.
+
+        Anchors are fixed before the second stage: small outliers cannot drag
+        a reliable mean toward themselves or chain through other outliers.
+        No anchor means no relaxed merging. Canonical identities always use
+        the smallest original number; finish does not mutate linking state.
+        """
         keys = list(self.globals)
         groups = merge_at_cut(list(self.globals.values()), self.cut)
-        label_map = {f"S{k}": f"S{keys[g]}" for k, g in zip(keys, groups, strict=True)}
-        return label_map, len(set(groups))
+        centers: dict[int, Centroid] = {}
+        seen: dict[int, set[int]] = {}
+        for key, group in zip(keys, groups, strict=True):
+            canonical = keys[group]
+            center = self.globals[key]
+            centers[canonical] = (
+                centers[canonical].merged(center) if canonical in centers else center
+            )
+            seen.setdefault(canonical, set()).update(self.observations.get(key, set()))
+        support = self.profile.min_support_s
+        anchors = [key for key, center in centers.items() if center.duration >= support]
+        parents = {key: key for key in centers}
+
+        def root(key: int) -> int:
+            while parents[key] != key:
+                key = parents[key]
+            return key
+
+        for key, center in centers.items():
+            if key in anchors or len(seen[key]) >= 2 or not anchors:
+                continue
+            value, nearest = min((distance(center, centers[a]), a) for a in anchors)
+            # A fully supported centroid must obey the ordinary ceiling;
+            # shorter single-block evidence approaches the geometric boundary
+            # between positive similarity and orthogonality, never beyond it.
+            bound = 1 - (1 - self.profile.merge_ceiling) * center.duration / support
+            if value <= bound:
+                first, second = sorted((root(key), root(nearest)))
+                parents[second] = first
+        label_map = {
+            f"S{key}": f"S{root(keys[group])}" for key, group in zip(keys, groups, strict=True)
+        }
+        return label_map, len(set(label_map.values()))
