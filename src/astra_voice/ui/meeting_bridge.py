@@ -1243,7 +1243,7 @@ class MeetingBridge(QObject):
             # The job started over (not a resume): show what it has now.
             builder.load(live, complete=False)
             return
-        builder.extend(live)
+        builder.sync(live)
 
     def _load_transcript(self, meeting: Meeting) -> None:
         self._card_serial += 1

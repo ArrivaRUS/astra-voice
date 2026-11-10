@@ -32,7 +32,7 @@ from uuid import uuid4
 from astra_voice.core.meeting_session import MetadataWriter
 from astra_voice.meetings import MeetingValidationError
 from astra_voice.meetings.events import MeetingState, ProcessingStatus, transition
-from astra_voice.meetings.model import FAILURE_CODES, Meeting, normalize_text
+from astra_voice.meetings.model import FAILURE_CODES, Meeting, normalize_text, utterance_order
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, Writer
 from astra_voice.security.files import private_directory
 
@@ -247,6 +247,11 @@ class _Active:
     total_ms: int = 0
     percent: int = 0
     utterances: dict[int, Message] = field(default_factory=dict)
+    transcript_revision: int = 0
+    replacements: dict[int, Message] = field(default_factory=dict)
+    restoring: bool = False
+    restore_request: str | None = None
+    restore_events: list[Message] = field(default_factory=list)
     released: Callable[[], None] | None = None
 
     @property
@@ -368,6 +373,7 @@ class MeetingJobs:
             "done_ms": active.done_ms,
             "total_ms": active.total_ms,
             "utterances": utterances,
+            "transcript_revision": active.transcript_revision,
         }
 
     def row(self, meeting_id: str, meeting: Meeting | None = None) -> Message:
@@ -1158,7 +1164,8 @@ class MeetingJobs:
             active.start_req, active.job_sent = "", False
             self._retry_load(active, "send")
             return
-        self._send("meeting.job.credit", **self._identity(active), n=INITIAL_CREDITS)
+        if not active.resume:
+            self._send("meeting.job.credit", **self._identity(active), n=INITIAL_CREDITS)
 
     def _send_cancel(self, meeting_id: str) -> None:
         active = self._active
@@ -1328,7 +1335,12 @@ class MeetingJobs:
             return
         if req is not None and req == active.start_req:
             if kind == "meeting.job.accepted":
+                if active.resume and active.restore_request == active.start_req:
+                    return  # replayed accepted must not grant readiness credits twice
                 active.phase = "running"
+                active.transcript_revision = int(event.get("transcript_revision", 0))
+                if active.resume:
+                    self._restore_live(active)
                 self._changed()
             elif kind == "error":
                 self._fail_after_exit(active, "model" if event.get("code") == "model" else "io")
@@ -1338,6 +1350,14 @@ class MeetingJobs:
             or event.get("meeting_generation") != active.generation
         ):
             return  # MJ-14: other meetings and stale generations never publish
+        if active.restoring and kind in {
+            "meeting.job.utterance",
+            "meeting.job.labels",
+            "meeting.job.replace",
+            "meeting.job.done",
+        }:
+            active.restore_events.append(event)
+            return
         if kind == "meeting.job.progress":
             total = int(event.get("total_ms", 0))
             done = int(event.get("done_ms", 0))
@@ -1352,13 +1372,33 @@ class MeetingJobs:
             seq = int(event["seq"])
             active.utterances[seq] = {
                 key: event[key]
-                for key in ("seq", "id", "track", "start_ms", "end_ms", "text", "speaker")
+                for key in (
+                    "seq",
+                    "id",
+                    "track",
+                    "start_ms",
+                    "end_ms",
+                    "text",
+                    "speaker",
+                    "multiple_speakers",
+                )
                 if key in event
             }
             active.received += 1
             if active.received % CREDIT_STEP == 0:
                 self._send("meeting.job.credit", **self._identity(active), n=CREDIT_STEP)
             self._changed()
+        elif kind == "meeting.job.labels":
+            labels = dict(event["items"])
+            for item in active.utterances.values():
+                if item["id"] in labels:
+                    item["speaker"] = labels[item["id"]]
+            active.transcript_revision = max(
+                active.transcript_revision, int(event.get("transcript_revision", 0))
+            )
+            self._changed()
+        elif kind == "meeting.job.replace":
+            self._replace(active, event)
         elif kind == "meeting.job.waiting":
             # Before accepted, memory ends admission as in M4. During the
             # selected diar pipeline the executor owns a bounded retry and
@@ -1373,6 +1413,140 @@ class MeetingJobs:
                 self._fail(active, code)
         elif kind == "meeting.job.done":
             self._done(active, event)
+
+    @staticmethod
+    def _replacement_payload(event: Message) -> Message:
+        return deepcopy({k: event[k] for k in ("seq", "replaces_id", "expected_revision", "items")})
+
+    def _restore_live(self, active: _Active) -> None:
+        """Prepare a validated snapshot off GUI, then grant the readiness credits."""
+        from astra_voice.meetings.model import Transcript
+
+        active.restoring = True
+        active.restore_request = active.start_req
+        active.restore_events = []
+        request, generation = active.start_req, active.generation
+        accepted_revision = active.transcript_revision
+
+        def current() -> bool:
+            return (
+                not self._closed
+                and self._active is active
+                and not active.purpose
+                and active.start_req == request
+                and active.phase == "running"
+            )
+
+        def work() -> Callable[[], None]:
+            try:
+                transcript = self.store.read(active.meeting_id, "transcript.json")
+            except MeetingStoreError:
+                if os.path.lexists(self.store.root / active.meeting_id / "transcript.json"):
+                    raise
+                transcript = None  # a resumed ASR may not have written any text yet
+            rows: dict[int, Message] = {}
+            receipts: dict[int, Message] = {}
+            revision = accepted_revision
+            if isinstance(transcript, Transcript) and transcript.meeting_generation == generation:
+                # store.read already validated the entire document. Per-row
+                # to_dict() would repeat expensive validation 9000 times.
+                rows = {
+                    u.seq: {
+                        "seq": u.seq,
+                        "id": u.id,
+                        "track": u.track,
+                        "start_ms": u.start_ms,
+                        "end_ms": u.end_ms,
+                        "text": u.text,
+                        "speaker": u.speaker,
+                        "multiple_speakers": u.multiple_speakers,
+                    }
+                    for u in transcript.utterances
+                }
+                revision = transcript.transcript_revision
+                pending = transcript.reconcile.pending
+                if pending is not None:
+                    receipts[pending.seq] = {
+                        "seq": pending.seq,
+                        "replaces_id": pending.replaces_id,
+                        "expected_revision": pending.expected_revision,
+                        "items": [
+                            {
+                                "id": u.id,
+                                "track": u.track,
+                                "start_ms": u.start_ms,
+                                "end_ms": u.end_ms,
+                                "text": u.text,
+                                "speaker": u.speaker,
+                                "provisional": True,
+                                "multiple_speakers": u.multiple_speakers,
+                            }
+                            for u in pending.items
+                        ],
+                    }
+
+            def completed() -> None:
+                if not current():
+                    return
+                active.utterances = rows
+                active.transcript_revision = revision
+                active.replacements = receipts
+                active.restoring = False
+                events, active.restore_events = active.restore_events, []
+                for event in events:
+                    self._event(event)
+                # A buffered done/cancel/delete may have retired this job.
+                if current():
+                    self._send("meeting.job.credit", **self._identity(active), n=INITIAL_CREDITS)
+                    self._changed()
+
+            return completed
+
+        def failed() -> None:
+            if current():
+                active.restoring = False
+                active.restore_events = []
+                self._fail_after_exit(active, "io")
+
+        self._run(work, failed=failed)
+
+    def _replace(self, active: _Active, event: Message) -> bool:
+        """Atomic in-memory edit. No GUI transcript writes, including on retry."""
+        payload = self._replacement_payload(event)
+        seq = int(event["seq"])
+        previous = active.replacements.get(seq)
+        if previous is not None:
+            if previous != payload:
+                return False
+        else:
+            if active.transcript_revision != event["expected_revision"]:
+                return False
+            rows = [item for _, item in sorted(active.utterances.items())]
+            positions = [i for i, item in enumerate(rows) if item["id"] == event["replaces_id"]]
+            if len(positions) != 1 or not event["items"]:
+                return False
+            index = positions[0]
+            inserted = [
+                {k: v for k, v in item.items() if k != "provisional"} for item in event["items"]
+            ]
+            rows[index : index + 1] = inserted
+            rows.sort(
+                key=lambda item: utterance_order(item["start_ms"], item["track"], item["end_ms"])
+            )
+            if len({item["id"] for item in rows}) != len(rows):
+                return False
+            updated = {i: {**item, "seq": i} for i, item in enumerate(rows)}
+            active.utterances = updated
+            active.transcript_revision += 1
+            active.replacements[seq] = payload
+            self._changed()
+        self._send(
+            "meeting.job.applied",
+            **self._identity(active),
+            seq=seq,
+            revision=int(event["expected_revision"]) + 1,
+        )
+        return True
 
     def _unload(self) -> None:
         if self._diar_unload_pending:
@@ -1471,7 +1645,7 @@ class MeetingJobs:
         meeting_id = active.meeting_id
         retention = int(self.audio_retention_days())
         load = active.admission.load or {}
-        diar_failed = event.get("diar_status") == "failed"
+        diar_failed = event.get("diar_status") == "failed" or bool(event.get("reconcile_failed"))
         if active.diar_models is not None:
             # A resumed completed diar skips its usual ASR unload. Request an
             # idempotent real unload on every diar completion, even with a queue.

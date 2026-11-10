@@ -154,6 +154,7 @@ def run_job(
     phases: dict[str, float] = {}
     phase, phase_started = "load", time.monotonic()
     blocks = 0
+    initial_utterances = 0
 
     def send(kind: str, **fields: Any) -> list[dict[str, Any]]:
         nonlocal serial
@@ -216,7 +217,15 @@ def run_job(
                         phase, phase_started = current, now
                     blocks = max(blocks, int(event.get("blocks", 0)))
                 elif kind == "meeting.job.utterance":
+                    initial_utterances += 1
                     send("meeting.job.credit", **identity, n=1)
+                elif kind == "meeting.job.replace":
+                    send(
+                        "meeting.job.applied",
+                        **identity,
+                        seq=event["seq"],
+                        revision=event["expected_revision"] + 1,
+                    )
                 elif kind == "meeting.job.failed":
                     raise ValueError("job-" + str(event.get("code")))
                 elif kind == "meeting.job.done":
@@ -238,6 +247,13 @@ def run_job(
             "transcriber_peak_rss_kb": done["peak_rss_kb"],
             "diar_peak_rss_kb": state.diar_peak_rss_kb,
             "fake_asr": fake_asr,
+            "reconcile_candidates": len(transcript.reconcile.done_ids),
+            "reconcile_replaced": len(transcript.reconcile.replaced_ids),
+            "reconcile_marked": sum(u.multiple_speakers for u in transcript.utterances),
+            "used_ms": transcript.reconcile.used_ms,
+            "budget_ms": transcript.reconcile.budget_ms,
+            "reconcile_s": round(phases.get("reconcile", 0), 4),
+            "initial_utterances": initial_utterances,
         }
     finally:
         state.cleanup()
@@ -290,7 +306,10 @@ def main() -> int:
         else f"Реплик: {result['utterances']}; дикторов: {result['speakers']}; "
         f"diar_status={result['diar_status']}; время: {result['wall_s']:.2f} с; "
         f"RSS transcribe/diar: {result['transcriber_peak_rss_kb']}/"
-        f"{result['diar_peak_rss_kb']} КиБ; фазы: {result['phase_s']}"
+        f"{result['diar_peak_rss_kb']} КиБ; фазы: {result['phase_s']}; "
+        f"Д5 кандидаты/замены/пометки: {result['reconcile_candidates']}/"
+        f"{result['reconcile_replaced']}/{result['reconcile_marked']}; "
+        f"бюджет: {result['used_ms']}/{result['budget_ms']} мс; Д5: {result['reconcile_s']} с"
     )
     return 0 if result["diar_status"] == "done" else 1
 

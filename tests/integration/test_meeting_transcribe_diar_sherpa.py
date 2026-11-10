@@ -53,3 +53,13 @@ def test_complete_job_labels_and_real_role_exit(
     assert all(u.speaker.startswith("S") for u in transcript.utterances)
     assert not (store.root / mid / "checkpoint.json").exists()
     assert result["diar_peak_rss_kb"] > 0
+
+    assert result["used_ms"] <= result["budget_ms"]
+    assert 100 * result["budget_ms"] <= 15 * transcript.reconcile.speech_ms
+    assert result["utterances"] >= result["initial_utterances"]
+    assert "reconcile" in result["phase_s"]
+    assert len({u.id for u in transcript.utterances}) == len(transcript.utterances)
+    assert len(transcript.reconcile.done_ids) == len(set(transcript.reconcile.done_ids))
+    if corpus_name == "synth":
+        assert result["reconcile_candidates"] > 0
+        assert result["used_ms"] > 0

@@ -40,6 +40,11 @@ HASH: Schema = {"type": "string", "pattern": r"^[a-f0-9]{64}$"}
 LABEL: Schema = {"type": "string", "pattern": LABEL_PATTERN}
 
 
+def utterance_order(start_ms: int, track: str, end_ms: int) -> tuple[int, int, int]:
+    """Shared ASR/D5 chronology: mic before far on equal starts, then end."""
+    return start_ms, 0 if track == "mic" else 1, end_ms
+
+
 def text_schema(limit: int, minimum: int = 0) -> Schema:
     return {"type": "string", "minLength": minimum, "maxLength": limit}
 
@@ -441,6 +446,7 @@ class Utterance(JsonModel):
     speaker: str = "me"
     final: bool = False
     echo: bool = False
+    multiple_speakers: bool = False
     SCHEMA = obj(
         {
             "id": IDENTIFIER,
@@ -452,8 +458,59 @@ class Utterance(JsonModel):
             "speaker": LABEL,
             "final": BOOL,
             "echo": BOOL,
+            "multiple_speakers": BOOL,
+        },
+        required=["id", "seq", "track", "start_ms", "end_ms", "text", "speaker", "final", "echo"],
+    )
+
+
+@dataclass
+class ReconcileReplacement(JsonModel):
+    seq: int = 0
+    replaces_id: str = "unspecified"
+    expected_revision: int = 0
+    items: list[Utterance] = field(default_factory=list)
+    SCHEMA = obj(
+        {
+            "seq": UINT,
+            "replaces_id": IDENTIFIER,
+            "expected_revision": UINT,
+            "items": array(Utterance.SCHEMA, 24),
         }
     )
+
+
+@dataclass
+class ReconcileProgress(JsonModel):
+    status: PhaseStatus = PhaseStatus.PENDING
+    done_ids: list[str] = field(default_factory=list)
+    used_ms: int = 0
+    budget_ms: int = 0
+    speech_ms: int = 0
+    inflight_id: str | None = None
+    pending: ReconcileReplacement | None = None
+    failed: bool = False
+    replaced_ids: list[str] = field(default_factory=list)
+    SCHEMA = obj(
+        {
+            "status": choices(*PhaseStatus),
+            "done_ids": array(IDENTIFIER, 9000, unique=True),
+            "used_ms": MILLISECONDS,
+            "budget_ms": MILLISECONDS,
+            "speech_ms": MILLISECONDS,
+            "inflight_id": nullable(IDENTIFIER),
+            "pending": nullable(ReconcileReplacement.SCHEMA),
+            "failed": BOOL,
+            "replaced_ids": array(IDENTIFIER, 9000, unique=True),
+        },
+        required=["status", "done_ids", "used_ms", "budget_ms", "speech_ms"],
+    )
+
+    @classmethod
+    def _check(cls, data: dict[str, Any]) -> None:
+        super()._check(data)
+        if data["used_ms"] > data["budget_ms"] or 100 * data["budget_ms"] > 15 * data["speech_ms"]:
+            raise MeetingValidationError("Недопустимый бюджет сверки")
 
 
 @dataclass
@@ -464,6 +521,7 @@ class Transcript(JsonModel):
     transcript_revision: int = 0
     utterances: list[Utterance] = field(default_factory=list)
     labels_final: bool = False
+    reconcile: ReconcileProgress = field(default_factory=ReconcileProgress)
     SCHEMA = obj(
         {
             "schema": VERSION,
@@ -472,7 +530,16 @@ class Transcript(JsonModel):
             "transcript_revision": UINT,
             "utterances": array(Utterance.SCHEMA, 9000),
             "labels_final": BOOL,
-        }
+            "reconcile": ReconcileProgress.SCHEMA,
+        },
+        required=[
+            "schema",
+            "meeting_id",
+            "meeting_generation",
+            "transcript_revision",
+            "utterances",
+            "labels_final",
+        ],
     )
 
     @classmethod
@@ -482,6 +549,21 @@ class Transcript(JsonModel):
         seqs = [u["seq"] for u in data["utterances"]]
         if len(set(ids)) != len(ids) or len(set(seqs)) != len(seqs):
             raise MeetingValidationError("Повтор реплики")
+        progress = data.get("reconcile", {})
+        pending = progress.get("pending")
+        if pending is not None:
+            items = pending["items"]
+            item_ids = {u["id"] for u in items}
+            # Another track can occur between parts in the merged chronology.
+            committed = [u for u in data["utterances"] if u["id"] in item_ids]
+            if (
+                pending["expected_revision"] + 1 != data["transcript_revision"]
+                or pending["seq"] != data["transcript_revision"]
+                or pending["replaces_id"] not in progress["done_ids"]
+                or not items
+                or committed != items
+            ):
+                raise MeetingValidationError("Недопустимая квитанция замены")
 
 
 @dataclass
@@ -547,30 +629,6 @@ class DiarProgress(JsonModel):
             "label_map": mapping(IDENTIFIER),
         }
     )
-
-
-@dataclass
-class ReconcileProgress(JsonModel):
-    status: PhaseStatus = PhaseStatus.PENDING
-    done_ids: list[str] = field(default_factory=list)
-    used_ms: int = 0
-    budget_ms: int = 0
-    speech_ms: int = 0
-    SCHEMA = obj(
-        {
-            "status": choices(*PhaseStatus),
-            "done_ids": array(IDENTIFIER, 9000, unique=True),
-            "used_ms": MILLISECONDS,
-            "budget_ms": MILLISECONDS,
-            "speech_ms": MILLISECONDS,
-        }
-    )
-
-    @classmethod
-    def _check(cls, data: dict[str, Any]) -> None:
-        super()._check(data)
-        if data["used_ms"] > data["budget_ms"] or 100 * data["budget_ms"] > 15 * data["speech_ms"]:
-            raise MeetingValidationError("Недопустимый бюджет сверки")
 
 
 @dataclass

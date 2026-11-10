@@ -600,3 +600,13 @@ def test_empty_self_label_setting_rejects_schema_accepts_t508(label: str) -> Non
         md = templates.render(template, meeting, transcript, "md", tz=MSK)
         assert "[0:00:04] `Я`: ``![x](https://evil) `x``" in md
         assert templates.speaker_label(meeting, "me") == "Я"
+
+
+@pytest.mark.parametrize("template", ["stenogram", "me_and_others", "text_only", "stats"])
+@pytest.mark.parametrize("fmt", ["md", "txt"])
+def test_multiple_speakers_marker_does_not_change_export(template: str, fmt: str) -> None:
+    transcript = fixture_transcript()
+    before = templates.render(template, fixture_meeting(), transcript, fmt, tz=MSK)
+    for u in transcript.utterances:
+        u.multiple_speakers = True
+    assert templates.render(template, fixture_meeting(), transcript, fmt, tz=MSK) == before

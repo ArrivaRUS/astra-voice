@@ -92,6 +92,8 @@ def test_r2_a3_canonical_intervals_are_combined_before_speaker_choice(
             label_map={"S1": "S1", "S2": "S1", "S3": "S3"},
         )
         monkeypatch.setattr(rig.state, "_finish", lambda *args: None)
+        # This test isolates canonical label choice; D5 transport is tested in T-405.
+        monkeypatch.setattr(rig.state, "_apply_replacement", lambda *args: None)
         row = Utterance("u0", track="far", end_ms=1000, text="Текст")
         reader: Any = None  # resume of completed diar never reads PCM
         with disk.writer(MID, Writer.TRANSCRIBE) as owner:

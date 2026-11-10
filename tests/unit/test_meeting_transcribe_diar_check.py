@@ -81,3 +81,7 @@ def test_complete_cli_job_summary_with_scripted_role(
     assert result["diar_peak_rss_kb"] == 1234
     assert result["transcriber_peak_rss_kb"] > 0
     assert {"asr", "diar", "reconcile", "finalize"} <= result["phase_s"].keys()
+
+    assert result["reconcile_candidates"] == result["reconcile_replaced"] == 0
+    assert result["reconcile_marked"] == result["used_ms"] == 0
+    assert result["budget_ms"] > 0 and result["reconcile_s"] >= 0

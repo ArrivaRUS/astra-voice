@@ -303,12 +303,15 @@ def table_marks(meeting: Meeting, utterances: Iterable[Utterance] = ()) -> list[
 
 
 def _same(a: Utterance, b: Utterance) -> bool:
-    return (a.seq, a.start_ms, a.end_ms, a.speaker, a.text) == (
+    return (a.id, a.seq, a.track, a.start_ms, a.end_ms, a.speaker, a.text, a.multiple_speakers) == (
+        b.id,
         b.seq,
+        b.track,
         b.start_ms,
         b.end_ms,
         b.speaker,
         b.text,
+        b.multiple_speakers,
     )
 
 
@@ -342,6 +345,13 @@ class CardRows:
             key: max(1, round(value / 60_000)) if value else 0
             for key, value in self.speaker_ms.items()
         }
+
+    def sync(self, utterances: list[Utterance]) -> None:
+        """Apply a validated complete live snapshot, including atomic D5 edits."""
+        if not self.continues(utterances):
+            self.load(utterances, complete=False)
+        else:
+            self.extend(utterances)
 
     def extend(self, utterances: list[Utterance]) -> None:
         fresh = [item for item in utterances if item.seq > self.last_seq]
@@ -392,6 +402,7 @@ def snapshot_utterances(snapshot: Mapping[str, Any] | None) -> list[Utterance]:
                     end_ms=int(item.get("end_ms", 0)),
                     text=str(item.get("text", "")),
                     speaker=str(item.get("speaker", "others")),
+                    multiple_speakers=bool(item.get("multiple_speakers", False)),
                 )
             )
         except (KeyError, TypeError, ValueError):

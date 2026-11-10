@@ -25,7 +25,11 @@ importlib.import_module(sys.argv[2])
 
 @pytest.mark.parametrize(
     "module",
-    ["astra_voice.meetings.echo_gate", "astra_voice.worker.meeting_transcribe"],
+    [
+        "astra_voice.meetings.echo_gate",
+        "astra_voice.meetings.reconcile",
+        "astra_voice.worker.meeting_transcribe",
+    ],
 )
 def test_module_imports_without_numpy(module: str) -> None:
     result = subprocess.run(

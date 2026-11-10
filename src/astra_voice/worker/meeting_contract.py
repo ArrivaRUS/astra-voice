@@ -73,7 +73,9 @@ UTTERANCE = obj(
         "text": text_schema(32768),
         "speaker": nullable(LABEL),
         "provisional": BOOL,
-    }
+        "multiple_speakers": BOOL,
+    },
+    required=["id", "track", "start_ms", "end_ms", "text", "speaker", "provisional"],
 )
 
 
@@ -382,7 +384,7 @@ EVENT_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
         "meeting.job.utterance": {
             **IDENTITY,
             "seq": UINT,
-            **UTTERANCE["properties"],
+            **{k: v for k, v in UTTERANCE["properties"].items() if k != "multiple_speakers"},
             "provisional": {"type": "boolean", "const": True},
         },
         "meeting.job.labels": {
@@ -450,6 +452,10 @@ OPTIONAL.update(
             ),
         },
         "meeting.job.progress": {"block": UINT, "blocks": UINT},
+        "meeting.job.utterance": {"multiple_speakers": BOOL},
+        "meeting.job.labels": {"transcript_revision": UINT},
+        "meeting.job.accepted": {"transcript_revision": UINT},
+        "meeting.job.done": {"reconcile_failed": BOOL},
     }
 )
 ERROR_CODES = choices(
