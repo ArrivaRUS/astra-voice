@@ -276,7 +276,7 @@ jobs:
           apt-get install -y ./dist/astra-voice_*.deb
           astra-voice --version
           packaging/smoke-installed.sh /
-          python3 -c "import sys; sys.path.insert(0, '/usr/lib/astra-voice/vendor'); import onnxruntime, onnx_asr; print(onnxruntime.__version__)"
+          python3 -c "import sys; sys.path.insert(0, '/usr/lib/astra-voice/vendor'); import onnxruntime, onnx_asr, sherpa_onnx; print(onnxruntime.__version__, sherpa_onnx.__version__)"
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: astra-voice-deb

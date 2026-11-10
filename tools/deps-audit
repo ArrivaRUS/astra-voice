@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Гейт Р3: `Requires-Dist` вендорных колёс ↔ версии в apt и в `Depends` пакета.
 
-Вендорим только `onnxruntime` и `onnx-asr` (`--no-deps`), а их зависимости —
+Вендорим `onnxruntime`, `onnx-asr`, `sherpa-onnx` и `sherpa-onnx-core`
+(`--no-deps`), а их внешние зависимости —
 numpy, protobuf, flatbuffers, sympy, packaging — берём системные, из apt.
 Значит, каждый релиз колеса надо сверять с тем, что реально есть в ALSE:
 если ORT потребует numpy новее, чем 1.24.2 из репозитория, пакет соберётся,
@@ -20,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+from email.parser import Parser
 from pathlib import Path
 
 # Соответствие имён PyPI → пакеты Debian/ALSE. Правится вручную и осознанно.
@@ -39,6 +41,31 @@ _REQ_RE = re.compile(
 _SPEC_RE = re.compile(r"(?P<op>[<>=!~]=?)\s*(?P<version>[0-9][0-9A-Za-z.*+!-]*)")
 
 
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _vendor_pins() -> dict[str, str]:
+    lock = Path(__file__).resolve().parents[1] / "packaging/wheels.lock"
+    return {
+        _norm(name): version
+        for name, version in re.findall(r"^([\w.-]+)==([^\s\\]+)", lock.read_text(), re.MULTILINE)
+    }
+
+
+def _installed_vendor(vendor: Path) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for path in sorted(vendor.glob("*.dist-info/METADATA")):
+        meta = Parser().parsestr(path.read_text(encoding="utf-8"))
+        name, version = meta.get("Name"), meta.get("Version")
+        if name and version:
+            normalized = _norm(name)
+            if normalized in found:
+                raise ValueError(f"{normalized}: дублированные METADATA")
+            found[normalized] = version
+    return found
+
+
 def _requirements(vendor: Path) -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
     for meta in sorted(vendor.glob("*.dist-info/METADATA")):
@@ -51,16 +78,14 @@ def _requirements(vendor: Path) -> list[tuple[str, str, str]]:
             # неактуален: целевая и сборочная — 3.11.
             if "extra ==" in marker or "python_version <" in marker:
                 continue
-            out.append((m.group("name").lower(), (m.group("spec") or "").strip(), marker))
+            out.append((_norm(m.group("name")), (m.group("spec") or "").strip(), marker))
     return out
 
 
 def _apt_version(pkg: str) -> str | None:
     if shutil.which("apt-cache") is None:
         return None
-    proc = subprocess.run(
-        ["apt-cache", "policy", pkg], capture_output=True, text=True, check=False
-    )
+    proc = subprocess.run(["apt-cache", "policy", pkg], capture_output=True, text=True, check=False)
     for line in proc.stdout.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0].endswith(":") and parts[1] not in ("(none)", ""):
@@ -80,9 +105,7 @@ def _satisfies(version: str, spec: str) -> bool | None:
         op, want = m.group("op"), m.group("version")
         if op not in ops or "*" in want:
             continue
-        proc = subprocess.run(
-            ["dpkg", "--compare-versions", version, ops[op], want], check=False
-        )
+        proc = subprocess.run(["dpkg", "--compare-versions", version, ops[op], want], check=False)
         if proc.returncode != 0:
             return False
     return True
@@ -117,12 +140,23 @@ def main(argv: list[str] | None = None) -> int:
 
     depends = _deb_depends(args.deb) if args.deb and args.deb.is_file() else None
     problems: list[str] = []
-    seen: set[str] = set()
+    pins = _vendor_pins()
+    try:
+        installed = _installed_vendor(args.vendor)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    for name, version in pins.items():
+        if installed.get(name) != version:
+            problems.append(f"{name}: METADATA {installed.get(name)!r} ≠ lock {version}")
 
     for name, spec, _marker in _requirements(args.vendor):
-        if name in seen:
+        if name in pins:
+            version = installed.get(name)
+            if version is None or _satisfies(version, spec) is False:
+                problems.append(f"vendor {name} {version} не удовлетворяет {spec}")
+            print(f"  {name}{spec} → vendor {version} (lock {pins[name]})")
             continue
-        seen.add(name)
         deb_name = DEBIAN_NAME.get(name)
         if deb_name is None:
             problems.append(f"{name}: нет соответствия пакету Debian в DEBIAN_NAME")
@@ -138,7 +172,10 @@ def main(argv: list[str] | None = None) -> int:
         if depends is not None and deb_name not in depends:
             ok = False
             problems.append(f"{deb_name} требуется колесом ({name}{spec}), но его нет в Depends")
-        print(f"  {name}{spec or ' (без ограничений)'} → {deb_name} {verdict} {'ok' if ok else 'РАСХОЖДЕНИЕ'}")
+        print(
+            f"  {name}{spec or ' (без ограничений)'} → {deb_name} "
+            f"{verdict} {'ok' if ok else 'РАСХОЖДЕНИЕ'}"
+        )
 
     if problems:
         print("\nрасхождения:", file=sys.stderr)

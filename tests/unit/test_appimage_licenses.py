@@ -83,7 +83,9 @@ def test_collects_all_documents(tree: tuple[Path, Path]) -> None:
     text = (out / "licenses" / "INDEX.txt").read_text("utf-8")
     assert "колесо PyQt5-5.15.11\tlicenses/PyQt5/LICENSE" in text
     # GCC SRPM теперь закреплены как source, устаревшее предупреждение исчезло.
-    assert "# ИСХОДНИКИ НЕ ПРИЛОЖЕНЫ" not in text
+    assert "libquadmath\t" not in text
+    assert "libgfortran\t" not in text
+    assert "alsa-lib\t1.2.12\tLGPL-2.1-or-later" in text
     assert "libquadmath (GCC runtime, numpy.libs)" not in text
 
 

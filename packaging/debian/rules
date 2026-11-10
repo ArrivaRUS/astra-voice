@@ -2,7 +2,7 @@
 # Раскладка пакета — бриф M1 и arch/plan-synth.md §7 (И7):
 #   /usr/lib/astra-voice/bootstrap.py      запускается как `python3 -I bootstrap.py app`
 #   /usr/lib/astra-voice/astra_voice/      код (bootstrap.py лежит РЯДОМ, не внутри)
-#   /usr/lib/astra-voice/vendor/           onnxruntime + onnx_asr (готовит build-deb.sh)
+#   /usr/lib/astra-voice/vendor/           onnxruntime, onnx_asr, sherpa_onnx/core (build-deb.sh)
 #   /usr/share/astra-voice/{qml,data}      ресурсы
 #   /usr/share/astra-voice/docs/           NOTICE и PRIVACY.md для «О программе» (не из
 #                                          /usr/share/doc: Debian Policy 12.3, dh_compress)
@@ -32,6 +32,9 @@ override_dh_auto_test:
 override_dh_auto_install:
 	install -d $(LIBDIR) $(LIBDIR)/vendor $(SHAREDIR) $(DOCDIR) $(PKG)/usr/bin
 	cp -a src/astra_voice $(LIBDIR)/astra_voice
+	if [ -n "$(ASTRA_VOICE_VERSION_FILE)" ]; then \
+		install -m 0644 "$(ASTRA_VOICE_VERSION_FILE)" $(LIBDIR)/astra_voice/_version.py; \
+	fi
 	if [ -f $(LIBDIR)/astra_voice/bootstrap.py ]; then \
 		mv $(LIBDIR)/astra_voice/bootstrap.py $(LIBDIR)/bootstrap.py; \
 	fi
@@ -61,12 +64,20 @@ override_dh_auto_install:
 	install -m 0644 docs/admin/templates/*.md $(DOCDIR)/admin/templates/
 	# Раздел «О программе» открывает свои копии: программа не должна зависеть от
 	# /usr/share/doc (Debian Policy 12.3), а там dh_compress сжал бы файлы в .gz.
+	install -d -m 0755 $(DOCDIR)/licenses $(DOCDIR)/licenses/sherpa-onnx \
+		$(DOCDIR)/licenses/common
+	for f in LICENSE ONNX-Runtime-LICENSE README.txt; do \
+		install -m 0644 packaging/appimage/licenses/sherpa-onnx/$$f \
+			$(DOCDIR)/licenses/sherpa-onnx/$$f; \
+	done
+	install -m 0644 packaging/appimage/licenses/common/LGPL-2.1.txt \
+		$(DOCDIR)/licenses/common/LGPL-2.1.txt
 	install -d $(SHAREDIR)/docs
 	install -m 0644 NOTICE docs/PRIVACY.md $(SHAREDIR)/docs/
 
 # Страховка: документы для людей в /usr/share/doc тоже остаются несжатыми.
 override_dh_compress:
-	dh_compress -XNOTICE -XPRIVACY.md
+	dh_compress -XNOTICE -XPRIVACY.md -Xlicenses
 
 # Каталог staging обязан быть 0700 (T1 M8): dh_fixperms сбрасывает каталоги в 0755,
 # поэтому право ставится после него.
@@ -83,10 +94,11 @@ override_dh_dwz:
 	dh_dwz -Xusr/lib/astra-voice/vendor
 
 # Вендорные .so сканируем НАМЕРЕННО: иначе в Depends не попадёт libc6, и lintian
-# честно ругается `missing-dependency-on-libc`. Приватных DT_NEEDED у них нет
-# (libonnxruntime грузится через dlopen), поэтому dpkg-shlibdeps разрешает всё.
+# честно ругается `missing-dependency-on-libc`. Sherpa имеет приватные DT_NEEDED:
+# явно добавляем оба каталога. Библиотеки внутри того же пакета dpkg-shlibdeps
+# не превращает в системные Depends; ошибки системных зависимостей не подавляем.
 override_dh_shlibdeps:
-	dh_shlibdeps
+	dh_shlibdeps -l$(LIBDIR)/vendor/sherpa_onnx/lib:$(LIBDIR)/vendor/sherpa_onnx.libs
 
 # А вот триггер ldconfig не нужен: библиотеки приватные, вне путей ld.so.
 override_dh_makeshlibs:

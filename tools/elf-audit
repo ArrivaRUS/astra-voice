@@ -4,7 +4,7 @@
 Зачем именно это (arch/spikes/S3.md §1.3, урок сборки Handy):
 
 * **число ELF** — сколько объектов придётся подписывать по ГОСТ в контуре с ЗПС
-  (v1.1). Ожидание жёсткое: 3 с vendor, 0 без него. Любое расхождение — стоп
+  (v1.1). Ожидание жёсткое: 8 с vendor, 0 без него. Любое расхождение — стоп
   сборки, а не предупреждение: лишний `.so` = лишняя позиция в SBOM и в процедуре
   подписи у заказчика;
 * **max GLIBC_** — колесо ORT собрано под manylinux_2_27, а целевая ALSE 1.8 несёт
@@ -15,7 +15,7 @@
     tools/elf-audit --strict dist/astra-voice_*.deb
     tools/elf-audit --strict --expect 0 dist/astra-voice_*.deb   # сборка --no-vendor
     tools/elf-audit /путь/к/каталогу                             # распакованное дерево
-    tools/elf-audit --strict --expect 157 --max-glibc 2.28 AppDir  # AppImage: оба из lock (MN-9)
+    tools/elf-audit --strict --expect 103 --max-glibc 2.36 AppDir  # AppImage: оба из lock (MN-9)
 """
 
 from __future__ import annotations
@@ -31,8 +31,25 @@ from pathlib import Path
 
 #: glibc целевой системы: ALSE 1.8.5 = Debian 12 = glibc 2.36.
 MAX_GLIBC = (2, 36)
-#: Ожидаемое число собственных ELF в пакете (3 `.so` onnxruntime).
-DEFAULT_EXPECT = 3
+#: Точный набор для CPython 3.11 в .deb и AppImage (T-451, E13.M7).
+VENDOR_ELFS = frozenset(
+    {
+        "onnxruntime/capi/libonnxruntime.so.1.24.4",
+        "onnxruntime/capi/libonnxruntime_providers_shared.so",
+        "onnxruntime/capi/onnxruntime_pybind11_state.cpython-311-x86_64-linux-gnu.so",
+        "sherpa_onnx/lib/_sherpa_onnx.cpython-311-x86_64-linux-gnu.so",
+        "sherpa_onnx/lib/libonnxruntime.so",
+        "sherpa_onnx/lib/libsherpa-onnx-c-api.so",
+        "sherpa_onnx/lib/libsherpa-onnx-cxx-api.so",
+        "sherpa_onnx.libs/libasound-fb5348bf.so.2.0.0",
+    }
+)
+DEFAULT_EXPECT = len(VENDOR_ELFS)
+DEB_VENDOR = Path("usr/lib/astra-voice/vendor")
+APPIMAGE_SITE = Path("opt/python3.11/lib/python3.11/site-packages")
+_PROVIDER_RE = re.compile(
+    r"libonnxruntime_providers_(?:cuda|tensorrt|azure)\.so(?:\..*)?", re.IGNORECASE
+)
 
 _GLIBC_RE = re.compile(r"GLIBC_(\d+)\.(\d+)(?:\.(\d+))?")
 _ISOC23_RE = re.compile(r"__isoc23_\w+")
@@ -44,6 +61,9 @@ class Elf:
     size: int
     max_glibc: tuple[int, ...]
     isoc23: list[str]
+    rpaths: list[str]
+    executable_stack: bool
+    has_gnu_stack: bool
 
 
 def _glibc_version(raw: str) -> tuple[int, ...]:
@@ -61,15 +81,29 @@ def _is_elf(path: Path) -> bool:
 
 
 def _audit_one(path: Path, rel: str) -> Elf:
-    out = subprocess.run(
-        ["objdump", "-T", str(path)], capture_output=True, text=True, check=False
+    out = subprocess.run(["objdump", "-T", str(path)], capture_output=True, text=True, check=False)
+    if out.returncode:
+        raise ValueError(f"{rel}: objdump: {out.stderr.strip()}")
+    dynamic = subprocess.run(
+        ["readelf", "-dW", str(path)], capture_output=True, text=True, check=True
     ).stdout
-    versions = [tuple(int(g) for g in m.groups() if g) for m in _GLIBC_RE.finditer(out)]
+    headers = subprocess.run(
+        ["readelf", "-lW", str(path)], capture_output=True, text=True, check=True
+    ).stdout
+    versions = [tuple(int(g) for g in m.groups() if g) for m in _GLIBC_RE.finditer(out.stdout)]
+    stack_flags = [line.split()[-2] for line in headers.splitlines() if "GNU_STACK" in line]
     return Elf(
         path=rel,
         size=path.stat().st_size,
         max_glibc=max(versions) if versions else (0,),
-        isoc23=sorted(set(_ISOC23_RE.findall(out))),
+        isoc23=sorted(set(_ISOC23_RE.findall(out.stdout))),
+        rpaths=[
+            entry
+            for value in re.findall(r"\((?:RPATH|RUNPATH)\).*?\[(.*?)\]", dynamic)
+            for entry in value.split(":")
+        ],
+        executable_stack=any("E" in flags for flags in stack_flags),
+        has_gnu_stack=bool(stack_flags),
     )
 
 
@@ -79,6 +113,67 @@ def _collect(root: Path) -> list[Elf]:
         if path.is_file() and not path.is_symlink() and _is_elf(path):
             found.append(_audit_one(path, "/" + str(path.relative_to(root))))
     return found
+
+
+def _manifest_problems(root: Path, elves: list[Elf], expect: int) -> list[str]:
+    site = APPIMAGE_SITE if (root / APPIMAGE_SITE).is_dir() else DEB_VENDOR
+    # Generic trees may audit other ELF (e.g. runtime); package layouts always use names.
+    if not (root / site).is_dir() and expect != DEFAULT_EXPECT:
+        return []
+    prefix = "/" + site.as_posix() + "/"
+    actual = {elf.path.removeprefix(prefix) for elf in elves if elf.path.startswith(prefix)}
+    if site == APPIMAGE_SITE:
+        actual = {
+            p
+            for p in actual
+            if p.split("/")[0] in {"onnxruntime", "sherpa_onnx", "sherpa_onnx.libs"}
+        }
+    wanted = VENDOR_ELFS if expect != 0 else frozenset()
+    return [f"отсутствует ELF: {p}" for p in sorted(wanted - actual)] + [
+        f"лишний ELF: {p}" for p in sorted(actual - wanted)
+    ]
+
+
+def _vendor_directory(root: Path) -> Path:
+    for directory in (APPIMAGE_SITE, DEB_VENDOR):
+        if (root / directory).is_dir():
+            return root / directory
+    # Standalone extracted wheels, as used by the five-ELF audit.
+    return root
+
+
+def _safe_rpath(root: Path, elf: Elf, entry: str) -> bool:
+    match = re.fullmatch(r"\$(?:ORIGIN|\{ORIGIN\})(?P<suffix>/[^:$]*)?", entry)
+    if match is None:
+        return False
+    root = root.resolve()
+    path = root / elf.path.lstrip("/")
+    boundary = _vendor_directory(root)
+    if not path.is_relative_to(boundary):
+        boundary = root  # Non-vendor ELF in AppDir, e.g. the interpreter.
+    try:
+        expanded = (path.parent / (match.group("suffix") or "").lstrip("/")).resolve()
+        return expanded.is_relative_to(boundary)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _symlink_problems(root: Path) -> list[str]:
+    boundary = _vendor_directory(root.resolve())
+    problems: list[str] = []
+    for path in sorted(boundary.rglob("*")):
+        if not path.is_symlink():
+            continue
+        try:
+            target = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            problems.append(f"ссылка {path.relative_to(boundary)}: цель не разрешается: {exc}")
+            continue
+        if not target.is_relative_to(boundary):
+            problems.append(f"ссылка {path.relative_to(boundary)}: цель вне vendor: {target}")
+        elif target.relative_to(boundary).as_posix() not in VENDOR_ELFS:
+            problems.append(f"ссылка {path.relative_to(boundary)}: цель не входит в список ELF")
+    return problems
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -97,8 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.target.exists():
         print(f"нет такого файла: {args.target}", file=sys.stderr)
         return 2
-    if shutil.which("objdump") is None:
-        print("нужен objdump (пакет binutils)", file=sys.stderr)
+    if any(shutil.which(tool) is None for tool in ("objdump", "readelf")):
+        print("нужны objdump и readelf (пакет binutils)", file=sys.stderr)
         return 2
 
     tmp: tempfile.TemporaryDirectory[str] | None = None
@@ -111,6 +206,21 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         elves = _collect(root)
+        manifest_problems = _manifest_problems(root, elves, args.expect)
+        symlink_problems = _symlink_problems(root)
+        rpath_problems = [
+            f"{elf.path}: RPATH/RUNPATH вне vendor или с недопустимой подстановкой: {elf.rpaths}"
+            for elf in elves
+            if any(not _safe_rpath(root, elf, p) for p in elf.rpaths)
+        ]
+        cpu_problems = [
+            f"не CPU provider: {p.relative_to(root)}"
+            for p in root.rglob("*")
+            if _PROVIDER_RE.fullmatch(p.name)
+        ]
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f"ошибка аудита ELF: {exc}", file=sys.stderr)
+        return 2
     finally:
         if tmp is not None:
             tmp.cleanup()
@@ -118,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     max_glibc: tuple[int, ...] = args.max_glibc
     limit = ".".join(str(p) for p in max_glibc)
     print(f"ELF найдено: {len(elves)} (ожидалось {args.expect}), GLIBC не новее {limit}")
-    problems: list[str] = []
+    problems: list[str] = manifest_problems + cpu_problems + symlink_problems + rpath_problems
     for elf in elves:
         glibc = ".".join(str(p) for p in elf.max_glibc)
         mark = "ok"
@@ -128,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
         if elf.isoc23:
             problems.append(f"{elf.path}: {len(elf.isoc23)} символов __isoc23_*")
             mark = "isoc23"
+        if not elf.has_gnu_stack:
+            problems.append(f"{elf.path}: нет PT_GNU_STACK")
+        if elf.executable_stack:
+            problems.append(f"{elf.path}: исполняемый стек")
         print(f"  {elf.path}  {elf.size:>10} Б  max GLIBC_{glibc}  {mark}")
 
     if len(elves) != args.expect:

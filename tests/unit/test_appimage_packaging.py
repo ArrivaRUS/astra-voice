@@ -106,7 +106,7 @@ def test_engine_pins_match_deb_lock() -> None:
     deb = (ROOT / "packaging" / "wheels.lock").read_text(encoding="utf-8")
     deb_pins = {req.name: req for req in lockfile.parse(_deb_lock_as_appimage(deb)).requirements}
     for req in lockfile.load(LOCK).requirements:
-        if req.name in ("onnxruntime", "onnx-asr"):
+        if req.name in ("onnxruntime", "onnx-asr", "sherpa-onnx", "sherpa-onnx-core"):
             assert deb_pins[req.name].version == req.version
             assert set(req.hashes) <= set(deb_pins[req.name].hashes)
 

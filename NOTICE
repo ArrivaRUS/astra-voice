@@ -47,6 +47,26 @@ onnx-asr 0.12.0 — MIT
     vendor/patches/onnx-asr-cancellable.patch (прерывание распознавания
     по запросу пользователя). Остальной код не менялся.
 
+sherpa-onnx и sherpa-onnx-core 1.13.8 — Apache-2.0
+    Правообладатели: k2-fsa, участники проекта sherpa-onnx.
+    https://github.com/k2-fsa/sherpa-onnx
+    Два колеса: Python binding и библиотеки C/C++ API; всего пять ELF.
+    Вложенный ONNX Runtime 1.28.2 (версия из строки бинаря
+    sherpa_onnx/lib/libonnxruntime.so) — MIT, Copyright (c) Microsoft Corporation.
+    Это отдельная библиотека, помимо onnxruntime 1.24.4, указанной выше.
+    sherpa_onnx.libs/libasound-fb5348bf.so.2.0.0 — alsa-lib
+    (строка версии 1.2.12), LGPL-2.1-or-later, участники проекта ALSA,
+    https://www.alsa-project.org/ ; https://github.com/alsa-project/alsa-lib.
+    Полный текст LGPL-2.1: usr/share/doc/astra-voice/licenses/common/LGPL-2.1.txt;
+    Apache-2.0 и MIT: usr/share/doc/astra-voice/licenses/sherpa-onnx/.
+    Библиотеку libasound можно заменить совместимой своей сборкой в
+    /usr/lib/astra-voice/vendor/sherpa_onnx.libs/; в AppImage — распаковать
+    образ ключом --appimage-extract и заменить файл в site-packages/sherpa_onnx.libs/.
+    Соответствующие исходники именно этой сборки libasound пока не приложены:
+    открытый пункт sherpa-libasound в packaging/appimage.lock и в SBOM AppImage.
+    Для вложенного ORT core-колесо не содержит ThirdPartyNotices; получение
+    уведомлений этой сборки остаётся открытым пунктом (licenses/sherpa-onnx/README.txt).
+
 Каталог /usr/share/astra-voice/data:
 
 Silero VAD v6.2.1 — MIT
@@ -243,6 +263,11 @@ onnx-asr 0.12.0 — MIT
     https://github.com/istupakov/onnx-asr
     (с тем же патчем, что в .deb)
 
+sherpa-onnx и sherpa-onnx-core 1.13.8 — Apache-2.0
+    Те же колёса и пять ELF, что в разделе 1: вложенные ONNX Runtime 1.28.2
+    (MIT) и alsa-lib (LGPL-2.1-or-later). Уведомления, замена libasound и
+    открытые пункты по исходникам/ThirdPartyNotices описаны в разделе 1.
+
 python-xlib 0.33 — LGPL-2.1-or-later
     Copyright (c) 2000-2013 Peter Liljenberg и участники проекта
     https://github.com/python-xlib/python-xlib
@@ -303,7 +328,7 @@ type2-runtime (выпуск 20251108) — начальная часть файл
 указанного репозитория Hugging Face (или с корпоративного зеркала), либо ставит
 из локального файла или папки. Лицензия каждой
 модели записана во встроенном каталоге моделей и показывается на её карточке.
-Ниже — все 12 моделей каталога с закреплёнными ревизиями.
+Ниже — модели распознавания с закреплёнными ревизиями и модели разделения.
 
 4.1. GigaAM (Сбер) — MIT
 
@@ -379,6 +404,14 @@ https://huggingface.co/ai-sage/GigaAM-v3 (карточка: license: mit).
         ревизия fb6753736c56de3259d78a26a488548c84b9dccb); используется
         CTC-декодер. Astra Voice веса не изменяет.
 
+4.6. Модели разделения по говорящим (скачиваются пользователем отдельно)
+
+    pyannote-segmentation-3.0 — MIT (pyannote).
+        https://huggingface.co/pyannote/segmentation-3.0
+    3D-Speaker CAM++ — Apache-2.0 (3D-Speaker, Alibaba).
+        https://github.com/modelscope/3D-Speaker
+    Веса не входят ни в .deb, ни в AppImage.
+
 ================================================================================
 5. Шрифты
 ================================================================================
@@ -404,10 +437,6 @@ PT Mono (fonts-pt-mono) — ParaType Free Font Licensing Agreement
 6. Что не используется
 ================================================================================
 
-sherpa-onnx (Apache-2.0, k2-fsa) — не используется: адаптер SherpaEngine не
-включён, программа работает только через onnx-asr (спайк S3). Условие
-Apache-2.0 §4(d) к поставке не применяется.
-
 silero-models (CC BY-NC-SA) — не используется; из проекта Silero берётся только
 Silero VAD (MIT, раздел 1).
 
@@ -420,11 +449,13 @@ Silero VAD (MIT, раздел 1).
 точная ревизия указана в README.txt и MANIFEST.txt внутри этого архива.
 
 Исходные тексты сторонних компонентов под GPL и LGPL (PyQt5, Qt, python-xlib,
-библиотеки GCC) — по ссылкам проектов выше; для пакетов раздела 2 — в
+библиотеки GCC, alsa-lib) — по ссылкам проектов выше; для пакетов раздела 2 — в
 репозиториях исходных текстов Astra Linux. Закреплённые исходники компонентов
 AppImage входят в архив исходников, сопровождающий образ; перечень и sha256 —
 в packaging/appimage.lock. CPython из раздела 3.1 соответствует исходному
 пакету Debian 12 python3.11 версии 3.11.2-6+deb12u8.
+Исключение: соответствующие исходники вложенной libasound пока не приложены
+(pending-source sherpa-libasound); получение — открытый пункт перед выпуском.
 Системные библиотеки раздела 3.2 не включены в AppImage: их исходные пакеты
 предоставляет дистрибутив операционной системы пользователя.
 

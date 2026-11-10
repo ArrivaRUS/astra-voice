@@ -18,6 +18,38 @@ Copyright: Ilya Stupakov
 License: MIT
 Comment: Вендорируется колесом onnx-asr 0.12.0, см. packaging/wheels.lock.
 
+Files: usr/lib/astra-voice/vendor/sherpa_onnx/*
+       usr/lib/astra-voice/vendor/sherpa_onnx-*.dist-info/*
+       usr/lib/astra-voice/vendor/sherpa_onnx_core-*.dist-info/*
+Copyright: k2-fsa and sherpa-onnx contributors
+License: Apache-2.0
+Comment: Два колеса 1.13.8; пины в packaging/wheels.lock.
+
+Files: usr/lib/astra-voice/vendor/sherpa_onnx/lib/libonnxruntime.so
+Copyright: Microsoft Corporation
+License: MIT
+Comment: ONNX Runtime 1.28.2 (строка версии бинаря); собственный ORT sherpa-onnx-core.
+ Уведомления ThirdPartyNotices этой сборки пока не приложены, см. NOTICE.
+
+Files: usr/lib/astra-voice/vendor/sherpa_onnx.libs/*
+Copyright: ALSA project contributors
+License: LGPL-2.1-or-later
+Comment: alsa-lib, строка версии 1.2.12; заменяемая приватная shared library.
+ Соответствующие исходники сборки пока не приложены, см. NOTICE.
+
+License: Apache-2.0
+ On Debian systems, the full text of the Apache License version 2.0
+ can be found in `/usr/share/common-licenses/Apache-2.0'.
+
+License: LGPL-2.1-or-later
+ This library is free software; you can redistribute it and/or modify it
+ under the terms of the GNU Lesser General Public License as published by
+ the Free Software Foundation; either version 2.1 of the License, or
+ (at your option) any later version.
+ .
+ The full text is in /usr/share/doc/astra-voice/licenses/common/LGPL-2.1.txt
+ and, on Debian systems, /usr/share/common-licenses/LGPL-2.1.
+
 License: GPL-3.0-or-later
  This program is free software: you can redistribute it and/or modify it
  under the terms of the GNU General Public License as published by the Free

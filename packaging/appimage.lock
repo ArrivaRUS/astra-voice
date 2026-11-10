@@ -18,7 +18,8 @@
 # Гейт tools/elf-audit (T1 MN-9, У112): новый ELF из обновлённого колеса или символ glibc новее
 # закреплённого роняет сборку. Меняются только осознанно, вместе с колесом или базой.
 # Порог glibc 2.36 — для гибрида (R3.1: ALSE 1.8 = Debian 12 = glibc 2.36; 1.7 не обещаем).
-# expect-elf: 98
+# expect-elf: 103
+# E13.M7: прежние 98 + 5 ELF sherpa-onnx/core, поимённо в tools/elf-audit.
 # max-glibc: 2.36
 #
 # Манифест внешних зависимостей (R3.2): SONAME с хоста, в образ НЕ кладутся (origin=host,
@@ -203,3 +204,15 @@ onnxruntime==1.24.4 \
     --hash=sha256:e54ad52e61d2d4618dcff8fa1480ac66b24ee2eab73331322db1049f11ccf330
 onnx-asr==0.12.0 \
     --hash=sha256:5e7ceca454609819ea7833f61e2302e0c8f6ece4f8a78b66c5daba53cb51de4a
+
+# sherpa-onnx/core: те же пины, что в .deb (AppImage использует cp311).
+
+sherpa-onnx==1.13.8 \
+    --hash=sha256:94fd1476b56ed36b851da8db9bd5144e92f669007ad54e0d8094913e4fbf1418 \
+    --hash=sha256:6949773017647febc0c3696dffb2c67dd3febd4737b87e3dd135a42773704a06
+sherpa-onnx-core==1.13.8 \
+    --hash=sha256:4da90acf435373d7b2ba9cc0be806e7e274d28f63f5780880b5dea6721626e36
+
+# libasound из sherpa-onnx: версия 1.2.12 наблюдается в strings бинаря.
+# Соответствующий исходник сборки auditwheel пока не получен (сети нет).
+# pending-source: {"id":"sherpa-libasound","component":"alsa-lib","version":"1.2.12","license":"LGPL-2.1-or-later","match":"libasound-fb5348bf.so.2.0.0","note":"Соответствующие исходники вложенной libasound не приложены; нужны источник и рецепт сборки sherpa-onnx 1.13.8."}
