@@ -185,7 +185,9 @@ def test_done_card_rows_hide_echo_and_empty_and_turn_placeholders_into_marks(
     ]
     assert card["badge"] == {"text": "Готово", "kind": "success", "icon": "check"}
     assert card["subtitle"]["mono"] == "0:30:00"
-    assert card["participants"] == [
+    assert [
+        {key: row[key] for key in ("kind", "label", "minutes")} for row in card["participants"]
+    ] == [
         {"kind": "me", "label": "Я", "minutes": "1 мин"},
         {"kind": "others", "label": "Собеседники", "minutes": "1 мин"},
     ]

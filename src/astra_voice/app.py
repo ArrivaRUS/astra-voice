@@ -833,6 +833,7 @@ def _bind_meeting_recording(
         # (or any other failure here) leaves meetings unavailable, never the program
         # (dictation keeps working) and never a bound capture without its overlay.
         from astra_voice.core.meeting_jobs import MeetingJobs, probe_gigaam_model
+        from astra_voice.meetings.diar_models import enabled_diar_models
         from astra_voice.ui.meeting_notice import MeetingNotice
         from astra_voice.ui.meeting_notifications import MeetingNotifications, job_notifier
         from astra_voice.ui.meeting_overlay import MeetingOverlay
@@ -853,6 +854,7 @@ def _bind_meeting_recording(
             audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
             meeting_retention_days=lambda: int(bridge.settings["meeting_retention_days"]),
             notify=job_notifier(),
+            diar_models=lambda: enabled_diar_models(bridge._stored, bridge._parsed),
             # The catalog's min_ram_mb is known before initialize() -> recover().
             model_probe=(_meeting_model_probe(model) if model is not None else probe_gigaam_model),
         )
@@ -2130,6 +2132,7 @@ def main(argv: list[str] | None = None) -> int:
         if meeting_bridge is not None:
             QQmlEngine.setObjectOwnership(meeting_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "meetingBridge", meeting_bridge)
+            meeting_bridge.bind_window(_root_window(shell))
             settings_bridge.offlineChanged.connect(meeting_bridge.changed.emit)
             _bind_meeting_recording(
                 meeting_bridge,

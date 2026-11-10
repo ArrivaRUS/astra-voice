@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
+from itertools import chain
 from typing import Any
 
 from PyQt5.QtCore import (
@@ -24,16 +25,22 @@ from PyQt5.QtCore import (
 )
 
 from astra_voice.meetings.events import MeetingState
-from astra_voice.meetings.model import Meeting, Transcript, Utterance
+from astra_voice.meetings.model import Meeting, SpeakerMap, Transcript, Utterance
+from astra_voice.meetings.speakers import (
+    canonical_speaker,
+    speaker_map,
+    speaker_number,
+    validated_map,
+)
 from astra_voice.meetings.templates import (
     DAMAGED_LABEL,
     DAMAGED_TEXT,
-    OTHERS_LABEL,
     PLACEHOLDERS,
     MarkInfo,
     clock,
     from_placeholder,
     meeting_marks,
+    minutes_from_totals,
     speaker_label,
     statistics,
     template_rows,
@@ -118,11 +125,16 @@ def _accessible_name(at: str, text: str, who: str | None = None) -> str:
     return f"{at}, {who}: {text}" if who is not None else f"{at}, {text}"
 
 
-def save_preview(template: str, meeting: Meeting, transcript: Transcript | None) -> dict[str, Any]:
+def save_preview(
+    template: str,
+    meeting: Meeting,
+    transcript: Transcript | None,
+    speakers: SpeakerMap | None = None,
+) -> dict[str, Any]:
     """Bounded, format-independent view of the same structures used by render."""
     utterances = visible_utterances(transcript)
     if template == "stats":
-        data = statistics(meeting, utterances, limit=8)
+        data = statistics(meeting, utterances, limit=8, speakers=speakers)
         summary = [
             {"text": TEXTS["previewDuration"], "mono": False},
             {"text": data.duration, "mono": True},
@@ -157,6 +169,7 @@ def save_preview(template: str, meeting: Meeting, transcript: Transcript | None)
         meeting,
         utterances,
         meeting_marks(meeting, utterances),
+        speakers=speakers,
         limit=limit + 1,
         text_limit=600 if paragraphs else 240,
     )
@@ -217,7 +230,11 @@ class TranscriptRows(QAbstractListModel):
             return None
         offset = role - Qt.UserRole - 1
         if 0 <= offset < len(ROLES):
-            return self._rows[index.row()].get(ROLES[offset], "")
+            key = ROLES[offset]
+            row = self._rows[index.row()]
+            if key == "accessibleName" and row.get("kind") == "utterance":
+                return _accessible_name(row["time"].strip("[]"), row["text"], row["who"])
+            return row.get(key, "")
         return None
 
     @pyqtProperty(int, notify=countChanged)
@@ -226,16 +243,39 @@ class TranscriptRows(QAbstractListModel):
 
     @pyqtSlot(int, result="QVariantMap")
     def get(self, row: int) -> dict[str, str]:
-        return dict(self._rows[row]) if 0 <= row < len(self._rows) else {}
+        if not 0 <= row < len(self._rows):
+            return {}
+        result = dict(self._rows[row])
+        if result.get("kind") == "utterance":
+            result["accessibleName"] = _accessible_name(
+                result["time"].strip("[]"), result["text"], result["who"]
+            )
+        return result
 
     def rows(self) -> list[dict[str, str]]:
-        return list(self._rows)
+        return [self.get(index) for index in range(len(self._rows))]
 
     def reset(self, rows: Iterable[dict[str, str]] = ()) -> None:
         self.beginResetModel()
         self._rows = list(rows)
         self.endResetModel()
         self.countChanged.emit()
+
+    def relabel(self, indices: list[int], who: str, number: str) -> None:
+        """Only label roles change; keep reply identity, order and text untouched."""
+        roles = [Qt.UserRole + 1 + ROLES.index(key) for key in ("who", "num", "accessibleName")]
+        start = previous = -1
+        for index in indices:
+            row = self._rows[index]
+            row["who"], row["num"] = who, number
+            if start >= 0 and index != previous + 1:
+                self.dataChanged.emit(self.index(start), self.index(previous), roles)
+                start = -1
+            if start < 0:
+                start = index
+            previous = index
+        if start >= 0:
+            self.dataChanged.emit(self.index(start), self.index(previous), roles)
 
     def append(self, rows: list[dict[str, str]]) -> None:
         if not rows:
@@ -261,7 +301,9 @@ def mark_row(mark: MarkInfo) -> dict[str, str]:
     }
 
 
-def utterance_row(meeting: Meeting, item: Utterance) -> dict[str, str]:
+def utterance_row(
+    meeting: Meeting, item: Utterance, speakers: SpeakerMap | None = None
+) -> dict[str, str]:
     at = clock(item.start_ms)
     if item.text in PLACEHOLDERS:
         text = item.text
@@ -277,13 +319,13 @@ def utterance_row(meeting: Meeting, item: Utterance) -> dict[str, str]:
             "icon": "alert",
             "accessibleName": _accessible_name(at, text),
         }
-    who = speaker_label(meeting, item.speaker)
+    who = speaker_label(meeting, item.speaker, speakers)
     return {
         "kind": "utterance",
         "time": f"[{at}]",
         "who": who,
         "whoKind": "me" if item.speaker == "me" else "others",
-        "num": "",
+        "num": str(speaker_number(item.speaker, speakers) or ""),
         "text": item.text,
         "icon": "",
         "accessibleName": _accessible_name(at, item.text, who),
@@ -320,6 +362,7 @@ class CardRows:
 
     def __init__(self, meeting: Meeting, model: TranscriptRows) -> None:
         self.meeting = meeting
+        self.speakers: SpeakerMap | None = None
         self.model = model
         self.last_seq = -1
         self._reset_stats()
@@ -332,19 +375,34 @@ class CardRows:
         self.placeholders: list[Utterance] = []
         self.speech = 0
         self.speaker_ms: dict[str, int] = {}
+        self.speaker_rows: dict[str, list[int]] = {}
+        self.first_utterances: dict[str, Utterance] = {}
 
     def load(self, utterances: list[Utterance], *, complete: bool) -> None:
+        if self.speakers is not None:
+            self.speakers = speaker_map(utterances, self.speakers)
         self._marks = table_marks(self.meeting, utterances)
         self._reset_stats()
         self.last_seq = -1
         self.model.reset(self._rows(utterances, complete=complete))
 
+    def rename(self, speakers: SpeakerMap, label: str) -> None:
+        self.speakers = speakers
+        groups = [
+            rows
+            for source, rows in self.speaker_rows.items()
+            if canonical_speaker(source, speakers) == label
+        ]
+        indices = groups[0] if len(groups) == 1 else sorted(chain.from_iterable(groups))
+        self.model.relabel(
+            indices,
+            speaker_label(self.meeting, label, speakers),
+            str(speaker_number(label, speakers) or ""),
+        )
+
     def minutes(self) -> dict[str, int]:
         """Whole minutes each speaker talked (≥ 1 when they said anything)."""
-        return {
-            key: max(1, round(value / 60_000)) if value else 0
-            for key, value in self.speaker_ms.items()
-        }
+        return minutes_from_totals(self.speaker_ms, self.speakers)
 
     def sync(self, utterances: list[Utterance]) -> None:
         """Apply a validated complete live snapshot, including atomic D5 edits."""
@@ -370,10 +428,17 @@ class CardRows:
 
     def _rows(self, utterances: list[Utterance], *, complete: bool) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
+        offset = self.model.rowCount()
+        # load() resets the model only after constructing its new rows.
+        if not self.utterances:
+            offset = 0
         for item in utterances:
             while self._marks and (self._marks[0].at_ms or 0) <= item.start_ms:
                 rows.append(mark_row(self._marks.pop(0)))
-            rows.append(utterance_row(self.meeting, item))
+            if item.text not in PLACEHOLDERS:
+                self.speaker_rows.setdefault(item.speaker, []).append(offset + len(rows))
+                self.first_utterances.setdefault(item.speaker, item)
+            rows.append(utterance_row(self.meeting, item, self.speakers))
             self.utterances.append(item)
             if item.text in PLACEHOLDERS:
                 self.placeholders.append(item)
@@ -581,24 +646,105 @@ def view_of(meeting: Meeting, *, loaded: bool, rows: int) -> str:
 
 
 def participants(
-    meeting: Meeting, minutes: Mapping[str, int], *, live: bool
-) -> list[dict[str, str]]:
-    """Panel/strip entries of M4: «Я» and «Собеседники» (no names before M7, BL-3)."""
-    rows = [
-        {
-            "kind": "me",
-            "label": meeting.self_label,
-            # 05 §3: «Я» — дорожка микрофона, минуты известны и во время расшифровки.
-            "minutes": f"{minutes.get('me', 0)} мин",
-        }
-    ]
-    if meeting.variant != "mic_only":
+    meeting: Meeting,
+    minutes: Mapping[str, int],
+    *,
+    live: bool,
+    speakers: SpeakerMap | None = None,
+    utterances: Sequence[Utterance] = (),
+    editable: bool = False,
+    first_utterances: Mapping[str, Utterance] | None = None,
+) -> list[dict[str, Any]]:
+    """One panel/strip contract, with stable canonical numbers and first reply cues."""
+    known = (
+        first_utterances.keys()
+        if first_utterances is not None
+        else (u.speaker for u in utterances)
+        if utterances
+        else minutes.keys()
+    )
+    speakers = validated_map(known, speakers) if speakers is not None else None
+    diar = (
+        meeting.transcription.diarization and meeting.transcription.diar_status != "failed"
+    ) or any(speaker_number(key) for key in minutes)
+    rows: list[dict[str, Any]] = []
+    if not (diar and meeting.variant == "mic_only"):
+        rows.append(
+            {
+                "kind": "me",
+                "id": "me",
+                "num": "",
+                "label": speaker_label(meeting, "me"),
+                "name": "",
+                "minutes": f"{minutes.get('me', 0)} мин",
+                "canEdit": False,
+                "canMerge": False,
+                "mergeCandidates": [],
+                "firstText": "",
+                "firstStartMs": None,
+            }
+        )
+    if not diar:
+        if meeting.variant == "mic_only":
+            rows = []
         others = sum(value for key, value in minutes.items() if key != "me")
         rows.append(
             {
                 "kind": "others",
-                "label": OTHERS_LABEL,
-                "minutes": "—" if live else f"{others} мин",
+                "id": "others",
+                "num": "",
+                "label": speaker_label(meeting, "others"),
+                "name": "",
+                "minutes": "—"
+                if live
+                else f"{sum(minutes.values()) if meeting.variant == 'mic_only' else others} мин",
+                "canEdit": False,
+                "canMerge": False,
+                "mergeCandidates": [],
+                "firstText": "",
+                "firstStartMs": None,
+            }
+        )
+        return rows
+    labels = set(minutes) | (set(speakers.labels) if speakers else set())
+    labels = {canonical_speaker(label, speakers) for label in labels if speaker_number(label)}
+    ordered = sorted(labels, key=lambda label: speaker_number(label) or 0)
+    firsts: dict[str, Utterance] = {}
+    first_source = (
+        sorted(first_utterances.values(), key=lambda u: (u.start_ms, u.seq))
+        if first_utterances is not None
+        else utterances
+    )
+    for row in first_source:
+        if row.text not in PLACEHOLDERS and row.text.strip():
+            firsts.setdefault(canonical_speaker(row.speaker, speakers), row)
+    for label in ordered:
+        first = firsts.get(label)
+        rows.append(
+            {
+                "kind": "speaker",
+                "id": label,
+                "num": str(speaker_number(label)),
+                "label": speaker_label(meeting, label, speakers),
+                "name": (speakers.labels[label].name or "")
+                if speakers and label in speakers.labels
+                else "",
+                "minutes": "—" if live else f"{minutes.get(label, 0)} мин",
+                "firstText": first.text[:160] if first else "",
+                "firstStartMs": first.start_ms if first else None,
+                "canEdit": editable,
+                "canMerge": editable and len(ordered) > 1,
+                "mergeCandidates": [
+                    {
+                        "id": target,
+                        "num": str(speaker_number(target)),
+                        "label": speaker_label(meeting, target, speakers),
+                    }
+                    for target in ordered
+                    if target != label
+                ]
+                if editable
+                else [],
             }
         )
     return rows
@@ -616,6 +762,8 @@ def presentation(
     snapshot: Mapping[str, Any] | None,
     deleting: bool = False,
     rename_allowed: bool = True,
+    names_editable: bool = False,
+    models_missing: bool = False,
 ) -> dict[str, Any]:
     # Marks alone are not speech: a done meeting without replies is «empty» (06).
     speech = rows.speech if rows is not None else 0
@@ -664,7 +812,37 @@ def presentation(
         "percent": percent,
         "progressDone": clock(done),
         "progressTotal": clock(total),
-        "participants": participants(meeting, rows.minutes() if rows else {}, live=live),
+        "participants": participants(
+            meeting,
+            rows.minutes() if rows else {},
+            live=live,
+            speakers=rows.speakers if rows else None,
+            utterances=rows.utterances if rows else (),
+            editable=names_editable,
+            first_utterances=rows.first_utterances if rows else None,
+        ),
+        "namesEditable": names_editable,
+        "namesHint": TEXTS["namesLater"] if live else "Имена действуют только в этой встрече.",
+        "speakerState": (
+            "transcribing"
+            if live
+            else "policy-off"
+            if policy_off
+            else "no-diarization"
+            if not meeting.transcription.diarization
+            or meeting.transcription.diar_status == "failed"
+            else "room"
+            if meeting.variant == "mic_only"
+            else "ready"
+        ),
+        "diarizationFailed": meeting.transcription.diar_status == "failed",
+        "diarizationModelsMissing": models_missing and not meeting.transcription.diarization,
+        "diarizationHint": "Разделение по голосам: модели не установлены"
+        if models_missing and not meeting.transcription.diarization
+        else "",
+        "diarizationAction": "Установить"
+        if models_missing and not meeting.transcription.diarization
+        else "",
         "live": live,
         "policyOff": policy_off and table,
         "panel": panel(meeting, view, can_transcribe=can_transcribe, failure=failure),

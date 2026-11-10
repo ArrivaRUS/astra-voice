@@ -274,7 +274,13 @@ class MeetingWriter:
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
 
-    def write(self, filename: str, document: JsonModel | PreparedDocument) -> None:
+    def write(
+        self,
+        filename: str,
+        document: JsonModel | PreparedDocument,
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
         try:
             if not self._active:
                 raise MeetingStoreError("Писатель встречи закрыт")
@@ -295,11 +301,31 @@ class MeetingWriter:
                     resources.enter_context(_lease(self._directory, Writer.TRANSCRIBE))
                 resources.enter_context(_lock(self._directory, ".store.lock"))
                 try:
-                    self._publish(prepared)
+                    self._publish(prepared, expected_generation=expected_generation)
                 except BaseException:
                     if isinstance(prepared.document, Transcript):
                         self._transcript_known = False  # disk state unknown: re-read
                     raise
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось сохранить данные встречи") from None
+
+    def reset_speakers(self, generation: int) -> None:
+        """GUI-only reset before admitting a new diar job; never races a live writer."""
+        try:
+            if not self._active or self._role != Writer.GUI:
+                raise MeetingStoreError("Неверный писатель файла встречи")
+            with contextlib.ExitStack() as resources:
+                resources.enter_context(_lease(self._directory, Writer.DIAR))
+                resources.enter_context(_lease(self._directory, Writer.TRANSCRIBE))
+                resources.enter_context(_lock(self._directory, ".store.lock"))
+                meeting = _metadata(self._directory, self._meeting_id)
+                if (
+                    meeting.state != MeetingState.TRANSCRIBING
+                    or meeting.cancelled
+                    or meeting.meeting_generation != generation
+                ):
+                    raise MeetingStoreError("Встреча недоступна для обработки")
+                self._persist("speakers.json", _encode(SpeakerMap().to_dict()))
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
 
@@ -360,9 +386,13 @@ class MeetingWriter:
             self._load_transcript()
         return self._transcript
 
-    def _publish(self, prepared: PreparedDocument) -> None:
+    def _publish(
+        self, prepared: PreparedDocument, *, expected_generation: int | None = None
+    ) -> None:
         filename, document, data = prepared.filename, prepared.document, prepared.data
         meeting = _metadata(self._directory, self._meeting_id)
+        if expected_generation is not None and meeting.meeting_generation != expected_generation:
+            raise MeetingStoreError("Не совпадает поколение встречи")
         if meeting.state == MeetingState.DELETING:
             raise MeetingStoreError("Встреча удаляется")
         if meeting.cancelled and filename != "meeting.json":
@@ -805,6 +835,14 @@ class MeetingStore:
             finally:
                 writer._active = False
 
-    def write(self, meeting_id: str, filename: str, document: JsonModel, *, writer: Writer) -> None:
+    def write(
+        self,
+        meeting_id: str,
+        filename: str,
+        document: JsonModel,
+        *,
+        writer: Writer,
+        expected_generation: int | None = None,
+    ) -> None:
         with self.writer(meeting_id, writer) as owner:
-            owner.write(filename, document)
+            owner.write(filename, document, expected_generation=expected_generation)

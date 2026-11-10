@@ -10,31 +10,40 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from PyQt5.QtCore import QObject, Qt, QTimer, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, pyqtProperty, pyqtSignal, pyqtSlot
 
 from astra_voice.core.diagnostics import endpoint_class
 from astra_voice.core.meeting_session import MetadataWriter
 from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.core.settings import save as settings_save
+from astra_voice.meetings import speakers as speaker_ops
 from astra_voice.meetings.apps import AppClass, AppDataError, AppDefinition, load_apps
-from astra_voice.meetings.events import MeetingState, PolicyCode
-from astra_voice.meetings.model import Meeting, Transcript, normalize_self_label, normalize_text
+from astra_voice.meetings.diar_models import installed_diar_models
+from astra_voice.meetings.events import MeetingState, PhaseStatus, PolicyCode
+from astra_voice.meetings.model import (
+    Meeting,
+    SpeakerMap,
+    Transcript,
+    normalize_self_label,
+    normalize_text,
+)
 from astra_voice.meetings.policy import RecordMode, parse_policy, validate_endpoint
 from astra_voice.meetings.settings_ext import (
     MEETING_DEFAULTS,
     EffectiveMeetingSettings,
     effective_settings,
 )
-from astra_voice.meetings.store import MeetingStore
+from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.meetings.templates import (
     TEMPLATES,
     ExportExists,
@@ -186,6 +195,21 @@ class _ExportResult:
     template: str
 
 
+@dataclass
+class _SpeakerGroup:
+    failed: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass(frozen=True)
+class _SpeakerWrite:
+    meeting_id: str
+    generation: int
+    speakers: SpeakerMap
+    group: _SpeakerGroup
+    code: str
+    text: str
+
+
 class MeetingBridge(QObject):
     changed = pyqtSignal()
     enabledChanged = pyqtSignal(bool)
@@ -204,6 +228,10 @@ class MeetingBridge(QObject):
     # QML bindings run before ordinary slots of the same signal: «card» is notified by
     # its own signal, emitted after the cache is dropped (a stale cache never reaches QML).
     cardChanged = pyqtSignal()
+    speakerOperationChanged = pyqtSignal()
+    savePreviewOpenChanged = pyqtSignal()
+    speakerOperationFinished = pyqtSignal(str)
+    diarizationInstallRequested = pyqtSignal()
     overlayKeyboardRequested = pyqtSignal()
     noticeKeyboardRequested = pyqtSignal()
     exitConfirmed = pyqtSignal()
@@ -223,9 +251,27 @@ class MeetingBridge(QObject):
         pick_save_path: Callable[[str, str], str | None] = _pick_save_path,
         documents_dir: Callable[[], Path] = _documents_dir,
         open_folder: Callable[[str], bool] = _open_folder,
+        diar_models_provider: Callable[[], tuple[str, str] | None] = installed_diar_models,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        self._diar_models_provider = diar_models_provider
+        self._speakers = SpeakerMap()
+        self._saved_speakers = SpeakerMap()
+        self._speaker_group = _SpeakerGroup()
+        self._speaker_commands: deque[tuple[str, int, str, str, str]] = deque()
+        self._speaker_busy = False
+        self._speaker_closing = False
+        self._speaker_pending = 0
+        self._speaker_writes: deque[_SpeakerWrite] = deque()
+        self._speaker_writer = MetadataWriter()
+        self._speaker_results: queue.SimpleQueue[tuple[_SpeakerWrite, bool]] = queue.SimpleQueue()
+        self._speaker_timer = QTimer(self)
+        self._speaker_timer.setInterval(10)
+        self._speaker_timer.timeout.connect(self._speaker_poll)
+        self._save_preview_open = False
+        self._speakers_error = False
+        self._speaker_operation: dict[str, Any] = {"ok": False, "code": "", "text": ""}
         self._pick_save_path, self._documents_dir = pick_save_path, documents_dir
         self._open_folder = open_folder
         self._stored, self._mirror, self._save = stored, mirror, save
@@ -662,6 +708,12 @@ class MeetingBridge(QObject):
         self.changed.emit()
 
     def shutdown(self) -> None:
+        self._speaker_closing = True
+        if not self.flushSpeakerWrites():
+            self._speaker_closing = False
+            raise RuntimeError("meeting-speaker-save-timeout")
+        self._speaker_writer.close(timeout=0.0)
+        self._speaker_timer.stop()
         # No notices about our own exit; W3 first, then the ordinary stop with
         # finalization (W2 still shows «Сохраняю запись…»), then W2.
         for name in ("_meeting_notifications", "_meeting_notice"):
@@ -1047,6 +1099,8 @@ class MeetingBridge(QObject):
         meeting = next((row for row in self._documents if row.id == meeting_id), None)
         if self._closed or meeting is None or meeting.state not in CARD_STATES:
             return
+        if self._card_id and not self.flushSpeakerWrites():
+            return
         self._save_template = TEMPLATES[0]
         self._card_id = meeting_id
         self._card_key = None
@@ -1073,6 +1127,13 @@ class MeetingBridge(QObject):
     def closeMeeting(self) -> None:
         if not self._card_id:
             return
+        self._speaker_closing = True
+        if not self.flushSpeakerWrites():
+            self._speaker_closing = False
+            return
+        if self._save_preview_open:
+            self._save_preview_open = False
+            self.savePreviewOpenChanged.emit()
         self._card_id = ""
         self._card_key = None
         self._card_builder = None
@@ -1082,6 +1143,7 @@ class MeetingBridge(QObject):
         self._card_serial += 1  # late reads of the closed card are dropped
         self._card_rows.reset()
         self._card_timer.stop()
+        self._speaker_closing = False
         self.savePreviewChanged.emit()
         self.changed.emit()
 
@@ -1122,7 +1184,9 @@ class MeetingBridge(QObject):
         meeting = self._savable_meeting("txt")
         if meeting is None:
             return {}
-        return meeting_card.save_preview(self._save_template, meeting, self._card_transcript)
+        return meeting_card.save_preview(
+            self._save_template, meeting, self._card_transcript, self._display_speakers()
+        )
 
     @pyqtProperty(str, notify=changed)
     def cardSaveError(self) -> str:
@@ -1177,6 +1241,9 @@ class MeetingBridge(QObject):
             policy_off=self.sectionState == "policy-off",
             failure=failure,
             snapshot=self._card_progress if meeting.state == MeetingState.TRANSCRIBING else None,
+            names_editable=self._names_editable(),
+            models_missing=self._effective().settings.meeting_diarization
+            and self._diar_models_provider() is None,
             rename_allowed=RENAME_ACTION in self._row(meeting)["actions"],
             deleting=meeting.id in self._delete_pending
             or (jobs is not None and meeting.id in jobs.tombstones),
@@ -1216,6 +1283,8 @@ class MeetingBridge(QObject):
             self._card_rows.reset()
             self._card_loaded = self._card_error = False
             self._card_transcript = None
+            self._speakers = SpeakerMap()
+            self._speakers_error = False
             self._card_progress = self._progress(meeting)
             if meeting.state in {MeetingState.DONE, MeetingState.TRANSCRIBING}:
                 self._load_transcript(meeting)
@@ -1294,9 +1363,11 @@ class MeetingBridge(QObject):
             return
         self._card_transcript = transcript
         self._card_loaded, self._card_error = True, failed
+        self._read_speakers(meeting)
         utterances = visible_utterances(transcript)
         done = meeting.state == MeetingState.DONE
         tail, self._card_tail = self._card_tail, False
+        self._card_builder.speakers = self._display_speakers()
         if tail and done and not failed and self._card_builder.continues(utterances):
             self._card_builder.finish(utterances)
         else:
@@ -1306,6 +1377,333 @@ class MeetingBridge(QObject):
         self.savePreviewChanged.emit()
         self.changed.emit()
         self._flush_card_save()
+
+    def _published_names(self) -> bool:
+        meeting, transcript = self._card_meeting(), self._card_transcript
+        jobs = self._jobs()
+        return bool(
+            meeting is not None
+            and meeting.state == MeetingState.DONE
+            and meeting.transcription.diarization
+            and meeting.transcription.diar_status == "done"
+            and self._card_loaded
+            and not self._card_error
+            and not self._card_tail
+            and transcript is not None
+            and transcript.labels_final
+            and transcript.meeting_generation == meeting.meeting_generation
+            and transcript.reconcile.status == PhaseStatus.DONE
+            and transcript.reconcile.pending is None
+            and transcript.reconcile.inflight_id is None
+            and (jobs is None or not jobs.names_busy(meeting.id))
+        )
+
+    def _display_speakers(self) -> SpeakerMap | None:
+        return self._speakers if self._published_names() and not self._speakers_error else None
+
+    def _read_speakers(self, meeting: Meeting) -> None:
+        saved: SpeakerMap | None = None
+        reader = getattr(self._store, "read", None)
+        if reader is not None and meeting.state == MeetingState.DONE:
+            try:
+                value = reader(meeting.id, "speakers.json")
+                saved = value if isinstance(value, SpeakerMap) else None
+            except Exception:
+                pass  # Corrupt/unreadable optional names are ignored, never repaired on read.
+        rows = self._card_transcript.utterances if self._card_transcript is not None else ()
+        self._speakers = speaker_ops.speaker_map(rows, saved)
+        self._saved_speakers = deepcopy(self._speakers)
+        self._speaker_group = _SpeakerGroup()
+        self._speakers_error = False
+
+    def _names_editable(self) -> bool:
+        meeting = self._card_meeting()
+        return bool(
+            not self._closed
+            and not self._speaker_closing
+            and self._published_names()
+            and not self._speakers_error
+            and self._parsed.recording_allowed
+            and meeting is not None
+            and not meeting.cancelled
+            and meeting.id not in self._delete_pending
+            and (self._jobs() is None or meeting.id not in self._jobs().tombstones)
+        )
+
+    @pyqtProperty("QVariantMap", notify=speakerOperationChanged)
+    def speakerOperation(self) -> dict[str, Any]:
+        return dict(self._speaker_operation)
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def speakerTexts(self) -> dict[str, str]:
+        return {
+            "placeholder": "Как подписать",
+            "merge": "Это один человек…",
+            "mergeSuffix": " — это…",
+            "mergeCaption": (
+                "Выберите, кто это на самом деле. Реплики получат одну подпись, "
+                "статистика пересчитается."
+            ),
+            "irreversible": "Разделить обратно будет нельзя",
+            "cancel": "Отмена",
+            "confirm": "Объединить",
+            "namesNote": "Имена действуют только в этой встрече.",
+            "namesLater": meeting_card.TEXTS["namesLater"],
+        }
+
+    @pyqtProperty(bool, notify=savePreviewOpenChanged)
+    def savePreviewOpen(self) -> bool:
+        return self._save_preview_open
+
+    @savePreviewOpen.setter  # type: ignore[no-redef]
+    def savePreviewOpen(self, opened: bool) -> None:
+        if self._save_preview_open != opened:
+            self._save_preview_open = opened
+            self.savePreviewOpenChanged.emit()
+            if opened:
+                self.savePreviewChanged.emit()
+
+    def bind_window(self, window: QObject | None) -> None:
+        """Drain accepted names before a settings window closes or hides to tray."""
+        if isinstance(window, QObject):
+            window.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Close and not self.flushSpeakerWrites():
+            event.ignore()
+            return True
+        return bool(super().eventFilter(watched, event))
+
+    def _speaker_result(self, ok: bool, code: str, text: str = "") -> bool:
+        self._speaker_operation = {"ok": ok, "code": code, "text": text}
+        self.speakerOperationChanged.emit()
+        if code != "pending":
+            self.speakerOperationFinished.emit(code)
+        return ok
+
+    def _apply_speakers(self, updated: SpeakerMap) -> None:
+        """Optimistic view/rollback; normal renames never reset the reply model."""
+        previous = self._speakers
+        self._speakers = updated
+        builder = self._card_builder
+        if builder is None:
+            return
+        merged = any(
+            previous.labels.get(label) is None
+            or previous.labels[label].merged_into != record.merged_into
+            for label, record in updated.labels.items()
+        )
+        if merged:
+            builder.speakers = updated
+            builder.load(list(builder.utterances), complete=True)
+            self._card_cache = None
+        else:
+            changed = {
+                label
+                for label, record in updated.labels.items()
+                if previous.labels.get(label) != record
+            }
+            for label in changed:
+                builder.rename(updated, label)
+            builder.speakers = updated
+            if self._card_cache is not None:
+                participants = []
+                for row in self._card_cache["participants"]:
+                    patch = dict(row) if row["id"] in changed else row
+                    if row["id"] in changed:
+                        patch["label"] = speaker_ops.speaker_label(
+                            builder.meeting, row["id"], updated
+                        )
+                        patch["name"] = updated.labels[row["id"]].name or ""
+                    if any(c["id"] in changed for c in row["mergeCandidates"]):
+                        patch = dict(patch)
+                        patch["mergeCandidates"] = [
+                            {
+                                **c,
+                                "label": speaker_ops.speaker_label(
+                                    builder.meeting, c["id"], updated
+                                ),
+                            }
+                            if c["id"] in changed
+                            else c
+                            for c in row["mergeCandidates"]
+                        ]
+                    participants.append(patch)
+                self._card_cache = {**self._card_cache, "participants": participants}
+        self.cardChanged.emit()
+        if self._save_preview_open:
+            self.savePreviewChanged.emit()
+
+    def _save_speakers(self, updated: SpeakerMap, code: str, text: str) -> bool:
+        meeting = self._card_meeting()
+        assert meeting is not None
+        write = _SpeakerWrite(
+            meeting.id, meeting.meeting_generation, updated, self._speaker_group, code, text
+        )
+        if self._speaker_pending >= 64:
+            return self._speaker_result(
+                False, "save-error", "Не удалось сохранить имена участников"
+            )
+        self._speaker_writes.append(write)
+        self._speaker_pending += 1
+        self._apply_speakers(updated)
+        self._speaker_result(True, "pending")
+        self._speaker_timer.start()
+        return True
+
+    def _submit_speaker_writes(self) -> None:
+        # Start filesystem work at the next GUI turn, outside the typing slot.
+        store, output = self._store, self._speaker_results
+        while self._speaker_writes:
+            write = self._speaker_writes.popleft()
+
+            def work(write: _SpeakerWrite = write) -> None:
+                ok = False
+                if not write.group.failed.is_set():
+                    try:
+                        write_file = getattr(store, "write", None)
+                        if write_file is None:
+                            raise RuntimeError("meeting-writer-unavailable")
+                        write_file(
+                            write.meeting_id,
+                            "speakers.json",
+                            write.speakers,
+                            writer=Writer.GUI,
+                            expected_generation=write.generation,
+                        )
+                        ok = True
+                    except Exception:
+                        write.group.failed.set()
+                output.put((write, ok))
+
+            try:
+                self._speaker_writer.submit(work)
+            except (RuntimeError, queue.Full):
+                write.group.failed.set()
+                output.put((write, False))
+
+    def _execute_speaker(self, command: tuple[str, int, str, str, str]) -> bool:
+        meeting_id, generation, kind, source, value = command
+        meeting = self._card_meeting()
+        if (
+            not self._names_editable()
+            or meeting is None
+            or meeting.id != meeting_id
+            or meeting.meeting_generation != generation
+        ):
+            return self._speaker_result(False, "unavailable", "Имена сейчас недоступны")
+        try:
+            updated = (
+                speaker_ops.rename(self._speakers, source, value)
+                if kind == "rename"
+                else speaker_ops.merge(self._speakers, source, value)
+            )
+        except ValueError:
+            return self._speaker_result(
+                False,
+                "invalid-name" if kind == "rename" else "invalid-merge",
+                "Проверьте имя участника: до 60 символов, без переводов строк"
+                if kind == "rename"
+                else "Нельзя объединить этих участников",
+            )
+        text = (
+            (
+                f"Спикер {speaker_ops.speaker_number(source)} объединён с «"
+                + speaker_ops.speaker_label(meeting, value, updated)
+                + "» · статистика пересчитана"
+            )
+            if kind == "merge"
+            else ""
+        )
+        return self._save_speakers(updated, "renamed" if kind == "rename" else "merged", text)
+
+    def _drain_speaker_commands(self) -> bool:
+        self._speaker_busy = True
+        results = []
+        try:
+            while self._speaker_commands:
+                results.append(self._execute_speaker(self._speaker_commands.popleft()))
+        finally:
+            self._speaker_busy = False
+        return results[0] if results else True
+
+    def _speaker_command(self, kind: str, source: str, value: str) -> bool:
+        meeting = self._card_meeting()
+        self._speaker_commands.append(
+            (self._card_id, meeting.meeting_generation if meeting else -1, kind, source, value)
+        )
+        if self._speaker_busy:
+            return True  # Queued, not executed recursively; terminal result comes later.
+        return self._drain_speaker_commands()
+
+    @pyqtSlot(str, str, result=bool)
+    def renameSpeaker(self, label: str, name: str) -> bool:
+        return self._speaker_command("rename", label, name)
+
+    @pyqtSlot(str, str, result=bool)
+    def mergeSpeakers(self, source: str, target: str) -> bool:
+        return self._speaker_command("merge", source, target)
+
+    def _speaker_poll(self) -> None:
+        if self._speaker_busy:
+            return
+        self._submit_speaker_writes()
+        self._speaker_busy = True
+        try:
+            while True:
+                try:
+                    write, ok = self._speaker_results.get_nowait()
+                except queue.Empty:
+                    break
+                self._speaker_pending -= 1
+                meeting = self._card_meeting()
+                current = (
+                    meeting is not None
+                    and meeting.id == write.meeting_id
+                    and meeting.meeting_generation == write.generation
+                    and self._published_names()
+                )
+                if current and ok:
+                    self._saved_speakers = write.speakers
+                elif current and write.group is self._speaker_group:
+                    self._speaker_group = _SpeakerGroup()
+                    self._apply_speakers(self._saved_speakers)
+                self._speaker_result(
+                    ok,
+                    write.code if ok else "save-error",
+                    write.text if ok else "Не удалось сохранить имена участников",
+                )
+        finally:
+            self._speaker_busy = False
+        if self._speaker_commands:
+            self._drain_speaker_commands()
+        if not self._speaker_pending:
+            self._speaker_timer.stop()
+
+    @pyqtSlot(result=bool)
+    def flushSpeakerWrites(self) -> bool:
+        """Bounded close barrier; failure keeps the card/window open."""
+        if self._speaker_busy:
+            return False
+        deadline = time.monotonic() + 2.0
+        while True:
+            self._submit_speaker_writes()
+            if not self._speaker_writer.close(timeout=max(0, deadline - time.monotonic())):
+                self._speaker_result(False, "save-error", "Не удалось сохранить имена участников")
+                return False
+            self._speaker_writer = MetadataWriter()
+            self._speaker_poll()
+            if not self._speaker_pending and not self._speaker_commands:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+
+    @pyqtSlot()
+    def requestDiarizationInstall(self) -> None:
+        if self._closed or self._card_meeting() is None:
+            return
+        if self._effective().settings.meeting_diarization and self._diar_models_provider() is None:
+            self.diarizationInstallRequested.emit()
 
     @pyqtSlot()
     def retryCard(self) -> None:
@@ -1553,12 +1951,13 @@ class MeetingBridge(QObject):
     ) -> str:
         # Plain detached values only: the worker never reads card/bridge state.
         snapshot, transcript = deepcopy(meeting), deepcopy(self._card_transcript)
+        speakers = deepcopy(self._display_speakers())
         serial, emit = self._card_serial, self._exportCompleted.emit
 
         def work() -> None:
             status = "saved"
             try:
-                text = render(template, snapshot, transcript, fmt)
+                text = render(template, snapshot, transcript, fmt, speakers=speakers)
                 write_export(target, text, overwrite=overwrite)
             except ExportExists:
                 status = "exists"

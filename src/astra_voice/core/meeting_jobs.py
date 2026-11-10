@@ -339,6 +339,14 @@ class MeetingJobs:
     def active_id(self) -> str:
         return self._active.meeting_id if self._active is not None else ""
 
+    def names_busy(self, meeting_id: str) -> bool:
+        """No edits while this meeting is admitted, queued or active."""
+        return (
+            self.active_id == meeting_id
+            or meeting_id in self.queued_ids
+            or self._admitting == meeting_id
+        )
+
     @property
     def queued_ids(self) -> list[str]:
         return [entry.meeting_id for entry in self._queue]
@@ -993,12 +1001,19 @@ class MeetingJobs:
                 self._to(meeting, target)
                 if outcome == "start":
                     meeting.processing_status = ProcessingStatus.RUNNING
+                    meeting.transcription.diarization = diar_models is not None
+                    meeting.transcription.diar_status = "pending" if diar_models else "skipped"
                 elif outcome == "failed":
                     meeting.processing_status = ProcessingStatus.FAILED
                     meeting.transcription.failure = "model"
                 return True
 
             updated = self._update(meeting_id, mutate, require_change=True)
+            if updated is not None and outcome == "start" and diar_models is not None:
+                # Only the GUI role owns speakers.json. Reset before the role can
+                # start publishing a new set of labels (also after crash/cancel).
+                with self.store.writer(meeting_id, Writer.GUI) as writer:
+                    writer.reset_speakers(updated.meeting_generation)
 
             def completed() -> None:
                 self._admitting = ""

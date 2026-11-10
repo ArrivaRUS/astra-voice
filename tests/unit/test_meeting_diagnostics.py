@@ -50,6 +50,7 @@ def test_archive_whitelist_excludes_data_keys_checkpoint_logs_and_settings_text(
     for relative in [
         "meetings/id/meeting.json",
         "meetings/id/transcript.json",
+        "meetings/id/speakers.json",
         "meetings/id/checkpoint.json",
         "checkpoint.json",
         "meeting-ai-key",

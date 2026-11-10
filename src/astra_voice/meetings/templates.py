@@ -13,7 +13,7 @@ import os
 import re
 import stat
 import unicodedata
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from heapq import merge
@@ -21,7 +21,9 @@ from itertools import islice
 from pathlib import Path
 from uuid import uuid4
 
-from astra_voice.meetings.model import DEFAULT_SELF_LABEL, Meeting, Transcript, Utterance
+from astra_voice.meetings.model import Meeting, SpeakerMap, Transcript, Utterance
+from astra_voice.meetings.speakers import canonical_speaker, speaker_map, validated_map
+from astra_voice.meetings.speakers import speaker_label as speaker_label
 
 TEMPLATES = ("stenogram", "me_and_others", "text_only", "stats")
 FORMATS = ("md", "txt")
@@ -222,27 +224,59 @@ def visible_utterances(transcript: Transcript | None) -> list[Utterance]:
     return sorted(rows, key=lambda u: (u.start_ms, u.seq))
 
 
-def speaker_label(meeting: Meeting, speaker: str) -> str:
-    """«Я» (the meeting's own label) / «Собеседники»; M7 adds «Спикер N»."""
-    if speaker == "me":
-        return meeting.self_label if meeting.self_label.strip() else DEFAULT_SELF_LABEL
-    if speaker.startswith("S") and speaker[1:].isdigit():
-        return f"Спикер {speaker[1:]}"
-    return OTHERS_LABEL
-
-
 def _minutes(milliseconds: int) -> int:
     return max(1, round(milliseconds / 60_000)) if milliseconds else 0
 
 
-def speaker_minutes(utterances: Iterable[Utterance]) -> dict[str, int]:
-    """Whole minutes each speaker talked (≥ 1 when they said anything)."""
-    total: dict[str, int] = {}
+def speaker_totals(
+    utterances: Iterable[Utterance],
+    speakers: SpeakerMap | None = None,
+    *,
+    include: Callable[[Utterance], bool] | None = None,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Shared duration/reply arithmetic for the panel and statistics.
+
+    Step 6 may supply its selection predicate; the existing visible_utterances filter
+    remains unchanged here.
+    """
+    utterances = list(utterances)
+    speakers = speaker_map(utterances, speakers) if speakers is not None else None
+    totals: dict[str, int] = {}
+    counts: dict[str, int] = {}
     for item in utterances:
+        if not item.text.strip() or (include is not None and not include(item)):
+            continue
+        who = canonical_speaker(item.speaker, speakers)
+        totals.setdefault(who, 0)
+        counts.setdefault(who, 0)
         if item.text in PLACEHOLDERS:
             continue
-        total[item.speaker] = total.get(item.speaker, 0) + max(0, item.end_ms - item.start_ms)
-    return {key: _minutes(value) for key, value in total.items()}
+        totals[who] = totals.get(who, 0) + max(0, item.end_ms - item.start_ms)
+        counts[who] = counts.get(who, 0) + 1
+    return totals, counts
+
+
+def minutes_from_totals(
+    totals: Mapping[str, int],
+    speakers: SpeakerMap | None = None,
+) -> dict[str, int]:
+    """Combine aliases before rounding; also accepts the live card's incremental totals."""
+    speakers = validated_map(totals, speakers) if speakers is not None else None
+    canonical: dict[str, int] = {}
+    for label, milliseconds in totals.items():
+        who = canonical_speaker(label, speakers)
+        canonical[who] = canonical.get(who, 0) + milliseconds
+    return {key: _minutes(value) for key, value in canonical.items()}
+
+
+def speaker_minutes(
+    utterances: Iterable[Utterance],
+    speakers: SpeakerMap | None = None,
+    *,
+    include: Callable[[Utterance], bool] | None = None,
+) -> dict[str, int]:
+    totals, _ = speaker_totals(utterances, speakers, include=include)
+    return minutes_from_totals(totals)
 
 
 def _local(value: str | None, tz: tzinfo | None) -> datetime | None:
@@ -289,6 +323,8 @@ def _merged(
     meeting: Meeting,
     utterances: Sequence[Utterance],
     *,
+    speakers: SpeakerMap | None = None,
+    file_labels: bool = False,
     binary: bool = False,
     paragraphs: bool = False,
     breaks: Sequence[int] = (),
@@ -306,14 +342,18 @@ def _merged(
         return TemplateRow(
             start,
             "utterance",
-            speaker_label(meeting, speaker),
+            speaker_label(meeting, speaker, speakers, file=file_labels),
             "me" if speaker == "me" else "others",
             " ".join(parts),
             truncated=truncated,
         )
 
     for item in utterances:
-        who = ("me" if item.speaker == "me" else "others") if binary else item.speaker
+        who = (
+            ("me" if item.speaker == "me" else "others")
+            if binary
+            else canonical_speaker(item.speaker, speakers)
+        )
         is_placeholder = item.text in PLACEHOLDERS
         joins = (
             speaker is not None
@@ -350,10 +390,13 @@ def template_rows(
     utterances: Sequence[Utterance],
     marks: Sequence[MarkInfo],
     *,
+    speakers: SpeakerMap | None = None,
+    file_labels: bool = False,
     limit: int | None = None,
     text_limit: int | None = None,
 ) -> list[TemplateRow]:
     """One chronology for export and preview; limits are applied during construction."""
+    speakers = speaker_map(utterances, speakers) if speakers is not None else None
     paragraphs = template == "text_only"
     timed = sorted(
         (mark for mark in marks if mark.at_ms is not None and not from_placeholder(mark)),
@@ -367,6 +410,8 @@ def template_rows(
     speech = _merged(
         meeting,
         utterances,
+        speakers=speakers,
+        file_labels=file_labels,
         binary=template == "me_and_others",
         paragraphs=paragraphs,
         breaks=[mark.at_ms for mark in timed if mark.at_ms is not None] if paragraphs else (),
@@ -388,6 +433,7 @@ def _header(
     marks: Sequence[MarkInfo],
     md: bool,
     tz: tzinfo | None,
+    speakers: SpeakerMap | None = None,
 ) -> list[str]:
     start = _local(meeting.started_at, tz)
     title = _field(meeting.title, md, default=DEFAULT_NAME)
@@ -397,7 +443,10 @@ def _header(
         lines.append(f"{item}Дата: {start:%d.%m.%Y}")
         lines.append(f"{item}Начало: {start:%H:%M}")
     lines.append(f"{item}Длительность: {clock(meeting.recorded_ms)}")
-    speakers = sorted({u.speaker for u in utterances}, key=lambda s: (s != "me", s))
+    labels_seen = sorted(
+        {canonical_speaker(u.speaker, speakers) for u in utterances},
+        key=lambda s: (s != "me", s),
+    )
     labels = (
         [
             speaker_label(meeting, group)
@@ -405,9 +454,12 @@ def _header(
             if any((u.speaker == "me") == (group == "me") for u in utterances)
         ]
         if template == "me_and_others"
-        else [speaker_label(meeting, speaker) for speaker in speakers]
+        else [
+            speaker_label(meeting, label, speakers, file=template == "stenogram")
+            for label in labels_seen
+        ]
     )
-    if labels and template != "text_only":
+    if labels and (template != "text_only" or speakers is not None):
         lines.append(f"{item}Участники: " + ", ".join(_field(label, md) for label in labels))
     if marks:
         lines.append(f"{item}Отметки:")
@@ -443,14 +495,13 @@ def statistics(
     utterances: Sequence[Utterance],
     *,
     limit: int | None = None,
+    speakers: SpeakerMap | None = None,
+    include: Callable[[Utterance], bool] | None = None,
 ) -> Statistics:
     """Shared millisecond arithmetic; only materialize the requested speaker rows."""
-    totals = dict.fromkeys((u.speaker for u in utterances), 0)
-    counts = dict(totals)
-    for row in utterances:
-        if row.text not in PLACEHOLDERS:
-            totals[row.speaker] += max(0, row.end_ms - row.start_ms)
-            counts[row.speaker] += 1
+    speakers = speaker_map(utterances, speakers) if speakers is not None else None
+    totals, counts = speaker_totals(utterances, speakers, include=include)
+    minutes = minutes_from_totals(totals)
     total = sum(totals.values())
     shares = {who: 100 * ms // total if total else 0 for who, ms in totals.items()}
     if total:
@@ -465,8 +516,8 @@ def statistics(
         bool(total),
         [
             SpeakerStat(
-                speaker_label(meeting, who),
-                _minutes(totals[who]),
+                speaker_label(meeting, who, speakers),
+                minutes[who],
                 shares[who] if total else None,
                 counts[who],
             )
@@ -519,20 +570,31 @@ def render(
     fmt: str = "md",
     *,
     tz: tzinfo | None = None,
+    speakers: SpeakerMap | None = None,
 ) -> str:
     """Render the same selected local template for preview and private file export."""
     if template not in TEMPLATES:
         raise ValueError("Неизвестный шаблон")
     if fmt not in FORMATS:
         raise ValueError("Неизвестный формат")
+    speakers = (
+        speaker_map(transcript.utterances if transcript else (), speakers)
+        if speakers is not None
+        else None
+    )
     md = fmt == "md"
     utterances = visible_utterances(transcript)
     marks = meeting_marks(meeting, utterances)
-    lines = _header(template, meeting, utterances, marks, md, tz)
+    lines = _header(template, meeting, utterances, marks, md, tz, speakers)
     if template == "stats":
-        return "\n".join(lines + _statistics(statistics(meeting, utterances), md)) + "\n"
+        return (
+            "\n".join(lines + _statistics(statistics(meeting, utterances, speakers=speakers), md))
+            + "\n"
+        )
     paragraphs = template == "text_only"
-    rows = template_rows(template, meeting, utterances, marks)
+    rows = template_rows(
+        template, meeting, utterances, marks, speakers=speakers, file_labels=template == "stenogram"
+    )
     body = [
         "— " + row.text
         if row.kind == "mark"
@@ -551,9 +613,10 @@ def stenogram(
     fmt: str = "md",
     *,
     tz: tzinfo | None = None,
+    speakers: SpeakerMap | None = None,
 ) -> str:
     """Compatibility entry for the original default template."""
-    return render(TEMPLATES[0], meeting, transcript, fmt, tz=tz)
+    return render(TEMPLATES[0], meeting, transcript, fmt, tz=tz, speakers=speakers)
 
 
 def sanitize_filename(title: str, fmt: str) -> str:
