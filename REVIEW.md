@@ -1,6 +1,6 @@
 # REVIEW.md — контракт ревью этого проекта
 
-> Читает ревьюер (reviewer-hub DeepSeek / GLM-5.3-Flash / Astra / Claude code-reviewer) вместе с дифом.
+> Читает ревьюер (GPT-6 Astra @high; перед релизом дополнительно Claude code-reviewer) вместе с дифом.
 > AstraVoice — локальная диктовка и запись встреч для Astra Linux (Python, PyQt5/QML, офлайн-STT GigaAM). Решение владельца 2026-10-31 (П1).
 
 ## Что здесь считается багом (отказ)
