@@ -11,7 +11,7 @@ from test_tray import qapp as qapp
 from astra_voice.meetings.model import Meeting, Utterance
 from astra_voice.ui.meeting_card import CardRows, TranscriptRows, snapshot_utterances
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
 
 def test_card_replaces_old_row_and_repeated_snapshot_is_idempotent(qapp: object) -> None:
