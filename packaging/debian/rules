@@ -74,6 +74,7 @@ override_dh_auto_install:
 		$(DOCDIR)/licenses/common/LGPL-2.1.txt
 	install -d $(SHAREDIR)/docs
 	install -m 0644 NOTICE docs/PRIVACY.md $(SHAREDIR)/docs/
+	install -D -m 0644 packaging/debian/astra-voice.lintian-overrides $(PKG)/usr/share/lintian/overrides/astra-voice
 
 # Страховка: документы для людей в /usr/share/doc тоже остаются несжатыми.
 override_dh_compress:

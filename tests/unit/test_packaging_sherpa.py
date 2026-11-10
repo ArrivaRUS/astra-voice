@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import re
 import shutil
 import stat
 import struct
@@ -318,7 +319,8 @@ def test_deb_install_target_keeps_both_wheels_and_license_texts(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("fixture\n")
     (project / "packaging/debian").mkdir(parents=True)
-    shutil.copyfile(ROOT / "packaging/debian/rules", project / "packaging/debian/rules")
+    for name in ("rules", "astra-voice.lintian-overrides"):
+        shutil.copyfile(ROOT / "packaging/debian" / name, project / "packaging/debian" / name)
     shutil.copytree(ROOT / "packaging/appimage/licenses", project / "packaging/appimage/licenses")
     if private_licenses:
         source_licenses = project / "packaging/appimage/licenses"
@@ -360,6 +362,12 @@ def test_deb_install_target_keeps_both_wheels_and_license_texts(
 
     for path in [doc, *doc.rglob("*")]:
         assert stat.S_IMODE(path.stat().st_mode) == (0o755 if path.is_dir() else 0o644)
+    overrides = pkg / "usr/share/lintian/overrides/astra-voice"
+    assert (
+        overrides.read_bytes()
+        == (ROOT / "packaging/debian/astra-voice.lintian-overrides").read_bytes()
+    )
+    assert stat.S_IMODE(overrides.stat().st_mode) == 0o644
 
 
 @pytest.mark.skipif(shutil.which("cc") is None, reason="requires compiler")
@@ -500,3 +508,27 @@ def test_round2_internal_alias_to_listed_elf_is_allowed(elf_tree: Path) -> None:
     (site / "alias.so").symlink_to("sherpa_onnx/lib/libonnxruntime.so")
     assert audit.main(["--strict", str(elf_tree)]) == 0
     assert bundle.check_symlinks(elf_tree) == []
+
+
+def test_lintian_overrides_are_exact_and_match_elf_inventory() -> None:
+    text = (ROOT / "packaging/debian/astra-voice.lintian-overrides").read_text()
+    lines = [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+    assert len(lines) == 4
+    paths: set[str] = set()
+    for line in lines:
+        match = re.fullmatch(
+            r"astra-voice: unstripped-binary-or-object "
+            r"\[(usr/lib/astra-voice/vendor/[A-Za-z0-9_./-]+)\]",
+            line,
+        )
+        assert match is not None, f"unexpected tag, wildcard or format: {line}"
+        paths.add(match.group(1))
+    prefix = "usr/lib/astra-voice/vendor/"
+    expected = {
+        "sherpa_onnx.libs/libasound-fb5348bf.so.2.0.0",
+        "sherpa_onnx/lib/libonnxruntime.so",
+        "sherpa_onnx/lib/libsherpa-onnx-c-api.so",
+        "sherpa_onnx/lib/libsherpa-onnx-cxx-api.so",
+    }
+    assert paths == {prefix + path for path in expected}
+    assert {path.removeprefix(prefix) for path in paths} <= audit.VENDOR_ELFS
