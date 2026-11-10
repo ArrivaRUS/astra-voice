@@ -1080,3 +1080,149 @@ def test_exit_without_role_or_jobs_is_immediate(tmp_path: Path) -> None:
     assert jobs.shutdown(timeout=1.0)
     assert time.monotonic() - started < 2.0
     assert rig.roles == []
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_diar_model_seam_controls_admission_and_start(rig: Rig, enabled: bool) -> None:
+    selected = ("/models/segmentation", "/models/embedder") if enabled else None
+    rig.jobs.diar_models = lambda: selected
+    rig.memory = rig.admission.min_ram_mb + meeting_jobs.MEMORY_MARGIN_MB + 899
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.jobs.tick()
+    if enabled:
+        assert rig.meeting().state == MeetingState.WAITING_MEMORY
+        assert not rig.roles
+        rig.memory += 1
+        rig.now += meeting_jobs.MEMORY_RETRY_S
+        rig.jobs.tick()
+    rig.loaded()
+    start = rig.accepted()
+    assert start["diarization"] == enabled
+    if enabled:
+        assert start["diar_models"] == {
+            "segmentation_dir": selected[0],  # type: ignore[index]
+            "embedder_dir": selected[1],  # type: ignore[index]
+        }
+    else:
+        assert "diar_models" not in start
+
+
+def test_diar_failure_finishes_text_without_success_retention_or_audio_deletion(rig: Rig) -> None:
+    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.retention = 0
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    rig.job_event(
+        "meeting.job.done",
+        utterances=3,
+        speakers=1,
+        diar_status="failed",
+        wall_ms=100,
+        peak_rss_kb=1000,
+        echo_dropped=0,
+        transcript_revision=2,
+    )
+    rig.jobs.tick()
+    meeting = rig.meeting()
+    assert meeting.state == MeetingState.DONE
+    assert meeting.processing_status == ProcessingStatus.PARTIAL
+    assert meeting.transcription.diarization and meeting.transcription.diar_status == "failed"
+    assert not meeting.cleanup_pending and rig.audio_present()
+    assert not rig.jobs._audio_succeeded(meeting)
+    rig.jobs.start_retention()
+    rig.now += 86400 * 100
+    rig.jobs.tick()
+    assert rig.audio_present()
+
+
+def test_diar_memory_wait_keeps_active_job_until_fallback_or_success(rig: Rig) -> None:
+    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    active = rig.jobs._active
+    rig.job_event("meeting.job.waiting", reason="memory", need_mb=1800, available_mb=100)
+    assert rig.jobs._active is active and not rig.jobs.queued_ids
+    assert "model.unload" not in rig.role.types()
+
+
+@pytest.mark.parametrize("outcome", ["done", "diar_failed", "failed", "cancelled"])
+@pytest.mark.parametrize("queued", [False, True])
+def test_r2_a4_diar_terminal_paths_explicitly_unload_resident_asr(
+    rig: Rig, outcome: str, queued: bool
+) -> None:
+    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    assert rig.jobs._active is not None
+    rig.jobs._active.resume = True  # durable diar done may skip the ordinary unload phase
+    if queued:
+        rig.create(MID2)
+        rig.jobs.on_recorded(MID2)
+    if outcome in {"done", "diar_failed"}:
+        rig.job_event(
+            "meeting.job.done",
+            utterances=1,
+            speakers=1,
+            diar_status="failed" if outcome == "diar_failed" else "done",
+            wall_ms=1,
+            peak_rss_kb=100,
+            echo_dropped=0,
+            transcript_revision=1,
+        )
+    elif outcome == "failed":
+        rig.job_event("meeting.job.failed", code="io")
+    else:
+        rig.jobs.cancel(MID)
+        cancel = rig.role.last("meeting.job.cancel")
+        rig.role.emit(
+            "meeting.job.cancelled",
+            req=cancel["req"],
+            request_type="meeting.job.cancel",
+            meeting_id=MID,
+            meeting_generation=cancel["meeting_generation"],
+        )
+    assert rig.role.types()[-1] == "model.unload"
+    assert rig.jobs._loaded is not None  # keep residency until the real outcome
+    unload = rig.role.last("model.unload")
+    rig.role.emit("meeting.ack", req=unload["req"], request_type="model.unload")
+    assert rig.jobs._loaded is not None
+    rig.jobs.tick()
+    assert rig.jobs.active_id == ""  # even a queued job waits for unload, not just its receipt
+    rig.role.emit("model.unloaded", req=unload["req"], request_type="model.unload")
+    assert rig.jobs._loaded is None
+
+
+def test_r2_a4_busy_unload_is_retried_and_stale_ack_does_not_clear_residency(rig: Rig) -> None:
+    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    rig.role.on_send["model.unload"] = lambda msg: rig.role.emit(
+        "error", req=msg["req"], request_type="model.unload", code="not-prepared", message="busy"
+    )
+    rig.done()
+    first = rig.role.last("model.unload")
+    assert rig.jobs._loaded is not None and rig.jobs._diar_unload_pending
+    rig.jobs.tick()
+    second = rig.role.last("model.unload")
+    assert second["req"] != first["req"]
+    rig.role.emit("model.unloaded", req=first["req"], request_type="model.unload")
+    assert rig.jobs._loaded is not None
+    rig.role.emit("model.unloaded", req=second["req"], request_type="model.unload")
+    assert rig.jobs._loaded is None and not rig.jobs._diar_unload_pending
+
+
+def test_r2_a4_confirmed_role_exit_retires_unload_without_blocking_next_job(rig: Rig) -> None:
+    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.create()
+    rig.jobs.on_recorded(MID)
+    rig.running()
+    rig.done()
+    assert rig.jobs._diar_unload_pending
+    rig.role.crash()
+    rig.jobs.tick()
+    assert rig.jobs._loaded is None and not rig.jobs._diar_unload_pending

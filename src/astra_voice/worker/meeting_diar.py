@@ -38,7 +38,7 @@ from astra_voice.worker.onnx_scan import collect_external_locations
 
 ROLE = "meeting-diar"
 RATE = 16000
-MAX_PCM_BYTES = 1200 * RATE * 4
+MAX_PCM_BYTES = 1380 * RATE * 4
 MAX_FRAME_BYTES = 65536
 QUEUE_FRAMES = 2
 # Linux UAPI; some CPython builds omit these fcntl names despite memfd support.

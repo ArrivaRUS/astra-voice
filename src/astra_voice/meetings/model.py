@@ -312,7 +312,7 @@ class Transcription(JsonModel):
     model_id: str = "unspecified"
     revision: str = "unspecified"
     diarization: bool = False
-    diar_status: PhaseStatus = PhaseStatus.PENDING
+    diar_status: str = PhaseStatus.PENDING
     finished_at: str | None = None
     wall_ms: int = 0
     peak_rss_kb: int = 0
@@ -324,7 +324,7 @@ class Transcription(JsonModel):
             "model_id": IDENTIFIER,
             "revision": text_schema(128, 1),
             "diarization": BOOL,
-            "diar_status": choices(*PhaseStatus),
+            "diar_status": choices(*PhaseStatus, "failed", "skipped"),
             "finished_at": nullable(TIMESTAMP),
             "wall_ms": UINT,
             "peak_rss_kb": UINT,
@@ -512,7 +512,11 @@ class AsrCursor(JsonModel):
 class AsrProgress(JsonModel):
     mic: AsrCursor = field(default_factory=AsrCursor)
     far: AsrCursor = field(default_factory=AsrCursor)
-    SCHEMA = obj({"mic": AsrCursor.SCHEMA, "far": AsrCursor.SCHEMA})
+    status: PhaseStatus = PhaseStatus.PENDING
+    SCHEMA = obj(
+        {"mic": AsrCursor.SCHEMA, "far": AsrCursor.SCHEMA, "status": choices(*PhaseStatus)},
+        required=["mic", "far"],
+    )
 
 
 @dataclass

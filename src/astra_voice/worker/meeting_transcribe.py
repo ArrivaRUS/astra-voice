@@ -11,7 +11,8 @@ to the transport, so a crash in between resumes straight to done. After a
 cancel is acknowledged no write to the meeting directory can start (write
 fence); serialization and validation run outside the fence.
 Speech text, user paths and file names never reach logs or error messages.
-Diarization (stage 4) is not part of this step: done carries diar_status=skipped.
+Diarization runs in a reaped child after acknowledged ASR unload. Only text,
+anonymous intervals and label maps are durable; interrupted diarization restarts.
 """
 
 from __future__ import annotations
@@ -35,16 +36,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from astra_voice.meetings import MeetingValidationError, echo_gate
+from astra_voice.meetings import MeetingValidationError, diar_link, echo_gate
+from astra_voice.meetings.events import PhaseStatus
 from astra_voice.meetings.model import (
     ID_PATTERN,
     MAX_MEETING_MS,
     AsrCursor,
     AsrProgress,
     Checkpoint,
+    DiarProgress,
+    DiarTurn,
     Meeting,
     ModelIdentity,
     ProcessingLimits,
+    ReconcileProgress,
     Transcript,
     Utterance,
 )
@@ -55,6 +60,7 @@ from astra_voice.security.files import check_private_file, private_directory
 from astra_voice.worker import ipc
 from astra_voice.worker.engine import CancelToken, Engine, EngineError, make_engine
 from astra_voice.worker.meeting_contract import ASR_WINDOW_TIMEOUT_S, COMMAND_FIELDS, RequestLedger
+from astra_voice.worker.meeting_diar_client import DiarCancelled, DiarProcess, model_fingerprint
 from astra_voice.worker.meeting_roles import failure
 
 if TYPE_CHECKING:
@@ -85,7 +91,12 @@ CHECKPOINT_UTTERANCES = 32
 CHECKPOINT_AUDIO_MS = 30_000
 WALL_SLACK_MS = 600_000  # ceiling: 2 x duration + 10 min
 PROGRESS_INTERVAL_S = 0.5  # <= 2 progress events per second
-MEMORY_MARGIN_MB = 200  # no diarization in this step
+MEMORY_MARGIN_MB = 200
+DIAR_MEMORY_MB = 900
+DIAR_BLOCK_MS = 1_200_000
+DIAR_PAUSE_SEARCH_MS = 90_000
+DIAR_MEMORY_WAIT_S = 120.0
+DIAR_MEMORY_RETRY_S = 1.0
 MAX_THREADS = 2
 MAX_SEGMENT_FRAMES = 4_800_000
 TRANSCRIPT_CAPACITY = 9000  # Transcript schema maximum
@@ -341,6 +352,7 @@ class _Resume:
     fresh: bool  # the text starts from zero
     on_disk: bool  # transcript.json or checkpoint.json already exists
     complete: Transcript | None = None  # final text of this very configuration
+    checkpoint: Checkpoint | None = None
 
 
 @dataclass
@@ -352,6 +364,9 @@ class _Durable:
     identity: ModelIdentity
     capacity: int
     revision: int
+    asr_status: PhaseStatus = PhaseStatus.PENDING
+    diar: DiarProgress = field(default_factory=DiarProgress)
+    reconcile: ReconcileProgress = field(default_factory=ReconcileProgress)
 
 
 class _Reader:
@@ -420,6 +435,10 @@ class _Job:
         self.current: CancelToken | None = None  # one ASR window
         self.progress_at = -math.inf
         self.delivered = threading.Event()  # done handed to the transport
+        self.diar_exited = threading.Event()
+        self.diar_exited.set()  # cleared under the write fence before the diar lease
+        self.diar_status = "skipped"
+        self.labels_seq = 0
 
     def matches(self, message: Message) -> bool:
         return all(message.get(key) == value for key, value in self.identity.items())
@@ -452,11 +471,14 @@ class MeetingTranscribeState:
         clock: Callable[[], float] = time.monotonic,
         asr_timeout_s: float = ASR_WINDOW_TIMEOUT_S,
         status_path: str = "/proc/self/status",
+        diar_factory: Callable[..., Any] = DiarProcess,
     ) -> None:
         self.store = store if store is not None else MeetingStore()
         self.engine_factory, self.vad_factory = engine_factory, vad_factory
         self.mem_available_mb, self.clock = mem_available_mb, clock
         self.asr_timeout_s, self.status_path = asr_timeout_s, status_path
+        self.diar_factory = diar_factory
+        self.diar_peak_rss_kb = 0  # scalar diagnostics for the CLI, never voice features
         self.ledger = RequestLedger()
         self.pending: dict[str, list[Message]] = {}
         self.stopped = False
@@ -566,16 +588,16 @@ class MeetingTranscribeState:
             if active is None or active.finished or not active.matches(message):
                 return self._remember(message, [self._reply("meeting.job.cancelled", message)])
             active.cancel()
-            if self._fenced():
+            if self._fenced(active):
                 return self._remember(message, [self._reply("meeting.job.cancelled", message)])
             self.cancels.append((message, active))
             return self._receipt(message)
         # meeting.job.applied: GUI application receipt only (never fsync evidence).
         return self._remember(message, [self._reply("meeting.ack", message)])
 
-    def _fenced(self) -> bool:
+    def _fenced(self, job: _Job) -> bool:
         """True when no meeting write is in flight; later writes see cancelled."""
-        if not self.fence.acquire(blocking=False):
+        if not job.diar_exited.is_set() or not self.fence.acquire(blocking=False):
             return False
         self.fence.release()
         return True
@@ -587,7 +609,7 @@ class MeetingTranscribeState:
     def poll(self, limit: int = 2) -> list[Message]:
         result: list[Message] = []
         for request, _job in list(self.cancels):
-            if self._fenced():
+            if self._fenced(_job):
                 self.cancels.remove((request, _job))
                 result.append(self._outcome(request, self._reply("meeting.job.cancelled", request)))
         while len(result) < limit:
@@ -617,7 +639,7 @@ class MeetingTranscribeState:
         if self.job is not None:
             self.job.cancel()
         self.tasks.put(None)
-        self.thread.join(1.0)
+        self.thread.join(3.0)
         if not self.thread.is_alive() and self.engine is not None:
             try:
                 self.engine.unload()
@@ -637,9 +659,9 @@ class MeetingTranscribeState:
                 if kind == "load":
                     self.outbox.put(("loaded", payload, self._load(payload)))
                 elif kind == "unload":
-                    self._unload()
+                    response = self._unload_ack()
                     self.spec = None
-                    self.outbox.put(("loaded", payload, {"type": "model.unloaded"}))
+                    self.outbox.put(("loaded", payload, response))
                 else:
                     self._run_job(payload)
             except BaseException:  # the executor must outlive any single task
@@ -655,11 +677,23 @@ class MeetingTranscribeState:
     def _unload(self) -> None:
         if self.engine is not None:
             self.engine.unload()
+            # OnnxAsrEngine keeps these references when a native operation
+            # outlives its unload timeout. Returning None alone is not an ACK.
+            if (
+                getattr(self.engine, "_model", None) is not None
+                or getattr(self.engine, "_pending", None) is not None
+            ):
+                raise EngineError("asr-unload-unconfirmed")
         self.engine = None
         self.loaded = None
         from astra_voice.worker import vad
 
         vad.unload()
+
+    def _unload_ack(self) -> Message:
+        """The model.unload executor path; ACK exists only after unload returns."""
+        self._unload()
+        return {"type": "model.unloaded"}
 
     def _load(self, request: Message) -> Message:
         spec = {
@@ -756,10 +790,14 @@ class MeetingTranscribeState:
         if job.cancelled:
             raise _Cancelled  # never load a model for a cancelled job
         if self.engine is not None:
-            return True
+            return True  # the resident ASR model is already charged to MemAvailable
         if self.spec is None:
             raise _Failed("model")
-        need = int(self.spec["min_ram_mb"]) + MEMORY_MARGIN_MB
+        need = (
+            int(self.spec["min_ram_mb"])
+            + MEMORY_MARGIN_MB
+            + (DIAR_MEMORY_MB if job.request["diarization"] else 0)
+        )
         available = self.mem_available_mb()
         if available < need:
             self._emit(
@@ -1066,8 +1104,22 @@ class MeetingTranscribeState:
             cursors["far"] = max(cursors["far"], checkpoint.asr.far.done_until_ms)
         # Every run that writes text from zero first publishes its own checkpoint,
         # so the latest compatible checkpoint vouches for the final text as well.
-        complete = transcript if transcript.labels_final else None
-        return _Resume(kept, cursors, transcript.transcript_revision, False, on_disk, complete)
+        complete = (
+            transcript
+            if transcript.labels_final
+            and (
+                not job.request["diarization"]
+                or (
+                    checkpoint.diar.status == PhaseStatus.DONE
+                    and checkpoint.reconcile.status == PhaseStatus.DONE
+                    and checkpoint.transcript_revision == transcript.transcript_revision
+                )
+            )
+            else None
+        )
+        return _Resume(
+            kept, cursors, transcript.transcript_revision, False, on_disk, complete, checkpoint
+        )
 
     # ---- pipeline ---------------------------------------------------------
 
@@ -1091,10 +1143,21 @@ class MeetingTranscribeState:
             "tracks": sorted(request["tracks"]),
             "self_track": request["self_track"],
             "variant": request["variant"],
-            "diarization": False,
+            "diarization": bool(request["diarization"]),
             "limits": request["limits"],
             "window": {"utterances": CHECKPOINT_UTTERANCES, "audio_ms": CHECKPOINT_AUDIO_MS},
         }
+        if request["diarization"]:
+            document["diar"] = {
+                "models": model_fingerprint(request.get("diar_models", {})),
+                "algorithm": diar_link.DIAR_ALGORITHM,
+                "profile": "3dspeaker-campplus",
+                "parameters": diar_link.DIAR_PROFILES["3dspeaker-campplus"]._asdict(),
+                "block_ms": DIAR_BLOCK_MS,
+                "pause_search_ms": DIAR_PAUSE_SEARCH_MS,
+                "grid": "fixed",
+                "max_block_ms": 1_380_000,
+            }
         return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
     def _identity(self, vad_name: str) -> ModelIdentity:
@@ -1111,7 +1174,15 @@ class MeetingTranscribeState:
         )
 
     def _progress(
-        self, job: _Job, stage: str, done: int, total: int, *, force: bool = False
+        self,
+        job: _Job,
+        stage: str,
+        done: int,
+        total: int,
+        *,
+        force: bool = False,
+        block: int | None = None,
+        blocks: int | None = None,
     ) -> None:
         now = self.clock()
         if not force and now - job.progress_at < PROGRESS_INTERVAL_S:
@@ -1126,6 +1197,7 @@ class MeetingTranscribeState:
                 "stage": stage,
                 "done_ms": min(total, max(0, done)),
                 "total_ms": total,
+                **({"block": block, "blocks": blocks} if block is not None else {}),
             },
         )
 
@@ -1146,6 +1218,19 @@ class MeetingTranscribeState:
         kept, cursors = resume.kept, resume.cursors
         capacity = min(int(limits["max_utterances"]), TRANSCRIPT_CAPACITY)
         durable = _Durable(manifest, config, identity, capacity, resume.revision)
+        profile = diar_link.DIAR_PROFILES["3dspeaker-campplus"]
+        durable.diar = DiarProgress(
+            algo=diar_link.DIAR_ALGORITHM,
+            block_ms=DIAR_BLOCK_MS,
+            threshold=profile.seed_threshold,
+            tau=profile.merge_ceiling,
+        )
+        checkpoint = resume.checkpoint
+        if checkpoint is not None:
+            durable.asr_status = checkpoint.asr.status
+            if checkpoint.diar.status == PhaseStatus.DONE:
+                durable.diar = deepcopy(checkpoint.diar)
+                durable.reconcile = deepcopy(checkpoint.reconcile)
         if resume.fresh and resume.on_disk and duration <= int(limits["max_ms"]):
             # From zero over existing files: our empty text and checkpoint go first,
             # so no older checkpoint can vouch for the text this run writes (D10).
@@ -1161,11 +1246,19 @@ class MeetingTranscribeState:
         if resume.complete is not None:
             # The final text of this configuration is durable: no VAD/ASR, no rewrite.
             # echo_dropped of the original run is not durable; it is reported as 0.
+            if request["diarization"]:
+                job.diar_status = "done"
+                self._labels(job, resume.complete.utterances, final=True)
             self._finish(job, owner, resume.complete, 0, started)
             return
         if duration > int(limits["max_ms"]):
             raise _Failed("limit")
         deadline = started + (2 * duration + WALL_SLACK_MS) / 1000
+        if durable.asr_status == PhaseStatus.DONE:
+            # All ASR text is vouched for by this exact revision. No inference,
+            # even VAD, is needed to restart the entire diarization track.
+            self._post_asr(job, owner, reader, spans, kept, cursors, durable, duration, started, 0)
+            return
         # Stage 1: VAD per span (deterministic, so resume yields the same list).
         candidates = list(damaged)
         for index, span in enumerate(spans):
@@ -1196,6 +1289,7 @@ class MeetingTranscribeState:
             kept, cursors = [], {"mic": 0, "far": 0}  # durable text is not this input
             self._persist(job, owner, durable, [], cursors)
         # Stage 3: ASR in chronological order of both tracks.
+        self._progress(job, "asr", 0, duration, force=True)
         self._asr(
             job,
             owner,
@@ -1349,7 +1443,11 @@ class MeetingTranscribeState:
             input_manifest_sha256=durable.manifest,
             processing_config_sha256=durable.config,
             model=durable.identity,
-            asr=AsrProgress(AsrCursor(cursors["mic"]), AsrCursor(cursors["far"])),
+            asr=AsrProgress(
+                AsrCursor(cursors["mic"]), AsrCursor(cursors["far"]), durable.asr_status
+            ),
+            diar=deepcopy(durable.diar),
+            reconcile=deepcopy(durable.reconcile),
             limits=ProcessingLimits(
                 utterances=durable.capacity, blocks=job.request["limits"]["max_blocks"]
             ),
@@ -1372,7 +1470,7 @@ class MeetingTranscribeState:
                 **job.identity,
                 "utterances": len(transcript.utterances),
                 "speakers": len({u.speaker for u in transcript.utterances}),
-                "diar_status": "skipped",
+                "diar_status": job.diar_status,
                 "wall_ms": max(0, round((self.clock() - started) * 1000)),
                 "peak_rss_kb": _status_kb("VmHWM", self.status_path),
                 "echo_dropped": echo_dropped,
@@ -1385,8 +1483,9 @@ class MeetingTranscribeState:
         while not job.delivered.wait(0.05):
             if job.cancelled or time.monotonic() > deadline:
                 return  # a leftover final checkpoint only short-cuts a later resume
-        with contextlib.suppress(MeetingStoreError):
-            self._remove_checkpoint(job, owner)
+        if job.diar_status != "failed":
+            with contextlib.suppress(MeetingStoreError):
+                self._remove_checkpoint(job, owner)
 
     def _asr(
         self,
@@ -1459,8 +1558,331 @@ class MeetingTranscribeState:
                 self._persist(job, owner, durable, utterances, cursors)
                 window_utterances = window_ms = 0
             self._progress(job, "asr", candidate.end_ms, duration)
-        # Stage 5: final text (labels_final without diarization) + its checkpoint,
-        # done, then the checkpoint is dropped (T-414).
+        durable.asr_status = PhaseStatus.DONE
+        self._post_asr(
+            job, owner, reader, spans, utterances, cursors, durable, duration, started, sum(echoes)
+        )
+
+    # ---- stage 4: isolated diarization -----------------------------------
+
+    def _labels(self, job: _Job, utterances: list[Utterance], *, final: bool) -> None:
+        # Both the item count and encoded byte count bound a frame (long ids
+        # need smaller batches than the schema's maximum 2000 items).
+        speakers = len({u.speaker for u in utterances if u.speaker.startswith("S")})
+        for first in range(0, max(1, len(utterances)), 256):
+            self._emit(
+                job,
+                {
+                    "type": "meeting.job.labels",
+                    **job.identity,
+                    "seq": job.labels_seq,
+                    "items": [[u.id, u.speaker] for u in utterances[first : first + 256]],
+                    "final": final,
+                    "speakers_total": speakers,
+                },
+            )
+            job.labels_seq += 1
+
+    def _diar_memory(self, job: _Job, deadline: float) -> None:
+        assert self.spec is not None
+        # ASR has already been unloaded. Only the new phase's incremental
+        # memory belongs in this check, not another ASR model reservation.
+        need = MEMORY_MARGIN_MB + DIAR_MEMORY_MB
+        until = min(deadline, self.clock() + DIAR_MEMORY_WAIT_S)
+        while True:
+            self._check_wall(job, until)
+            available = self.mem_available_mb()
+            if available >= need:
+                return
+            self._emit(
+                job,
+                {
+                    "type": "meeting.job.waiting",
+                    **job.identity,
+                    "reason": "memory",
+                    "need_mb": need,
+                    "available_mb": max(0, available),
+                },
+            )
+            with job.condition:
+                job.condition.wait(min(DIAR_MEMORY_RETRY_S, max(0.001, until - self.clock())))
+
+    @staticmethod
+    def _block_audio(reader: _Reader, spans: list[_Span], first: int, end: int) -> Audio:
+        import numpy as np
+
+        audio = np.zeros((end - first) * RATE // 1000, dtype="<f4")
+        for span in spans:
+            a = max(first, span.recorded(span.first))
+            b = min(end, span.recorded(span.end))
+            if a >= b:
+                continue
+            samples = reader.read(span, span.sample_at(a), span.sample_at(b))
+            offset = (a - first) * RATE // 1000
+            count = min(len(samples), len(audio) - offset)
+            audio[offset : offset + count] = samples[:count]
+        return audio
+
+    @staticmethod
+    def _canonical_map(turns: list[DiarTurn], final: Message) -> dict[str, str]:
+        labels = {t.label for t in turns}
+        mapping: dict[str, str] = final["label_map"]
+        if (
+            set(mapping) != labels
+            or not set(mapping.values()) <= labels
+            or len(set(mapping.values())) != final["speakers_total"]
+            or any(mapping.get(value) != value for value in mapping.values())
+            or any(int(value[1:]) > int(old[1:]) for old, value in mapping.items())
+        ):
+            raise ValueError("diar-final-map")
+        return mapping
+
+    def _diarize(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        reader: _Reader,
+        spans: list[_Span],
+        utterances: list[Utterance],
+        cursors: dict[str, int],
+        durable: _Durable,
+        duration: int,
+        deadline: float,
+    ) -> None:
+        target = diar_target(utterances, spans)
+        target_spans = [span for span in spans if span.track == target]
+        blocks = diar_blocks(utterances, target, duration, durable.diar.block_ms)
+        role: Any = None
+        completed = False
+        try:
+            # Same synchronous handler as model.unload; a failure never
+            # acknowledges and must never start a child. No child/DIAR lease
+            # exists yet, so cancellation need not wait for ASR cleanup.
+            ack = self._unload_ack()
+            if ack["type"] != "model.unloaded" or self.engine is not None:
+                raise ValueError("diar-unload-unconfirmed")
+            durable.diar.status = PhaseStatus.RUNNING
+            self._progress(job, "diar", 0, duration, force=True, block=0, blocks=len(blocks))
+            self._persist(job, owner, durable, utterances, cursors)
+            if len(blocks) > job.request["limits"]["max_blocks"]:
+                raise ValueError("diar-block-limit")
+            self._diar_memory(job, deadline)
+            if not job.request.get("diar_models"):
+                raise ValueError("diar-models-missing")
+            with self.fence:
+                if job.cancelled:
+                    raise _Cancelled
+                job.diar_exited.clear()
+            with self.store.writer(job.identity["meeting_id"], Writer.DIAR) as diar_owner:
+                try:
+                    role = self.diar_factory(
+                        job.identity, lambda: job.cancelled, lease_fd=diar_owner.diar_lease_fd()
+                    )
+                    role.overall_deadline = time.monotonic() + max(0, deadline - self.clock())
+                    role.load(job.request["diar_models"])
+                    for index, (first, end) in enumerate(blocks):
+                        self._diar_memory(job, deadline)
+                        self._check_wall(job, deadline)
+                        audio = self._block_audio(reader, target_spans, first, end)
+                        rows = role.block(audio, index, first)
+                        del audio
+                        self._check_wall(job, deadline)
+                        if len(durable.diar.turns) + len(rows) > diar_link.MAX_SEGMENTS:
+                            raise ValueError("diar-turns-limit")
+                        for a, b, label in rows:
+                            if (
+                                not first <= a < b <= end
+                                or re.fullmatch(r"S[1-9][0-9]*", label) is None
+                            ):
+                                raise ValueError("diar-turn-invalid")
+                            durable.diar.turns.append(DiarTurn(label, a, b))
+                        assign_speakers(utterances, durable.diar.turns, target)
+                        self._persist(job, owner, durable, utterances, cursors)
+                        self._labels(job, utterances, final=False)
+                        self._progress(
+                            job, "diar", end, duration, block=index + 1, blocks=len(blocks)
+                        )
+                    self._check_wall(job, deadline)
+                    final = role.finish()
+                    if not durable.diar.turns and any(u.track == target for u in utterances):
+                        raise ValueError("diar-empty-turns")
+                    durable.diar.label_map = self._canonical_map(durable.diar.turns, final)
+                    # Durable final intervals/map while the lease and child are
+                    # still alive. A crash here restarts the whole diar track.
+                    self._persist(job, owner, durable, utterances, cursors)
+                    if not role.close(completed=True):
+                        raise ValueError("diar-exit-unconfirmed")
+                    self.diar_peak_rss_kb = max(self.diar_peak_rss_kb, role.peak_rss_kb)
+                    role = None
+                    self._check_wall(job, deadline)
+                    completed = True
+                finally:
+                    if role is not None:
+                        role.close()
+                        self.diar_peak_rss_kb = max(self.diar_peak_rss_kb, role.peak_rss_kb)
+        except (DiarCancelled, _Cancelled):
+            raise _Cancelled from None
+        except (OSError, ValueError, RuntimeError, MemoryError, TimeoutError, EngineError, _Failed):
+            if job.cancelled:
+                raise _Cancelled from None
+            # All child failure paths have reaped it before fallback publication.
+            job.diar_status = "failed"
+            durable.diar.status = PhaseStatus.PENDING
+            durable.diar.turns.clear()
+            durable.diar.label_map.clear()
+            for utterance in utterances:
+                utterance.speaker = "others" if utterance.track == target else "me"
+        finally:
+            job.diar_exited.set()  # after confirmed exit AND releasing the lease
+        if completed:
+            job.diar_status = "done"
+            durable.diar.status = PhaseStatus.DONE
+            durable.reconcile.status = PhaseStatus.PENDING
+            self._persist(job, owner, durable, utterances, cursors)
+
+    def _reconcile(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        utterances: list[Utterance],
+        cursors: dict[str, int],
+        durable: _Durable,
+    ) -> None:
+        """Single D5 entry point. This step only marks the empty phase complete."""
+        durable.reconcile.status = PhaseStatus.DONE
+        self._persist(job, owner, durable, utterances, cursors)
+
+    def _post_asr(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        reader: _Reader,
+        spans: list[_Span],
+        utterances: list[Utterance],
+        cursors: dict[str, int],
+        durable: _Durable,
+        duration: int,
+        started: float,
+        echo_dropped: int,
+    ) -> None:
+        if job.request["diarization"]:
+            deadline = started + (2 * duration + WALL_SLACK_MS) / 1000
+            if durable.diar.status != PhaseStatus.DONE:
+                target = diar_target(utterances, spans)
+                for u in utterances:
+                    u.speaker = "others" if u.track == target else "me"
+                # ASR done, text is durable before acknowledging unload.
+                self._persist(job, owner, durable, utterances, cursors)
+                self._diarize(
+                    job, owner, reader, spans, utterances, cursors, durable, duration, deadline
+                )
+            else:
+                job.diar_status = "done"
+            if job.diar_status == "done":
+                self._progress(job, "reconcile", duration, duration, force=True)
+                target = diar_target(utterances, spans)
+                canonical_turns = [
+                    dataclasses.replace(t, label=durable.diar.label_map[t.label])
+                    for t in durable.diar.turns
+                ]
+                assign_speakers(utterances, canonical_turns, target)
+                self._reconcile(job, owner, utterances, cursors, durable)
         self._progress(job, "finalize", duration, duration, force=True)
         final = self._persist(job, owner, durable, utterances, cursors, final=True)
-        self._finish(job, owner, final, sum(echoes), started)
+        if job.request["diarization"]:
+            self._labels(job, final.utterances, final=True)
+        self._finish(job, owner, final, echo_dropped, started)
+
+
+def diar_target(utterances: Sequence[Utterance], spans: Sequence[_Span]) -> str:
+    """An absent far track must not prevent the room/microphone variant."""
+    return (
+        "far"
+        if any(s.track == "far" for s in spans) or any(u.track == "far" for u in utterances)
+        else "mic"
+    )
+
+
+def diar_blocks(
+    utterances: Sequence[Utterance], target: str, duration: int, block_ms: int = DIAR_BLOCK_MS
+) -> list[tuple[int, int]]:
+    """Nearest pause in each fixed-grid ±90 s window, without boundary drift.
+
+    A pause is an interval: if the nominal point is inside it, keep that point;
+    otherwise use the nearest edge. Equal-distance ties choose the earlier cut.
+    The final short block ends at duration; the number is ceil(duration/block_ms).
+    """
+    regions = sorted((u.start_ms, u.end_ms) for u in utterances if u.track == target)
+    pauses = []
+    end = 0
+    for a, b in regions:
+        if a - end >= MIN_PAUSE_MS:
+            pauses.append((end, a))
+        end = max(end, b)
+    if duration - end >= MIN_PAUSE_MS:
+        pauses.append((end, duration))
+    count = min(math.ceil(duration / block_ms), diar_link.MAX_BLOCKS + 1)
+    boundaries = [0]
+    for index in range(1, count):
+        nominal = index * block_ms
+        low = max(boundaries[-1] + 1, nominal - DIAR_PAUSE_SEARCH_MS)
+        high = min(duration - (count - index), nominal + DIAR_PAUSE_SEARCH_MS)
+        choices = [
+            min(max(nominal, max(a, low)), min(b, high))
+            for a, b in pauses
+            if a <= high and b >= low
+        ]
+        cut = min(choices, key=lambda value: (abs(value - nominal), value), default=nominal)
+        boundaries.append(cut)
+    if count:
+        boundaries.append(duration)
+    return list(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
+def assign_speakers(
+    utterances: Sequence[Utterance], turns: Sequence[DiarTurn], target: str
+) -> None:
+    """Union overlap per speaker (>=30%), otherwise nearest interval; stable ties."""
+    ordered = sorted(turns, key=lambda t: (t.start_ms, t.end_ms, int(t.label[1:])))
+    ends = sorted(ordered, key=lambda t: (t.end_ms, t.start_ms, int(t.label[1:])))
+    starts_ms = [t.start_ms for t in ordered]
+    ends_ms = [t.end_ms for t in ends]
+    active: list[DiarTurn] = []
+    index = 0
+    for u in sorted(utterances, key=lambda u: (u.start_ms, u.end_ms, u.seq)):
+        if u.track != target:
+            u.speaker = "me"
+            continue
+        active = [t for t in active if t.end_ms > u.start_ms]
+        while index < len(ordered) and ordered[index].start_ms < u.end_ms:
+            if ordered[index].end_ms > u.start_ms:
+                active.append(ordered[index])
+            index += 1
+        coverage: dict[str, int] = {}
+        last: dict[str, int] = {}
+        for t in active:
+            a, b = max(u.start_ms, t.start_ms), min(u.end_ms, t.end_ms)
+            coverage[t.label] = coverage.get(t.label, 0) + max(0, b - max(a, last.get(t.label, a)))
+            last[t.label] = max(last.get(t.label, a), b)
+        best = min(coverage, key=lambda k: (-coverage[k], int(k[1:])), default=None)
+        if best is not None and coverage[best] * 10 >= 3 * max(1, u.end_ms - u.start_ms):
+            u.speaker = best
+            continue
+        nearby = list(active)
+        before = bisect.bisect_right(ends_ms, u.start_ms) - 1
+        after = bisect.bisect_left(starts_ms, u.end_ms)
+        if before >= 0:
+            nearby.append(ends[before])
+        if after < len(ordered):
+            nearby.append(ordered[after])
+        closest = min(
+            nearby,
+            key=lambda t: (
+                max(0, t.start_ms - u.end_ms, u.start_ms - t.end_ms),
+                abs((t.start_ms + t.end_ms) - (u.start_ms + u.end_ms)),
+                t.start_ms,
+                int(t.label[1:]),
+            ),
+            default=None,
+        )
+        u.speaker = closest.label if closest else "others"

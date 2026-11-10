@@ -40,7 +40,8 @@ Message = dict[str, Any]
 ROLE = "meeting-transcribe"
 INITIAL_CREDITS = 64
 CREDIT_STEP = 32
-MEMORY_MARGIN_MB = 200  # no diarization in M4 (+900 MB arrives with M7)
+MEMORY_MARGIN_MB = 200
+DIAR_MEMORY_MB = 900
 MEMORY_RETRY_S = 60.0
 MODEL_RETRY_S = 60.0
 CANCEL_TIMEOUT_S = 1.0  # worker/meeting_contract.CANCEL_TIMEOUT_S
@@ -229,6 +230,7 @@ class _Active:
     meeting: Meeting
     admission: ModelAdmission
     resume: bool
+    diar_models: tuple[str, str] | None = None
     phase: str = "launching"
     # launching -> loading -> starting -> running; cancelling -> exiting; crashed
     purpose: str = ""  # "" | cancel | delete | fail (role killed, then «Ошибка»)
@@ -275,10 +277,14 @@ class MeetingJobs:
         notify: Notify = lambda kind, meeting: None,
         echo_gate: bool | None = None,
         admit_allowed: Callable[[], bool] = lambda: True,
+        diar_models: Callable[[], tuple[str, str] | None] = lambda: None,
     ) -> None:
         self.store = store
         # Setting + administrator policy (I3): nothing is admitted while it is False.
         self.admit_allowed = admit_allowed
+        # One seam for the next policy/catalog step. Resolve once per admission;
+        # memory admission and the actual job must use the same choice.
+        self.diar_models = diar_models
         self._role_factory = role_factory
         self.transcribe_immediately = transcribe_immediately
         self.audio_retention_days = audio_retention_days
@@ -305,6 +311,8 @@ class MeetingJobs:
         self._role: JobRole | None = None
         self._role_serial = 0
         self._loaded: tuple[int, Message] | None = None  # (process generation, spec)
+        self._diar_unload_pending = False
+        self._diar_unload_req = ""
         self._crashes: deque[float] = deque()
         self._exits: list[int] = []
         self.failures: dict[str, str] = {}
@@ -835,6 +843,8 @@ class MeetingJobs:
         ):
             self._retention_pass()
         self._handle_exits()
+        if self._diar_unload_pending:
+            self._unload_diar()
         self._retry_cancel_writes()
         active = self._active
         if active is not None:
@@ -935,7 +945,8 @@ class MeetingJobs:
 
     def _schedule(self) -> None:
         if (
-            self._retention_scanning
+            self._diar_unload_pending
+            or self._retention_scanning
             or self._admitting
             or not self._queue
             or not self.admit_allowed()
@@ -956,13 +967,16 @@ class MeetingJobs:
 
         def work() -> Callable[[], None]:
             admission = self.model_probe()
+            diar_models = self.diar_models()
             available = self.mem_available() if admission.status == "ok" else None
             if admission.status == "missing":
                 outcome = "needs_model"
                 target = MeetingState.NEEDS_MODEL
             elif admission.status != "ok":
                 outcome, target = "failed", MeetingState.FAILED
-            elif available is not None and available < admission.min_ram_mb + MEMORY_MARGIN_MB:
+            elif available is not None and available < (
+                admission.min_ram_mb + MEMORY_MARGIN_MB + (DIAR_MEMORY_MB if diar_models else 0)
+            ):
                 outcome, target = "waiting_memory", MeetingState.WAITING_MEMORY
             else:
                 outcome, target = "start", MeetingState.TRANSCRIBING
@@ -1004,7 +1018,9 @@ class MeetingJobs:
                     current.retry_at = 0.0
                 else:
                     self._take(meeting_id)
-                    self._active = _Active(updated, admission, resume=current.resume)
+                    self._active = _Active(
+                        updated, admission, resume=current.resume, diar_models=diar_models
+                    )
                     self._advance(self._active)
                 self._changed()
 
@@ -1120,7 +1136,17 @@ class MeetingJobs:
             dir=str(self.store.root / meeting.id),
             tracks=tracks,
             variant=meeting.variant,
-            diarization=False,
+            diarization=active.diar_models is not None,
+            **(
+                {
+                    "diar_models": {
+                        "segmentation_dir": active.diar_models[0],
+                        "embedder_dir": active.diar_models[1],
+                    }
+                }
+                if active.diar_models is not None
+                else {}
+            ),
             self_track="mic",
             resume=active.resume,
             echo_gate=bool(echo and "far" in tracks),
@@ -1176,6 +1202,8 @@ class MeetingJobs:
             except (RuntimeError, ValueError):
                 pass
         self._active = None
+        if active.diar_models is not None:
+            self._unload_diar()
         if active.released is not None:
             active.released()
         self._changed()
@@ -1187,6 +1215,7 @@ class MeetingJobs:
         if not exits:
             return
         self._loaded = None  # a new process loads the model again
+        self._diar_unload_pending, self._diar_unload_req = False, ""
         active = self._active
         if active is None:
             return
@@ -1244,6 +1273,13 @@ class MeetingJobs:
         if role is None or event.get("generation") != role.generation:
             return
         kind = event.get("type")
+        if event.get("req") == self._diar_unload_req and self._diar_unload_req:
+            if kind == "model.unloaded":
+                self._loaded = None  # only the correlated unload ACK proves this
+                self._diar_unload_pending, self._diar_unload_req = False, ""
+            elif kind == "error":
+                self._diar_unload_req = ""  # transient busy/send failure: retry from tick
+            return
         active = self._active
         if active is not None and self.deletions.get(active.meeting_id) == "pending":
             # Preserve every role event for replay if the durable write fails.
@@ -1324,7 +1360,11 @@ class MeetingJobs:
                 self._send("meeting.job.credit", **self._identity(active), n=CREDIT_STEP)
             self._changed()
         elif kind == "meeting.job.waiting":
-            self._wait_memory(active)
+            # Before accepted, memory ends admission as in M4. During the
+            # selected diar pipeline the executor owns a bounded retry and
+            # retains its lease; do not launch a competing replacement job.
+            if active.diar_models is None or active.phase != "running":
+                self._wait_memory(active)
         elif kind == "meeting.job.failed":
             code = str(event.get("code", "io"))
             if code == "memory":
@@ -1335,9 +1375,29 @@ class MeetingJobs:
             self._done(active, event)
 
     def _unload(self) -> None:
+        if self._diar_unload_pending:
+            return  # a tracked terminal unload already owns this transition
         if self._loaded is not None:
             self._loaded = None
             self._send("model.unload")
+
+    def _unload_diar(self) -> None:
+        """Every diar terminal path unloads, including a resumed completed phase.
+
+        Keep resident accounting and block admission until the correlated ACK.
+        A receipt/busy/error does not prove unloading; the GUI tick retries.
+        """
+        role = self._role
+        if role is None or role.exited:
+            self._loaded = None  # confirmed process exit also releases the model
+            self._diar_unload_pending, self._diar_unload_req = False, ""
+            return
+        self._diar_unload_pending = True
+        if self._diar_unload_req:
+            return
+        self._diar_unload_req = request = uuid4().hex
+        if not self._send("model.unload", req=request):
+            self._diar_unload_req = ""
 
     def _wait_memory(self, active: _Active) -> None:
         """Role ended the job for memory: unload the model, retry in 60 s (T-483)."""
@@ -1377,7 +1437,9 @@ class MeetingJobs:
     def _fail(self, active: _Active, code: str) -> None:
         """Audio stays; «Ошибка расшифровки» with «Повторить» (T-482/T-484)."""
         self._active = None
-        if code == "model":
+        if active.diar_models is not None:
+            self._unload_diar()
+        if code == "model" and not self._diar_unload_pending:
             self._loaded = None
         meeting_id = active.meeting_id
         self.failures[meeting_id] = code
@@ -1409,21 +1471,29 @@ class MeetingJobs:
         meeting_id = active.meeting_id
         retention = int(self.audio_retention_days())
         load = active.admission.load or {}
+        diar_failed = event.get("diar_status") == "failed"
+        if active.diar_models is not None:
+            # A resumed completed diar skips its usual ASR unload. Request an
+            # idempotent real unload on every diar completion, even with a queue.
+            self._unload_diar()
 
         def mutate(meeting: Meeting) -> bool:
             if meeting.cancelled or meeting.meeting_generation != active.generation:
                 return False
             self._to(meeting, MeetingState.DONE)
-            meeting.processing_status = ProcessingStatus.SUCCEEDED
+            meeting.processing_status = (
+                ProcessingStatus.PARTIAL if diar_failed else ProcessingStatus.SUCCEEDED
+            )
             transcription = meeting.transcription
             transcription.model_id = str(load.get("id", transcription.model_id))
             transcription.revision = str(load.get("revision", transcription.revision))
-            transcription.diarization = False
+            transcription.diarization = active.diar_models is not None
+            transcription.diar_status = str(event.get("diar_status", "skipped"))
             transcription.finished_at = self.wall_clock().isoformat()
             transcription.wall_ms = int(event.get("wall_ms", 0))
             transcription.peak_rss_kb = int(event.get("peak_rss_kb", 0))
             meeting.audio.retain_days = max(0, min(365, retention))
-            meeting.cleanup_pending = retention == 0 and meeting.audio.present
+            meeting.cleanup_pending = not diar_failed and retention == 0 and meeting.audio.present
             return True
 
         def work() -> Callable[[], None]:

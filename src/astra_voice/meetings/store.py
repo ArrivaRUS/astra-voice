@@ -104,13 +104,13 @@ def _child(
 
 
 @contextlib.contextmanager
-def _lease(directory: int, role: Writer) -> Iterator[None]:
-    with _lock(directory, f".writer-{role.value}.lock"):
-        yield
+def _lease(directory: int, role: Writer) -> Iterator[int]:
+    with _lock(directory, f".writer-{role.value}.lock") as descriptor:
+        yield descriptor
 
 
 @contextlib.contextmanager
-def _lock(directory: int, name: str) -> Iterator[None]:
+def _lock(directory: int, name: str) -> Iterator[int]:
     flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     created = False
     try:
@@ -124,7 +124,7 @@ def _lock(directory: int, name: str) -> Iterator[None]:
             os.fsync(directory)
         check_private_file(os.fstat(descriptor))
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        yield descriptor
     finally:
         os.close(descriptor)
 
@@ -224,13 +224,27 @@ class MeetingWriter:
     cache: the next use re-reads the disk.
     """
 
-    def __init__(self, directory: int, meeting_id: str, role: Writer) -> None:
+    def __init__(
+        self, directory: int, meeting_id: str, role: Writer, *, lease_fd: int | None = None
+    ) -> None:
         self._directory = directory
         self._meeting_id = meeting_id
         self._role = role
         self._active = True
+        self._lease_fd = lease_fd
         self._transcript: _TranscriptState | None = None
         self._transcript_known = False
+
+    def diar_lease_fd(self) -> int:
+        """Borrow the DIAR flock's open file description for child pass_fds.
+
+        Never LOCK_UN it: closing the parent's descriptor must leave the lock
+        held until the inherited child descriptor also closes. The child only
+        keeps this fd open and never uses it for file I/O.
+        """
+        if not self._active or self._role != Writer.DIAR or self._lease_fd is None:
+            raise MeetingStoreError("Дескриптор аренды разделения недоступен")
+        return self._lease_fd
 
     def prepare(self, filename: str, document: JsonModel) -> PreparedDocument:
         try:
@@ -774,11 +788,11 @@ class MeetingStore:
             if not isinstance(role, Writer):
                 raise MeetingStoreError("Неизвестный писатель встречи")
             directory = resources.enter_context(self._directory(meeting_id))
-            resources.enter_context(_lease(directory, role))
+            lease_fd = resources.enter_context(_lease(directory, role))
             meeting = _metadata(directory, meeting_id)
             if meeting.state == MeetingState.DELETING:
                 raise MeetingStoreError("Встреча удаляется")
-            writer = MeetingWriter(directory, meeting_id, role)
+            writer = MeetingWriter(directory, meeting_id, role, lease_fd=lease_fd)
         except (OSError, ValueError, TypeError, RecursionError):
             resources.close()
             raise MeetingStoreError("Писатель встречи недоступен") from None

@@ -190,7 +190,7 @@ COMMAND_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
             "block_index": {"type": "integer", "minimum": 0, "maximum": 11},
             "offset_ms": MILLISECONDS,
             "pcm_fd": {"type": "integer", "minimum": 3, "maximum": 2147483647},
-            "block_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 1200},
+            "block_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 1380},
             "expected_rtf": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
         },
         "diar.finish": IDENTITY,

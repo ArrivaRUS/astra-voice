@@ -232,7 +232,7 @@ def test_fd_limit_checked_without_reading_large_audio() -> None:
     os.ftruncate(fd, diar.MAX_PCM_BYTES + 4)
     fcntl.fcntl(fd, diar.F_ADD_SEALS, diar.REQUIRED_SEALS)
     with pytest.raises(ValueError):
-        diar.read_pcm(fd, 1200, threading.Event())
+        diar.read_pcm(fd, 1380, threading.Event())
     with pytest.raises(OSError):
         os.fstat(fd)
 
@@ -1022,3 +1022,25 @@ def test_trace_syscall_list_covers_lifecycle_and_output_calls() -> None:
 def test_trace_new_outputs_require_own_memfd_even_with_name(body: str) -> None:
     assert _audit_trace("191996 " + body + " = 0") == ["file-write"]
     assert _audit_trace(_R3_CREATE + "\n191996 " + body + " = 0") == []
+
+
+def test_r2_b_pcm_grid_ceiling_passes_validation_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcntl
+
+    class Validated(Exception):
+        pass
+
+    def allocate(count: int, **kwargs: Any) -> Any:
+        assert count == 1380 * diar.RATE
+        raise Validated
+
+    fd = os.memfd_create("grid-ceiling", os.MFD_ALLOW_SEALING)
+    os.ftruncate(fd, 1380 * diar.RATE * 4)
+    fcntl.fcntl(fd, diar.F_ADD_SEALS, diar.REQUIRED_SEALS)
+    monkeypatch.setattr(np, "empty", allocate)
+    with pytest.raises(Validated):
+        diar.read_pcm(fd, 1380, threading.Event())
+    with pytest.raises(OSError):
+        os.fstat(fd)
