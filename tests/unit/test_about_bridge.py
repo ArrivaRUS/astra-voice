@@ -126,7 +126,7 @@ def test_debian_rules_install_documents_where_bridge_looks() -> None:
     assert f"install -m 0644 NOTICE docs/PRIVACY.md $(SHAREDIR)/{RESOURCE_DOCS}/" in rules
     assert "DOCDIR   := $(PKG)/usr/share/doc/astra-voice" in rules
     assert "for f in NOTICE docs/PRIVACY.md" in rules
-    assert "override_dh_compress:\n\tdh_compress -XNOTICE -XPRIVACY.md\n" in rules
+    assert "override_dh_compress:\n\tdh_compress -XNOTICE -XPRIVACY.md -Xlicenses\n" in rules
     smoke = (REPO / "packaging/smoke-installed.sh").read_text(encoding="utf-8")
     assert "*doc_paths().values()," in smoke
     assert '"$ROOTDIR/usr/share/astra-voice/docs" "$ROOTDIR/usr/share/doc/astra-voice"' in smoke
