@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-import yaml  # type: ignore[import-untyped]  # PyYAML без types-PyYAML в lint-venv.
+
+yaml = pytest.importorskip("yaml")
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]

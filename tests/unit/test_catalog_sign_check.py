@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml  # type: ignore[import-untyped]  # PyYAML без types-PyYAML в lint-venv.
 from scripts import catalog_sign_check as gate
+
+yaml = pytest.importorskip("yaml")
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
