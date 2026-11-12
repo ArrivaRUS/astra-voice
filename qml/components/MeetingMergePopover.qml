@@ -38,7 +38,7 @@ Popup {
     onOpened: {
         choice.currentIndex = 0
         fitViewport()
-        Qt.callLater(function() { root.fitViewport(); cancel.forceActiveFocus(Qt.TabFocusReason) })
+        Qt.callLater(function() { root.fitViewport(); cancel.focus = false; cancel.forceActiveFocus(Qt.TabFocusReason) })
     }
     onClosed: {
         if (ownerPanel) ownerPanel.highlightedSpeaker = ""
@@ -50,6 +50,8 @@ Popup {
             surfaceWidth: parent.width
             surfaceHeight: parent.height
             surfaceRadius: Theme.popoverRadius
+            borderWidth: Theme.cardBorder
+            borderColor: Theme.border
             surfaceColor: Theme.bgSurface
             shadowX: Theme.shadowMenuX
             shadowY: Theme.shadowMenuY

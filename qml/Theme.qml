@@ -778,4 +778,13 @@ QtObject {
     readonly property real shadowToastRadius: 28
     readonly property color shadowToastColor: Qt.rgba(0, 0, 0, 0.35)
     readonly property color transcriptEchoFg: fgMuted
+    readonly property real diarInstallIconSize: 12
+    readonly property real diarInstallIconGap: 5
+    readonly property real diarInstallProgressTop: 6
+    readonly property real diarInstallCardProgressW: 160
+    readonly property real diarInstallCardControlH: 28.75
+    readonly property real diarInstallHeaderPhaseY: 0.5
+    readonly property real diarInstallCardGap: 8
+    readonly property real diarInstallCardBottom: 10
+    readonly property real speakerNumTextOffsetY: -2
 }

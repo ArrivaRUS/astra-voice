@@ -51,8 +51,24 @@ REFERENCE_BOUNDS.update(
         "models-missing": ("09-diar-install", 312, 4605, 840, 416, 22, 12),
         "marks-1024": ("08-marks", 312, 311, 840, 778, 22, 12),
         "marks-900": ("08-marks", 374, 2271, 716, 765, 22, 12),
-        "save-echo": ("08-marks", 220, 5139, 840, 552, 22, 12),
-        "save-echo-checked": ("08-marks", 220, 5693, 840, 552, 22, 12),
+        "save-echo": ("08-marks", 220, 5109, 840, 552, 22, 12),
+        "save-echo-checked": ("08-marks", 220, 5640, 840, 552, 22, 12),
+    }
+)
+# 09: full-sheet coordinates, 1280 × 8086. Content fragments exclude shadows.
+# §2 crops share card border y=39 despite the fractional HTML frame origins.
+REFERENCE_BOUNDS.update(
+    {
+        "diar-missing": ("09-diar-install", 100, 5198, 840, 130, 22, 14),
+        "diar-downloading": ("09-diar-install", 100, 5375, 840, 131, 22, 14),
+        "diar-installed": ("09-diar-install", 100, 5932, 840, 122, 22, 14),
+        "diar-failed-admin-900": ("09-diar-install", 100, 6719, 716, 161, 22, 14),
+        "section-group-missing": ("09-diar-install", 312, 407, 840, 287, 22, 0),
+        "section-missing": ("09-diar-install", 100, 891, 840, 155, 22, 4),
+        "section-downloading": ("09-diar-install", 100, 1117, 840, 164, 22, 4),
+        "section-installed": ("09-diar-install", 100, 1847, 840, 155, 22, 4),
+        "section-failed-admin": ("09-diar-install", 100, 2501, 840, 155, 22, 4),
+        "section-offline": ("09-diar-install", 100, 3809, 840, 155, 22, 4),
     }
 )
 # No corresponding frame exists in the committed reference. Dimensions describe
@@ -68,7 +84,6 @@ RENDER_VIEWPORTS = {
     "room": (716, 520),
     "no-diarization": (840, 552),
     "policy-off": (716, 520),
-    "models-missing": (840, 552),
 }
 
 MEETING_ID = "2026-10-09_100000-ab12"
@@ -260,6 +275,15 @@ def make_bridge() -> Any:
         def _get_replace(self) -> str:
             return self.replace_file
 
+        @pyqtProperty("QVariantMap", notify=changed)
+        def diarizationInstall(self) -> dict[str, Any]:  # noqa: N802
+            from astra_voice.ui.meeting_texts import diar_install_presentation
+
+            code = getattr(self, "install_code", "missing")
+            percent = 100 if code in {"verifying", "installing", "installed"} else 42
+            result = diar_install_presentation(code, percent, "hf")
+            return {**result, "visible": True, "accessiblePercent": 100 if percent == 100 else 40}
+
         card = pyqtProperty("QVariantMap", _get_card, notify=changed)
         cardRows = pyqtProperty(QObject, _get_rows, constant=True)  # noqa: N815
         cardTexts = pyqtProperty("QVariantMap", _get_texts, constant=True)  # noqa: N815
@@ -450,7 +474,19 @@ def make_bridge() -> Any:
                 and self.meeting.state == "done",
                 models_missing=self.models_missing,
             )
+            if self.models_missing:
+                state = self.diarizationInstall
+                self._card.update(
+                    diarizationInstallVisible=True,
+                    diarizationModelsMissing=state["code"] != "installed",
+                    diarizationHint=state["cardText"],
+                    diarizationAction=state["action"],
+                )
             self.changed.emit()
+
+        @pyqtSlot()
+        def cancelDiarizationInstall(self) -> None:  # noqa: N802
+            self.actions.append("cancel-install")
 
         @pyqtSlot(str)
         def cardAction(self, action: str) -> None:  # noqa: N802
@@ -586,7 +622,26 @@ def visual_states() -> dict[str, dict[str, Any]]:
         "utterances": fixture_utterances(LINES[:5]),
         "fragment": True,
     }
-    fixtures["models-missing"] = {**states()["ready-1024"], "models_missing": True}
+    # 09 §3: no pauses, no participants panel, first seven non-mark replies.
+    plain = [(t, w, text) for t, w, text in LINES if w != "mark"]
+    fixtures["models-missing"] = {
+        "meeting": fixture_meeting(marks=[], intervals=[]),
+        "utterances": fixture_utterances(plain[:7]),
+        "models_missing": True,
+    }
+    for name, code in (
+        ("diar-missing", "missing"),
+        ("diar-downloading", "downloading"),
+        ("diar-installed", "installed"),
+        ("diar-failed-admin-900", "failed:admin"),
+    ):
+        fixtures[name] = {
+            "meeting": fixture_meeting(marks=[], intervals=[]),
+            "utterances": fixture_utterances(plain[:2]),
+            "models_missing": True,
+            "install_code": code,
+            "install_fragment": True,
+        }
     fixtures["diarization-failed"] = states()["ready-1024"]
     fixtures["diarization-failed"]["meeting"].transcription.diar_status = "failed"
     policy = named()
@@ -887,6 +942,7 @@ Window {
             from PyQt5.QtCore import Qt
 
             reset_focus()
+            bridge.install_code = fixture.get("install_code", "missing")
             bridge.show(
                 fixture["meeting"],
                 fixture.get("utterances"),
@@ -909,6 +965,13 @@ Window {
                 )
             apply_panel_fixture(bridge, fixture)
             QTest.qWait(80)
+            if fixture.get("install_fragment"):
+                row = window.findChild(QObject, "meetingDiarizationMissing")
+                from PyQt5.QtCore import QPointF
+
+                card.setY(pad_y - row.mapToItem(card, QPointF(0, 0)).y())
+            else:
+                card.setY(pad_y)
             from PyQt5.QtCore import QMetaObject
 
             action = fixture.get("action")
@@ -991,6 +1054,21 @@ Window {
                 ]
                 if leaked:
                     raise RuntimeError(f"Focus leaked into {name}/{theme_name}: {leaked}")
+            # Reassert keyboard focus after theme/state changes, in both palettes.
+            if action == "merge":
+                window.requestActivate()
+                cancel = window.findChild(QObject, "meetingMergeCancel")
+                cancel.setProperty("focus", False)
+                cancel.forceActiveFocus(Qt.TabFocusReason)
+                QTest.qWait(20)
+                if not cancel.property("visualFocus"):
+                    raise RuntimeError(f"Merge cancel lost keyboard focus: {theme_name}")
+            if name == "diar-downloading":
+                window.requestActivate()
+                button = window.findChild(QObject, "meetingDiarizationInstall")
+                button.setProperty("focus", False)
+                button.forceActiveFocus(Qt.TabFocusReason)
+                QTest.qWait(20)
             image = window.grabWindow()
             grab = None
             for _attempt in range(20):
@@ -1007,6 +1085,7 @@ Window {
             filename = f"{name}-{theme_name}.png"
             if not image.save(str(out / filename), "PNG"):
                 raise RuntimeError(f"Cannot write {filename}")
+            print(f"{filename}: {width}x{height}", flush=True)
             rows.append(
                 {
                     "file": filename,
@@ -1038,6 +1117,12 @@ Window {
                     }
                     if action == "merge"
                     else None,
+                    "save_dialog_geometry": {
+                        key: window.findChild(QObject, "meetingSaveDialog").property(key)
+                        for key in ("x", "y", "width", "height")
+                    }
+                    if action in {"save-echo", "save-echo-checked"}
+                    else None,
                     "rows": bridge.cardRows.rowCount(),
                     "preview": bridge.savePreview()
                     if action and action.startswith("save-")
@@ -1050,6 +1135,7 @@ Window {
                     else None,
                 }
             )
+    rows.extend(render_sections(out, app, theme))
     rows.extend(reference_crops(out))
     window.hide()
     sip.delete(engine)
@@ -1057,6 +1143,9 @@ Window {
         raise RuntimeError("\n".join(warnings))
     qml = [
         REPO / "qml/sections/MeetingCard.qml",
+        REPO / "qml/sections/Meetings.qml",
+        REPO / "qml/components/SettingRow.qml",
+        REPO / "qml/components/DiarizationProgress.qml",
         REPO / "qml/Theme.qml",
         REPO / "qml/components/AvSelect.qml",
         REPO / "qml/components/OverlaySurface.qml",
@@ -1087,13 +1176,179 @@ Window {
     return manifest
 
 
+def render_sections(out: Path, app: Any, theme: Any) -> list[dict[str, Any]]:
+    """Actual Meetings.qml, showing the same two-row group fragments as 09 §2."""
+    import tempfile
+
+    from PyQt5 import sip
+    from PyQt5.QtCore import QObject, Qt, QUrl
+    from PyQt5.QtQml import QQmlApplicationEngine, QQmlEngine, QQmlExpression
+    from PyQt5.QtQuick import QQuickItem
+    from PyQt5.QtTest import QTest
+
+    from astra_voice.core.settings import Settings
+    from astra_voice.meetings.store import MeetingStore
+    from astra_voice.ui.icons import install_icon_provider
+    from astra_voice.ui.meeting_bridge import MeetingBridge
+
+    rows: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="s7b2-section-") as folder:
+        bridge = MeetingBridge(
+            Settings(meetings_enabled=True, meeting_diarization=True),
+            store=MeetingStore(Path(folder)),
+            save=lambda _: None,
+            diar_models_provider=lambda: None,
+        )
+        engine = QQmlApplicationEngine()
+        warnings: list[str] = []
+        engine.warnings.connect(lambda messages: warnings.extend(m.toString() for m in messages))
+        engine.rootContext().setContextProperty("themeSource", theme)
+        engine.rootContext().setContextProperty("meetingBridge", bridge)
+        install_icon_provider(engine)
+        engine.loadData(
+            b"""import QtQuick 2.15
+import QtQuick.Window 2.15
+import "qml"
+import "qml/sections"
+Window { width:840; height:164; visible:true
+ Rectangle { anchors.fill:parent; color:Theme.bgApp; clip:true
+  Meetings { objectName:"renderSection"; x:22; y:4; width:796 }
+ }
+}""",
+            QUrl.fromLocalFile(str(REPO / "_render-section.qml")),
+        )
+        if not engine.rootObjects():
+            raise RuntimeError("\n".join(warnings))
+        window = engine.rootObjects()[0]
+        section = window.findChild(QObject, "renderSection")
+        group_box = window.findChild(QObject, "meetingSettingsGroups")
+        install = window.findChild(QObject, "meetingDiarizationModels")
+        toggle = window.findChild(QObject, "meetingDiarization")
+        toggle_row = toggle.parentItem().parentItem().parentItem()
+        row_column = install.parentItem()
+        group = row_column.parentItem().parentItem()
+        # Hide out-of-fragment material, retaining production geometry and controls.
+        for child in section.childItems():
+            if child != group_box:
+                child.setVisible(False)
+        for child in group_box.childItems():
+            if child != group:
+                child.setVisible(False)
+        full_rows = list(row_column.childItems())
+        # 09 §1 assumes the independent ASR model is installed; screenshot-only fixture.
+        asr_row = full_rows[0]
+        # Freeze its canonical geometry before replacing the out-of-scope ASR fixture.
+        freeze = QQmlExpression(
+            QQmlEngine.contextForObject(asr_row), asr_row, "implicitHeight = Theme.cardRowHWithSub"
+        )
+        freeze.evaluate()
+        if freeze.hasError():
+            raise RuntimeError(freeze.error().toString())
+        asr_row.setProperty("sub", "GigaAM v3 RNN-T · установлена")
+        for child in asr_row.findChildren(QObject):
+            if child.property("small") is True:
+                child.setProperty("visible", False)
+        for child in full_rows:
+            if child not in (toggle_row, install):
+                child.setVisible(False)
+        toggle_row.setProperty("divider", False)
+        # Reparent the actual group out of the full section; its canonical rows remain.
+        holder = QQuickItem(window.contentItem())
+        holder.setX(22)
+        holder.setY(17)
+        holder.setWidth(796)
+        group.setParentItem(holder)
+        group.setX(0)
+        group.setY(0)
+        section.setVisible(False)
+        QTest.qWait(100)
+
+        def visual_children(item: Any) -> Any:
+            yield item
+            for child in item.childItems():
+                yield from visual_children(child)
+
+        def reset_focus() -> None:
+            for item in reversed(list(visual_children(window.contentItem()))):
+                if item.property("focus") or item.property("visualFocus"):
+                    item.forceActiveFocus(Qt.OtherFocusReason)
+                    item.setProperty("focus", False)
+            window.contentItem().forceActiveFocus(Qt.OtherFocusReason)
+
+        for palette in ("light", "dark"):
+            theme.value = palette == "dark"
+            theme.changed.emit()
+            for suffix, code in (
+                ("group-missing", "missing"),
+                ("missing", "missing"),
+                ("downloading", "downloading"),
+                ("installed", "installed"),
+                ("failed-admin", "failed:admin"),
+                ("offline", "offline-user"),
+            ):
+                name = "section-" + suffix
+                full_group = suffix == "group-missing"
+                for child in full_rows:
+                    child.setVisible(full_group or child in (toggle_row, install))
+                toggle_row.setProperty("divider", full_group)
+                holder.setY(0 if full_group else 17)
+                _, _x, _y, width, height, _, _ = REFERENCE_BOUNDS[name]
+                window.setHeight(height)
+                bridge._diar_code = code
+                bridge._diar_percent = 100 if code == "installed" else 42
+                bridge._diar_accessible_percent = 100 if code == "installed" else 40
+                bridge._publish_diar_install()
+                button = window.findChild(QObject, "meetingDiarizationModelsAction")
+                reset_focus()
+                if suffix == "downloading":
+                    window.requestActivate()
+                    button.forceActiveFocus(Qt.TabFocusReason)
+                QTest.qWait(100)
+                focused = [
+                    item.objectName()
+                    for item in visual_children(window.contentItem())
+                    if item.isVisible() and item.property("visualFocus")
+                ]
+                expected_focus = [button.objectName()] if suffix == "downloading" else []
+                if focused != expected_focus:
+                    raise RuntimeError(f"Section focus leaked into {name}/{palette}: {focused}")
+                picture = window.grabWindow()
+                if picture.isNull():
+                    grab = window.contentItem().grabToImage()
+                    QTest.qWait(50)
+                    picture = grab.image()
+                filename = f"{name}-{palette}.png"
+                if picture.isNull() or not picture.save(str(out / filename), "PNG"):
+                    raise RuntimeError(filename)
+                print(f"{filename}: {width}x{height}", flush=True)
+                rows.append(
+                    {
+                        "file": filename,
+                        "kind": "render",
+                        "scale": 1,
+                        "width": width,
+                        "height": height,
+                        "presentation": _jsonable(bridge.diarizationInstall),
+                        "visual_focus": focused,
+                        "comparison_scope": "09 section group fragment",
+                    }
+                )
+        bridge.shutdown()
+        window.hide()
+        sip.delete(engine)
+        if warnings:
+            raise RuntimeError("\n".join(warnings))
+    return rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True, help="Destination for PNGs and manifest")
     options = parser.parse_args()
     manifest = render(options.out.resolve())
     for row in manifest["pngs"]:
-        print(f"{row['file']}: {row['width']}x{row['height']}")
+        if row["kind"] != "render":
+            print(f"{row['file']}: {row['width']}x{row['height']}")
     return 0
 
 

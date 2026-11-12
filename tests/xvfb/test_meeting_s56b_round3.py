@@ -100,7 +100,7 @@ b._stored.meeting_diarization=True
 rig.open_card()
 QTest.qWait(40)
 row=one('meetingDiarizationMissing'); button=one('meetingDiarizationInstall')
-assert abs(button.x()+button.width()-row.width()) < 0.01
+assert abs(button.mapToItem(row,QPointF(button.width(),0)).x()-row.width()) < 0.01
 button_bottom=button.mapToScene(QPointF(0,button.height())).y()
 table_top=one('meetingCardTable').mapToScene(QPointF(0,0)).y()
 assert abs(table_top-button_bottom-10) < 0.01, (table_top,button_bottom)

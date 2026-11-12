@@ -182,23 +182,33 @@ Rectangle {
                             renderType: Text.NativeRendering
                         }
                     }
-                    Text {
-                        id: quote
-                        objectName: "meetingParticipantQuote"
+                    // Qt5 rounds font.pixelSize to int. Render at ceil(size), then
+                    // map both glyphs and layout back to the specified 11.5 logical px.
+                    Item {
                         visible: person.info.kind === "me" || !!person.info.firstText
                         width: parent.width
-                        text: person.info.kind === "me" ? (root.cardTexts.meCaption || "")
-                            : person.info.firstText ? "«" + person.info.firstText + "»" : ""
-                        textFormat: Text.PlainText
-                        wrapMode: Text.WordWrap
-                        maximumLineCount: person.info.kind === "speaker" ? 2 : Number.MAX_VALUE
-                        elide: Text.ElideRight
-                        color: Theme.fgMuted
-                        font.family: Theme.fontUi
-                        font.pixelSize: Theme.participantsQuoteSize
-                        lineHeight: Theme.participantsQuoteSize * Theme.participantsQuoteLineHeight
-                        lineHeightMode: Text.FixedHeight
-                        renderType: Text.NativeRendering
+                        objectName: "meetingParticipantQuoteBox"
+                        height: person.info.kind === "me" ? Math.ceil(quote.height * quote.scale)
+                            : quote.height * quote.scale
+                        Text {
+                            id: quote
+                            objectName: "meetingParticipantQuote"
+                            transformOrigin: Item.TopLeft
+                            scale: Theme.participantsQuoteSize / Math.ceil(Theme.participantsQuoteSize)
+                            width: parent.width / scale
+                            text: person.info.kind === "me" ? (root.cardTexts.meCaption || "")
+                                : person.info.firstText ? "«" + person.info.firstText + "»" : ""
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WordWrap
+                            maximumLineCount: person.info.kind === "speaker" ? 2 : Number.MAX_VALUE
+                            elide: Text.ElideRight
+                            color: Theme.fgMuted
+                            font.family: Theme.fontUi
+                            font.pixelSize: Math.ceil(Theme.participantsQuoteSize)
+                            lineHeight: Math.ceil(Theme.participantsQuoteSize) * Theme.participantsQuoteLineHeight
+                            lineHeightMode: Text.FixedHeight
+                            renderType: Text.NativeRendering
+                        }
                     }
                     TextField {
                         id: field

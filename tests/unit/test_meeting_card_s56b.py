@@ -93,7 +93,25 @@ def test_snapshot_states_have_real_crops_or_explicit_missing_evidence() -> None:
         "save-echo-checked",
         "save-statistics",
     } <= states.keys()
-    assert states.keys() == REFERENCE_BOUNDS.keys() | MISSING_REFERENCES.keys()
+    section_states = {
+        "section-group-missing",
+        "section-missing",
+        "section-downloading",
+        "section-installed",
+        "section-failed-admin",
+        "section-offline",
+    }
+    assert states.keys() | section_states == REFERENCE_BOUNDS.keys() | MISSING_REFERENCES.keys()
+    assert {
+        "diar-missing",
+        "diar-downloading",
+        "diar-installed",
+        "diar-failed-admin-900",
+    } <= states.keys()
+    missing = states["models-missing"]
+    assert len(missing["utterances"]) == 7
+    assert not missing["meeting"].marks and not missing["meeting"].intervals
+    assert all(REFERENCE_BOUNDS[name][0] == "09-diar-install" for name in section_states)
     assert all(
         (REPO / f"design/meetings/refs/{sheet}-light.png").is_file()
         for sheet, *_ in REFERENCE_BOUNDS.values()

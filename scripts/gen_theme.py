@@ -257,6 +257,19 @@ def build_theme(data: dict[str, Any]) -> str:
         add([f"readonly property color {prefix}Color: {colour}"], prefix + "Color")
     # Meetings §Д.2: semantic alias; no new palette entry.
     add(["readonly property color transcriptEchoFg: fgMuted"], "transcriptEchoFg")
+    # Meetings spec §У.3–У.4; geometry supplement, design sources are read-only.
+    for name, value in {
+        "diarInstallIconSize": 12,
+        "diarInstallIconGap": 5,
+        "diarInstallProgressTop": 6,
+        "diarInstallCardProgressW": 160,
+        "diarInstallCardControlH": 28.75,
+        "diarInstallHeaderPhaseY": 0.5,
+        "diarInstallCardGap": 8,
+        "diarInstallCardBottom": 10,
+        "speakerNumTextOffsetY": -2,
+    }.items():
+        add([f"readonly property real {name}: {value}"], name)
     return render(data, "Theme", body)
 
 

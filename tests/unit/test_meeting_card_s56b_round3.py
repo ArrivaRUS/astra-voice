@@ -34,8 +34,8 @@ def test_snapshot_fragments_and_reference_coordinates() -> None:
     assert rc.RENDER_VIEWPORTS["room"][0] - 44 == 672
     assert rc.RENDER_VIEWPORTS["no-diarization"][0] - 44 == 796
     assert rc.REFERENCE_BOUNDS["names-edit"][1:5] == (374, 1634, 716, 520)
-    assert rc.REFERENCE_BOUNDS["save-echo"][2] == 5139
-    assert rc.REFERENCE_BOUNDS["save-echo-checked"][2] == 5693
+    assert rc.REFERENCE_BOUNDS["save-echo"][2] == 5109
+    assert rc.REFERENCE_BOUNDS["save-echo-checked"][2] == 5640
     assert rc.REFERENCE_BOUNDS["policy-off"][1:4] == (663, 1212, 502)
     assert rc.REFERENCE_BOUNDS["policy-off"][4] >= 370
 
@@ -66,3 +66,20 @@ def test_new_ui_strings_use_standalone_guillemets() -> None:
         for source in (DELETE_TEXTS, MARK_TEXTS, W2_TEXTS)
         for value in source.values()
     )
+
+
+def test_section_reference_card_tops_share_integer_origin() -> None:
+    from tools.render_meeting_card import REFERENCE_BOUNDS
+
+    gui = pytest.importorskip("PyQt5.QtGui")
+    for theme, border in (("light", "#d7deea"), ("dark", "#2c3445")):
+        sheet = gui.QImage(str(REPO / f"design/meetings/refs/09-diar-install-{theme}.png"))
+        assert not sheet.isNull()
+        for state, (_sheet, x, y, width, height, _px, _py) in REFERENCE_BOUNDS.items():
+            if not state.startswith("section-") or state == "section-group-missing":
+                continue
+            assert all(isinstance(value, int) for value in (x, y, width, height))
+            top = next(
+                row for row in range(65) if sheet.pixelColor(x + 40, y + row).name() == border
+            )
+            assert top == 39, (theme, state, top)

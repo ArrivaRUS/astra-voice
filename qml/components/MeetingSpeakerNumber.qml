@@ -16,6 +16,7 @@ Rectangle {
     Text {
         id: digit
         anchors.centerIn: parent
+        anchors.verticalCenterOffset: Theme.speakerNumTextOffsetY
         text: root.num
         textFormat: Text.PlainText
         color: Theme.speakerNumFg

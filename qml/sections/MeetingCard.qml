@@ -15,13 +15,15 @@ FocusScope {
 
     property var bridge: null
     readonly property var card: bridge && bridge.card !== undefined && bridge.card.open === true ? bridge.card : ({})
+    readonly property var diarInstall: bridge && bridge.diarizationInstall !== undefined ? bridge.diarizationInstall : ({})
     readonly property var texts: bridge && bridge.cardTexts !== undefined ? bridge.cardTexts : ({})
     readonly property var rowsModel: bridge && bridge.cardRows !== undefined ? bridge.cardRows : null
     readonly property string view: card.view !== undefined ? card.view : ""
     // Точка 760 по ширине контента (spec §5.2): шире — панель «Участники» справа.
+    readonly property bool hasParticipants: card.diarizationInstallVisible !== true
     readonly property bool wide: width >= Theme.sizeMeetingSplitContentW
     readonly property bool panelState: card.panel !== undefined && card.panel.title !== undefined
-    readonly property real tableWidth: wide ? width - Theme.participantsPanelGap - Theme.participantsPanelW : width
+    readonly property real tableWidth: wide && hasParticipants ? width - Theme.participantsPanelGap - Theme.participantsPanelW : width
     // Рамка карточек: в тёмной теме border полупрозрачный; Qt не кладёт под рамку заливку,
     // поэтому смешиваем его с bgSurface заранее (CSS border-box), как OverlaySurface (M3).
     readonly property color cardBorderColor: Qt.tint(Theme.bgSurface, Theme.border)
@@ -77,7 +79,7 @@ FocusScope {
         panel.highlightedSpeaker = person.id
         mergePopover.returnFocusItem = origin
         var point = panel.speakerAnchor(person.id, mergePopover.parent)
-        mergePopover.x = Math.max(0, point.x - Theme.mergePopoverW - Theme.participantsPanelGap)
+        mergePopover.x = Math.max(0, point.x - Theme.mergePopoverW - Theme.participantsPanelGap + Theme.focusOffset + Theme.focusWidth)
         mergePopover.anchorCenterY = point.y + point.height / 2
         mergePopover.open()
     }
@@ -348,7 +350,7 @@ FocusScope {
                 AvButton {
                     id: moreButton
                     objectName: "meetingCardMore"
-                    KeyNavigation.tab: table
+                    KeyNavigation.tab: installButton.visible ? installButton : table
                     width: Theme.meetingHeadIconButton
                     height: Theme.meetingHeadIconButton
                     leftPadding: 0
@@ -427,7 +429,10 @@ FocusScope {
             width: 1
             visible: (root.card.marks === undefined || root.card.marks.length === 0) && root.view !== ""
             // 06: подстрока панельных состояний — отступ снизу 12; без отметок над таблицей — 10.
-            height: visible ? (root.panelState || root.view === "read-error" ? 12 : Theme.meetingHeadMarksMarginBottom) : 0
+            // Preserve the CSS header's half-pixel baseline phase before the inline install row.
+            height: visible ? (root.panelState || root.view === "read-error" ? 12
+                : Theme.meetingHeadMarksMarginBottom
+                    + (root.card.diarizationInstallVisible === true ? Theme.diarInstallHeaderPhaseY : 0)) : 0
         }
 
         // ── расшифровка идёт (В4) ──────────────────────────────────────────
@@ -709,7 +714,7 @@ FocusScope {
         // ── полоса «Участники» (контент < 760) ─────────────────────────────
         Item {
             width: parent.width
-            visible: root.card.showTable === true && !root.wide
+            visible: root.card.showTable === true && root.hasParticipants && !root.wide
             height: visible ? strip.height + Theme.participantsStripMarginBottom : 0
             Rectangle {
                 id: strip
@@ -751,7 +756,7 @@ FocusScope {
                                 Text {
                                     text: modelData.label
                                     textFormat: Text.PlainText
-                                    color: modelData.kind === "me" ? Theme.transcriptMeFg : Theme.fg
+                                    color: Theme.fg
                                     font.family: Theme.fontUi
                                     font.pixelSize: Theme.participantsStripChipSize
                                     height: Theme.participantsStripChipSize * Theme.participantsQuoteLineHeight
@@ -783,32 +788,84 @@ FocusScope {
         Item {
             id: missingModels
             objectName: "meetingDiarizationMissing"
-            visible: root.card.diarizationModelsMissing === true
+            visible: root.card.diarizationInstallVisible === true
             width: parent.width
-            height: visible ? Math.max(installLabel.height, installButton.height) + Theme.participantsStripMarginBottom : 0
+            height: visible ? Math.max(installLabel.height, installButton.visible ? installButton.height : 0) + Theme.diarInstallCardBottom : 0
+            readonly property bool progressVisible: ["downloading", "verifying", "installing"].indexOf(root.diarInstall.code) >= 0
+            readonly property bool hasIcon: root.diarInstall.error === true || root.diarInstall.code === "installed"
+            // Fixed line-height in Qt5 does not add CSS half-leading to the glyph baseline.
+            readonly property real lineTop: (Math.max(installLabel.height,
+                installButton.visible ? Theme.diarInstallCardControlH : 0) - installLabel.height) / 2
+            readonly property real halfLeading: Math.max(0,
+                (Theme.fontSmallSize * Theme.fontBodyLineHeight - installMetrics.height) / 2)
+            FontMetrics { id: installMetrics; font: installLabel.font }
+            Icon {
+                objectName: "meetingDiarizationStatusIcon"
+                visible: missingModels.hasIcon
+                name: root.diarInstall.error ? "alert" : "check"
+                size: Theme.diarInstallIconSize
+                color: root.diarInstall.error ? Theme.dangerInk : Theme.successInk
+                // Inline vertical-middle includes half the 3 px top margin;
+                // check ink has a 3 px bottom inset, alert a 1 px top inset.
+                y: root.diarInstall.error ? missingModels.lineTop + 3
+                    : installLabel.y + installLabel.baselineOffset - height + 3 + 3 / 2
+                Accessible.ignored: true
+            }
             Text {
                 id: installLabel
-                width: Math.max(0, parent.width - (installButton.visible ? installButton.width + Theme.mergePopoverGap : 0))
-                y: (parent.height - Theme.participantsStripMarginBottom - height) / 2
+                objectName: "meetingDiarizationLabel"
+                x: missingModels.hasIcon ? Theme.diarInstallIconSize + Theme.diarInstallIconGap : 0
+                width: Math.max(0, parent.width - x - (installControls.width > 0 ? installControls.width + Theme.diarInstallCardGap : 0))
+                // NativeRendering rounds the origin; the half-pixel correction
+                // selects the preceding pixel like the CSS line box.
+                y: missingModels.lineTop + missingModels.halfLeading - 0.5
                 text: root.card.diarizationHint || ""
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSmallSize
-                color: Theme.fgMuted
+                lineHeight: Theme.fontSmallSize * Theme.fontBodyLineHeight
+                lineHeightMode: Text.FixedHeight
+                color: root.diarInstall.error ? Theme.dangerInk : Theme.fgMuted
                 renderType: Text.NativeRendering
+                Accessible.name: text
+                Accessible.role: missingModels.visible && (root.diarInstall.error === true || root.diarInstall.code === "installed") ? Accessible.AlertMessage : Accessible.StaticText
             }
-            AvButton {
-                id: installButton
-                objectName: "meetingDiarizationInstall"
+            Row {
+                id: installControls
                 anchors.right: parent.right
-                y: (parent.height - Theme.participantsStripMarginBottom - height) / 2
-                visible: text !== ""
-                Keys.onReturnPressed: if (enabled) clicked()
-                Keys.onEnterPressed: if (enabled) clicked()
-                text: root.card.diarizationAction || ""
-                small: true
-                onClicked: if (root.bridge) root.bridge.requestDiarizationInstall()
+                y: (parent.height - Theme.diarInstallCardBottom - height) / 2
+                spacing: Theme.diarInstallCardGap
+                DiarizationProgress {
+                    objectName: "meetingDiarizationCardProgress"
+                    width: Theme.diarInstallCardProgressW
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: missingModels.progressVisible
+                    install: root.diarInstall
+                }
+                AvButton {
+                    id: installButton
+                    objectName: "meetingDiarizationInstall"
+                    property bool ownedFocus: false
+                    onActiveFocusChanged: if (activeFocus) ownedFocus = true; else if (visible) ownedFocus = false
+                    onVisibleChanged: if (!visible && ownedFocus) {
+                        ownedFocus = false
+                        var target = table.visible && table.enabled && table.activeFocusOnTab ? table : back
+                        if (target.visible && target.enabled) target.forceActiveFocus(Qt.TabFocusReason)
+                    }
+                    visible: missingModels.visible && text !== ""
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEnterPressed: clicked()
+                    KeyNavigation.tab: table.visible && table.enabled && table.activeFocusOnTab ? table : back
+                    text: root.card.diarizationAction || ""
+                    small: true
+                    Accessible.name: root.diarInstall.actionName || ""
+                    Accessible.description: root.diarInstall.error ? root.diarInstall.cardText : ""
+                    onClicked: if (root.bridge) {
+                        if (missingModels.progressVisible) root.bridge.cancelDiarizationInstall()
+                        else root.bridge.requestDiarizationInstall()
+                    }
+                }
             }
         }
 
@@ -846,7 +903,8 @@ FocusScope {
                         if (activeFocus && (!item || !item.activeFocus)) root.moveRow(0)
                     }
                     Keys.onBacktabPressed: {
-                        if (root.card.showActions === true) moreButton.forceActiveFocus(Qt.BacktabFocusReason)
+                        if (installButton.visible) installButton.forceActiveFocus(Qt.BacktabFocusReason)
+                        else if (root.card.showActions === true) moreButton.forceActiveFocus(Qt.BacktabFocusReason)
                         else {
                             var previous = table.nextItemInFocusChain(false)
                             if (previous) previous.forceActiveFocus(Qt.BacktabFocusReason)
@@ -952,7 +1010,7 @@ FocusScope {
 
             MeetingParticipants {
                 id: participants
-                visible: root.wide
+                visible: root.wide && root.hasParticipants
                 bridge: root.bridge
                 tableFocusTarget: table
                 onMergeRequested: root.openMerge(participant, origin, participants)

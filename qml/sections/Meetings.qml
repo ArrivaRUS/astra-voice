@@ -10,6 +10,7 @@ Column {
     id: root
     objectName: "meetingsSection"
     readonly property var bridge: typeof meetingBridge !== "undefined" && meetingBridge !== null ? meetingBridge : null
+    readonly property var diarInstall: bridge && bridge.diarizationInstall !== undefined ? bridge.diarizationInstall : ({})
     readonly property string sectionState: bridge ? bridge.sectionState : "off"
     readonly property bool featureEnabled: bridge ? bridge.enabled : false
     readonly property var rows: bridge ? bridge.meetings : []
@@ -488,6 +489,52 @@ Column {
                 rowEnabled: root.editable("meeting_diarization")
                 toggle: diarToggle
                 AvToggle { id: diarToggle; objectName: "meetingDiarization"; checked: root.value("meeting_diarization", true); locked: !root.editable("meeting_diarization"); onToggled: root.commit("meeting_diarization", checked) }
+            }
+            SettingRow {
+                id: diarInstallRow
+                objectName: "meetingDiarizationModels"
+                width: parent.width
+                visible: root.diarInstall.visible === true
+                label: root.diarInstall.title || ""
+                sub: root.diarInstall.text || ""
+                subColor: root.diarInstall.error ? Theme.dangerInk : Theme.fgMuted
+                subIcon: root.diarInstall.error ? "alert" : ""
+                readonly property bool downloadingModels: ["downloading", "verifying", "installing"].indexOf(root.diarInstall.code) >= 0
+                implicitHeight: Theme.cardRowHWithSub + (divider ? Theme.spaceCardRowDivider : 0) + footerHeight
+                footerHeight: downloadingModels ? Theme.diarInstallProgressTop + Theme.progressHThin : 0
+                subAlert: visible && (root.diarInstall.error === true || root.diarInstall.code === "installed")
+                labelFooterData: Item {
+                    width: parent.width
+                    visible: ["downloading", "verifying", "installing"].indexOf(root.diarInstall.code) >= 0
+                    height: visible ? Theme.diarInstallProgressTop - 2 + Theme.progressHThin : 0
+                    DiarizationProgress {
+                        objectName: "meetingDiarizationProgress"
+                        y: Theme.diarInstallProgressTop - 2 // Column already supplies the 2 px text gap.
+                        width: parent.width
+                        install: root.diarInstall
+                    }
+                }
+                AvButton {
+                    id: diarInstallButton
+                    objectName: "meetingDiarizationModelsAction"
+                    property bool ownedFocus: false
+                    onActiveFocusChanged: if (activeFocus) ownedFocus = true; else if (visible) ownedFocus = false
+                    onVisibleChanged: if (!visible && ownedFocus) {
+                        ownedFocus = false
+                        diarToggle.forceActiveFocus(Qt.TabFocusReason)
+                    }
+                    visible: diarInstallRow.visible && text !== ""
+                    small: true
+                    text: root.diarInstall.action || ""
+                    Accessible.name: root.diarInstall.actionName || ""
+                    Accessible.description: root.diarInstall.error ? root.diarInstall.text : ""
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEnterPressed: clicked()
+                    onClicked: if (root.bridge) {
+                        if (["downloading", "verifying", "installing"].indexOf(root.diarInstall.code) >= 0) root.bridge.cancelDiarizationInstall()
+                        else root.bridge.requestDiarizationInstall()
+                    }
+                }
             }
             MeetingSettingField {
                 width: parent.width
