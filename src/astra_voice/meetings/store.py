@@ -41,6 +41,7 @@ from astra_voice.meetings.model import (
     Meeting,
     SpeakerMap,
     Transcript,
+    published_generation,
 )
 from astra_voice.meetings.segments import CaptureJournal, SegmentSidecar
 from astra_voice.security.files import (
@@ -56,6 +57,8 @@ _DOCUMENTS: dict[str, type[JsonModel]] = {
     "meeting.json": Meeting,
     "transcript.json": Transcript,
     "checkpoint.json": Checkpoint,
+    "rediar-transcript.json": Transcript,
+    "rediar-checkpoint.json": Checkpoint,
     "speakers.json": SpeakerMap,
     "capture.json": CaptureJournal,
 }
@@ -168,9 +171,23 @@ def _metadata(directory: int, meeting_id: str) -> Meeting:
     return value
 
 
+def _transcript_name(filename: str) -> str:
+    return "rediar-transcript.json" if filename.startswith("rediar-") else "transcript.json"
+
+
+def _check_rediar(meeting: Meeting, generation: int) -> None:
+    if (
+        meeting.state != MeetingState.DONE
+        or meeting.rediar is None
+        or generation != meeting.rediar.generation
+        or generation != meeting.meeting_generation
+    ):
+        raise MeetingStoreError("Рабочий документ не соответствует повторному разделению")
+
+
 @dataclass(frozen=True)
 class _TranscriptState:
-    """What this lease last saw durable in transcript.json (no utterances kept)."""
+    """What this lease last saw durable in a transcript file (no utterances kept)."""
 
     meeting_id: str
     generation: int
@@ -217,11 +234,11 @@ class MeetingWriter:
 
     prepare() validates and serializes without any store lock, so a caller can
     keep its own publication critical section short; write() publishes under
-    the per-meeting .store.lock. transcript.json has exactly one writer role and
-    the lifetime lease excludes any other holder, so the last durable revision
-    is cached for the lease instead of re-reading and re-validating the whole
-    text on every publication. Any failed transcript publication drops the
-    cache: the next use re-reads the disk.
+    the per-meeting .store.lock. Each transcript has exactly one writer role and
+    the lifetime lease excludes any other holder, so durable revisions are
+    cached by filename instead of re-reading and re-validating the whole text
+    on every publication. A failed publication drops that file's cache entry:
+    the next use re-reads the disk.
     """
 
     def __init__(
@@ -232,8 +249,7 @@ class MeetingWriter:
         self._role = role
         self._active = True
         self._lease_fd = lease_fd
-        self._transcript: _TranscriptState | None = None
-        self._transcript_known = False
+        self._transcripts: dict[str, _TranscriptState | None] = {}
 
     def diar_lease_fd(self) -> int:
         """Borrow the DIAR flock's open file description for child pass_fds.
@@ -267,7 +283,8 @@ class MeetingWriter:
             data = document.to_dict()
             raw = _encode(data)
             if isinstance(document, (Transcript, Checkpoint)):
-                self._known_transcript()  # warm the lease cache outside the store lock
+                # Warm this file's lease cache outside the store lock.
+                self._known_transcript(_transcript_name(filename))
             return PreparedDocument(
                 filename, document, data, raw, hashlib.sha256(raw).hexdigest(), self
             )
@@ -304,7 +321,7 @@ class MeetingWriter:
                     self._publish(prepared, expected_generation=expected_generation)
                 except BaseException:
                     if isinstance(prepared.document, Transcript):
-                        self._transcript_known = False  # disk state unknown: re-read
+                        self._transcripts.pop(filename, None)  # disk state unknown: re-read
                     raise
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
@@ -322,6 +339,7 @@ class MeetingWriter:
                 if (
                     meeting.state != MeetingState.TRANSCRIBING
                     or meeting.cancelled
+                    or meeting.rediar is not None
                     or meeting.meeting_generation != generation
                 ):
                     raise MeetingStoreError("Встреча недоступна для обработки")
@@ -330,11 +348,13 @@ class MeetingWriter:
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
 
     def remove(self, filename: str) -> None:
-        """Transcribe drops checkpoint.json only after the final text is durable (T-414)."""
+        """Drop a checkpoint only after its final text is durable (T-414)."""
         try:
             if not self._active:
                 raise MeetingStoreError("Писатель встречи закрыт")
-            if filename != "checkpoint.json" or self._role != Writer.TRANSCRIBE:
+            if filename not in {"checkpoint.json", "rediar-checkpoint.json"} or (
+                self._role != Writer.TRANSCRIBE
+            ):
                 raise MeetingStoreError("Неверный писатель файла встречи")
             with _lock(self._directory, ".store.lock"):
                 meeting = _metadata(self._directory, self._meeting_id)
@@ -342,8 +362,17 @@ class MeetingWriter:
                     raise MeetingStoreError("Встреча удаляется")
                 if meeting.cancelled:
                     raise MeetingStoreError("Обработка встречи отменена")
-                transcript = self._known_transcript()
-                if transcript is None or not transcript.labels_final:
+                if filename == "rediar-checkpoint.json":
+                    _check_rediar(meeting, meeting.meeting_generation)
+                elif meeting.rediar is not None:
+                    raise MeetingStoreError("Опубликованный текст занят повторным разделением")
+                transcript = self._known_transcript(_transcript_name(filename))
+                if (
+                    transcript is None
+                    or not transcript.labels_final
+                    or transcript.meeting_id != self._meeting_id
+                    or transcript.generation != meeting.meeting_generation
+                ):
                     raise MeetingStoreError("Текст встречи ещё не окончательный")
                 try:
                     os.unlink(filename, dir_fd=self._directory)
@@ -353,21 +382,23 @@ class MeetingWriter:
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
 
-    def read_transcript(self) -> Transcript | None:
-        """Durable transcript.json (None if absent); also primes the lease cache."""
+    def read_transcript(self, name: str = "transcript.json") -> Transcript | None:
+        """Read either durable transcript (None if absent); prime its lease cache."""
         try:
             if not self._active:
                 raise MeetingStoreError("Писатель встречи закрыт")
             if self._role != Writer.TRANSCRIBE:
                 raise MeetingStoreError("Неверный писатель файла встречи")
-            return self._load_transcript()
+            if name not in {"transcript.json", "rediar-transcript.json"}:
+                raise MeetingStoreError("Недопустимый тип файла встречи")
+            return self._load_transcript(name)
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось прочитать данные встречи") from None
 
-    def _load_transcript(self) -> Transcript | None:
+    def _load_transcript(self, name: str) -> Transcript | None:
         try:
             raw = read_private(
-                Path("transcript.json"),
+                Path(name),
                 MAX_DOCUMENT_BYTES,
                 directory_fd=self._directory,
                 private=True,
@@ -376,20 +407,27 @@ class MeetingWriter:
             parsed = None
         else:
             parsed = Transcript.from_dict(json.loads(raw, object_pairs_hook=_pairs))
-        self._transcript = None if parsed is None else _transcript_state(parsed, raw)
-        self._transcript_known = True
+            if parsed.meeting_id != self._meeting_id:
+                raise MeetingStoreError("meeting-document-id")
+            if name == "rediar-transcript.json":
+                _check_rediar(
+                    _metadata(self._directory, self._meeting_id), parsed.meeting_generation
+                )
+        self._transcripts[name] = None if parsed is None else _transcript_state(parsed, raw)
         return parsed
 
-    def _known_transcript(self) -> _TranscriptState | None:
-        """Durable transcript.json as of this lease; read and validated once."""
-        if not self._transcript_known:
-            self._load_transcript()
-        return self._transcript
+    def _known_transcript(self, name: str) -> _TranscriptState | None:
+        """Durable state per filename as of this lease; read and validated once."""
+        if name not in self._transcripts:
+            self._load_transcript(name)
+        return self._transcripts[name]
 
     def _publish(
         self, prepared: PreparedDocument, *, expected_generation: int | None = None
     ) -> None:
         filename, document, data = prepared.filename, prepared.document, prepared.data
+        # Check the serialized snapshot, even if the caller mutated its model
+        # after prepare(). The same snapshot is what _persist will publish.
         meeting = _metadata(self._directory, self._meeting_id)
         if expected_generation is not None and meeting.meeting_generation != expected_generation:
             raise MeetingStoreError("Не совпадает поколение встречи")
@@ -397,10 +435,16 @@ class MeetingWriter:
             raise MeetingStoreError("Встреча удаляется")
         if meeting.cancelled and filename != "meeting.json":
             raise MeetingStoreError("Обработка встречи отменена")
+        if filename in {"transcript.json", "checkpoint.json"} and meeting.rediar is not None:
+            raise MeetingStoreError("Опубликованный текст занят повторным разделением")
+        if filename in {"rediar-transcript.json", "rediar-checkpoint.json"}:
+            if self._role != Writer.TRANSCRIBE:
+                raise MeetingStoreError("Неверный писатель файла встречи")
+            _check_rediar(meeting, data["meeting_generation"])
         if isinstance(document, Meeting):
             if (
-                document.id != self._meeting_id
-                or document.meeting_generation < meeting.meeting_generation
+                data["id"] != self._meeting_id
+                or data["meeting_generation"] < meeting.meeting_generation
             ):
                 raise MeetingStoreError("Не совпадает идентичность встречи")
             target = MeetingState(data["state"])
@@ -410,46 +454,54 @@ class MeetingWriter:
             # new job (new generation) may clear it; never a stale GUI update.
             if (
                 meeting.cancelled
-                and not document.cancelled
-                and meeting.meeting_generation == document.meeting_generation
+                and not data["cancelled"]
+                and meeting.meeting_generation == data["meeting_generation"]
             ):
                 raise MeetingStoreError("Отмена встречи уже сохранена")
         if isinstance(document, (Transcript, Checkpoint, SegmentSidecar, CaptureJournal)):
             if (
-                document.meeting_id != self._meeting_id
-                or document.meeting_generation != meeting.meeting_generation
+                data["meeting_id"] != self._meeting_id
+                or data["meeting_generation"] != meeting.meeting_generation
             ):
                 raise MeetingStoreError("Не совпадает поколение встречи")
         if isinstance(document, Transcript):
-            previous = self._known_transcript()
+            previous = self._known_transcript(filename)
             if previous is not None and (
-                previous.generation == document.meeting_generation
+                previous.generation == data["meeting_generation"]
                 and (
-                    previous.revision > document.transcript_revision
+                    previous.revision > data["transcript_revision"]
                     or (
-                        previous.revision == document.transcript_revision
+                        previous.revision == data["transcript_revision"]
                         and previous.digest != prepared.digest
                         # Bytes differ (e.g. another encoder): compare as before.
-                        and _read(self._directory, "transcript.json").to_dict() != data
+                        and _read(self._directory, filename).to_dict() != data
                     )
                 )
             ):
                 raise MeetingStoreError("Ревизия текста уже опубликована")
         if isinstance(document, Checkpoint):
-            current = self._known_transcript()
+            current = self._known_transcript(_transcript_name(filename))
             if current is None or (
-                current.generation != document.meeting_generation
-                or current.revision != document.transcript_revision
-                or current.meeting_id != document.meeting_id
+                current.generation != data["meeting_generation"]
+                or current.revision != data["transcript_revision"]
+                or current.meeting_id != data["meeting_id"]
             ):
                 raise MeetingStoreError("Чекпойнт не ссылается на устойчивый текст")
         if isinstance(document, SpeakerMap):
-            if meeting.state != MeetingState.DONE:
+            if meeting.state != MeetingState.DONE or meeting.rediar is not None:
                 raise MeetingStoreError("Имена доступны после публикации")
+            generation = data["transcript_generation"]
+            if generation is not None and generation != published_generation(meeting):
+                raise MeetingStoreError("Не совпадает поколение имён встречи")
         self._persist(filename, prepared.raw)
         if isinstance(document, Transcript):
-            self._transcript = _transcript_state(document, prepared.raw)
-            self._transcript_known = True
+            self._transcripts[filename] = _TranscriptState(
+                data["meeting_id"],
+                data["meeting_generation"],
+                data["transcript_revision"],
+                data["labels_final"],
+                prepared.digest,
+            )
 
     def _persist(self, filename: str, raw: bytes) -> None:
         if filename.startswith("audio/"):
@@ -757,11 +809,13 @@ class MeetingStore:
     def read(self, meeting_id: str, filename: str) -> Any:
         try:
             with self._directory(meeting_id) as directory:
-                _metadata(directory, meeting_id)
+                meeting = _metadata(directory, meeting_id)
                 document = _read(directory, filename)
                 if isinstance(document, (Transcript, Checkpoint, SegmentSidecar, CaptureJournal)):
                     if document.meeting_id != meeting_id:
                         raise MeetingStoreError("meeting-document-id") from None
+                    if filename in {"rediar-transcript.json", "rediar-checkpoint.json"}:
+                        _check_rediar(meeting, document.meeting_generation)
                 return document
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось прочитать данные встречи") from None

@@ -70,7 +70,10 @@ def validate_name(value: str) -> str | None:
 def validated_map(labels: Iterable[str], saved: SpeakerMap | None) -> SpeakerMap:
     """Ignore invalid records/chains, without I/O; only published S labels survive."""
     available = {label for label in labels if speaker_number(label) is not None}
-    result = SpeakerMap(labels={label: Speaker() for label in available})
+    result = SpeakerMap(
+        labels={label: Speaker() for label in available},
+        transcript_generation=saved.transcript_generation if saved is not None else None,
+    )
     if saved is None:
         return result
     for label, record in saved.labels.items():

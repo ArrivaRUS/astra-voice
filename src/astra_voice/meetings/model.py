@@ -382,6 +382,13 @@ class AiHistory(JsonModel):
 
 
 @dataclass
+class Rediar(JsonModel):
+    generation: int
+    base_sha256: str
+    SCHEMA = obj({"generation": UINT, "base_sha256": HASH})
+
+
+@dataclass
 class Meeting(JsonModel):
     id: str
     started_at: str
@@ -406,6 +413,8 @@ class Meeting(JsonModel):
     processing_status: ProcessingStatus = ProcessingStatus.PENDING
     cancelled: bool = False
     cleanup_pending: bool = False
+    rediar: Rediar | None = None
+    transcript_generation: int | None = None
     SCHEMA = obj(
         {
             "schema": VERSION,
@@ -431,7 +440,58 @@ class Meeting(JsonModel):
             "processing_status": choices(*ProcessingStatus),
             "cancelled": BOOL,
             "cleanup_pending": BOOL,
-        }
+            "rediar": nullable(Rediar.SCHEMA),
+            "transcript_generation": nullable(UINT),
+        },
+        required=[
+            "schema",
+            "id",
+            "started_at",
+            "meeting_generation",
+            "state",
+            "variant",
+            "app_class",
+            "title",
+            "ended_at",
+            "recorded_ms",
+            "limit_ms",
+            "intervals",
+            "marks",
+            "tracks",
+            "audio",
+            "transcription",
+            "self_label",
+            "warnings",
+            "ai",
+            "size_bytes",
+            "processing_status",
+            "cancelled",
+            "cleanup_pending",
+        ],
+    )
+
+    @classmethod
+    def _check(cls, data: dict[str, Any]) -> None:
+        super()._check(data)
+        generation = data["meeting_generation"]
+        published = data.get("transcript_generation")
+        rediar = data.get("rediar")
+        if published is not None and published > generation:
+            raise MeetingValidationError("Недопустимое поколение опубликованного текста")
+        if rediar is not None and (
+            rediar["generation"] > generation
+            or published is None
+            or published >= rediar["generation"]
+        ):
+            raise MeetingValidationError("Недопустимое поколение повторного разделения")
+
+
+def published_generation(meeting: Meeting) -> int:
+    """Generation of the published text, independently of subsequent jobs."""
+    return (
+        meeting.meeting_generation
+        if meeting.transcript_generation is None
+        else meeting.transcript_generation
     )
 
 
@@ -545,6 +605,8 @@ class Transcript(JsonModel):
     @classmethod
     def _check(cls, data: dict[str, Any]) -> None:
         super()._check(data)
+        if data["labels_final"] and any(not u["final"] for u in data["utterances"]):
+            raise MeetingValidationError("Текст встречи ещё не окончательный")
         ids = [u["id"] for u in data["utterances"]]
         seqs = [u["seq"] for u in data["utterances"]]
         if len(set(ids)) != len(ids) or len(set(seqs)) != len(seqs):
@@ -705,7 +767,16 @@ class SpeakerMap(JsonModel):
     schema: int = 1
     labels: dict[str, Speaker] = field(default_factory=dict)
     renumbered: bool = False
-    SCHEMA = obj({"schema": VERSION, "labels": mapping(Speaker.SCHEMA, LABEL), "renumbered": BOOL})
+    transcript_generation: int | None = None
+    SCHEMA = obj(
+        {
+            "schema": VERSION,
+            "labels": mapping(Speaker.SCHEMA, LABEL),
+            "renumbered": BOOL,
+            "transcript_generation": nullable(UINT),
+        },
+        required=["schema", "labels", "renumbered"],
+    )
 
     @classmethod
     def _check(cls, data: dict[str, Any]) -> None:
