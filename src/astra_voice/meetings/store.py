@@ -23,14 +23,14 @@ import stat
 import string
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from astra_voice.core.paths import data_dir_path
 from astra_voice.meetings import MeetingValidationError
-from astra_voice.meetings.events import MeetingState, transition
+from astra_voice.meetings.events import MeetingState, ProcessingStatus, transition
 from astra_voice.meetings.model import (
     MAX_DOCUMENT_BYTES as MAX_DOCUMENT_BYTES,
 )
@@ -68,6 +68,10 @@ class MeetingStoreError(Exception):
     """Storage failure with a constant, path/content-free message."""
 
 
+class MeetingStoreBusy(MeetingStoreError):
+    """Nonblocking lease/gate contention; retry without reporting corruption."""
+
+
 class Writer(StrEnum):
     GUI = "gui"
     CAPTURE = "capture"
@@ -93,6 +97,22 @@ class RediarPublishResult(StrEnum):
 
 class _RediarCommitUncertain(Exception):
     """A replacement may be visible but is not confirmed durable: retry."""
+
+
+def audio_succeeded(meeting: Meeting) -> bool:
+    """The single retention predicate, shared by queue and locked deletion."""
+    return (
+        meeting.state == MeetingState.DONE
+        and not meeting.cancelled
+        and meeting.rediar is None
+        and (
+            meeting.processing_status == ProcessingStatus.SUCCEEDED
+            or (
+                meeting.processing_status == ProcessingStatus.PARTIAL
+                and meeting.transcription.diar_status == "done"
+            )
+        )
+    )
 
 
 def new_meeting_id(start: datetime) -> str:
@@ -269,10 +289,12 @@ def _rediar_unlink(directory: int, names: tuple[str, ...]) -> None:
     Writers must have released both lifetime leases before calling this.
     """
     temporary = re.compile(r"\.rediar-(?:transcript|checkpoint)-[0-9a-f]{32}\.tmp\Z")
-    for name in (*names, *(n for n in os.listdir(directory) if temporary.fullmatch(n))):
+    entries = (*names, *(n for n in os.listdir(directory) if temporary.fullmatch(n)))
+    for name in entries:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(name, dir_fd=directory)
-    os.fsync(directory)
+    if entries:
+        os.fsync(directory)
 
 
 class MeetingWriter:
@@ -296,6 +318,7 @@ class MeetingWriter:
         self._active = True
         self._lease_fd = lease_fd
         self._transcripts: dict[str, _TranscriptState | None] = {}
+        self.rediar_error = ""  # last publication: uncertain sync versus lease contention
 
     def diar_lease_fd(self) -> int:
         """Borrow the DIAR flock's open file description for child pass_fds.
@@ -402,6 +425,7 @@ class MeetingWriter:
         A same-UID process can still swap the source between validation and
         rename: accepted P26 boundary, not isolation against that process.
         """
+        self.rediar_error = ""
         if not self._active or self._role != Writer.GUI:
             return RediarPublishResult.REJECTED
         try:
@@ -418,6 +442,7 @@ class MeetingWriter:
                     or generation != meeting.meeting_generation
                 ):
                     return RediarPublishResult.REJECTED
+                _rediar_unlink(self._directory, ())
                 raw = read_private(
                     Path("transcript.json"),
                     MAX_DOCUMENT_BYTES,
@@ -511,9 +536,13 @@ class MeetingWriter:
                 # K5 also confirms a prior uncertain K4 and interrupted unlink.
                 _rediar_unlink(self._directory, ("rediar-checkpoint.json", "checkpoint.json"))
                 return RediarPublishResult.PUBLISHED
-        except (BlockingIOError, _RediarCommitUncertain):
+        except _RediarCommitUncertain:
+            self.rediar_error = "io"
+            return RediarPublishResult.BUSY
+        except BlockingIOError:
             return RediarPublishResult.BUSY
         except (OSError, ValueError, TypeError, RecursionError, MeetingStoreError):
+            self.rediar_error = "io"
             return RediarPublishResult.IO_ERROR
         finally:
             self._transcripts.clear()  # K3 can have committed even on an exception.
@@ -562,6 +591,8 @@ class MeetingWriter:
                 _rediar_unlink(
                     self._directory, ("rediar-transcript.json", "rediar-checkpoint.json")
                 )
+        except BlockingIOError:
+            raise MeetingStoreBusy("Рабочий результат ещё занят") from None
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось удалить рабочий результат") from None
 
@@ -1104,6 +1135,154 @@ class MeetingStore:
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось поставить повторное разделение") from None
 
+    def keep_as_is(
+        self,
+        meeting_id: str,
+        expected_generation: int,
+        *,
+        retain_days: int,
+        now: datetime | None = None,
+    ) -> Meeting | None:
+        """Accept failed first diarization once, under the same gate as P4.
+
+        None means no change (including a duplicate click). An uncertain write
+        is recognized and synced by its exact disk value before releasing the
+        gate. A retry never recomputes the logical acceptance timestamp.
+        """
+        stamp = (now or datetime.now(UTC)).isoformat()
+        try:
+            with (
+                self._directory(meeting_id) as directory,
+                _lease(directory, Writer.GUI),
+                _lease(directory, Writer.DIAR),
+                _lease(directory, Writer.TRANSCRIBE),
+                _lock(directory, ".store.lock"),
+            ):
+                meeting = _metadata(directory, meeting_id)
+                if (
+                    meeting.state != MeetingState.DONE
+                    or meeting.cancelled
+                    or meeting.rediar is not None
+                    or meeting.meeting_generation != expected_generation
+                    or meeting.processing_status != ProcessingStatus.PARTIAL
+                    or meeting.transcription.diar_status != "failed"
+                ):
+                    # Also confirms a prior post-replace fsync failure without
+                    # writing again or extending the retention period.
+                    os.fsync(directory)
+                    return None
+                meeting.processing_status = ProcessingStatus.SUCCEEDED
+                meeting.transcription.diarization = False
+                meeting.transcription.diar_status = "skipped"
+                meeting.transcription.finished_at = stamp
+                meeting.audio.retain_days = max(0, min(365, int(retain_days)))
+                meeting.cleanup_pending = meeting.audio.retain_days == 0 and meeting.audio.present
+                self._persist_metadata(directory, meeting)
+                return meeting
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось оставить результат встречи") from None
+
+    @staticmethod
+    def _persist_metadata(directory: int, meeting: Meeting) -> None:
+        """One locked write; distinguish failed replacement from failed sync."""
+        try:
+            write_private(
+                Path("meeting.json"),
+                _encode(meeting.to_dict()),
+                directory_fd=directory,
+                private=True,
+            )
+        except (OSError, ValueError):
+            if _metadata(directory, meeting.id).to_dict() != meeting.to_dict():
+                raise
+            os.fsync(directory)
+
+    def mark_audio_cleanup(self, meeting_id: str, now: datetime) -> Meeting | None:
+        """Reserve expired audio for deletion; P4 cannot pass cleanup_pending."""
+        return self.remove_audio(meeting_id, now=now, mark_only=True)
+
+    def remove_audio(
+        self, meeting_id: str, *, now: datetime | None = None, mark_only: bool = False
+    ) -> Meeting | None:
+        """Leases -> store gate -> fresh eligibility check -> pinned unlinks.
+
+        cleanup_pending is durable before any unlink. Missing entries/directories
+        are normal after a crash; metadata is cleared only after directory sync.
+        Busy writers raise MeetingStoreError and leave cleanup for the next pass.
+        """
+        wall = now or datetime.now(UTC)
+        try:
+            with (
+                self._directory(meeting_id) as directory,
+                _lease(directory, Writer.GUI),
+                _lease(directory, Writer.DIAR),
+                _lease(directory, Writer.TRANSCRIBE),
+                _lock(directory, ".store.lock"),
+            ):
+                meeting = _metadata(directory, meeting_id)
+                if not audio_succeeded(meeting) or not meeting.audio.present:
+                    return None
+                if not meeting.cleanup_pending:
+                    stamp = meeting.transcription.finished_at
+                    if not stamp:
+                        return None
+                    end = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                    if wall < end + timedelta(days=meeting.audio.retain_days):
+                        return None
+                    meeting.cleanup_pending = True
+                    self._persist_metadata(directory, meeting)
+                if mark_only:
+                    return meeting
+                try:
+                    with _child(directory, "audio") as audio:
+                        for name in os.listdir(audio):
+                            with contextlib.suppress(FileNotFoundError):
+                                os.unlink(name, dir_fd=audio)
+                        os.fsync(audio)
+                    os.rmdir("audio", dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+                os.fsync(directory)
+                meeting.cleanup_pending = False
+                meeting.audio.present = False
+                meeting.audio.deleted_at = wall.isoformat()
+                self._persist_metadata(directory, meeting)
+                return meeting
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось удалить звук встречи") from None
+
+    def rediar_cleanup(self, meeting_id: str) -> Meeting:
+        """Startup sweep of exact temp names, only after both writers release.
+
+        Inconsistent non-DONE descriptors are retired in this same transaction.
+        For DONE with an active descriptor the working pair is always preserved.
+        """
+        try:
+            with (
+                self._directory(meeting_id) as directory,
+                _lease(directory, Writer.GUI),
+                _lease(directory, Writer.DIAR),
+                _lease(directory, Writer.TRANSCRIBE),
+                _lock(directory, ".store.lock"),
+            ):
+                meeting = _metadata(directory, meeting_id)
+                if meeting.state == MeetingState.DELETING:
+                    return meeting
+                if meeting.state != MeetingState.DONE and meeting.rediar is not None:
+                    meeting.rediar = None
+                    self._persist_metadata(directory, meeting)
+                names = (
+                    ("rediar-transcript.json", "rediar-checkpoint.json")
+                    if meeting.rediar is None
+                    else ()
+                )
+                _rediar_unlink(directory, names)
+                return meeting
+        except BlockingIOError:
+            raise MeetingStoreBusy("Рабочие файлы ещё заняты") from None
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось убрать рабочие файлы встречи") from None
+
     def transcript_state(self, meeting_id: str) -> _TranscriptState:
         """Typed private snapshot of published bytes, including their SHA256.
 
@@ -1182,6 +1361,9 @@ class MeetingStore:
             if meeting.state == MeetingState.DELETING:
                 raise MeetingStoreError("Встреча удаляется")
             writer = MeetingWriter(directory, meeting_id, role, lease_fd=lease_fd)
+        except BlockingIOError:
+            resources.close()
+            raise MeetingStoreBusy("Писатель встречи занят") from None
         except (OSError, ValueError, TypeError, RecursionError):
             resources.close()
             raise MeetingStoreError("Писатель встречи недоступен") from None

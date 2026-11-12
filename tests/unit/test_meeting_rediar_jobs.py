@@ -599,7 +599,7 @@ def test_fresh_queue_after_uncertain_k6_keeps_logical_time(
     assert not fresh.busy
     assert rig.meeting().transcription.finished_at == before
     assert fresh.redo_results[MID] == "done"
-    assert rig.audio_present() == partial  # 5в-5 changes retention for PARTIAL
+    assert not rig.audio_present()  # 5в-5: partial from Д5 follows the same retention term
     assert rig.meeting().processing_status == (
         ProcessingStatus.PARTIAL if partial else ProcessingStatus.SUCCEEDED
     )

@@ -136,7 +136,7 @@ def test_resume_from_committed_pending_does_not_replace_again(rig: Rig) -> None:
     assert rig.store.read(MID, "transcript.json") == transcript
 
 
-def test_reconcile_failure_never_starts_audio_retention(rig: Rig) -> None:
+def test_reconcile_failure_starts_audio_retention(rig: Rig) -> None:
     rig.retention = 0
     rig.job_event(
         "meeting.job.done",
@@ -153,4 +153,4 @@ def test_reconcile_failure_never_starts_audio_retention(rig: Rig) -> None:
     meeting = rig.meeting()
     assert meeting.processing_status == ProcessingStatus.PARTIAL
     assert meeting.transcription.diar_status == "done"
-    assert meeting.audio.present and not meeting.cleanup_pending
+    assert not meeting.audio.present and not meeting.cleanup_pending

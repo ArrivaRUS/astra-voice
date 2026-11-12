@@ -283,11 +283,19 @@ def test_crash_after_unlink_before_metadata_is_idempotent_t433(
     rig: RetentionRig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     text = rig.saved(cleanup_pending=True)
-    real_update = rig.jobs._update
-    monkeypatch.setattr(rig.jobs, "_update", lambda *a, **kw: None)
+    real_persist = rig.store._persist_metadata
+
+    def fail_after_unlink(directory: int, meeting: Meeting) -> None:
+        if not meeting.audio.present:
+            raise OSError("fixed")
+        real_persist(directory, meeting)
+
+    # The metadata edge moved into the store transaction in 5в-5. Inject at
+    # that same durable boundary, preserving every original recovery assertion.
+    monkeypatch.setattr(rig.store, "_persist_metadata", fail_after_unlink)
     rig.jobs._retention_pass()
     assert rig.meeting().cleanup_pending and not rig.audio_present()
-    monkeypatch.setattr(rig.jobs, "_update", real_update)
+    monkeypatch.setattr(rig.store, "_persist_metadata", real_persist)
     rig.jobs._retention_pass()
     assert not rig.meeting().cleanup_pending and not rig.meeting().audio.present
     assert (rig.store.root / MID / "transcript.json").read_bytes() == text

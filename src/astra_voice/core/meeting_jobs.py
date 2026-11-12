@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import os
 import queue
-import stat
 import time
 from collections import deque
 from collections.abc import Callable
@@ -33,7 +32,14 @@ from astra_voice.core.meeting_session import MetadataWriter
 from astra_voice.meetings import MeetingValidationError
 from astra_voice.meetings.events import MeetingState, ProcessingStatus, transition
 from astra_voice.meetings.model import FAILURE_CODES, Meeting, normalize_text, utterance_order
-from astra_voice.meetings.store import MeetingStore, MeetingStoreError, RediarPublishResult, Writer
+from astra_voice.meetings.store import (
+    MeetingStore,
+    MeetingStoreBusy,
+    MeetingStoreError,
+    RediarPublishResult,
+    Writer,
+    audio_succeeded,
+)
 from astra_voice.security.files import private_directory
 
 Message = dict[str, Any]
@@ -49,6 +55,7 @@ DELETE_PURGE_ATTEMPTS = 3
 DELETE_PURGE_RETRY_LATER_S = 300.0
 DELETE_PURGE_RETRY_S = 0.5
 RETENTION_INTERVAL_S = 86400
+AUDIO_CLEANUP_RETRY_S = 5.0
 MAX_CRASHES = 3  # restarts per window; the fourth crash fails the job
 CRASH_WINDOW_S = 600.0
 # model.load answered by an unexpected error (timeout, limit, ...): crash path, retry later.
@@ -192,27 +199,8 @@ def mem_available_mb() -> int | None:
 
 
 def remove_audio(store: MeetingStore, meeting_id: str) -> None:
-    """Remove ``<meeting>/audio`` through directory descriptors, never by path walk."""
-    with private_directory(store.root / meeting_id, private_from=store.root) as directory:
-        try:
-            audio = os.open(
-                "audio",
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=directory,
-            )
-        except FileNotFoundError:
-            return
-        try:
-            for name in os.listdir(audio):
-                info = os.stat(name, dir_fd=audio, follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    raise OSError("meeting-audio-unexpected-directory")
-                os.unlink(name, dir_fd=audio)
-            os.fsync(audio)
-        finally:
-            os.close(audio)
-        os.rmdir("audio", dir_fd=directory)
-        os.fsync(directory)
+    """Compatibility seam; the store owns every lock, check and unlink."""
+    store.remove_audio(meeting_id)
 
 
 @dataclass
@@ -328,6 +316,10 @@ class MeetingJobs:
         self.tombstones: set[str] = set()
         self.deletions: dict[str, str] = {}
         self._purge_retry_at: dict[str, float] = {}
+        # Workers report cleanup outcomes; only GUI completions own retry timers.
+        self._audio_cleanup_results: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
+        self._audio_retry_at: dict[str, float] = {}
+        self._audio_cleanup_io: set[str] = set()
         self._retention_deletions: set[str] = set()
         self._delete_events: dict[str, dict[tuple[str, str], Message]] = {}
         self.cancelled: set[str] = set()
@@ -342,6 +334,10 @@ class MeetingJobs:
         self._redo_aborts: dict[str, tuple[_Active, str]] = {}
         self._redo_retry: dict[str, float] = {}
         self._redo_io: set[str] = set()
+        self._redo_recovery: dict[str, float] = {}
+        self._redo_resumable: set[str] = set()
+        self._recover_requested = False
+        self.recovery_errors: dict[str, str] = {}
         self.redo_results: dict[str, str] = {}
         self.revision = 0
         self._closed = False
@@ -361,6 +357,7 @@ class MeetingJobs:
             or meeting_id in self._redo_preparing
             or meeting_id in self._redo_commits
             or meeting_id in self._redo_aborts
+            or meeting_id in self._redo_recovery
             or (meeting_id in self._cancel_writes and meeting_id in self._redo_generations)
         )
 
@@ -377,6 +374,7 @@ class MeetingJobs:
             or bool(self._redo_preparing)
             or bool(self._redo_commits)
             or bool(self._redo_aborts)
+            or bool(self._redo_recovery)
             or bool(self._cancel_writes.keys() & self._redo_generations.keys())
         )
 
@@ -421,12 +419,16 @@ class MeetingJobs:
         status, stage, percent = "", "", 0
         if meeting_id in self._redo_preparing:
             status = "queued"
+        if meeting_id in self._redo_recovery:
+            status = "recovery_error" if meeting_id in self.recovery_errors else "recovering"
         if entry is not None:
             status = entry.status
         if active is not None and active.meeting_id == meeting_id and active.redo:
             status, stage, percent = active.phase, active.stage, active.percent
         if meeting_id in self._redo_commits:
             status, stage, percent = "committing", self._redo_commits[meeting_id].stage, 100
+            if meeting_id in self.recovery_errors:
+                status = "recovery_error"
         if meeting_id in self._redo_aborts or (
             meeting_id in self._cancel_writes and meeting_id in self._redo_generations
         ):
@@ -437,6 +439,7 @@ class MeetingJobs:
             "stage": stage,
             "percent": percent,
             "outcome": self.redo_results.get(meeting_id, ""),
+            "recoveryError": self.recovery_errors.get(meeting_id, ""),
         }
 
     def row(self, meeting_id: str, meeting: Meeting | None = None) -> Message:
@@ -472,6 +475,7 @@ class MeetingJobs:
 
     def recover(self) -> None:
         """Resume jobs only; the caller admits processing after start_retention()."""
+        self._recover_requested = True
 
         def scan() -> Callable[[], None]:
             try:
@@ -484,10 +488,7 @@ class MeetingJobs:
                 if not meeting.cancelled
                 and meeting.id not in self.tombstones
                 and meeting.state != MeetingState.DELETING
-                and (
-                    meeting.state in RESUMABLE
-                    or (meeting.state == MeetingState.RECORDED and self._has_checkpoint(meeting.id))
-                )
+                and (meeting.rediar is not None or self._ordinary_resumable(meeting))
             ]
             resume.sort(key=lambda row: (row.ended_at or row.started_at, row.id))
 
@@ -499,7 +500,14 @@ class MeetingJobs:
                     # after this worker snapshot, before either GUI completion.
                     if meeting.id in self.tombstones:
                         continue
-                    if meeting.state == MeetingState.RECORDED:
+                    if meeting.rediar is not None:
+                        if meeting.id in self._redo_resumable:
+                            self._redo_generations[meeting.id] = meeting.meeting_generation
+                            self._add(meeting.id, resume=True, redo=True)
+                            self.meetings[meeting.id] = meeting
+                        elif not self.names_busy(meeting.id):
+                            self._settle_redo_disk(meeting.id)
+                    elif meeting.state == MeetingState.RECORDED:
                         self._enqueue(meeting.id, auto=False, resume=True)
                     else:
                         self._add(meeting.id, resume=True)
@@ -508,6 +516,42 @@ class MeetingJobs:
             return completed
 
         self._run(scan)
+
+    def _ordinary_resumable(self, meeting: Meeting) -> bool:
+        """Worker-only eligibility shared by initial and repaired recovery."""
+        return not meeting.cancelled and (
+            meeting.state in RESUMABLE
+            or (meeting.state == MeetingState.RECORDED and self._has_checkpoint(meeting.id))
+        )
+
+    def _recover_ordinary_after_redo(self, meeting_id: str) -> None:
+        """A delayed descriptor repair must not lose the ordinary resume job."""
+
+        def work() -> Callable[[], None]:
+            current = self._redo_read(meeting_id)
+            eligible = (
+                current is not None and current.rediar is None and self._ordinary_resumable(current)
+            )
+
+            def completed() -> None:
+                if (
+                    not eligible
+                    or current is None
+                    or self._closed
+                    or meeting_id in self.tombstones
+                    or meeting_id in self.cancelled
+                    or self.names_busy(meeting_id)
+                ):
+                    return
+                if current.state == MeetingState.RECORDED:
+                    self._enqueue(meeting_id, auto=False, resume=True)
+                else:
+                    self.meetings[meeting_id] = current
+                    self._add(meeting_id, resume=True)
+
+            return completed
+
+        self._run(work)
 
     @staticmethod
     def _expired(stamp: str | None, days: int, now: datetime) -> bool:
@@ -521,13 +565,7 @@ class MeetingJobs:
 
     @staticmethod
     def _audio_succeeded(meeting: Meeting) -> bool:
-        # M7 must publish SUCCEEDED only after the selected diarization/Д5 pipeline.
-        return (
-            meeting.state == MeetingState.DONE
-            and meeting.processing_status == ProcessingStatus.SUCCEEDED
-            and not meeting.cancelled
-            and meeting.rediar is None
-        )
+        return audio_succeeded(meeting)
 
     def _deletion_owned(self, meeting_id: str) -> bool:
         return meeting_id in self.tombstones or self.deletions.get(meeting_id) in {
@@ -544,6 +582,19 @@ class MeetingJobs:
         self._retention_scanning = True
         self._retention_at = deadline
         self._retention_wall = wall
+        # Snapshot GUI ownership before submitting the serial filesystem scan.
+        owned = (
+            {mid for mid in self.meetings if self.names_busy(mid)}
+            | set(self.queued_ids)
+            | self._redo_preparing
+            | self._redo_commits.keys()
+            | self._redo_aborts.keys()
+            | self._redo_recovery.keys()
+        )
+        if self._admitting:
+            owned.add(self._admitting)
+        if self.active_id:
+            owned.add(self.active_id)
         # Back off even if the scan itself fails (for example on an unreadable root).
         retrying = tuple(self._purge_retry_at)
         for meeting_id in retrying:
@@ -590,10 +641,23 @@ class MeetingJobs:
                 meetings = []
             expired: list[str] = []
             updates: list[Meeting] = []
+            redos: list[tuple[Meeting, RediarPublishResult]] = []
             for meeting in meetings:
                 try:
                     if self._deletion_owned(meeting.id) or meeting.id in pending:
                         continue
+                    if meeting.id not in owned:
+                        # Classification precedes both retention and role admission.
+                        if meeting.rediar is not None:
+                            meeting, result = self._probe_redo(meeting)
+                            redos.append((meeting, result))
+                        elif meeting.state != MeetingState.DELETING:
+                            try:
+                                meeting = self.store.rediar_cleanup(meeting.id)
+                            except MeetingStoreBusy:
+                                redos.append((meeting, RediarPublishResult.BUSY))
+                            except MeetingStoreError:
+                                redos.append((meeting, RediarPublishResult.IO_ERROR))
                     if meeting.state == MeetingState.DELETING:
                         try:
                             self.store.begin_delete(meeting.id)
@@ -620,18 +684,7 @@ class MeetingJobs:
                             meeting.transcription.finished_at, meeting.audio.retain_days, now
                         )
                     ):
-
-                        def mark(current: Meeting) -> bool:
-                            if not self._audio_succeeded(current) or not current.audio.present:
-                                return False
-                            if not self._expired(
-                                current.transcription.finished_at, current.audio.retain_days, now
-                            ):
-                                return False
-                            current.cleanup_pending = True
-                            return True
-
-                        marked = self._update(meeting.id, mark, require_change=True)
+                        marked = self.store.mark_audio_cleanup(meeting.id, now)
                         if marked is not None:
                             updated = self._remove_audio(meeting.id)
                             if updated is not None:
@@ -643,6 +696,9 @@ class MeetingJobs:
                 self._retention_scanning = False
                 if self._closed:
                     return
+                for meeting, result in redos:
+                    if meeting.id not in self.tombstones:
+                        self._accept_redo_recovery(meeting, result)
                 for meeting_id in retry:
                     self._purge_retry_at[meeting_id] = self.clock() + DELETE_PURGE_RETRY_LATER_S
                 retained_count = 0
@@ -762,6 +818,44 @@ class MeetingJobs:
             self._changed()
 
         self._run(work, failed=failed)
+
+    def keep_as_is(
+        self, meeting_id: str, expected_generation: int, done: Callable[[bool], None] | None = None
+    ) -> None:
+        """5в-6 action, available independently of policy/model admission.
+
+        The generation comes from the displayed snapshot; the backend rechecks
+        every condition under the P4 gate. A successful duplicate does no write.
+        """
+        if self._closed or meeting_id in self.tombstones or self.names_busy(meeting_id):
+            if done is not None:
+                done(False)
+            return
+        stamp = self.wall_clock()
+        retention = int(self.audio_retention_days())
+
+        def work() -> Callable[[], None]:
+            self.store.keep_as_is(meeting_id, expected_generation, retain_days=retention, now=stamp)
+            current = self.store.read(meeting_id, "meeting.json")
+            ok = (
+                current.meeting_generation == expected_generation
+                and current.rediar is None
+                and current.processing_status == ProcessingStatus.SUCCEEDED
+                and current.transcription.diar_status == "skipped"
+            )
+            if ok and current.cleanup_pending:
+                current = self._remove_audio(meeting_id) or current
+
+            def completed() -> None:
+                if meeting_id not in self.tombstones:
+                    self.meetings[meeting_id] = current
+                    self._changed()
+                if done is not None:
+                    done(ok)
+
+            return completed
+
+        self._run(work, failed=(lambda: done(False)) if done is not None else None)
 
     def models_changed(self) -> None:
         """A model was installed/checked: needs_model jobs re-check now (T-481)."""
@@ -982,6 +1076,7 @@ class MeetingJobs:
             self._unload_diar()
         self._retry_cancel_writes()
         self._retry_redo()
+        self._retry_audio_cleanup()
         active = self._active
         if active is not None:
             self._advance(active)
@@ -1846,7 +1941,9 @@ class MeetingJobs:
             transcription.wall_ms = int(event.get("wall_ms", 0))
             transcription.peak_rss_kb = int(event.get("peak_rss_kb", 0))
             meeting.audio.retain_days = max(0, min(365, retention))
-            meeting.cleanup_pending = not diar_failed and retention == 0 and meeting.audio.present
+            meeting.cleanup_pending = (
+                self._audio_succeeded(meeting) and retention == 0 and meeting.audio.present
+            )
             return True
 
         def work() -> Callable[[], None]:
@@ -1868,29 +1965,49 @@ class MeetingJobs:
         self._changed()
 
     def _remove_audio(self, meeting_id: str) -> Meeting | None:
-        """Worker thread: delete audio/ then publish audio.present=false, deleted_at."""
+        """Worker: store transaction proves writers released before deleting."""
+        if meeting_id in self.tombstones:
+            return None
         try:
-            current = self.store.read(meeting_id, "meeting.json")
-            if (
-                not isinstance(current, Meeting)
-                or not current.cleanup_pending
-                or not self._audio_succeeded(current)
-                or meeting_id in self.tombstones
-            ):
-                return None
             remove_audio(self.store, meeting_id)
+            current = self.store.read(meeting_id, "meeting.json")
+            self._audio_cleanup_results.put(
+                (meeting_id, current.cleanup_pending and self._audio_succeeded(current))
+            )
+            return current if not current.audio.present else None
         except (MeetingStoreError, OSError, ValueError):
+            self._audio_cleanup_results.put((meeting_id, True))
             return None
 
-        def mutate(meeting: Meeting) -> bool:
-            if not meeting.cleanup_pending or not self._audio_succeeded(meeting):
-                return False
-            meeting.cleanup_pending = False
-            meeting.audio.present = False
-            meeting.audio.deleted_at = self.wall_clock().isoformat()
-            return True
+    def _retry_audio_cleanup(self) -> None:
+        """Short, rate-limited retries; neither admission nor models are needed."""
+        for mid, at in list(self._audio_retry_at.items()):
+            if mid in self.tombstones or mid in self._redo_deleted:
+                self._audio_retry_at.pop(mid, None)
+                continue
+            if at > self.clock() or mid in self._audio_cleanup_io:
+                continue
+            self._audio_retry_at[mid] = self.clock() + AUDIO_CLEANUP_RETRY_S
+            self._audio_cleanup_io.add(mid)
+            self._retry_audio_cleanup_one(mid)
 
-        return self._update(meeting_id, mutate, require_change=True)
+    def _retry_audio_cleanup_one(self, meeting_id: str) -> None:
+        def work() -> Callable[[], None]:
+            current = self.store.read(meeting_id, "meeting.json")
+            pending = current.cleanup_pending and self._audio_succeeded(current)
+            updated = self._remove_audio(meeting_id) if pending else None
+            if not pending:
+                self._audio_cleanup_results.put((meeting_id, False))
+
+            def completed() -> None:
+                self._audio_cleanup_io.discard(meeting_id)
+                if updated is not None and meeting_id not in self.tombstones:
+                    self.meetings[meeting_id] = updated
+                    self._changed()
+
+            return completed
+
+        self._run(work, failed=lambda: self._audio_cleanup_io.discard(meeting_id))
 
     # ---- redo lifecycle (published meeting remains DONE throughout) --------
 
@@ -2008,11 +2125,15 @@ class MeetingJobs:
         self._redo_generations.pop(meeting_id, None)
         self._redo_io.discard(meeting_id)
         self._redo_preparing.discard(meeting_id)
+        self._redo_recovery.pop(meeting_id, None)
+        self._redo_resumable.discard(meeting_id)
+        self.recovery_errors.pop(meeting_id, None)
         self._changed()
 
     def _forget_redo(self, meeting_id: str) -> None:
         """Confirmed deletion retires contexts and every delayed redo callback."""
         self._redo_deleted.add(meeting_id)
+        self._audio_retry_at.pop(meeting_id, None)
         self._redo_release(meeting_id)
         self._take(meeting_id)
         if self._admitting == meeting_id:
@@ -2058,6 +2179,8 @@ class MeetingJobs:
                 return lambda: None
             try:
                 completed = work()
+            except MeetingStoreBusy:
+                return lambda: self._redo_later(mid)
             except (MeetingStoreError, OSError):
                 if self._redo_read(mid) is not None:
                     raise
@@ -2066,6 +2189,7 @@ class MeetingJobs:
 
         def failed() -> None:
             if current():
+                self.recovery_errors[mid] = "io"
                 self._redo_later(mid)
 
         self._run(guarded, failed=failed)
@@ -2078,6 +2202,9 @@ class MeetingJobs:
         self._changed()
 
     def _retry_redo(self) -> None:
+        for mid, at in list(self._redo_recovery.items()):
+            if at <= self.clock():
+                self._settle_redo_disk(mid)
         for mid in list(self._redo_commits):
             if mid not in self._redo_io and self._redo_retry.get(mid, 0) <= self.clock():
                 self._settle_redo(mid)
@@ -2121,6 +2248,8 @@ class MeetingJobs:
                 else:
                     with self.store.writer(meeting_id, Writer.GUI) as writer:
                         result = writer.rediar_publish(active.generation)
+                        if result == RediarPublishResult.BUSY and writer.rediar_error:
+                            result = RediarPublishResult.IO_ERROR
                 if result == RediarPublishResult.PUBLISHED:
                     text = self.store.read(meeting_id, "transcript.json")
                     if text.meeting_generation != active.generation or not text.labels_final:
@@ -2151,19 +2280,29 @@ class MeetingJobs:
                         transcription.peak_rss_kb = active.meeting.transcription.peak_rss_kb
                         meeting.audio.retain_days = retention
                         meeting.cleanup_pending = (
-                            not text.reconcile.failed and retention == 0 and meeting.audio.present
+                            self._audio_succeeded(meeting)
+                            and retention == 0
+                            and meeting.audio.present
                         )
                         return True
 
                     updated = self._redo_update(meeting_id, active.generation, finalize)
-                    if updated is not None and updated.cleanup_pending:
-                        updated = self._remove_audio(meeting_id) or updated
+                    if updated is not None:
+                        with self.store.writer(meeting_id, Writer.GUI) as writer:
+                            writer.rediar_discard()
+                        if updated.cleanup_pending:
+                            cleaned = self._remove_audio(meeting_id)
+                            if cleaned is None:
+                                raise MeetingStoreError("Не удалось завершить хранение звука")
+                            updated = cleaned
 
             def completed() -> None:
                 self._redo_io.discard(meeting_id)
                 if meeting_id in self.tombstones:
                     self._redo_release(meeting_id)
                 elif result in {RediarPublishResult.BUSY, RediarPublishResult.IO_ERROR}:
+                    if result == RediarPublishResult.IO_ERROR:
+                        self.recovery_errors[meeting_id] = "io"
                     self._redo_later(meeting_id)
                 elif result in {RediarPublishResult.WORK_PENDING, RediarPublishResult.INVALID}:
                     self._redo_commits.pop(meeting_id, None)
@@ -2178,18 +2317,81 @@ class MeetingJobs:
 
         self._run_redo(active, work)
 
-    def _settle_redo_disk(self, meeting_id: str) -> None:
-        """Explicit re-entry after K3/K6 on a fresh queue, without starting a role.
+    def _probe_redo(self, meeting: Meeting) -> tuple[Meeting, RediarPublishResult]:
+        """Worker-only disk classification; no models, admission or role calls."""
+        try:
+            if meeting.rediar is not None and meeting.state == MeetingState.DONE:
+                with self.store.writer(meeting.id, Writer.GUI) as writer:
+                    result = writer.rediar_publish(meeting.meeting_generation)
+                    if result == RediarPublishResult.BUSY and writer.rediar_error:
+                        result = RediarPublishResult.IO_ERROR
+                    return meeting, result
+            current = self.store.rediar_cleanup(meeting.id)
+            if current.rediar is None and current.state == MeetingState.DONE:
+                text = self.store.transcript_state(current.id)
+                if (
+                    current.transcript_generation is None
+                    and current.transcription.diar_status == "done"
+                    and text.generation == current.meeting_generation
+                    and text.labels_final
+                ):
+                    return current, RediarPublishResult.PUBLISHED
+            return current, RediarPublishResult.REJECTED
+        except MeetingStoreBusy:
+            return meeting, RediarPublishResult.BUSY
+        except (MeetingStoreError, OSError, ValueError):
+            return meeting, RediarPublishResult.IO_ERROR
 
-        Automatic scanning/resuming unfinished work belongs to 5в-5. Here the
-        published generation must already prove K3; cancellation cannot pass
-        this check because it retains the older transcript_generation.
-        """
+    def _accept_redo_recovery(self, meeting: Meeting, result: RediarPublishResult) -> None:
+        mid = meeting.id
+        if self._closed or mid in self.tombstones or mid in self._redo_deleted:
+            return
+        self._redo_recovery.pop(mid, None)
+        self.recovery_errors.pop(mid, None)
+        self.meetings[mid] = meeting
+        if result == RediarPublishResult.WORK_PENDING:
+            self._redo_resumable.add(mid)
+            if self._recover_requested:
+                self._redo_generations[mid] = meeting.meeting_generation
+                self._add(mid, resume=True, redo=True)
+        elif result == RediarPublishResult.PUBLISHED:
+            self._redo_resumable.discard(mid)
+            current = deepcopy(meeting)
+            if current.rediar is not None:
+                current.transcription.finished_at = self.wall_clock().isoformat()
+            active = _Active(
+                current, ModelAdmission("missing"), resume=True, redo=True, phase="committing"
+            )
+            self._redo_generations[mid] = current.meeting_generation
+            self._redo_commits[mid] = active
+            self._settle_redo(mid)
+        elif result == RediarPublishResult.REJECTED:
+            if (
+                self._recover_requested
+                and meeting.rediar is None
+                and meeting.state != MeetingState.DONE
+            ):
+                self._recover_ordinary_after_redo(mid)
+        else:
+            # INVALID at startup is repairable damage, never permission to run
+            # a role or discard a potentially committed publication.
+            self._redo_resumable.discard(mid)
+            self._redo_recovery[mid] = self.clock() + ADMIT_RETRY_S
+            if result != RediarPublishResult.BUSY:
+                self.recovery_errors[mid] = "io"
+        self._changed()
+
+    def _settle_redo_disk(self, meeting_id: str) -> None:
+        """Classify/retry startup work and roll forward K3/K6 without a role."""
         if (
             self._closed
             or meeting_id in self.tombstones
             or meeting_id in self._redo_deleted
-            or self.names_busy(meeting_id)
+            or meeting_id in self._redo_preparing
+            or meeting_id in self._redo_commits
+            or meeting_id in self._redo_aborts
+            or meeting_id in self.queued_ids
+            or self.active_id == meeting_id
         ):
             return
         self._redo_preparing.add(meeting_id)
@@ -2199,50 +2401,20 @@ class MeetingJobs:
             current = self._redo_read(meeting_id)
             if current is None:
                 return lambda: self._forget_redo(meeting_id)
-            text = self.store.transcript_state(meeting_id)
-            committed = (
-                current.state == MeetingState.DONE
-                and current.meeting_generation == text.generation
-                and text.labels_final
-                and (
-                    current.rediar is not None
-                    or (
-                        current.transcript_generation is None
-                        and current.transcription.diar_status == "done"
-                    )
-                )
-            )
-            if current.rediar is not None:
-                current.transcription.finished_at = self.wall_clock().isoformat()
+            meeting, result = self._probe_redo(current)
 
             def completed() -> None:
                 self._redo_preparing.discard(meeting_id)
-                if (
-                    committed
-                    and meeting_id not in self.tombstones
-                    and meeting_id not in self._redo_deleted
-                    and not self._closed
-                ):
-                    active = _Active(
-                        current,
-                        ModelAdmission("missing"),
-                        resume=True,
-                        redo=True,
-                        phase="committing",
-                    )
-                    self._redo_generations[meeting_id] = current.meeting_generation
-                    self._redo_commits[meeting_id] = active
-                    self._settle_redo(meeting_id)
-                self._changed()
+                self._accept_redo_recovery(meeting, result)
 
             return completed
 
         def failed() -> None:
-            if meeting_id in self._redo_deleted:
-                return
             self._redo_preparing.discard(meeting_id)
-            self.failures[meeting_id] = "io"
-            self._changed()
+            if meeting_id not in self._redo_deleted:
+                self._redo_recovery[meeting_id] = self.clock() + ADMIT_RETRY_S
+                self.recovery_errors[meeting_id] = "io"
+                self._changed()
 
         self._run(work, failed=failed)
 
@@ -2502,6 +2674,17 @@ class MeetingJobs:
             completed = self._results.get_nowait()
             self._pending -= 1
             completed()
+        while not self._audio_cleanup_results.empty():
+            mid, retry = self._audio_cleanup_results.get_nowait()
+            if (
+                retry
+                and not self._closed
+                and mid not in self.tombstones
+                and mid not in self._redo_deleted
+            ):
+                self._audio_retry_at.setdefault(mid, self.clock() + AUDIO_CLEANUP_RETRY_S)
+            else:
+                self._audio_retry_at.pop(mid, None)
 
     @property
     def filesystem_pending(self) -> bool:
