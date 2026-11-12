@@ -1038,6 +1038,72 @@ class MeetingStore:
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось прочитать данные встречи") from None
 
+    def rediar_enqueue(self, meeting_id: str, expected_generation: int) -> Meeting | None:
+        """P2–P4, one transaction owner; retry only this request's generation.
+
+        The caller checks models/policy first. An existing descriptor is adopted
+        only when it is the successor of expected_generation and still refers
+        to these exact published bytes. No nested writer/update acquires flock.
+        """
+        from astra_voice.meetings.model import Rediar
+
+        try:
+            with (
+                self._directory(meeting_id) as directory,
+                _lease(directory, Writer.GUI),
+                _lock(directory, ".store.lock"),
+            ):
+                meeting = _metadata(directory, meeting_id)
+                if (
+                    meeting.state != MeetingState.DONE
+                    or meeting.cancelled
+                    or not meeting.audio.present
+                    or meeting.cleanup_pending
+                ):
+                    return None
+                raw = read_private(
+                    Path("transcript.json"),
+                    MAX_DOCUMENT_BYTES,
+                    directory_fd=directory,
+                    private=True,
+                )
+                text = Transcript.from_dict(json.loads(raw, object_pairs_hook=_pairs))
+                state = _transcript_state(text, raw)
+                if (
+                    state.meeting_id != meeting_id
+                    or not state.labels_final
+                    or state.generation != published_generation(meeting)
+                ):
+                    return None
+                if meeting.rediar is not None:
+                    if (
+                        meeting.meeting_generation != expected_generation + 1
+                        or meeting.rediar.generation != meeting.meeting_generation
+                        or meeting.rediar.base_sha256 != state.digest
+                    ):
+                        return None
+                    os.fsync(directory)
+                    return meeting
+                if meeting.meeting_generation != expected_generation:
+                    return None
+                meeting.transcript_generation = state.generation
+                meeting.meeting_generation += 1
+                meeting.rediar = Rediar(meeting.meeting_generation, state.digest)
+                encoded = _encode(meeting.to_dict())
+                try:
+                    write_private(
+                        Path("meeting.json"), encoded, directory_fd=directory, private=True
+                    )
+                except (OSError, ValueError):
+                    # replace may have succeeded. Establish outcome while still
+                    # owning the gate, then confirm directory durability.
+                    if _metadata(directory, meeting_id).to_dict() != meeting.to_dict():
+                        raise
+                    os.fsync(directory)
+                return meeting
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось поставить повторное разделение") from None
+
     def transcript_state(self, meeting_id: str) -> _TranscriptState:
         """Typed private snapshot of published bytes, including their SHA256.
 

@@ -33,7 +33,7 @@ from astra_voice.core.meeting_session import MetadataWriter
 from astra_voice.meetings import MeetingValidationError
 from astra_voice.meetings.events import MeetingState, ProcessingStatus, transition
 from astra_voice.meetings.model import FAILURE_CODES, Meeting, normalize_text, utterance_order
-from astra_voice.meetings.store import MeetingStore, MeetingStoreError, Writer
+from astra_voice.meetings.store import MeetingStore, MeetingStoreError, RediarPublishResult, Writer
 from astra_voice.security.files import private_directory
 
 Message = dict[str, Any]
@@ -222,6 +222,7 @@ class _Entry:
     status: str = "queued"  # queued | waiting_memory | needs_model
     retry_at: float = 0.0
     resume: bool = False
+    redo: bool = False
     notified: set[str] = field(default_factory=set)
 
 
@@ -231,6 +232,8 @@ class _Active:
     admission: ModelAdmission
     resume: bool
     diar_models: dict[str, str] | None = None
+    redo: bool = False
+    stage: str = ""
     phase: str = "launching"
     # launching -> loading -> starting -> running; cancelling -> exiting; crashed
     purpose: str = ""  # "" | cancel | delete | fail (role killed, then «Ошибка»)
@@ -330,6 +333,16 @@ class MeetingJobs:
         self.cancelled: set[str] = set()
         # meeting_id -> (failed cancel writes, retry time or None while a write is queued)
         self._cancel_writes: dict[str, tuple[int, float | None]] = {}
+        # Redo metadata work, terminal cleanup and commit remain busy even when
+        # no role is active. Only GUI completions mutate these registries.
+        self._redo_deleted: set[str] = set()
+        self._redo_generations: dict[str, int] = {}
+        self._redo_preparing: set[str] = set()
+        self._redo_commits: dict[str, _Active] = {}
+        self._redo_aborts: dict[str, tuple[_Active, str]] = {}
+        self._redo_retry: dict[str, float] = {}
+        self._redo_io: set[str] = set()
+        self.redo_results: dict[str, str] = {}
         self.revision = 0
         self._closed = False
 
@@ -345,6 +358,10 @@ class MeetingJobs:
             self.active_id == meeting_id
             or meeting_id in self.queued_ids
             or self._admitting == meeting_id
+            or meeting_id in self._redo_preparing
+            or meeting_id in self._redo_commits
+            or meeting_id in self._redo_aborts
+            or (meeting_id in self._cancel_writes and meeting_id in self._redo_generations)
         )
 
     @property
@@ -354,13 +371,20 @@ class MeetingJobs:
     @property
     def busy(self) -> bool:
         """A job is running or waits in the queue (exit stays unconfirmed: T-478)."""
-        return self._active is not None or bool(self._queue)
+        return (
+            self._active is not None
+            or bool(self._queue)
+            or bool(self._redo_preparing)
+            or bool(self._redo_commits)
+            or bool(self._redo_aborts)
+            or bool(self._cancel_writes.keys() & self._redo_generations.keys())
+        )
 
     @property
     def percent(self) -> int | None:
         """Running job's progress for the tray hint, else None."""
         active = self._active
-        if active is None or active.purpose:
+        if active is None or active.purpose or active.redo:
             return None
         return active.percent
 
@@ -377,11 +401,42 @@ class MeetingJobs:
         return {
             "meeting_id": meeting_id,
             "phase": active.phase,
+            "redo": active.redo,
+            "stage": active.stage,
             "percent": active.percent,
             "done_ms": active.done_ms,
             "total_ms": active.total_ms,
             "utterances": utterances,
             "transcript_revision": active.transcript_revision,
+        }
+
+    def redo_snapshot(self, meeting_id: str) -> Message:
+        """5в-6 bridge: busy/status/stage and ephemeral terminal outcome.
+
+        The bridge may pop redo_results[id] when the card closes. revision
+        changes on every visible transition; no terminal hint is persisted.
+        """
+        active = self._active
+        entry = next((e for e in self._queue if e.meeting_id == meeting_id and e.redo), None)
+        status, stage, percent = "", "", 0
+        if meeting_id in self._redo_preparing:
+            status = "queued"
+        if entry is not None:
+            status = entry.status
+        if active is not None and active.meeting_id == meeting_id and active.redo:
+            status, stage, percent = active.phase, active.stage, active.percent
+        if meeting_id in self._redo_commits:
+            status, stage, percent = "committing", self._redo_commits[meeting_id].stage, 100
+        if meeting_id in self._redo_aborts or (
+            meeting_id in self._cancel_writes and meeting_id in self._redo_generations
+        ):
+            status = "cancelling"
+        return {
+            "busy": bool(status),
+            "status": status,
+            "stage": stage,
+            "percent": percent,
+            "outcome": self.redo_results.get(meeting_id, ""),
         }
 
     def row(self, meeting_id: str, meeting: Meeting | None = None) -> Message:
@@ -471,6 +526,7 @@ class MeetingJobs:
             meeting.state == MeetingState.DONE
             and meeting.processing_status == ProcessingStatus.SUCCEEDED
             and not meeting.cancelled
+            and meeting.rediar is None
         )
 
     def _deletion_owned(self, meeting_id: str) -> bool:
@@ -594,6 +650,7 @@ class MeetingJobs:
                     self.meetings.pop(meeting_id, None)
                     self._purge_retry_at.pop(meeting_id, None)
                     self.deletions[meeting_id] = "deleted"
+                    self._forget_redo(meeting_id)
                     if meeting_id in self._retention_deletions:
                         self._retention_deletions.discard(meeting_id)
                         retained_count += 1
@@ -642,11 +699,69 @@ class MeetingJobs:
         """«Расшифровать»/«Повторить»: a new job (new generation, clears cancelled)."""
         if self._closed or meeting_id in self.tombstones:
             return
-        if meeting_id == self.active_id or meeting_id in self.queued_ids:
+        if self.names_busy(meeting_id):
             return
         self.cancelled.discard(meeting_id)
         self._cancel_writes.pop(meeting_id, None)  # a new job: the old cancel is moot
         self._enqueue(meeting_id, auto=False)
+
+    def rediarize(self, meeting_id: str) -> None:
+        """Explicit redo; bridge flushes accepted speaker writes before calling."""
+        if (
+            self._closed
+            or meeting_id in self.tombstones
+            or meeting_id in self._redo_deleted
+            or self.names_busy(meeting_id)
+        ):
+            return
+        self._redo_preparing.add(meeting_id)
+        self.cancelled.discard(meeting_id)
+        self.redo_results.pop(meeting_id, None)
+        self._changed()
+
+        def work() -> Callable[[], None]:
+            updated = None
+            if self.admit_allowed() and self.diar_models() and self.model_probe().status == "ok":
+                current = self.store.read(meeting_id, "meeting.json")
+                expected = (
+                    current.rediar.generation - 1
+                    if current.rediar is not None
+                    else current.meeting_generation
+                )
+                # The fixed expected generation survives every ambiguous retry.
+                for attempt in range(WRITE_ATTEMPTS):
+                    try:
+                        updated = self.store.rediar_enqueue(meeting_id, expected)
+                        break
+                    except MeetingStoreError:
+                        if attempt + 1 == WRITE_ATTEMPTS:
+                            raise
+
+            def completed() -> None:
+                self._redo_preparing.discard(meeting_id)
+                if (
+                    updated is not None
+                    and meeting_id not in self.tombstones
+                    and meeting_id not in self._redo_deleted
+                ):
+                    self.meetings[meeting_id] = updated
+                    self._redo_generations[meeting_id] = updated.meeting_generation
+                    if meeting_id in self.cancelled:
+                        self._persist_cancel(meeting_id)
+                    else:
+                        self._add(meeting_id, resume=True, redo=True)
+                self._changed()
+
+            return completed
+
+        def failed() -> None:
+            if meeting_id in self._redo_deleted:
+                return
+            self._redo_preparing.discard(meeting_id)
+            self.failures[meeting_id] = "io"
+            self._changed()
+
+        self._run(work, failed=failed)
 
     def models_changed(self) -> None:
         """A model was installed/checked: needs_model jobs re-check now (T-481)."""
@@ -663,6 +778,10 @@ class MeetingJobs:
         write is retried, and a cancel that cannot be made durable ends in «Ошибка».
         """
         if self._closed or meeting_id in self.tombstones:
+            return
+        if meeting_id in self._redo_commits or meeting_id in self._redo_aborts:
+            return  # done was delivered first: only commit recovery is legal
+        if meeting_id in self._redo_generations and not self.names_busy(meeting_id):
             return
         self.cancelled.add(meeting_id)
         entry = self._take(meeting_id)
@@ -771,6 +890,7 @@ class MeetingJobs:
                     tombstone_failed()
                     return
                 self.deletions[meeting_id] = "deleting"
+                self._forget_redo(meeting_id)
                 self._delete_events.pop(meeting_id, None)
                 self._cancel_writes.pop(meeting_id, None)
                 self.meetings.pop(meeting_id, None)
@@ -822,6 +942,7 @@ class MeetingJobs:
                 self.meetings.pop(meeting_id, None)
                 self.tombstones.discard(meeting_id)
                 self.deletions[meeting_id] = "deleted"
+                self._forget_redo(meeting_id)
                 self._purge_retry_at.pop(meeting_id, None)
                 self._notify("deleted", meeting)
                 self._changed()
@@ -860,6 +981,7 @@ class MeetingJobs:
         if self._diar_unload_pending:
             self._unload_diar()
         self._retry_cancel_writes()
+        self._retry_redo()
         active = self._active
         if active is not None:
             self._advance(active)
@@ -889,7 +1011,7 @@ class MeetingJobs:
                 pass
         if active.meeting_id not in self.tombstones:
             first = min((entry.order for entry in self._queue), default=self._order + 1)
-            self._queue.append(_Entry(active.meeting_id, first - 1, resume=True))
+            self._queue.append(_Entry(active.meeting_id, first - 1, resume=True, redo=active.redo))
         self._changed()
         return True
 
@@ -912,11 +1034,11 @@ class MeetingJobs:
     def _changed(self) -> None:
         self.revision += 1
 
-    def _add(self, meeting_id: str, *, resume: bool) -> None:
+    def _add(self, meeting_id: str, *, resume: bool, redo: bool = False) -> None:
         if meeting_id in self.tombstones or meeting_id in self.queued_ids:
             return
         self._order += 1
-        self._queue.append(_Entry(meeting_id, self._order, resume=resume))
+        self._queue.append(_Entry(meeting_id, self._order, resume=resume, redo=redo))
         self._changed()
 
     def _take(self, meeting_id: str) -> _Entry | None:
@@ -929,12 +1051,15 @@ class MeetingJobs:
 
     def _enqueue(self, meeting_id: str, *, auto: bool, resume: bool = False) -> None:
         def mutate(meeting: Meeting) -> bool:
+            if meeting.rediar is not None:
+                return False
             if auto and (meeting.state != MeetingState.RECORDED or meeting.cancelled):
                 return False
             if not auto and meeting.state not in TRANSCRIBABLE and not resume:
                 return False
             if not resume:
                 meeting.meeting_generation += 1
+                meeting.transcript_generation = None
                 meeting.cancelled = False
                 meeting.processing_status = ProcessingStatus.PENDING
                 meeting.transcription.failure = None
@@ -951,6 +1076,8 @@ class MeetingJobs:
                     return
                 self.meetings[meeting_id] = updated
                 self.failures.pop(meeting_id, None)
+                self._redo_generations.pop(meeting_id, None)
+                self.redo_results.pop(meeting_id, None)
                 self._add(meeting_id, resume=resume)
 
             return completed
@@ -976,6 +1103,9 @@ class MeetingJobs:
             return
 
     def _admit(self, entry: _Entry) -> None:
+        if entry.redo:
+            self._admit_redo(entry)
+            return
         meeting_id = entry.meeting_id
         self._admitting = meeting_id
 
@@ -1059,7 +1189,7 @@ class MeetingJobs:
         self._run(work, failed=failed)
 
     def _notify_once(self, entry: _Entry, kind: str, meeting: Meeting) -> None:
-        if kind not in entry.notified:
+        if not entry.redo and kind not in entry.notified:
             entry.notified.add(kind)
             self._notify(kind, meeting)
 
@@ -1161,6 +1291,7 @@ class MeetingJobs:
             **({"diar_models": dict(active.diar_models)} if active.diar_models is not None else {}),
             self_track="mic",
             resume=active.resume,
+            **({"operation": "rediarize"} if active.redo else {}),
             echo_gate=bool(echo and "far" in tracks),
             limits=dict(LIMITS),
         )
@@ -1217,6 +1348,8 @@ class MeetingJobs:
         self._active = None
         if active.diar_models is not None:
             self._unload_diar()
+        if active.redo and active.purpose == "cancel":
+            self._redo_abort(active, "cancelled")
         if active.released is not None:
             active.released()
         self._changed()
@@ -1307,10 +1440,12 @@ class MeetingJobs:
             return
         if kind == "error" and "req" not in event:
             if event.get("code") in {"restart-limit", "worker-start"} and active is not None:
-                if active.purpose == "delete":
+                if active.purpose == "delete" or (active.redo and active.purpose):
                     self._kill(active)  # even a supervisor error must await confirmed poll
                 elif active.purpose:
                     self._finish_stop(active)
+                elif active.redo:
+                    self._fail_after_exit(active, "io")
                 else:
                     self._fail(active, "io")
             return
@@ -1319,7 +1454,7 @@ class MeetingJobs:
         req = event.get("req")
         if req is not None and req == active.cancel_req:
             if kind == "meeting.job.cancelled" and active.phase == "cancelling":
-                if active.purpose == "delete":
+                if active.purpose == "delete" or active.redo:
                     self._kill(active)  # files are released only by a confirmed exit
                 else:
                     self._finish_stop(active)
@@ -1341,11 +1476,11 @@ class MeetingJobs:
             return
         if req is not None and req == active.start_req:
             if kind == "meeting.job.accepted":
-                if active.resume and active.restore_request == active.start_req:
+                if (active.resume or active.redo) and active.restore_request == active.start_req:
                     return  # replayed accepted must not grant readiness credits twice
                 active.phase = "running"
                 active.transcript_revision = int(event.get("transcript_revision", 0))
-                if active.resume:
+                if active.resume or active.redo:
                     self._restore_live(active)
                 self._changed()
             elif kind == "error":
@@ -1369,6 +1504,10 @@ class MeetingJobs:
             done = int(event.get("done_ms", 0))
             percent = min(100, done * 100 // total) if total > 0 else 0
             active.done_ms, active.total_ms = done, total
+            stage = str(event.get("stage", active.stage))
+            if stage != active.stage:
+                active.stage = stage
+                self._changed()
             if active.phase == "starting":
                 active.phase = "running"
             if percent != active.percent:
@@ -1416,6 +1555,8 @@ class MeetingJobs:
             code = str(event.get("code", "io"))
             if code == "memory":
                 self._wait_memory(active)
+            elif active.redo:
+                self._fail_after_exit(active, code)
             else:
                 self._fail(active, code)
         elif kind == "meeting.job.done":
@@ -1446,9 +1587,12 @@ class MeetingJobs:
 
         def work() -> Callable[[], None]:
             try:
-                transcript = self.store.read(active.meeting_id, "transcript.json")
+                filename = "rediar-transcript.json" if active.redo else "transcript.json"
+                transcript = self.store.read(active.meeting_id, filename)
             except MeetingStoreError:
-                if os.path.lexists(self.store.root / active.meeting_id / "transcript.json"):
+                if active.redo or os.path.lexists(
+                    self.store.root / active.meeting_id / "transcript.json"
+                ):
                     raise
                 transcript = None  # a resumed ASR may not have written any text yet
             rows: dict[int, Message] = {}
@@ -1584,7 +1728,10 @@ class MeetingJobs:
     def _wait_memory(self, active: _Active) -> None:
         """Role ended the job for memory: unload the model, retry in 60 s (T-483)."""
         self._active = None
-        self._unload()
+        if active.redo:
+            self._unload_diar()
+        else:
+            self._unload()
         meeting_id = active.meeting_id
         self._order += 1
         entry = _Entry(
@@ -1593,8 +1740,12 @@ class MeetingJobs:
             status="waiting_memory",
             retry_at=self.clock() + MEMORY_RETRY_S,
             resume=True,
+            redo=active.redo,
         )
         self._queue.append(entry)
+        if active.redo:
+            self._changed()
+            return
 
         def mutate(meeting: Meeting) -> bool:
             if meeting.cancelled:
@@ -1617,7 +1768,12 @@ class MeetingJobs:
         self._changed()
 
     def _fail(self, active: _Active, code: str) -> None:
-        """Audio stays; «Ошибка расшифровки» with «Повторить» (T-482/T-484)."""
+        """Audio stays; ordinary failure is durable, redo failure is ephemeral."""
+        if active.redo:
+            self._active = None
+            self._unload_diar()
+            self._redo_abort(active, self._redo_failure(active.meeting))
+            return
         self._active = None
         if active.diar_models is not None:
             self._unload_diar()
@@ -1649,6 +1805,21 @@ class MeetingJobs:
         self._changed()
 
     def _done(self, active: _Active, event: Message) -> None:
+        if active.redo:
+            if event.get("diar_status") != "done":
+                self._fail_after_exit(active, "io")
+                return
+            self._active = None
+            active.phase = "committing"
+            # Keep timing/metrics from this logical done, never from a retry.
+            active.meeting.transcription.wall_ms = int(event.get("wall_ms", 0))
+            active.meeting.transcription.peak_rss_kb = int(event.get("peak_rss_kb", 0))
+            active.meeting.transcription.finished_at = self.wall_clock().isoformat()
+            self._redo_commits[active.meeting_id] = active
+            self._unload_diar()
+            self._settle_redo(active.meeting_id)
+            self._changed()
+            return
         self._active = None
         meeting_id = active.meeting_id
         retention = int(self.audio_retention_days())
@@ -1721,10 +1892,454 @@ class MeetingJobs:
 
         return self._update(meeting_id, mutate, require_change=True)
 
+    # ---- redo lifecycle (published meeting remains DONE throughout) --------
+
+    @staticmethod
+    def _redo_failure(meeting: Meeting) -> str:
+        return "redo-failed" if meeting.transcription.diar_status == "done" else "failed-again"
+
+    def _redo_update(
+        self, meeting_id: str, generation: int, mutate: Callable[[Meeting], bool]
+    ) -> Meeting | None:
+        """Idempotent redo metadata action, including post-replace fsync errors.
+
+        A false mutator means the same action is already visible on disk.
+        Re-sync it rather than treating the previous exception as a rollback.
+        The mutator's logical timestamp must be captured outside this function.
+        """
+        for _ in range(WRITE_ATTEMPTS):
+            try:
+                current = self.store.read(meeting_id, "meeting.json")
+                if (
+                    not isinstance(current, Meeting)
+                    or current.state != MeetingState.DONE
+                    or meeting_id in self.tombstones
+                    or current.meeting_generation != generation
+                ):
+                    return None
+                if current.rediar is not None and current.rediar.generation != generation:
+                    return None
+                updated = deepcopy(current)
+                if mutate(updated):
+                    self.store.write(meeting_id, "meeting.json", updated, writer=Writer.GUI)
+                with private_directory(
+                    self.store.root / meeting_id, private_from=self.store.root
+                ) as directory:
+                    os.fsync(directory)
+                return updated
+            except (MeetingStoreError, MeetingValidationError, OSError, ValueError):
+                continue
+        raise MeetingStoreError("Не удалось завершить повторное разделение")
+
+    def _admit_redo(self, entry: _Entry) -> None:
+        meeting_id = entry.meeting_id
+        self._admitting = meeting_id
+
+        def work() -> Callable[[], None]:
+            admission = self.model_probe()
+            pair = self.diar_models()
+            allowed = self.admit_allowed()
+            meeting = self.store.read(meeting_id, "meeting.json")
+            available = self.mem_available()
+            outcome = "start"
+            if not allowed:
+                outcome = "paused"
+            elif not pair or admission.status != "ok":
+                outcome = "failed"
+            elif available is not None and available < (
+                admission.min_ram_mb + MEMORY_MARGIN_MB + DIAR_MEMORY_MB
+            ):
+                outcome = "waiting_memory"
+
+            def completed() -> None:
+                if meeting_id in self._redo_deleted:
+                    return
+                self._admitting = ""
+                if entry not in self._queue or meeting_id in self.tombstones:
+                    return
+                if (
+                    meeting.state != MeetingState.DONE
+                    or meeting.rediar is None
+                    or meeting.rediar.generation != self._redo_generations.get(meeting_id)
+                ):
+                    self._take(meeting_id)
+                    return
+                self.meetings[meeting_id] = meeting
+                # A processing ban pauses both first admission and resume. Model
+                # trust/diarization refusal is evaluated only once processing is allowed.
+                if not self.admit_allowed() or outcome == "paused":
+                    entry.retry_at = 0.0
+                    self._changed()
+                    return
+                if outcome == "failed" or self.diar_models() != pair:
+                    self._take(meeting_id)
+                    active = _Active(meeting, admission, resume=True, redo=True)
+                    self._redo_abort(active, self._redo_failure(meeting))
+                elif outcome == "waiting_memory":
+                    entry.status = "waiting_memory"
+                    entry.retry_at = self.clock() + MEMORY_RETRY_S
+                else:
+                    self._take(meeting_id)
+                    self._active = _Active(
+                        meeting, admission, resume=True, diar_models=pair, redo=True
+                    )
+                    self._advance(self._active)
+                self._changed()
+
+            return completed
+
+        def failed() -> None:
+            if meeting_id in self._redo_deleted:
+                return
+            self._admitting = ""
+            if entry in self._queue:
+                entry.retry_at = self.clock() + ADMIT_RETRY_S
+            self._changed()
+
+        self._run(work, failed=failed)
+
+    def _redo_release(self, meeting_id: str) -> None:
+        # Exit/abort may finish while a cancel write awaits retry. Retire its
+        # timer with the redo context, never route it into ordinary cancellation.
+        self._cancel_writes.pop(meeting_id, None)
+        self._redo_commits.pop(meeting_id, None)
+        self._redo_aborts.pop(meeting_id, None)
+        self._redo_retry.pop(meeting_id, None)
+        self._redo_generations.pop(meeting_id, None)
+        self._redo_io.discard(meeting_id)
+        self._redo_preparing.discard(meeting_id)
+        self._changed()
+
+    def _forget_redo(self, meeting_id: str) -> None:
+        """Confirmed deletion retires contexts and every delayed redo callback."""
+        self._redo_deleted.add(meeting_id)
+        self._redo_release(meeting_id)
+        self._take(meeting_id)
+        if self._admitting == meeting_id:
+            self._admitting = ""
+        self.redo_results.pop(meeting_id, None)
+        self.failures.pop(meeting_id, None)
+        self.cancelled.discard(meeting_id)
+
+    def _redo_read(self, meeting_id: str) -> Meeting | None:
+        """Worker: distinguish deletion/absent directory from damaged private I/O."""
+        try:
+            meeting = self.store.read(meeting_id, "meeting.json")
+        except MeetingStoreError:
+            try:
+                os.stat(self.store.root / meeting_id, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            raise
+        if not isinstance(meeting, Meeting):
+            raise MeetingStoreError("Не удалось прочитать встречу")
+        return None if meeting.state == MeetingState.DELETING else meeting
+
+    def _run_redo(self, active: _Active, work: Callable[[], Callable[[], None]]) -> None:
+        """Late work/completions cannot revive a retired commit or discard."""
+        mid = active.meeting_id
+
+        def current() -> bool:
+            abort = self._redo_aborts.get(mid)
+            return (
+                mid not in self._redo_deleted
+                and self._redo_generations.get(mid) == active.generation
+                and (
+                    self._redo_commits.get(mid) is active
+                    or (abort is not None and abort[0] is active)
+                )
+            )
+
+        def forgotten() -> None:
+            self._forget_redo(mid)
+
+        def guarded() -> Callable[[], None]:
+            if not current():
+                return lambda: None
+            try:
+                completed = work()
+            except (MeetingStoreError, OSError):
+                if self._redo_read(mid) is not None:
+                    raise
+                completed = forgotten
+            return lambda: completed() if current() else None
+
+        def failed() -> None:
+            if current():
+                self._redo_later(mid)
+
+        self._run(guarded, failed=failed)
+
+    def _redo_later(self, meeting_id: str) -> None:
+        if meeting_id in self._redo_deleted or meeting_id not in self._redo_generations:
+            return
+        self._redo_io.discard(meeting_id)
+        self._redo_retry[meeting_id] = self.clock() + ADMIT_RETRY_S
+        self._changed()
+
+    def _retry_redo(self) -> None:
+        for mid in list(self._redo_commits):
+            if mid not in self._redo_io and self._redo_retry.get(mid, 0) <= self.clock():
+                self._settle_redo(mid)
+        for mid, (active, outcome) in list(self._redo_aborts.items()):
+            if mid not in self._redo_io and self._redo_retry.get(mid, 0) <= self.clock():
+                self._redo_abort(active, outcome)
+
+    def _settle_redo(self, meeting_id: str) -> None:
+        """K0–K7; only commit recovery is legal after a delivered successful done."""
+        if meeting_id in self._redo_deleted:
+            return
+        active = self._redo_commits.get(meeting_id)
+        if active is None:
+            self._settle_redo_disk(meeting_id)
+            return
+        if meeting_id in self._redo_io:
+            return
+        self._redo_io.add(meeting_id)
+        retention = max(0, min(365, int(self.audio_retention_days())))
+
+        def work() -> Callable[[], None]:
+            current = self._redo_read(meeting_id)
+            if current is None:
+                return lambda: self._forget_redo(meeting_id)
+            updated = None
+            result = RediarPublishResult.REJECTED
+            if (
+                current.state == MeetingState.DONE
+                and current.meeting_generation == active.generation
+                and meeting_id not in self.tombstones
+            ):
+                if current.rediar is None:
+                    # K6 may already have replaced meeting.json before fsync failed.
+                    if (
+                        current.transcript_generation is None
+                        and current.transcription.diar_status == "done"
+                    ):
+                        state = self.store.transcript_state(meeting_id)
+                        if state.generation == active.generation and state.labels_final:
+                            result = RediarPublishResult.PUBLISHED
+                else:
+                    with self.store.writer(meeting_id, Writer.GUI) as writer:
+                        result = writer.rediar_publish(active.generation)
+                if result == RediarPublishResult.PUBLISHED:
+                    text = self.store.read(meeting_id, "transcript.json")
+                    if text.meeting_generation != active.generation or not text.labels_final:
+                        raise MeetingStoreError("Не совпадает поколение результата")
+
+                    def finalize(meeting: Meeting) -> bool:
+                        if meeting.rediar is None:
+                            if (
+                                meeting.transcript_generation is not None
+                                or meeting.transcription.diar_status != "done"
+                            ):
+                                raise MeetingStoreError("Нет завершённого повтора")
+                            return False
+                        if meeting.rediar != active.meeting.rediar:
+                            raise MeetingStoreError("Не совпадает дескриптор повтора")
+                        meeting.rediar = None
+                        meeting.transcript_generation = None
+                        meeting.processing_status = (
+                            ProcessingStatus.PARTIAL
+                            if text.reconcile.failed
+                            else ProcessingStatus.SUCCEEDED
+                        )
+                        transcription = meeting.transcription
+                        transcription.diarization = True
+                        transcription.diar_status = "done"
+                        transcription.finished_at = active.meeting.transcription.finished_at
+                        transcription.wall_ms = active.meeting.transcription.wall_ms
+                        transcription.peak_rss_kb = active.meeting.transcription.peak_rss_kb
+                        meeting.audio.retain_days = retention
+                        meeting.cleanup_pending = (
+                            not text.reconcile.failed and retention == 0 and meeting.audio.present
+                        )
+                        return True
+
+                    updated = self._redo_update(meeting_id, active.generation, finalize)
+                    if updated is not None and updated.cleanup_pending:
+                        updated = self._remove_audio(meeting_id) or updated
+
+            def completed() -> None:
+                self._redo_io.discard(meeting_id)
+                if meeting_id in self.tombstones:
+                    self._redo_release(meeting_id)
+                elif result in {RediarPublishResult.BUSY, RediarPublishResult.IO_ERROR}:
+                    self._redo_later(meeting_id)
+                elif result in {RediarPublishResult.WORK_PENDING, RediarPublishResult.INVALID}:
+                    self._redo_commits.pop(meeting_id, None)
+                    self._redo_abort(active, self._redo_failure(active.meeting))
+                else:
+                    if updated is not None:
+                        self.meetings[meeting_id] = updated
+                        self.redo_results[meeting_id] = "done"
+                    self._redo_release(meeting_id)
+
+            return completed
+
+        self._run_redo(active, work)
+
+    def _settle_redo_disk(self, meeting_id: str) -> None:
+        """Explicit re-entry after K3/K6 on a fresh queue, without starting a role.
+
+        Automatic scanning/resuming unfinished work belongs to 5в-5. Here the
+        published generation must already prove K3; cancellation cannot pass
+        this check because it retains the older transcript_generation.
+        """
+        if (
+            self._closed
+            or meeting_id in self.tombstones
+            or meeting_id in self._redo_deleted
+            or self.names_busy(meeting_id)
+        ):
+            return
+        self._redo_preparing.add(meeting_id)
+        self._changed()
+
+        def work() -> Callable[[], None]:
+            current = self._redo_read(meeting_id)
+            if current is None:
+                return lambda: self._forget_redo(meeting_id)
+            text = self.store.transcript_state(meeting_id)
+            committed = (
+                current.state == MeetingState.DONE
+                and current.meeting_generation == text.generation
+                and text.labels_final
+                and (
+                    current.rediar is not None
+                    or (
+                        current.transcript_generation is None
+                        and current.transcription.diar_status == "done"
+                    )
+                )
+            )
+            if current.rediar is not None:
+                current.transcription.finished_at = self.wall_clock().isoformat()
+
+            def completed() -> None:
+                self._redo_preparing.discard(meeting_id)
+                if (
+                    committed
+                    and meeting_id not in self.tombstones
+                    and meeting_id not in self._redo_deleted
+                    and not self._closed
+                ):
+                    active = _Active(
+                        current,
+                        ModelAdmission("missing"),
+                        resume=True,
+                        redo=True,
+                        phase="committing",
+                    )
+                    self._redo_generations[meeting_id] = current.meeting_generation
+                    self._redo_commits[meeting_id] = active
+                    self._settle_redo(meeting_id)
+                self._changed()
+
+            return completed
+
+        def failed() -> None:
+            if meeting_id in self._redo_deleted:
+                return
+            self._redo_preparing.discard(meeting_id)
+            self.failures[meeting_id] = "io"
+            self._changed()
+
+        self._run(work, failed=failed)
+
+    def _redo_abort(self, active: _Active, outcome: str) -> None:
+        """Clear descriptor durably, then discard only after leases are released."""
+        mid = active.meeting_id
+        if mid in self._redo_deleted or self._redo_generations.get(mid) != active.generation:
+            return
+        self._redo_aborts[mid] = (active, outcome)
+        if mid in self._redo_io:
+            return
+        self._redo_io.add(mid)
+
+        def clear(meeting: Meeting) -> bool:
+            if meeting.rediar is None:
+                return False
+            meeting.rediar = None
+            return True
+
+        def work() -> Callable[[], None]:
+            if self._redo_read(mid) is None:
+                return lambda: self._forget_redo(mid)
+            updated = self._redo_update(mid, active.generation, clear)
+            if updated is not None:
+                with self.store.writer(mid, Writer.GUI) as writer:
+                    writer.rediar_discard()
+
+            def completed() -> None:
+                self._redo_io.discard(mid)
+                if updated is not None and mid not in self.tombstones:
+                    self.meetings[mid] = updated
+                    self.redo_results[mid] = outcome
+                self._redo_release(mid)
+
+            return completed
+
+        self._run_redo(active, work)
+
+    def _persist_redo_cancel(self, meeting_id: str) -> None:
+        generation = self._redo_generations[meeting_id]
+        attempts = self._cancel_writes.get(meeting_id, (0, None))[0]
+        self._cancel_writes[meeting_id] = (attempts, None)
+
+        def clear(meeting: Meeting) -> bool:
+            if meeting.rediar is None:
+                return False
+            meeting.rediar = None
+            return True
+
+        def work() -> Callable[[], None]:
+            updated = self._redo_update(meeting_id, generation, clear)
+            if updated is None:
+                return failed
+
+            def completed() -> None:
+                self._cancel_writes.pop(meeting_id, None)
+                if (
+                    meeting_id in self.tombstones
+                    or self._redo_generations.get(meeting_id) != generation
+                ):
+                    return
+                self.meetings[meeting_id] = updated
+                active = self._active
+                if active is not None and active.meeting_id == meeting_id:
+                    self._send_cancel(meeting_id)
+                else:
+                    self._redo_abort(
+                        _Active(updated, ModelAdmission("missing"), resume=True, redo=True),
+                        "cancelled",
+                    )
+                self._changed()
+
+            return completed
+
+        def failed() -> None:
+            if (
+                meeting_id in self.tombstones
+                or self._redo_generations.get(meeting_id) != generation
+            ):
+                self._cancel_writes.pop(meeting_id, None)
+                return
+            count = self._cancel_writes.get(meeting_id, (0, None))[0] + 1
+            if count < CANCEL_WRITE_ATTEMPTS:
+                self._cancel_writes[meeting_id] = (count, self.clock() + CANCEL_RETRY_S)
+            else:
+                self._cancel_writes.pop(meeting_id, None)
+                self._cancel_failed(meeting_id)
+
+        self._run(work, failed=failed)
+
     # ---- durable metadata ---------------------------------------------------
 
     def _persist_cancel(self, meeting_id: str) -> None:
         """D12: meeting.job.cancel only after ``cancelled=true`` is on disk."""
+        if meeting_id in self._redo_generations:
+            self._persist_redo_cancel(meeting_id)
+            return
         attempts = self._cancel_writes.get(meeting_id, (0, None))[0]
         self._cancel_writes[meeting_id] = (attempts, None)
 
@@ -1776,6 +2391,12 @@ class MeetingJobs:
         would come back after a restart. The user sees «Ошибка расшифровки» instead."""
         self.failures[meeting_id] = "io"
         active = self._active
+        if meeting_id in self._redo_generations:
+            if active is not None and active.meeting_id == meeting_id:
+                active.purpose = "cancel-write-failed"
+                self._kill(active)
+            self._changed()
+            return
         if active is not None and active.meeting_id == meeting_id and active.purpose == "cancel":
             if active.phase == "exiting":  # the role is already being killed
                 active.purpose, active.failure = "fail", "io"
