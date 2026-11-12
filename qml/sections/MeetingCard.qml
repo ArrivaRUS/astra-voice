@@ -1,9 +1,10 @@
 // Карточка встречи A «Документ» — design/meetings/spec.md §3.7/§4.7/§5.2, §7;
 // значения — design/meetings/tokens.md §3. Макеты 05-meeting-A.html, 06-meeting-states.html.
-// M4: без имён и номеров спикеров (M7), без переименования/удаления (M5), без плеера (Could).
+// M7: имена, объединение, пометки; плеер — Could.
 // Вся карточка живёт в общем Flickable окна (§5.2): своей прокрутки нет.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Window 2.15
 import QtQuick.Layouts 1.15
 import ".."
 import "../components"
@@ -18,7 +19,7 @@ FocusScope {
     readonly property var rowsModel: bridge && bridge.cardRows !== undefined ? bridge.cardRows : null
     readonly property string view: card.view !== undefined ? card.view : ""
     // Точка 760 по ширине контента (spec §5.2): шире — панель «Участники» справа.
-    readonly property bool wide: width >= 760
+    readonly property bool wide: width >= Theme.sizeMeetingSplitContentW
     readonly property bool panelState: card.panel !== undefined && card.panel.title !== undefined
     readonly property real tableWidth: wide ? width - Theme.participantsPanelGap - Theme.participantsPanelW : width
     // Рамка карточек: в тёмной теме border полупрозрачный; Qt не кладёт под рамку заливку,
@@ -27,6 +28,20 @@ FocusScope {
     // Сколько строк таблицы создано: инкрементальная модель не пересоздаёт старые.
     property int rowsCreated: 0
     property int currentRow: 0
+
+    onVisibleChanged: {
+        if (!visible) closeOverlays()
+    }
+    onCardChanged: {
+        if (card.open !== true) closeOverlays()
+        else if (card.namesEditable !== true && mergePopover) mergePopover.close()
+    }
+    function closeOverlays() {
+        if (namesDrawer) namesDrawer.close()
+        if (mergePopover) mergePopover.close()
+        if (saveDialog) saveDialog.close()
+        if (speakerToast) speakerToast.visible = false
+    }
 
     signal backRequested()
 
@@ -41,6 +56,32 @@ FocusScope {
         renameDialog.returnFocusItem = origin
         bridge.cardAction("rename")
     }
+    readonly property Item overlayViewport: {
+        var item = root.parent
+        while (item) {
+            if (item.contentY !== undefined && item.contentHeight !== undefined) return item
+            if (!item.parent) break
+            item = item.parent
+        }
+        return root.parent
+    }
+    property var namesOrigin: null
+    function openNames(origin) {
+        namesOrigin = origin
+        if (wide) participants.focusFirst()
+        else namesDrawer.open()
+    }
+    function openMerge(person, origin, panel) {
+        mergePopover.source = person
+        mergePopover.ownerPanel = panel
+        panel.highlightedSpeaker = person.id
+        mergePopover.returnFocusItem = origin
+        var point = panel.speakerAnchor(person.id, mergePopover.parent)
+        mergePopover.x = Math.max(0, point.x - Theme.mergePopoverW - Theme.participantsPanelGap)
+        mergePopover.anchorCenterY = point.y + point.height / 2
+        mergePopover.open()
+    }
+
     function moveRow(step) {
         var count = rows.count
         if (count === 0) return
@@ -111,6 +152,11 @@ FocusScope {
         target: root.rowsModel
         function onModelReset() { root.refeedRows() }
         function onRowsInserted() { if (!rowFeeder.running) root.feedRows() }
+        function onDataChanged(first, last) {
+            if (root.rowsDraining) return
+            for (var i = first.row; i <= last.row && i < shownRows.count; ++i)
+                shownRows.set(i, root.rowsModel.get(i))
+        }
     }
 
     Column {
@@ -302,6 +348,7 @@ FocusScope {
                 AvButton {
                     id: moreButton
                     objectName: "meetingCardMore"
+                    KeyNavigation.tab: table
                     width: Theme.meetingHeadIconButton
                     height: Theme.meetingHeadIconButton
                     leftPadding: 0
@@ -332,7 +379,12 @@ FocusScope {
                             enabled: root.card.renameEnabled === true
                             onTriggered: root.requestRename(moreButton)
                         }
-                        MenuItem { text: root.txt("names"); enabled: false }
+                        MenuItem {
+                            objectName: "meetingCardNamesAction"
+                            text: root.txt("names")
+                            enabled: root.card.live !== true && root.card.showTable === true && (root.card.participants || []).some(function(p) { return p.kind === "speaker" })
+                            onTriggered: Qt.callLater(function() { root.openNames(moreButton) })
+                        }
                         MenuSeparator {}
                         // D2 «Удалить встречу» — M5.
                         MenuItem {
@@ -363,6 +415,8 @@ FocusScope {
                     MeetingBadge {
                         text: modelData.label
                         mono: modelData.mono
+                        suffix: modelData.suffix || ""
+                        accessibleName: modelData.accessibleName || ""
                         kind: modelData.tone
                         iconName: modelData.icon
                     }
@@ -411,10 +465,11 @@ FocusScope {
                             readonly property real kUi: uiMetrics.ascent - uiMetrics.descent
                             readonly property real kMono: monoMetrics.ascent - monoMetrics.descent
                             readonly property real baseY: (lead + Math.max(kUi, kMono)) / 2
-                            height: lead + Math.abs(kUi - kMono) / 2
+                            height: Math.max(lead + Math.abs(kUi - kMono) / 2, progressNames.y + progressNames.height)
                             FontMetrics { id: uiMetrics; font.family: Theme.fontUi; font.pixelSize: Theme.transcribeProgressTextSize }
                             FontMetrics { id: monoMetrics; font.family: Theme.fontMono; font.pixelSize: Theme.transcribeProgressTextSize }
                             Row {
+                                id: progressTimes
                                 Text {
                                     text: root.txt("progressDone")
                                     textFormat: Text.PlainText
@@ -454,6 +509,22 @@ FocusScope {
                                     font.letterSpacing: Theme.transcribeProgressTextSize * Theme.fontMonoInlineTracking
                                     renderType: Text.NativeRendering
                                 }
+                            }
+                            Text {
+                                id: progressNames
+                                objectName: "meetingProgressNames"
+                                x: progressTimes.width
+                                y: progressLine.baseY - baselineOffset
+                                width: Math.max(0, progressLine.width - x)
+                                text: root.txt("progressNames")
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                                color: Theme.fg
+                                font.family: Theme.fontUi
+                                font.pixelSize: Theme.transcribeProgressTextSize
+                                lineHeight: Theme.transcribeProgressTextSize * Theme.fontBodyLineHeight
+                                lineHeightMode: Text.FixedHeight
+                                renderType: Text.NativeRendering
                             }
                         }
                         // FixedHeight оставляет leading снизу; CSS делит его пополам (как Step4Mic).
@@ -674,30 +745,70 @@ FocusScope {
                         }
                         Repeater {
                             model: root.card.participants !== undefined ? root.card.participants : []
-                            Text {
-                                text: modelData.label
-                                textFormat: Text.PlainText
-                                color: Theme.fg
-                                font.family: Theme.fontUi
-                                font.pixelSize: Theme.participantsStripChipSize
-                                lineHeight: Theme.participantsStripChipSize * Theme.fontBodyLineHeight
-                                lineHeightMode: Text.FixedHeight
-                                height: Theme.participantsStripChipSize * 1.4
-                                verticalAlignment: Text.AlignVCenter
-                                renderType: Text.NativeRendering
+                            Row {
+                                spacing: Theme.speakerNumGap
+                                MeetingSpeakerNumber { num: modelData.num || ""; anchors.verticalCenter: parent.verticalCenter }
+                                Text {
+                                    text: modelData.label
+                                    textFormat: Text.PlainText
+                                    color: modelData.kind === "me" ? Theme.transcriptMeFg : Theme.fg
+                                    font.family: Theme.fontUi
+                                    font.pixelSize: Theme.participantsStripChipSize
+                                    height: Theme.participantsStripChipSize * Theme.participantsQuoteLineHeight
+                                    verticalAlignment: Text.AlignVCenter
+                                    renderType: Text.NativeRendering
+                                }
                             }
                         }
                     }
-                    // Имена — M7: кнопка видна, но недоступна (полей для правки в M4 нет).
+                    // При узком контенте открывает панель 300.
                     AvButton {
+                        id: namesButton
                         objectName: "meetingCardNames"
+                        KeyNavigation.backtab: table
+                        KeyNavigation.tab: back
+                        Keys.onReturnPressed: if (enabled) clicked()
+                        Keys.onEnterPressed: if (enabled) clicked()
                         small: true
                         iconName: "people"
                         text: root.txt("names")
-                        enabled: false
+                        enabled: root.card.live !== true && (root.card.participants || []).some(function(p) { return p.kind === "speaker" })
+                        onClicked: root.openNames(namesButton)
                         Layout.alignment: Qt.AlignVCenter
                     }
                 }
+            }
+        }
+
+        Item {
+            id: missingModels
+            objectName: "meetingDiarizationMissing"
+            visible: root.card.diarizationModelsMissing === true
+            width: parent.width
+            height: visible ? Math.max(installLabel.height, installButton.height) + Theme.participantsStripMarginBottom : 0
+            Text {
+                id: installLabel
+                width: Math.max(0, parent.width - (installButton.visible ? installButton.width + Theme.mergePopoverGap : 0))
+                y: (parent.height - Theme.participantsStripMarginBottom - height) / 2
+                text: root.card.diarizationHint || ""
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSmallSize
+                color: Theme.fgMuted
+                renderType: Text.NativeRendering
+            }
+            AvButton {
+                id: installButton
+                objectName: "meetingDiarizationInstall"
+                anchors.right: parent.right
+                y: (parent.height - Theme.participantsStripMarginBottom - height) / 2
+                visible: text !== ""
+                Keys.onReturnPressed: if (enabled) clicked()
+                Keys.onEnterPressed: if (enabled) clicked()
+                text: root.card.diarizationAction || ""
+                small: true
+                onClicked: if (root.bridge) root.bridge.requestDiarizationInstall()
             }
         }
 
@@ -721,6 +832,7 @@ FocusScope {
                 FocusScope {
                     id: table
                     objectName: "meetingCardTableFocus"
+                    KeyNavigation.tab: null
                     x: Theme.cardBorder
                     y: Theme.cardBorder
                     width: parent.width - Theme.cardBorder * 2
@@ -734,8 +846,19 @@ FocusScope {
                         if (activeFocus && (!item || !item.activeFocus)) root.moveRow(0)
                     }
                     Keys.onBacktabPressed: {
-                        var previous = table.nextItemInFocusChain(false)
-                        if (previous) previous.forceActiveFocus(Qt.BacktabFocusReason)
+                        if (root.card.showActions === true) moreButton.forceActiveFocus(Qt.BacktabFocusReason)
+                        else {
+                            var previous = table.nextItemInFocusChain(false)
+                            if (previous) previous.forceActiveFocus(Qt.BacktabFocusReason)
+                        }
+                    }
+                    Keys.onTabPressed: {
+                        if (!root.wide && namesButton.enabled) namesButton.forceActiveFocus(Qt.TabFocusReason)
+                        else if (!participants.focusFirst()) {
+                            var next = table.nextItemInFocusChain(true)
+                            if (next && next !== table) next.forceActiveFocus(Qt.TabFocusReason)
+                            else event.accepted = false
+                        }
                     }
                     Keys.onUpPressed: root.moveRow(-1)
                     Keys.onDownPressed: root.moveRow(1)
@@ -767,6 +890,10 @@ FocusScope {
                                     kind: model.kind
                                     time: model.time
                                     who: model.who
+                                    num: model.num
+                                    flagText: model.flagText
+                                    flagIcon: model.flagIcon
+                                    textMuted: model.textMuted
                                     whoKind: model.whoKind
                                     text: model.text
                                     iconName: model.icon
@@ -823,137 +950,109 @@ FocusScope {
                 }
             }
 
-            // Панель «Участники» 232 (контент ≥ 760). M4: «Я» и «Собеседники», без полей имён.
-            Rectangle {
+            MeetingParticipants {
                 id: participants
-                objectName: "meetingCardParticipants"
                 visible: root.wide
-                width: Theme.participantsPanelW
-                height: participantsColumn.height + Theme.cardBorder * 2
-                color: Theme.bgSurface
-                radius: Theme.cardRadius
-                border.width: Theme.cardBorder
-                border.color: root.cardBorderColor
-                Column {
-                    id: participantsColumn
-                    x: Theme.cardBorder
-                    y: Theme.cardBorder
-                    width: parent.width - Theme.cardBorder * 2
-                    Item {
-                        width: parent.width
-                        height: participantsTitle.height + Theme.participantsHeadPaddingY * 2
-                        Text {
-                            id: participantsTitle
-                            x: Theme.participantsHeadPaddingX
-                            anchors.verticalCenter: parent.verticalCenter
-                            // FixedHeight оставляет leading снизу; CSS делит его пополам (как Step4Mic).
-                            topPadding: (lineHeight - participantsTitleMetrics.height) / 2
-                            height: lineHeight
-                            text: root.txt("participants")
-                            textFormat: Text.PlainText
-                            color: Theme.fg
-                            font.family: Theme.fontUi
-                            font.pixelSize: Theme.participantsTitleSize
-                            lineHeight: Theme.participantsTitleSize * Theme.fontBodyLineHeight
-                            lineHeightMode: Text.FixedHeight
-                            font.weight: Font.Medium
-                            renderType: Text.NativeRendering
-                            FontMetrics { id: participantsTitleMetrics; font: participantsTitle.font }
-                        }
-                        Icon {
-                            x: parent.width - Theme.participantsHeadPaddingX - width
-                            anchors.verticalCenter: parent.verticalCenter
-                            name: "people"
-                            size: Theme.participantsHeadIcon
-                            color: Theme.fgMuted
-                        }
-                    }
-                    Repeater {
-                        model: root.card.participants !== undefined ? root.card.participants : []
-                        Item {
-                            objectName: "meetingCardParticipant"
-                            width: participantsColumn.width
-                            height: Theme.participantsItemPaddingY * 2 + Theme.cardBorder + itemColumn.height
-                            Rectangle { width: parent.width; height: Theme.cardBorder; color: Theme.borderSoft }
-                            Column {
-                                id: itemColumn
-                                x: Theme.participantsItemPaddingX
-                                y: Theme.cardBorder + Theme.participantsItemPaddingY
-                                width: parent.width - Theme.participantsItemPaddingX * 2
-                                Item {
-                                    width: parent.width
-                                    height: name.height
-                                    Text {
-                                        id: name
-                                        width: Math.min(implicitWidth, parent.width - minutes.width - 6)
-                                        text: modelData.label
-                                        textFormat: Text.PlainText
-                                        elide: Text.ElideRight
-                                        color: modelData.kind === "me" ? Theme.transcriptMeFg : Theme.fg
-                                        font.family: Theme.fontUi
-                                        font.pixelSize: Theme.participantsNameSize
-                                        lineHeight: Theme.participantsNameSize * Theme.fontBodyLineHeight
-                                        lineHeightMode: Text.FixedHeight
-                                        font.weight: Font.Medium
-                                        renderType: Text.NativeRendering
-                                    }
-                                    Text {
-                                        id: minutes
-                                        objectName: "meetingCardMinutes"
-                                        x: parent.width - width
-                                        y: name.baselineOffset - baselineOffset
-                                        text: modelData.minutes
-                                        textFormat: Text.PlainText
-                                        color: Theme.fgMuted
-                                        font.family: Theme.fontMono
-                                        font.pixelSize: Theme.participantsMinutesSize
-                                        lineHeight: Theme.participantsMinutesSize * Theme.fontBodyLineHeight
-                                        lineHeightMode: Text.FixedHeight
-                                        font.letterSpacing: Theme.participantsMinutesSize * Theme.fontMonoInlineTracking
-                                        renderType: Text.NativeRendering
-                                    }
-                                }
-                                Text {
-                                    visible: modelData.kind === "me"
-                                    width: parent.width
-                                    text: root.txt("meCaption")
-                                    textFormat: Text.PlainText
-                                    wrapMode: Text.WordWrap
-                                    color: Theme.fgMuted
-                                    font.family: Theme.fontUi
-                                    font.pixelSize: Theme.participantsCaptionSize
-                                    lineHeight: Theme.participantsCaptionSize * Theme.fontBodyLineHeight
-                                    lineHeightMode: Text.FixedHeight
-                                    renderType: Text.NativeRendering
-                                }
-                            }
-                        }
-                    }
-                    Item {
-                        objectName: "meetingCardNamesLater"
-                        visible: root.card.live === true
-                        width: parent.width
-                        height: visible ? Theme.cardBorder + Theme.participantsFootPaddingY + laterText.height + Theme.participantsCaptionPaddingBottom : 0
-                        Rectangle { width: parent.width; height: Theme.cardBorder; color: Theme.borderSoft }
-                        Text {
-                            id: laterText
-                            x: Theme.participantsFootPaddingX
-                            y: Theme.cardBorder + Theme.participantsFootPaddingY
-                            width: parent.width - Theme.participantsFootPaddingX * 2
-                            text: root.txt("namesLater")
-                            textFormat: Text.PlainText
-                            wrapMode: Text.WordWrap
-                            color: Theme.fgMuted
-                            font.family: Theme.fontUi
-                            font.pixelSize: Theme.participantsCaptionSize
-                            lineHeight: Theme.participantsCaptionSize * Theme.fontBodyLineHeight
-                            lineHeightMode: Text.FixedHeight
-                            renderType: Text.NativeRendering
-                        }
-                    }
-                }
+                bridge: root.bridge
+                tableFocusTarget: table
+                onMergeRequested: root.openMerge(participant, origin, participants)
             }
         }
+    }
+
+    Popup {
+        id: namesDrawer
+        objectName: "meetingParticipantsDrawer"
+        parent: root.overlayViewport
+        x: parent ? parent.width - width : 0
+        y: 0
+        width: Theme.participantsDrawerW
+        height: parent ? parent.height : drawerPanel.height
+        padding: 0
+        z: Theme.popoverZ - 1
+        modal: true
+        dim: false
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        onOpened: drawerPanel.focusFirst()
+        onClosed: Qt.callLater(function() { if (root.namesOrigin && root.namesOrigin.visible) root.namesOrigin.forceActiveFocus(Qt.TabFocusReason) })
+        background: Rectangle {
+            OverlaySurface {
+                anchors.fill: parent
+                surfaceWidth: parent.width
+                surfaceHeight: parent.height
+                surfaceRadius: 0
+                surfaceColor: Theme.participantsDrawerBg
+                shadowX: Theme.shadowMeetingDrawerX
+                shadowY: Theme.shadowMeetingDrawerY
+                shadowRadius: Theme.shadowMeetingDrawerRadius
+                shadowColor: Theme.shadowMeetingDrawerColor
+                shadowSourceColor: Theme.participantsDrawerBg
+            }
+            color: Theme.participantsDrawerBg
+        }
+        contentItem: Item {
+            Flickable {
+                anchors.fill: parent
+                id: participantsScroll
+                objectName: "meetingParticipantsScroll"
+                contentWidth: width
+                contentHeight: drawerPanel.height
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                function revealFocus() {
+                    var item = root.Window.window ? root.Window.window.activeFocusItem : null
+                    var ancestor = item
+                    while (ancestor && ancestor !== drawerPanel) ancestor = ancestor.parent
+                    if (!ancestor || !item) return
+                    var point = item.mapToItem(drawerPanel, 0, 0)
+                    var margin = Theme.focusOffset + Theme.focusWidth
+                    var end = Math.max(0, contentHeight - height)
+                    if (point.y - margin < contentY) contentY = Math.max(0, point.y - margin)
+                    else if (point.y + item.height + margin > contentY + height)
+                        contentY = Math.min(end, point.y + item.height + margin - height)
+                }
+                Connections {
+                    target: root.Window.window
+                    function onActiveFocusItemChanged() { Qt.callLater(participantsScroll.revealFocus) }
+                }
+                MeetingParticipants {
+                    id: drawerPanel
+                    bridge: root.bridge
+                    drawer: true
+                    onCloseRequested: namesDrawer.close()
+                    onMergeRequested: root.openMerge(participant, origin, drawerPanel)
+                }
+            }
+            Rectangle {
+                objectName: "meetingParticipantsBorder"
+                width: Theme.participantsDrawerBorderLeft
+                height: parent.height
+                color: Theme.border
+                z: 1
+            }
+        }
+        enter: Transition {
+            NumberAnimation { property: "x"; from: namesDrawer.parent ? namesDrawer.parent.width : 0; to: namesDrawer.parent ? namesDrawer.parent.width - namesDrawer.width : 0; duration: Theme.durationEnter; easing.type: Easing.Bezier; easing.bezierCurve: Theme.easingEnter.concat([1, 1]) }
+        }
+        exit: Transition {
+            NumberAnimation { property: "x"; to: namesDrawer.parent ? namesDrawer.parent.width : 0; duration: Theme.durationExit; easing.type: Easing.Bezier; easing.bezierCurve: Theme.easingExit.concat([1, 1]) }
+        }
+    }
+    MeetingMergePopover {
+        id: mergePopover
+        parent: Overlay.overlay
+        bridge: root.bridge
+    }
+    MeetingSpeakerToast {
+        id: speakerToast
+        bridge: root.bridge
+        parent: root.overlayViewport
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Theme.toastBottom
+        maxWidth: root.width - Theme.toastMaxWInset
     }
 
     MeetingRenameDialog {

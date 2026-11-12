@@ -1530,6 +1530,12 @@ runtime и жизненный цикл lease: [command-mouse.md](arch/command-mo
 | `requestDiarizationInstall()` | При доступной настройке и отсутствующих моделях отправляет сигнал; не устанавливает модели |
 | `diarizationInstallRequested()` | Запрос перехода к установке; обработчик добавляется в следующем шаге |
 
+Шаг 5б добавляет только строки представления: `participants[].inputAccessibleName`
+(«Как подписать: <подпись>»), `participants[].mergeTitle` («<подпись> — это…»),
+`speakerTexts.closeNames` («Закрыть имена участников») и `speakerTexts.mergeTarget`
+(«Это один человек»). QML передаёт эти готовые строки диктору, не собирая их заново.
+Номер по-прежнему отдельный `num`; `mergeCandidates` сохраняет прежний контракт.
+
 `names-edit` (фокус поля) и `merge` (открытый поповер) — локальные состояния QML.
 В `names-edit` вызывается `renameSpeaker` на каждый ввод; успех обновляет `cardChanged`,
 `cardRows` и, только при открытом D4, `savePreviewChanged`. `merged` определяется результатом операции, затем

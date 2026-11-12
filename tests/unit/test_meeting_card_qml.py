@@ -795,7 +795,7 @@ bridge.changed.emit()
 bridge.requestMeetingAction(rc.MEETING_ID, 'Удалить')
 delete_dialog = window.findChild(QObject, 'meetingDeleteDialog')
 wait(lambda: delete_dialog.property('opened') is True, 'D2 from list')
-assert 'Удалить встречу „' in delete_dialog.property('message')
+assert 'Удалить встречу «' in delete_dialog.property('message')
 message = delete_dialog.property('message')
 assert 'Удалятся запись звука, расшифровка и все её файлы в программе.' in message
 assert 'Файлы, которые вы сохранили в другие папки, останутся — удалите их сами.' in message

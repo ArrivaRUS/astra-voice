@@ -99,6 +99,7 @@ TEXTS = {
     ),
     "progressDone": "Расшифровано ",
     "progressOf": " из ",
+    "progressNames": " · имена спикеров уточняются до конца",
     "cancel": "Отменить",
     "tail": "Дальше — по мере расшифровки",
     "policyOff": (
@@ -234,6 +235,7 @@ def save_preview(
                 "markPosition": "start" if paragraphs else "after-name",
                 "time": at if row.kind == "mark" else f"[{at}]",
                 "who": row.who,
+                "num": row.num,
                 "whoKind": row.who_kind,
                 "text": text,
                 "icon": row.icon,
@@ -837,6 +839,9 @@ def participants(
                 "id": label,
                 "num": str(speaker_number(label)),
                 "label": speaker_label(meeting, label, speakers),
+                "panelLabel": speaker_label(meeting, label),
+                "inputAccessibleName": f"Как подписать: {speaker_label(meeting, label, speakers)}",
+                "mergeTitle": f"{speaker_label(meeting, label, speakers)} — это…",
                 "name": (speakers.labels[label].name or "")
                 if speakers and label in speakers.labels
                 else "",

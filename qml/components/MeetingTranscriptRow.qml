@@ -12,6 +12,10 @@ Item {
     property string kind: "utterance" // utterance | mark
     property string time: ""
     property string who: ""
+    property string num: ""
+    property string flagText: ""
+    property string flagIcon: ""
+    property bool textMuted: false
     property string whoKind: ""
     property string text: ""
     property string iconName: ""
@@ -21,7 +25,7 @@ Item {
     readonly property real lead: first ? 0 : Theme.transcriptRowDivider
 
     height: lead + Theme.transcriptRowPaddingY * 2
-        + (isMark ? markText.height : Math.max(speech.height, whoText.height + Theme.transcriptWhoOffsetTop))
+        + (isMark ? markText.height : Math.max(speech.height, whoColumn.height + Theme.transcriptWhoOffsetTop))
     Accessible.role: Accessible.ListItem
     Accessible.name: accessibleName
 
@@ -60,33 +64,80 @@ Item {
         font.letterSpacing: Theme.transcriptTimeSize * Theme.fontMonoInlineTracking
         renderType: Text.NativeRendering
     }
-    Text {
-        id: whoText
-        objectName: "meetingCardWho"
+    Column {
+        id: whoColumn
         visible: !root.isMark
         x: Theme.transcriptRowPaddingX + Theme.transcriptColTimeW + Theme.transcriptColGap
         y: root.lead + Theme.transcriptRowPaddingY + Theme.transcriptWhoOffsetTop
         width: Theme.transcriptColWhoW
-        text: root.isMark ? "" : root.who
-        textFormat: Text.PlainText
-        elide: Text.ElideRight
-        color: root.whoKind === "me" ? Theme.transcriptMeFg : Theme.fg
-        font.family: Theme.fontUi
-        font.pixelSize: Theme.transcriptWhoSize
-        font.weight: Font.Medium
-        renderType: Text.NativeRendering
+        spacing: 0
+        Item {
+            width: parent.width
+            height: Theme.transcriptWhoSize * Theme.fontBodyLineHeight
+            MeetingSpeakerNumber {
+                id: number
+                num: root.num
+                anchors.verticalCenter: parent.verticalCenter
+            }
+            Text {
+                id: whoText
+                objectName: "meetingCardWho"
+                x: number.visible ? number.width + Theme.speakerNumGap : 0
+                width: parent.width - x
+                height: parent.height
+                text: root.isMark ? "" : root.who
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                verticalAlignment: Text.AlignVCenter
+                color: root.whoKind === "me" ? Theme.transcriptMeFg : Theme.fg
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.transcriptWhoSize
+                font.weight: Font.Medium // CSS 500 → Qt5 Medium.
+                renderType: Text.NativeRendering
+            }
+        }
+        Row {
+            visible: root.flagText !== ""
+            width: parent.width
+            spacing: Theme.spaceStep
+            Loader {
+                active: root.flagText !== ""
+                y: (Theme.transcriptMarkSize * Theme.transcriptTextLineHeight - height) / 2
+                width: Theme.transcriptMarkIcon
+                height: Theme.transcriptMarkIcon
+                sourceComponent: Icon {
+                    name: root.flagIcon
+                    size: Theme.transcriptMarkIcon
+                    color: Theme.transcriptMarkFg
+                }
+            }
+            Text {
+                objectName: "meetingCardFlag"
+                width: parent.width - Theme.transcriptMarkIcon - parent.spacing
+                text: root.flagText
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: Theme.transcriptMarkFg
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.transcriptMarkSize
+                lineHeight: Theme.transcriptMarkSize * Theme.transcriptTextLineHeight
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                Accessible.ignored: true
+            }
+        }
     }
     Text {
         id: speech
         objectName: "meetingCardText"
         visible: !root.isMark
-        x: whoText.x + Theme.transcriptColWhoW + Theme.transcriptColGap
+        x: whoColumn.x + Theme.transcriptColWhoW + Theme.transcriptColGap
         y: root.lead + Theme.transcriptRowPaddingY
         width: Math.max(0, root.width - x - Theme.transcriptRowPaddingX)
         text: root.isMark ? "" : root.text
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
-        color: Theme.fg
+        color: root.textMuted ? Theme.transcriptEchoFg : Theme.fg
         font.family: Theme.fontUi
         font.pixelSize: Theme.transcriptTextSize
         lineHeight: Theme.transcriptTextSize * Theme.transcriptTextLineHeight
@@ -95,10 +146,10 @@ Item {
     }
     Row {
         visible: root.isMark
-        x: whoText.x
+        x: whoColumn.x
         y: root.lead + Theme.transcriptRowPaddingY
         width: Math.max(0, root.width - x - Theme.transcriptRowPaddingX)
-        spacing: 4 // макет: пробел между глифом и текстом отметки.
+        spacing: Theme.spaceStep
         // Icon (Screen и Image) только у отметок: тысячи таких объектов в строках
         // реплик делали удаление таблицы квадратичным (секунды на 9000 строк).
         Loader {

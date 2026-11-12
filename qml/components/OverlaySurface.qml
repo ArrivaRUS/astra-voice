@@ -20,9 +20,10 @@ Item {
     // light fringe on the rounded corners.
     property color shadowSourceColor: PillTheme.pillFg
     Canvas {
-        x: -root.shadowRadius
+        objectName: "overlayShadowCanvas"
+        x: -root.shadowRadius + Math.min(0, root.shadowX)
         y: -root.shadowRadius
-        width: root.surfaceWidth + root.shadowRadius * 2
+        width: root.surfaceWidth + root.shadowRadius * 2 + Math.abs(root.shadowX)
         height: root.surfaceHeight + root.shadowRadius * 2 + root.shadowY
         renderTarget: Canvas.Image
         onWidthChanged: requestPaint()
@@ -32,7 +33,7 @@ Item {
             var ctx = getContext("2d");
             ctx.reset();
             ctx.clearRect(0, 0, width, height);
-            var left = root.shadowRadius;
+            var left = -x;
             var top = root.shadowRadius;
             var right = left + root.surfaceWidth;
             var bottom = top + root.surfaceHeight;

@@ -1492,6 +1492,8 @@ class MeetingBridge(QObject):
     def speakerTexts(self) -> dict[str, str]:
         return {
             "placeholder": "Как подписать",
+            "closeNames": "Закрыть имена участников",
+            "mergeTarget": "Это один человек",
             "merge": "Это один человек…",
             "mergeSuffix": " — это…",
             "mergeCaption": (
@@ -1570,6 +1572,8 @@ class MeetingBridge(QObject):
                             builder.meeting, row["id"], updated
                         )
                         patch["name"] = updated.labels[row["id"]].name or ""
+                        patch["inputAccessibleName"] = f"Как подписать: {patch['label']}"
+                        patch["mergeTitle"] = f"{patch['label']} — это…"
                     if any(c["id"] in changed for c in row["mergeCandidates"]):
                         patch = dict(patch)
                         patch["mergeCandidates"] = [

@@ -1155,7 +1155,7 @@ def test_echo_checkbox_preview_export_no_mutation_t545_t547_t548_t551_t553(
     bridge.setSaveExcludeEcho(checked)
     assert bool(signals) == checked
     assert bridge.saveEchoCount == 2 and bridge.saveEchoVisible == (template != "stats")
-    assert bridge.saveEchoAccessibleName == "Не включать реплики с пометкой „возможное эхо“, 2"
+    assert bridge.saveEchoAccessibleName == "Не включать реплики с пометкой «возможное эхо», 2"
     assert bridge.saveEchoDescription == meeting_card.TEXTS["excludeEchoDescription"]
     expected = render(template, rig.meeting(), data, fmt, exclude_echo=checked)
     assert bridge.savePreviewText(fmt) == expected

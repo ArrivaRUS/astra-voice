@@ -11,6 +11,8 @@ Rectangle {
     property string text: ""
     // Явный моно-хвост («0:31:10–0:34:02» у отметок); иначе — всё после « · ».
     property string mono: ""
+    property string suffix: ""
+    property string accessibleName: ""
     // neutral | primary | success | warning | danger
     property string kind: "neutral"
     property string iconName: ""
@@ -34,7 +36,7 @@ Rectangle {
     // Браузер снапит 21.25 к 21 пикселю; дробная высота даёт строку-полутень (22).
     height: Math.round(implicitHeight)
     Accessible.role: Accessible.StaticText
-    Accessible.name: mono !== "" ? text + " " + mono : text
+    Accessible.name: accessibleName !== "" ? accessibleName : mono !== "" ? text + " " + mono + suffix : text
 
     Row {
         id: label
@@ -44,7 +46,7 @@ Rectangle {
         Icon {
             objectName: "meetingBadgeSymbol"
             name: root.iconName
-            size: 11 // design/meetings/tokens.md §8.2: badge glyph.
+            size: Theme.fontGroupCapsSize // 11, tokens §8.2
             strokeWidth: name === "pause" ? 2.2 : 1.5
             fill: root.iconFill
             color: root.ink
@@ -74,6 +76,18 @@ Rectangle {
             font.family: Theme.fontMono
             font.pixelSize: Theme.fontBadgeSize
             font.letterSpacing: Theme.fontBadgeSize * Theme.fontMonoInlineTracking
+            lineHeight: Theme.fontBadgeSize * Theme.fontBodyLineHeight
+            lineHeightMode: Text.FixedHeight
+            renderType: Text.NativeRendering
+        }
+        Text {
+            visible: root.suffix !== ""
+            text: root.suffix.trim()
+            textFormat: Text.PlainText
+            color: root.ink
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fontBadgeSize
+            font.weight: Font.Medium
             lineHeight: Theme.fontBadgeSize * Theme.fontBodyLineHeight
             lineHeightMode: Text.FixedHeight
             renderType: Text.NativeRendering

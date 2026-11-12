@@ -61,10 +61,16 @@ AvDialog {
     confirmText: txt("saveConfirm")
     width: parent ? Math.min(Theme.meetingDialogSaveW, parent.width - 24) : Theme.meetingDialogSaveW
 
-    onAboutToShow: refreshPreview()
+    onAboutToShow: {
+        if (bridge && bridge.savePreviewOpen !== undefined) bridge.savePreviewOpen = true
+        refreshPreview()
+    }
     onOpened: if (templates.length) selectTemplate(templateIndex, Qt.PopupFocusReason)
     // Esc/«Отмена» возвращают фокус на «Сохранить как…» (spec §7).
-    onClosed: if (returnFocusItem && returnFocusItem.visible) root.focusWithReason(returnFocusItem, Qt.TabFocusReason)
+    onClosed: {
+        if (bridge && bridge.savePreviewOpen !== undefined) bridge.savePreviewOpen = false
+        if (returnFocusItem && returnFocusItem.visible) root.focusWithReason(returnFocusItem, Qt.TabFocusReason)
+    }
     onCancelled: if (bridge) bridge.clearCardSaveError()
     // Сначала закрывается D4, потом открывается системный диалог; отмена или ошибка
     // возвращают D4 с выбранным форматом (и строкой ошибки).
@@ -284,15 +290,20 @@ AvDialog {
                 id: previewCard
                 objectName: "meetingSavePreview"
                 readonly property bool transcript: root.preview.kind === "transcript"
-                readonly property real insetX: transcript ? Theme.cardBorder : root.preview.kind === "stats" ? 16 : 12
-                readonly property real insetY: transcript ? Theme.cardBorder : root.preview.kind === "stats" ? 14 : 12
+                readonly property real insetX: transcript ? Theme.mergePopoverPadding : root.preview.kind === "stats" ? Theme.meetingDialogSavePanePaddingX : Theme.mergePopoverPadding
+                readonly property real insetY: transcript ? Theme.spaceStep : root.preview.kind === "stats" ? Theme.meetingDialogSavePanePaddingY : Theme.mergePopoverPadding
                 width: parent.width
-                height: Math.min(440, previewColumn.height + insetY * 2)
+                height: Math.min(previewColumn.height + insetY * 2,
+                    Math.max(Theme.selectHeight, (root.parent ? root.parent.height : Theme.sizeBodyH)
+                        - root.header.height - root.footer.height - Theme.meetingDialogSavePanePaddingY * 2
+                        - format.height - Theme.meetingDialogSavePaneGap * 3
+                        - (echoCheck.visible ? echoContent.height : 0)))
                 color: Theme.bgSurface
                 radius: Theme.cardRadius
                 border.width: Theme.cardBorder
                 border.color: Theme.border
                 Flickable {
+                    objectName: "meetingSavePreviewFlickable"
                     anchors.fill: parent
                     anchors.leftMargin: previewCard.insetX
                     anchors.rightMargin: previewCard.insetX
@@ -309,17 +320,10 @@ AvDialog {
                         spacing: root.preview.kind === "text_only" ? 21 : 0
                         Repeater {
                             model: root.preview.kind === "transcript" ? root.preview.rows : []
-                            MeetingTranscriptRow {
-                                objectName: "meetingSavePreviewRow"
+                            MeetingSavePreviewRow {
                                 width: previewColumn.width
                                 first: index === 0
-                                kind: modelData.kind
-                                time: modelData.time
-                                who: modelData.who
-                                whoKind: modelData.whoKind
-                                text: modelData.text
-                                iconName: modelData.icon
-                                accessibleName: modelData.accessibleName
+                                row: modelData
                             }
                         }
                         Repeater {
@@ -327,26 +331,27 @@ AvDialog {
                             Text {
                                 objectName: "meetingSaveParagraph"
                                 width: previewColumn.width
-                                text: (modelData.kind === "mark" ? "— " : "") + modelData.text
+                                text: (modelData.kind === "mark" ? "— " : (modelData.fileMark || "")) + modelData.text
                                 textFormat: Text.PlainText
                                 wrapMode: Text.Wrap
                                 font.family: Theme.fontUi
                                 font.pixelSize: 13
                                 lineHeight: font.pixelSize * 1.6
                                 lineHeightMode: Text.FixedHeight
-                                color: modelData.kind === "mark" ? Theme.fgMuted : Theme.fg
+                                color: modelData.textMuted === true ? Theme.transcriptEchoFg : modelData.kind === "mark" ? Theme.fgMuted : Theme.fg
                                 renderType: Text.NativeRendering
                             }
                         }
                         Text {
                             objectName: "meetingSaveContinuation"
-                            visible: root.preview.kind === "text_only" && text !== ""
+                            topPadding: root.preview.kind === "transcript" ? Theme.spaceStep : 0
+                            visible: root.preview.kind !== "stats" && text !== ""
                             width: previewColumn.width
-                            text: root.preview.kind === "text_only" ? root.preview.moreText : ""
+                            text: root.preview.moreText || ""
                             textFormat: Text.PlainText
                             font.family: Theme.fontUi
-                            font.pixelSize: 13
-                            lineHeight: font.pixelSize * 1.6
+                            font.pixelSize: root.preview.kind === "transcript" ? Theme.transcriptMarkSize : 13
+                            lineHeight: font.pixelSize * (root.preview.kind === "transcript" ? Theme.fontBodyLineHeight : 1.6)
                             lineHeightMode: Text.FixedHeight
                             color: Theme.fgMuted
                             renderType: Text.NativeRendering
@@ -446,6 +451,19 @@ AvDialog {
                                 }
                             }
                             Text {
+                                objectName: "meetingSaveExcludedEcho"
+                                visible: text !== ""
+                                width: parent.width
+                                topPadding: Theme.spaceStep
+                                text: root.preview.kind === "stats" ? (root.preview.excludedEcho || "") : ""
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                                color: Theme.fgMuted
+                                font.family: Theme.fontUi
+                                font.pixelSize: Theme.meetingDialogSaveFootSize
+                                renderType: Text.NativeRendering
+                            }
+                            Text {
                                 visible: text !== ""
                                 text: root.preview.kind === "stats" ? root.preview.moreText : ""
                                 textFormat: Text.PlainText
@@ -456,6 +474,93 @@ AvDialog {
                                 color: Theme.fgMuted
                                 renderType: Text.NativeRendering
                             }
+                        }
+                    }
+                }
+            }
+
+            AbstractButton {
+                id: echoCheck
+                objectName: "meetingSaveExcludeEcho"
+                visible: root.bridge && root.bridge.saveEchoVisible === true
+                width: parent.width
+                height: visible ? echoContent.height : 0
+                activeFocusOnTab: true
+                checkable: true
+                checked: root.bridge && root.bridge.saveExcludeEcho === true
+                onClicked: if (root.bridge) root.bridge.setSaveExcludeEcho(!root.bridge.saveExcludeEcho)
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: root.bridge && root.bridge.saveEchoAccessibleName !== undefined ? root.bridge.saveEchoAccessibleName : ""
+                Accessible.description: root.bridge && root.bridge.saveEchoDescription !== undefined ? root.bridge.saveEchoDescription : ""
+                Accessible.checkable: true
+                Accessible.checked: checked
+                background: Rectangle {
+                    color: "transparent"
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: -(Theme.focusOffset + Theme.focusWidth)
+                        radius: Theme.focusRadius
+                        color: "transparent"
+                        border.width: Theme.focusWidth
+                        border.color: Theme.stateFocusRing
+                        visible: echoCheck.visualFocus
+                    }
+                }
+                contentItem: Item {
+                    implicitHeight: echoContent.height
+                    Rectangle {
+                        y: Theme.transcriptTimeOffsetTop
+                        width: Theme.checkboxSize
+                        height: Theme.checkboxSize
+                        radius: Theme.checkboxRadius
+                        color: echoCheck.checked ? Theme.checkboxOnBg : Theme.checkboxBg
+                        border.width: Theme.checkboxBorder
+                        border.color: echoCheck.checked ? Theme.checkboxOnBg : Theme.checkboxBorderColor
+                        Icon {
+                            anchors.centerIn: parent
+                            visible: echoCheck.checked
+                            name: "check"
+                            size: Theme.checkboxIcon
+                            color: Theme.checkboxOnFg
+                        }
+                    }
+                    Column {
+                        id: echoContent
+                        x: Theme.checkboxSize + Theme.checkboxLabelGap
+                        width: parent.width - x
+                        Flow {
+                            width: parent.width
+                            spacing: Theme.spaceStep
+                            Text {
+                                width: Math.min(implicitWidth, parent.width)
+                                text: root.txt("excludeEcho")
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                                color: Theme.fg
+                                font.family: Theme.fontUi
+                                font.pixelSize: Theme.fontSmallSize
+                                renderType: Text.NativeRendering
+                            }
+                            Text {
+                                text: "(" + (root.bridge && root.bridge.saveEchoCount !== undefined ? root.bridge.saveEchoCount : 0) + ")"
+                                textFormat: Text.PlainText
+                                color: Theme.fgMuted
+                                font.family: Theme.fontMono
+                                font.pixelSize: Theme.fontSmallSize
+                                renderType: Text.NativeRendering
+                            }
+                        }
+                        Text {
+                            width: parent.width
+                            text: root.bridge && root.bridge.saveEchoDescription !== undefined ? root.bridge.saveEchoDescription : ""
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WordWrap
+                            color: Theme.fgMuted
+                            font.family: Theme.fontUi
+                            font.pixelSize: Theme.meetingDialogSaveFootSize
+                            lineHeight: Theme.meetingDialogSaveFootSize * Theme.fontSmallLineHeight
+                            lineHeightMode: Text.FixedHeight
+                            renderType: Text.NativeRendering
                         }
                     }
                 }

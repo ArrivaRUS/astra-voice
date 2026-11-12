@@ -22,7 +22,12 @@ from pathlib import Path
 from uuid import uuid4
 
 from astra_voice.meetings.model import Meeting, SpeakerMap, Transcript, Utterance
-from astra_voice.meetings.speakers import canonical_speaker, speaker_map, validated_map
+from astra_voice.meetings.speakers import (
+    canonical_speaker,
+    speaker_map,
+    speaker_number,
+    validated_map,
+)
 from astra_voice.meetings.speakers import speaker_label as speaker_label
 from astra_voice.ui.meeting_texts import MARK_TEXTS, echo_label, reply_count
 
@@ -346,6 +351,7 @@ class TemplateRow:
     icon: str = ""
     truncated: bool = False
     flag: str = ""
+    num: str = ""
 
 
 def _merged(
@@ -377,6 +383,7 @@ def _merged(
             " ".join(parts),
             truncated=truncated,
             flag=flag,
+            num=str(speaker_number(speaker, speakers) or ""),
         )
 
     for item in utterances:

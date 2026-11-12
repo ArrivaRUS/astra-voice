@@ -2,14 +2,12 @@
 """Render card A «Документ» states (E13.M4) without X11, audio or real bridges.
 
 Example: python tools/render_meeting_card.py --out /tmp/e13m4-render-s3
-Each PNG has scale 1 and the size of its reference crop: the settings-window
-content area (840×552 at 1024, 716×520 at 900; card at 22/12) for
-refs/05-meeting-A, the state frame (502 wide, card at 18/14) for
-refs/06-meeting-states. Reference crops use QImage.copy on the unmodified
-committed originals (no resampling); the manifest records source hashes,
-rectangles, the card's own content height and the presentation that was shown.
-Data is the mockup's (design/meetings/mockups/_p3.py LINES); M4 has no speaker
-names, so «Ирина Соколова»/«Олег Ли»/«Спикер 3» are «Собеседники».
+Each PNG has scale 1. Full 05/08 windows use the reference viewport; 06 state
+fragments are recorded separately from the actual product viewport. Reference
+crops use QImage.copy on the unmodified committed originals (no resampling).
+The manifest records source hashes, rectangles, comparison scope, card geometry,
+focus and the presentation shown. Fixtures use _p3/_p4/_p6 mockup data; D4 uses
+its own literal d4_echo sample without changing the application's export logic.
 """
 
 from __future__ import annotations
@@ -41,6 +39,38 @@ REFERENCE_BOUNDS: dict[str, tuple[str, int, int, int, int, int, int]] = {
     "interrupted": ("06-meeting-states", 663, 888, 502, 255, 18, 14),
     "empty": ("06-meeting-states", 115, 1212, 502, 255, 18, 14),
 }
+# Crops measured from committed PNG boundaries, without resampling.
+REFERENCE_BOUNDS.update(
+    {
+        "names-edit": ("05-meeting-A", 374, 1634, 716, 520, 22, 12),
+        "merge": ("05-meeting-A", 312, 3700, 840, 552, 22, 12),
+        "merged": ("05-meeting-A", 312, 4336, 840, 552, 22, 12),
+        "room": ("06-meeting-states", 115, 1663, 502, 241, 18, 14),
+        "no-diarization": ("06-meeting-states", 663, 1663, 502, 471, 18, 14),
+        "policy-off": ("06-meeting-states", 663, 1212, 502, 382, 18, 14),
+        "models-missing": ("09-diar-install", 312, 4605, 840, 416, 22, 12),
+        "marks-1024": ("08-marks", 312, 311, 840, 778, 22, 12),
+        "marks-900": ("08-marks", 374, 2271, 716, 765, 22, 12),
+        "save-echo": ("08-marks", 220, 5139, 840, 552, 22, 12),
+        "save-echo-checked": ("08-marks", 220, 5693, 840, 552, 22, 12),
+    }
+)
+# No corresponding frame exists in the committed reference. Dimensions describe
+# the requested product viewport; the manifest explicitly records the missing crop.
+MISSING_REFERENCES = {
+    "diarization-failed": (840, 552, "06 has no failed-separation frame"),
+    "save-statistics": (840, 620, "08 contains no statistics preview frame"),
+}
+
+# 06 shows state fragments; render the product at its real content width,
+# and compare only the common header/banner/table fragment, not whole frames.
+RENDER_VIEWPORTS = {
+    "room": (716, 520),
+    "no-diarization": (840, 552),
+    "policy-off": (716, 520),
+    "models-missing": (840, 552),
+}
+
 MEETING_ID = "2026-10-09_100000-ab12"
 TITLE = "Планёрка по бюджету"
 # design/meetings/mockups/_p3.py LINES (time, who, text); «mark» is the microphone gap.
@@ -78,6 +108,7 @@ def set_timezone() -> None:
 
 def fixture_meeting(state: str = "done", **changes: Any) -> Any:
     sys.path.insert(0, str(REPO / "src"))
+    from astra_voice.meetings.events import MeetingState
     from astra_voice.meetings.model import Audio, Interval, Mark, Meeting
 
     meeting = Meeting(
@@ -85,7 +116,7 @@ def fixture_meeting(state: str = "done", **changes: Any) -> Any:
         started_at="2026-10-09T07:00:00Z",
         ended_at="2026-10-09T08:12:40Z",
         title=TITLE,
-        state=state,
+        state=MeetingState(state),
         variant="app_stream",
         app_class="dion",
         recorded_ms=4_360_000,
@@ -167,7 +198,7 @@ def make_bridge() -> Any:
     from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
 
     sys.path.insert(0, str(REPO / "src"))
-    from astra_voice.meetings.model import Transcript
+    from astra_voice.meetings.model import SpeakerMap, Transcript
     from astra_voice.meetings.templates import TEMPLATES
     from astra_voice.ui import meeting_card
     from astra_voice.ui.meeting_card import CardRows, TranscriptRows
@@ -178,6 +209,10 @@ def make_bridge() -> Any:
         savePreviewChanged = pyqtSignal()  # noqa: N815
         renameRequested = pyqtSignal(str, str)  # noqa: N815
         renameFinished = pyqtSignal(str)  # noqa: N815
+        speakerOperationFinished = pyqtSignal(str)  # noqa: N815
+        speakerOperationChanged = pyqtSignal()  # noqa: N815
+        savePreviewOpenChanged = pyqtSignal()  # noqa: N815
+        saveEchoChanged = pyqtSignal()  # noqa: N815
         cardSaveRequested = pyqtSignal()  # noqa: N815 — QML API
 
         def __init__(self) -> None:
@@ -191,12 +226,21 @@ def make_bridge() -> Any:
             self.rename_result = "pending"
             self.saved_templates: list[str] = []
             self._save_template = TEMPLATES[0]
+            self._exclude_echo = False
             self.utterances: list[Any] = []
             self.preview_calls = 0
             self.save_error = ""
             self.save_result = "cancelled"
             self.replace_file = ""
             self.replace_result = "saved"
+            self._speakers: SpeakerMap | None = None
+            self._preview_open = False
+            self._exclude_echo = False
+            self._speaker_operation: dict[str, Any] = {}
+            self.speaker_calls: list[tuple[str, str, str]] = []
+            self.reject_names = False
+            self.models_missing = False
+            self.preview_fixture: dict[str, Any] | None = None
 
         def _get_card(self) -> dict[str, Any]:
             return self._card
@@ -224,6 +268,100 @@ def make_bridge() -> Any:
         cardReplaceFile = pyqtProperty(str, _get_replace, notify=changed)  # noqa: N815
 
         @pyqtProperty("QVariantMap", constant=True)
+        def speakerTexts(self) -> dict[str, str]:  # noqa: N802
+            from astra_voice.ui.meeting_bridge import MeetingBridge
+
+            return dict(MeetingBridge.speakerTexts.fget(self))
+
+        @pyqtProperty("QVariantMap", notify=speakerOperationChanged)
+        def speakerOperation(self) -> dict[str, Any]:  # noqa: N802
+            return dict(self._speaker_operation)
+
+        @pyqtProperty(bool, notify=savePreviewOpenChanged)
+        def savePreviewOpen(self) -> bool:  # noqa: N802
+            return self._preview_open
+
+        @savePreviewOpen.setter  # type: ignore[no-redef]
+        def savePreviewOpen(self, value: bool) -> None:  # noqa: N802
+            self._preview_open = value
+            if value:
+                self.setSaveExcludeEcho(False)
+            self.savePreviewOpenChanged.emit()
+
+        @pyqtProperty(bool, notify=saveEchoChanged)
+        def saveExcludeEcho(self) -> bool:  # noqa: N802
+            return self._exclude_echo
+
+        @pyqtSlot(bool)
+        def setSaveExcludeEcho(self, value: bool) -> None:  # noqa: N802
+            self._exclude_echo = value
+            self.saveEchoChanged.emit()
+            self.savePreviewChanged.emit()
+
+        @pyqtProperty(int, notify=savePreviewChanged)
+        def saveEchoCount(self) -> int:  # noqa: N802
+            return sum(bool(u.echo) for u in self.utterances)
+
+        @pyqtProperty(bool, notify=savePreviewChanged)
+        def saveEchoVisible(self) -> bool:  # noqa: N802
+            return bool(self.saveTemplate != "stats" and self.saveEchoCount > 0)
+
+        @pyqtProperty(str, notify=savePreviewChanged)
+        def saveEchoAccessibleName(self) -> str:  # noqa: N802
+            return f"{meeting_card.TEXTS['excludeEcho']}, {self.saveEchoCount}"
+
+        @pyqtProperty(str, constant=True)
+        def saveEchoDescription(self) -> str:  # noqa: N802
+            return meeting_card.TEXTS["excludeEchoDescription"]
+
+        @pyqtSlot()
+        def requestDiarizationInstall(self) -> None:  # noqa: N802
+            self.actions.append("install-diarization")
+
+        @pyqtSlot(str, str, result=bool)
+        def renameSpeaker(self, label: str, name: str) -> bool:  # noqa: N802
+            from astra_voice.meetings import speakers
+
+            self.speaker_calls.append(("rename", label, name))
+            if self.reject_names:
+                self._speaker_operation = {
+                    "ok": False,
+                    "code": "save-error",
+                    "text": "Не удалось сохранить имена участников",
+                }
+                self.speakerOperationChanged.emit()
+                self.speakerOperationFinished.emit("save-error")
+                return False
+            assert self._speakers is not None
+            self._speakers = speakers.rename(self._speakers, label, name)
+            assert self.builder is not None
+            self.builder.rename(self._speakers, label)
+            self.refresh()
+            self._speaker_operation = {"ok": True, "code": "renamed", "text": ""}
+            self.speakerOperationChanged.emit()
+            self.speakerOperationFinished.emit("renamed")
+            return True
+
+        @pyqtSlot(str, str, result=bool)
+        def mergeSpeakers(self, source: str, target: str) -> bool:  # noqa: N802
+            from astra_voice.meetings import speakers
+
+            self.speaker_calls.append(("merge", source, target))
+            old = speakers.speaker_label(self.meeting, source, self._speakers)
+            assert self._speakers is not None
+            self._speakers = speakers.merge(self._speakers, source, target)
+            assert self.builder is not None
+            self.builder.speakers = self._speakers
+            self.builder.load(self.utterances, complete=True)
+            self.refresh()
+            label = speakers.speaker_label(self.meeting, target, self._speakers)
+            text = f"{old} объединён с «{label}» · статистика пересчитана"
+            self._speaker_operation = {"ok": True, "code": "merged", "text": text}
+            self.speakerOperationChanged.emit()
+            self.speakerOperationFinished.emit("merged")
+            return True
+
+        @pyqtProperty("QVariantMap", constant=True)
         def renameTexts(self) -> dict[str, str]:  # noqa: N802
             from astra_voice.ui.meeting_texts import RENAME_TEXTS
 
@@ -247,7 +385,7 @@ def make_bridge() -> Any:
         def saveTemplate(self) -> str:  # noqa: N802
             return self._save_template
 
-        @saveTemplate.setter
+        @saveTemplate.setter  # type: ignore[no-redef]
         def saveTemplate(self, value: str) -> None:  # noqa: N802
             if value in TEMPLATES and value != self._save_template:
                 self._save_template = value
@@ -257,10 +395,14 @@ def make_bridge() -> Any:
         @pyqtSlot(result="QVariantMap")
         def savePreview(self) -> dict[str, Any]:  # noqa: N802
             self.preview_calls += 1
+            if self.preview_fixture is not None:
+                return self.preview_fixture
             return meeting_card.save_preview(
                 self._save_template,
                 self.meeting,
                 Transcript(meeting_id=self.meeting.id, utterances=self.utterances),
+                self._speakers,
+                exclude_echo=self._exclude_echo,
             )
 
         def show(
@@ -271,10 +413,17 @@ def make_bridge() -> Any:
             snapshot: dict[str, Any] | None = None,
             failure: str = "",
             policy_off: bool = False,
+            speakers: Any = None,
+            models_missing: bool = False,
         ) -> None:
             self._save_template = TEMPLATES[0]
+            self._exclude_echo = False
+            self.preview_fixture = None
             self.utterances = list(utterances or [])
+            self._speakers = speakers
+            self.models_missing = models_missing
             self.builder = CardRows(meeting, self._rows)
+            self.builder.speakers = speakers
             loaded = utterances is not None
             self.builder.load(list(utterances or []), complete=meeting.state == "done")
             self.meeting, self.snapshot = meeting, snapshot
@@ -296,6 +445,10 @@ def make_bridge() -> Any:
                 rename_allowed=not self.policy_off,
                 failure=self.failure,
                 snapshot=self.snapshot,
+                names_editable=bool(self._speakers)
+                and not self.policy_off
+                and self.meeting.state == "done",
+                models_missing=self.models_missing,
             )
             self.changed.emit()
 
@@ -344,6 +497,220 @@ def make_bridge() -> Any:
     return FakeBridge()
 
 
+def visual_states() -> dict[str, dict[str, Any]]:
+    """M7 presentations; mockup text is imported read-only, never regenerated."""
+    from dataclasses import replace
+
+    from astra_voice.meetings.model import Speaker, SpeakerMap
+
+    source = REPO / "design/meetings/mockups"
+    sys.path.insert(0, str(source))
+    from _p3 import SPK  # type: ignore[import-not-found]
+    from _p6 import LINES as MARK_LINES  # type: ignore[import-not-found]
+
+    fixtures = states()
+    names = SpeakerMap(
+        labels={
+            "S1": Speaker(name="Ирина Соколова"),
+            "S2": Speaker(name="Олег Ли"),
+            "S3": Speaker(),
+        }
+    )
+
+    def named(marked: bool = False, room: bool = False) -> dict[str, Any]:
+        meeting = fixture_meeting(variant="mic_only" if room else "app_stream")
+        meeting.transcription.diarization = True
+        meeting.transcription.diar_status = "done"
+        lines = [(t, w, x) for t, w, x, _ in MARK_LINES] if marked else LINES
+        replies = fixture_utterances(lines)
+        flags = [f for *_, f in MARK_LINES] if marked else [""] * len(replies)
+        replies = [
+            replace(
+                u,
+                speaker="S1" if room and w == "me" else w.upper() if w != "me" else "me",
+                track="mic" if room or w == "me" else "far",
+                echo=flag == "echo",
+                multiple_speakers=flag == "multi",
+            )
+            for u, (_, w, _), flag in zip(replies, lines, flags, strict=True)
+        ]
+        if marked:
+            # 08-marks contains only the pause badge, no microphone/lock gaps.
+            meeting.marks = [m for m in meeting.marks if m.kind == "pause" and m.reason == "user"]
+
+        return {"meeting": meeting, "utterances": replies, "speakers": names, "panel_fixture": SPK}
+
+    for key in ("ready-1024", "ready-900", "names-edit", "merge", "merged"):
+        fixtures[key] = named()
+    fixtures["names-edit"]["action"] = "names-edit"
+    fixtures["merge"]["action"] = "merge"
+    fixtures["merged"]["action"] = "merged"
+    fixtures["transcribing-1024"] = named()
+    fixtures["transcribing-1024"]["meeting"].state = "transcribing"
+    fixtures["transcribing-1024"]["snapshot"] = {
+        "percent": 40,
+        "done_ms": 1_744_000,
+        "total_ms": 4_360_000,
+    }
+    fixtures["transcribing-1024"]["speakers"] = None
+    import ast
+
+    tree06 = ast.parse((source / "_p4.py").read_text())
+    room_call = next(
+        n
+        for n in ast.walk(tree06)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "table"
+        and n.args
+        and isinstance(n.args[0], ast.List)
+    )
+    room_lines = ast.literal_eval(room_call.args[0])
+    room = named(room=True)
+    room["meeting"].app_class = None
+    room["meeting"].started_at = "2026-10-10T11:00:00Z"
+    room["meeting"].ended_at = "2026-10-10T11:41:12Z"
+    room["meeting"].recorded_ms = 2_472_000
+    room["meeting"].marks = []
+    room["meeting"].intervals = []
+    room["utterances"] = [
+        replace(u, speaker=w.upper(), track="mic")
+        for u, (_, w, _) in zip(fixture_utterances(room_lines), room_lines, strict=True)
+    ]
+    room["speakers"] = SpeakerMap(labels={"S1": Speaker(), "S2": Speaker(), "S3": Speaker()})
+    room.pop("panel_fixture", None)
+    room["fragment"] = True
+    fixtures["room"] = room
+    fixtures["no-diarization"] = {
+        "meeting": fixture_meeting(marks=[], intervals=[]),
+        "utterances": fixture_utterances(LINES[:5]),
+        "fragment": True,
+    }
+    fixtures["models-missing"] = {**states()["ready-1024"], "models_missing": True}
+    fixtures["diarization-failed"] = states()["ready-1024"]
+    fixtures["diarization-failed"]["meeting"].transcription.diar_status = "failed"
+    policy = named()
+    policy["meeting"].marks = []
+    policy["meeting"].intervals = []
+    policy["utterances"] = [
+        replace(u, speaker=w.upper() if w != "me" else "me")
+        for u, (_, w, _) in zip(fixture_utterances(LINES[:3]), LINES[:3], strict=True)
+    ]
+    policy["speakers"] = SpeakerMap(labels={"S1": Speaker(), "S2": Speaker()})
+    policy.pop("panel_fixture", None)
+    fixtures["policy-off"] = {**policy, "policy_off": True, "fragment": True}
+    for key in ("marks-1024", "marks-900", "save-echo", "save-echo-checked", "save-statistics"):
+        fixtures[key] = named(marked=True)
+        if key.startswith("save-"):
+            fixtures[key]["action"] = key
+    fixtures["marks-900"]["table_until_ms"] = 80_000
+    # Statistics is a different worked example in _p6 (214 counted replies,
+    # 61 echoes / 16 minutes). Build those durations instead of forging a label.
+    import ast
+
+    tree = ast.parse((source / "_p6.py").read_text())
+    function = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "stats_file"
+    )
+    assignment = next(
+        n
+        for n in function.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "data" for t in n.targets)
+    )
+    statistics_data = ast.literal_eval(assignment.value)
+    seed_rows = fixtures["save-statistics"]["utterances"]
+    generated: list[Any] = []
+    for label, minutes, _share, count in statistics_data:
+        speaker = {"Ирина Соколова": "S1", "Олег Ли": "S2", "Я": "me", "Спикер 3": "S3"}[label]
+        seed = next(u for u in seed_rows if u.speaker == speaker and not u.echo)
+        total_ms = minutes * 60_000
+        for i in range(count):
+            start = total_ms * i // count
+            end = total_ms * (i + 1) // count
+            generated.append(
+                replace(
+                    seed,
+                    id=f"u{len(generated):05d}",
+                    seq=len(generated),
+                    start_ms=start,
+                    end_ms=end,
+                    multiple_speakers=False,
+                )
+            )
+    seed = next(u for u in seed_rows if u.echo)
+    for i in range(61):
+        generated.append(
+            replace(
+                seed,
+                id=f"u{len(generated):05d}",
+                seq=len(generated),
+                start_ms=960_000 * i // 61,
+                end_ms=960_000 * (i + 1) // 61,
+            )
+        )
+    fixtures["save-statistics"]["utterances"] = generated
+    return fixtures
+
+
+def d4_preview_fixture(meeting: Any, speakers: Any, *, checked: bool) -> dict[str, Any]:
+    """Literal bounded fragment in _p6.d4_echo, including its hand-shortened text.
+
+    This is screenshot-only data. Production echo filtering/merging is unchanged.
+    """
+    import ast
+    from dataclasses import replace
+
+    from astra_voice.meetings.model import Transcript
+    from astra_voice.ui import meeting_card
+
+    tree = ast.parse((REPO / "design/meetings/mockups/_p6.py").read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "d4_echo")
+    assign = next(
+        n
+        for n in fn.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "rows" for t in n.targets)
+    )
+    rows = ast.literal_eval(assign.value)
+    if checked:
+        branch = next(
+            n
+            for n in fn.body
+            if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "checked"
+        )
+        update = branch.body[0]
+        assert isinstance(update, ast.Assign) and isinstance(update.value, ast.BinOp)
+        rows = [r for r in rows if r[3] != "echo"] + ast.literal_eval(update.value.right)
+    plain = [(t, w, text) for t, w, text, _flag in rows]
+    utterances = [
+        replace(u, speaker=w.upper() if w != "me" else "me", echo=flag == "echo")
+        for u, (_t, w, _text, flag) in zip(fixture_utterances(plain), rows, strict=True)
+    ]
+    result = meeting_card.save_preview(
+        "stenogram", meeting, Transcript(meeting_id=meeting.id, utterances=utterances), speakers
+    )
+    result["rows"] = [r for r in result["rows"] if r["kind"] == "utterance"]
+    result["moreText"] = "…"
+    return result
+
+
+def apply_panel_fixture(bridge: Any, fixture: dict[str, Any]) -> None:
+    """Reapply the mockup's full-meeting totals after any name/merge operation."""
+    if not fixture.get("panel_fixture"):
+        return
+    panel = {
+        "me" if k == "me" else k.upper(): (minutes, quote)
+        for k, _label, minutes, quote, _name in fixture["panel_fixture"]
+    }
+    for person in bridge._card["participants"]:
+        if person["id"] in panel:
+            person["minutes"], person["firstText"] = panel[person["id"]]
+            if bridge._card["live"] and person["kind"] == "speaker":
+                person["minutes"] = "—"
+    bridge.changed.emit()
+
+
 def reference_crops(out: Path) -> list[dict[str, Any]]:
     from PyQt5.QtGui import QImage
 
@@ -375,6 +742,9 @@ def reference_crops(out: Path) -> list[dict[str, Any]]:
                     "source_sha256": digest,
                     "source_rect": {"x": x, "y": y, "width": width, "height": height},
                     "compare_with": f"{state}-{theme}.png",
+                    "comparison_scope": "state fragment"
+                    if state in RENDER_VIEWPORTS
+                    else "full viewport",
                 }
             )
         for _image, digest, source in originals.values():
@@ -403,7 +773,7 @@ def render(out: Path) -> dict[str, Any]:
     )
     set_timezone()
     from PyQt5 import sip
-    from PyQt5.QtCore import QObject, QUrl, pyqtProperty, pyqtSignal
+    from PyQt5.QtCore import Q_ARG, QObject, QUrl, pyqtProperty, pyqtSignal
     from PyQt5.QtGui import QFont, QFontDatabase, QGuiApplication
     from PyQt5.QtQml import QQmlApplicationEngine
     from PyQt5.QtQuick import QQuickWindow
@@ -470,22 +840,157 @@ Window {
     card = window.findChild(QObject, "renderCard")
     out.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
+
+    def visual_children(node: Any) -> Any:
+        yield node
+        for child in node.childItems():
+            yield from visual_children(child)
+
+    def reset_focus() -> None:
+        from PyQt5.QtCore import Qt
+
+        for node in reversed(list(visual_children(window.contentItem()))):
+            if node.property("focus") or node.property("visualFocus"):
+                node.forceActiveFocus(Qt.OtherFocusReason)
+                node.setProperty("focus", False)
+        window.contentItem().forceActiveFocus(Qt.OtherFocusReason)
+
     for theme_name in ("light", "dark"):
         theme.value = theme_name == "dark"
         theme.changed.emit()
-        for name, fixture in states().items():
-            _sheet, _x, _y, width, height, pad_x, pad_y = REFERENCE_BOUNDS[name]
+        for name, fixture in visual_states().items():
+            if name in REFERENCE_BOUNDS:
+                _sheet, _x, _y, width, height, pad_x, pad_y = REFERENCE_BOUNDS[name]
+            else:
+                width, height, _reason = MISSING_REFERENCES[name]
+                pad_x, pad_y = 22, 12
+            if name in RENDER_VIEWPORTS:
+                width, height = RENDER_VIEWPORTS[name]
+                pad_x, pad_y = 22, 12
             window.setProperty("padX", pad_x)
             window.setProperty("padY", pad_y)
             window.setWidth(width)
             window.setHeight(height)
+            for popup_name in (
+                "meetingSaveDialog",
+                "meetingMergePopover",
+                "meetingParticipantsDrawer",
+            ):
+                popup = window.findChild(QObject, popup_name)
+                if popup is not None:
+                    from PyQt5.QtCore import QMetaObject
+
+                    QMetaObject.invokeMethod(popup, "close")
+            toast = window.findChild(QObject, "meetingSpeakerToast")
+            toast.setProperty("visible", False)
+            QTest.qWait(200)
+            from PyQt5.QtCore import Qt
+
+            reset_focus()
             bridge.show(
                 fixture["meeting"],
                 fixture.get("utterances"),
                 snapshot=fixture.get("snapshot"),
                 failure=fixture.get("failure", ""),
+                policy_off=fixture.get("policy_off", False),
+                speakers=fixture.get("speakers"),
+                models_missing=fixture.get("models_missing", False),
             )
+            if fixture.get("fragment"):
+                bridge._card["showActions"] = False
+                bridge.changed.emit()
+            if "table_until_ms" in fixture:
+                bridge._rows.reset(
+                    [
+                        r
+                        for r in bridge._rows.rows()
+                        if _ms(r["time"].strip("[]")) <= fixture["table_until_ms"]
+                    ]
+                )
+            apply_panel_fixture(bridge, fixture)
             QTest.qWait(80)
+            from PyQt5.QtCore import QMetaObject
+
+            action = fixture.get("action")
+            if action == "names-edit":
+                window.requestActivate()
+                QMetaObject.invokeMethod(
+                    card, "openNames", Qt.DirectConnection, Q_ARG("QVariant", None)
+                )
+                QTest.qWait(200)
+
+                for field in visual_children(window.contentItem()):
+                    if (
+                        field.objectName() == "meetingSpeakerName"
+                        and field.isVisible()
+                        and field.property("speakerId") == "S2"
+                    ):
+                        field.forceActiveFocus(Qt.TabFocusReason)
+                        field.setProperty("cursorPosition", len(field.property("text")))
+                        break
+            elif action == "merge":
+                panel = window.findChild(QObject, "meetingCardParticipants")
+                QMetaObject.invokeMethod(
+                    panel, "showMerge", Qt.DirectConnection, Q_ARG("QVariant", "S3")
+                )
+            elif action == "merged":
+                bridge.mergeSpeakers("S3", "S1")
+                apply_panel_fixture(bridge, fixture)
+                window.contentItem().forceActiveFocus(Qt.OtherFocusReason)
+            elif action and action.startswith("save-"):
+                QMetaObject.invokeMethod(card, "openSaveDialog")
+                QTest.qWait(40)
+                if action == "save-echo-checked":
+                    bridge.setSaveExcludeEcho(True)
+                elif action == "save-statistics":
+                    bridge.saveTemplate = "stats"
+                if action in {"save-echo", "save-echo-checked"}:
+                    bridge.preview_fixture = d4_preview_fixture(
+                        bridge.meeting, bridge._speakers, checked=action == "save-echo-checked"
+                    )
+                    bridge.savePreviewChanged.emit()
+            QTest.qWait(200)
+            if action == "names-edit":
+                for field in visual_children(window.contentItem()):
+                    if (
+                        field.objectName() == "meetingSpeakerName"
+                        and field.isVisible()
+                        and field.property("speakerId") == "S2"
+                    ):
+                        field.forceActiveFocus(Qt.TabFocusReason)
+                        field.setProperty("cursorPosition", len(field.property("text")))
+                        if not field.hasActiveFocus():
+                            raise RuntimeError("names-edit failed to focus S2")
+                        break
+                else:
+                    raise RuntimeError("names-edit has no visible S2 field")
+            if action == "save-statistics":
+                preview_scroll = window.findChild(QObject, "meetingSavePreviewFlickable")
+                preview_scroll.setProperty(
+                    "contentY",
+                    max(
+                        0,
+                        preview_scroll.property("contentHeight")
+                        - preview_scroll.property("height"),
+                    ),
+                )
+                QTest.qWait(40)
+            if action not in {
+                "names-edit",
+                "merge",
+                "save-echo",
+                "save-echo-checked",
+                "save-statistics",
+            }:
+                reset_focus()
+                QTest.qWait(20)
+                leaked = [
+                    n.objectName()
+                    for n in visual_children(window.contentItem())
+                    if n.isVisible() and n.property("visualFocus")
+                ]
+                if leaked:
+                    raise RuntimeError(f"Focus leaked into {name}/{theme_name}: {leaked}")
             image = window.grabWindow()
             grab = None
             for _attempt in range(20):
@@ -516,7 +1021,33 @@ Window {
                         "content_height": card.property("implicitHeight"),
                     },
                     "presentation": _jsonable(bridge.property("card")),
+                    "visual_focus": [
+                        node.objectName()
+                        for node in visual_children(window.contentItem())
+                        if node.isVisible() and node.property("visualFocus")
+                    ],
+                    "comparison_scope": "state fragment: header/banner/table/install row only"
+                    if name in RENDER_VIEWPORTS
+                    else "full viewport",
+                    "preview_data_source": "_p6.d4_echo"
+                    if action in {"save-echo", "save-echo-checked"}
+                    else None,
+                    "merge_geometry": {
+                        key: window.findChild(QObject, "meetingMergePopover").property(key)
+                        for key in ("x", "y", "width", "height")
+                    }
+                    if action == "merge"
+                    else None,
                     "rows": bridge.cardRows.rowCount(),
+                    "preview": bridge.savePreview()
+                    if action and action.startswith("save-")
+                    else None,
+                    "excluded_echo_geometry": {
+                        key: window.findChild(QObject, "meetingSaveExcludedEcho").property(key)
+                        for key in ("x", "y", "width", "height", "visible", "text")
+                    }
+                    if action == "save-statistics"
+                    else None,
                 }
             )
     rows.extend(reference_crops(out))
@@ -526,9 +1057,10 @@ Window {
         raise RuntimeError("\n".join(warnings))
     qml = [
         REPO / "qml/sections/MeetingCard.qml",
-        REPO / "qml/components/MeetingBadge.qml",
-        REPO / "qml/components/MeetingTranscriptRow.qml",
-        REPO / "qml/components/MeetingSaveDialog.qml",
+        REPO / "qml/Theme.qml",
+        REPO / "qml/components/AvSelect.qml",
+        REPO / "qml/components/OverlaySurface.qml",
+        *sorted((REPO / "qml/components").glob("Meeting*.qml")),
     ]
     manifest: dict[str, Any] = {
         "scale": 1,
@@ -539,9 +1071,13 @@ Window {
         "ui_font": "PT Root UI (tests/fixtures/fonts/pt-root-ui)",
         "mono_font": f"PT Mono → {MONO_SUBSTITUTE} (as in the reference measurements)",
         "note": (
-            "M4: no speaker names/numbers (M7), no rename/delete (M5); "
-            "minutes are computed from the fixture replies"
+            "M7 QML: named participants, operations, marks, D4; "
+            "short snippets and panel minutes/quotes come from _p3/_p6. "
+            "Reference gaps are explicit."
         ),
+        "missing_references": {
+            name: reason for name, (_w, _h, reason) in MISSING_REFERENCES.items()
+        },
         "warnings": warnings,
         "pngs": rows,
     }
