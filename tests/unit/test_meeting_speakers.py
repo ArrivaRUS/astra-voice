@@ -187,7 +187,16 @@ def test_diarization_setting_policy_provider_matrix(
     policy = parse_policy(
         Policy(raw={} if policy_value is None else {"meeting_diarization": policy_value})
     )
-    pair = ("/trusted/seg", "/trusted/embed") if installed else None
+    pair = (
+        {
+            "segmentation_dir": "/trusted/seg",
+            "embedder_dir": "/trusted/embed",
+            "segmentation_sha256": "a" * 64,
+            "embedder_sha256": "b" * 64,
+        }
+        if installed
+        else None
+    )
     provider = Mock(return_value=pair)
     effective = choice if policy_value is None else policy_value == "on"
     assert enabled_diar_models(settings, policy, provider) == (pair if effective else None)
@@ -368,7 +377,12 @@ def test_new_diar_admission_resets_names_before_start(tmp_path: Path) -> None:
             '{"schema":1,"labels":{"S1":{"name":"PRIVATE_NAME","merged_into":null}},"renumbered":false}'
         )
         path.chmod(0o600)
-        rig.jobs.diar_models = lambda: ("/trusted/seg", "/trusted/embed")
+        rig.jobs.diar_models = lambda: {
+            "segmentation_dir": "/trusted/seg",
+            "embedder_dir": "/trusted/embed",
+            "segmentation_sha256": "a" * 64,
+            "embedder_sha256": "b" * 64,
+        }
         rig.jobs.transcribe(JOB_MID)
         rig.running()
         assert rig.store.read(JOB_MID, "speakers.json").labels == {}
@@ -471,7 +485,14 @@ def test_bridge_export_and_preview_use_current_names(rig: SaveRig, fmt: str, tem
 
 
 def test_invalid_policy_closes_only_diarization() -> None:
-    provider = Mock(return_value=("/trusted/seg", "/trusted/embed"))
+    provider = Mock(
+        return_value={
+            "segmentation_dir": "/trusted/seg",
+            "embedder_dir": "/trusted/embed",
+            "segmentation_sha256": "a" * 64,
+            "embedder_sha256": "b" * 64,
+        }
+    )
     policy = parse_policy(Policy(raw={"meeting_diarization": "INVALID"}))
     assert enabled_diar_models(Settings(meeting_diarization=True), policy, provider) is None
     provider.assert_not_called()
@@ -526,12 +547,24 @@ def test_bridge_meta_contract_and_model_provider_wire(
     monkeypatch.setattr(recording_module, "MeetingRecording", Mock(return_value=recording))
     settings = Settings(meeting_diarization=True)
     policy = parse_policy(Policy())
-    probe = Mock(return_value=("/trusted/seg", "/trusted/embed"))
+    probe = Mock(
+        return_value={
+            "segmentation_dir": "/trusted/seg",
+            "embedder_dir": "/trusted/embed",
+            "segmentation_sha256": "a" * 64,
+            "embedder_sha256": "b" * 64,
+        }
+    )
     monkeypatch.setattr(diar_models, "enabled_diar_models", probe)
     jobs_factory = Mock()
     monkeypatch.setattr(meeting_jobs, "MeetingJobs", jobs_factory)
     bridge = Mock(_store=rig.store, _stored=settings, _parsed=policy)
     app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None)
     resolver = jobs_factory.call_args.kwargs["diar_models"]
-    assert resolver() == ("/trusted/seg", "/trusted/embed")
-    probe.assert_called_once_with(settings, policy)
+    assert resolver() == {
+        "segmentation_dir": "/trusted/seg",
+        "embedder_dir": "/trusted/embed",
+        "segmentation_sha256": "a" * 64,
+        "embedder_sha256": "b" * 64,
+    }
+    probe.assert_called_once_with(settings, policy, bridge._diar_models_provider)

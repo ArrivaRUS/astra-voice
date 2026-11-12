@@ -108,7 +108,12 @@ class Rig:
         self.store = MeetingStore(root / "meetings")
         self.settings = Settings(meetings_enabled=True)
         self.tasks: list[Callable[[], None]] = []
-        self.bridge = MeetingBridge(self.settings, store=self.store, submit=self.tasks.append)
+        self.bridge = MeetingBridge(
+            self.settings,
+            store=self.store,
+            submit=self.tasks.append,
+            diar_models_provider=lambda: None,
+        )
         self.recording = MeetingRecording(
             self.store,
             enabled=lambda: self.bridge.enabled,

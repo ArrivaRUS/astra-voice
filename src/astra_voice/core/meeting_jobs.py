@@ -230,7 +230,7 @@ class _Active:
     meeting: Meeting
     admission: ModelAdmission
     resume: bool
-    diar_models: tuple[str, str] | None = None
+    diar_models: dict[str, str] | None = None
     phase: str = "launching"
     # launching -> loading -> starting -> running; cancelling -> exiting; crashed
     purpose: str = ""  # "" | cancel | delete | fail (role killed, then «Ошибка»)
@@ -282,7 +282,7 @@ class MeetingJobs:
         notify: Notify = lambda kind, meeting: None,
         echo_gate: bool | None = None,
         admit_allowed: Callable[[], bool] = lambda: True,
-        diar_models: Callable[[], tuple[str, str] | None] = lambda: None,
+        diar_models: Callable[[], dict[str, str] | None] = lambda: None,
     ) -> None:
         self.store = store
         # Setting + administrator policy (I3): nothing is admitted while it is False.
@@ -1158,16 +1158,7 @@ class MeetingJobs:
             tracks=tracks,
             variant=meeting.variant,
             diarization=active.diar_models is not None,
-            **(
-                {
-                    "diar_models": {
-                        "segmentation_dir": active.diar_models[0],
-                        "embedder_dir": active.diar_models[1],
-                    }
-                }
-                if active.diar_models is not None
-                else {}
-            ),
+            **({"diar_models": dict(active.diar_models)} if active.diar_models is not None else {}),
             self_track="mic",
             resume=active.resume,
             echo_gate=bool(echo and "far" in tracks),

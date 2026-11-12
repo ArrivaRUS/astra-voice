@@ -76,6 +76,7 @@ with tempfile.TemporaryDirectory(prefix='astra-policy-qml-') as temporary:
         recorded = Meeting(id='00000000-0000-4000-8000-000000000002', title='Записанная встреча',
                            started_at='2026-10-30T12:00:00Z', state=MeetingState.RECORDED)
         bridge = MeetingBridge(stored, policy=source, known_apps=apps,
+                               diar_models_provider=lambda: None,
                                store=Mock(list=Mock(return_value=[done, recorded])),
                                save=Mock(), submit=lambda work: work())
         bridges.append(bridge)

@@ -28,7 +28,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.core.settings import save as settings_save
 from astra_voice.meetings import speakers as speaker_ops
 from astra_voice.meetings.apps import AppClass, AppDataError, AppDefinition, load_apps
-from astra_voice.meetings.diar_models import installed_diar_models
+from astra_voice.meetings.diar_models import installed_diar_models, nonblocking_diar_models
 from astra_voice.meetings.events import MeetingState, PhaseStatus, PolicyCode
 from astra_voice.meetings.model import (
     Meeting,
@@ -53,18 +53,21 @@ from astra_voice.meetings.templates import (
     with_extension,
     write_export,
 )
+from astra_voice.net.gate import NetworkGate
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui import meeting_card
 from astra_voice.ui.meeting_card import CARD_STATES, MODEL_ACTIONS, CardRows, TranscriptRows
 from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.meeting_texts import (
     DELETE_TEXTS,
+    DIAR_INSTALL_TEXTS,
     EXIT_TEXTS,
     RENAME_TEXTS,
     RESPONSIBILITY_ITEMS,
     TEXTS,
     W2_TEXTS,
     W4_TEXTS,
+    diar_install_presentation,
 )
 
 RENAME_ACTION = "Переименовать"
@@ -234,6 +237,7 @@ class MeetingBridge(QObject):
     savePreviewOpenChanged = pyqtSignal()
     speakerOperationFinished = pyqtSignal(str)
     diarizationInstallRequested = pyqtSignal()
+    diarizationInstallChanged = pyqtSignal()
     overlayKeyboardRequested = pyqtSignal()
     noticeKeyboardRequested = pyqtSignal()
     exitConfirmed = pyqtSignal()
@@ -253,7 +257,8 @@ class MeetingBridge(QObject):
         pick_save_path: Callable[[str, str], str | None] = _pick_save_path,
         documents_dir: Callable[[], Path] = _documents_dir,
         open_folder: Callable[[str], bool] = _open_folder,
-        diar_models_provider: Callable[[], tuple[str, str] | None] = installed_diar_models,
+        diar_models_provider: Callable[[], dict[str, str] | None] = installed_diar_models,
+        diarization_service: Any | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -335,6 +340,28 @@ class MeetingBridge(QObject):
         self._card_cache: dict[str, Any] | None = None
         self._card_progress: dict[str, Any] | None = None
         self.changed.connect(self._drop_card_cache)
+        self._diar_downloads: Any = None
+        self._diar_revoked: Callable[[], bool] = lambda: False
+        self._diar_catalog_token: Callable[[], object] = lambda: None
+        self._diar_revocation_token: object = None
+        self._diar_code, self._diar_reason, self._diar_source = "missing", "", "hf"
+        self._diar_busy = False
+        self._diar_cancel_left = False
+        self._diar_effective_enabled = bool(self._effective().settings.meeting_diarization)
+        self._diar_percent = self._diar_accessible_percent = 0
+        self._diar_last_progress = self._diar_last_accessible = float("-inf")
+        self._diar_pending_percent: int | None = None
+        self._diar_card_installed = ""
+        self._section_window: QObject | None = None
+        self._diar_install: dict[str, Any] = {}
+        self._diar_progress_timer = QTimer(self)
+        self._diar_progress_timer.setInterval(100)
+        self._diar_progress_timer.timeout.connect(self._diar_progress_flush)
+        self.changed.connect(self._refresh_diar_install_settings)
+        if diarization_service is not None:
+            self.bindDiarizationService(diarization_service)
+        else:
+            self.refreshDiarizationModels()
 
     def _effective(self) -> EffectiveMeetingSettings:
         return effective_settings(self._stored, self._parsed)
@@ -711,6 +738,9 @@ class MeetingBridge(QObject):
         self.changed.emit()
 
     def shutdown(self) -> None:
+        if self._diar_downloads is not None:
+            self._diar_downloads.shutdown()
+        self._diar_progress_timer.stop()
         self._speaker_closing = True
         if not self.flushSpeakerWrites():
             self._speaker_closing = False
@@ -729,6 +759,7 @@ class MeetingBridge(QObject):
         if overlay is not None:
             overlay.shutdown()
         self._closed = True
+        self._section_window = None
         self._delete_timer.stop()
         self._export_writer.close(timeout=2.0)
         self._timer.stop()
@@ -1106,6 +1137,8 @@ class MeetingBridge(QObject):
             return
         self._save_template = TEMPLATES[0]
         self.setSaveExcludeEcho(False)
+        self._diar_card_installed = ""
+        self.refreshDiarizationModels()
         self._card_id = meeting_id
         self._card_key = None
         self._card_save_error = ""
@@ -1139,6 +1172,7 @@ class MeetingBridge(QObject):
             self._save_preview_open = False
             self.savePreviewOpenChanged.emit()
         self.setSaveExcludeEcho(False)
+        self._diar_card_installed = ""
         self._card_id = ""
         self._card_key = None
         self._card_builder = None
@@ -1286,7 +1320,7 @@ class MeetingBridge(QObject):
             str(hints.get("failureCode", "")) if hints else (meeting.transcription.failure or "")
         )
         builder = self._card_builder
-        return meeting_card.presentation(
+        result = meeting_card.presentation(
             meeting,
             loaded=self._card_loaded,
             read_error=self._card_error,
@@ -1297,11 +1331,25 @@ class MeetingBridge(QObject):
             snapshot=self._card_progress if meeting.state == MeetingState.TRANSCRIBING else None,
             names_editable=self._names_editable(),
             models_missing=self._effective().settings.meeting_diarization
-            and self._diar_models_provider() is None,
+            and self._diar_code != "installed",
             rename_allowed=RENAME_ACTION in self._row(meeting)["actions"],
             deleting=meeting.id in self._delete_pending
             or (jobs is not None and meeting.id in jobs.tombstones),
         )
+        show = bool(
+            self._diar_install.get("visible")
+            and not meeting.transcription.diarization
+            and (self._diar_code != "installed" or self._diar_card_installed == meeting.id)
+        )
+        result["diarizationModelsMissing"] = bool(
+            self._diar_install.get("visible")
+            and not meeting.transcription.diarization
+            and self._diar_code != "installed"
+        )
+        result["diarizationInstallVisible"] = show
+        result["diarizationHint"] = self._diar_install["cardText"] if show else ""
+        result["diarizationAction"] = self._diar_install["action"] if show else ""
+        return result
 
     def _sync_card(self) -> None:
         """Rows follow the open meeting: reload on a new state/generation, append live text."""
@@ -1524,11 +1572,27 @@ class MeetingBridge(QObject):
         """Drain accepted names before a settings window closes or hides to tray."""
         if isinstance(window, QObject):
             window.installEventFilter(self)
+            self._section_window = window
+            section_changed = getattr(window, "currentSectionChanged", None)
+            if section_changed is not None:
+                section_changed.connect(self._window_section_changed)
+
+    def _window_section_changed(self) -> None:
+        window = self._section_window
+        if window is None:
+            return
+        section = window.property("currentSection")
+        if hasattr(section, "toVariant"):
+            section = section.toVariant()
+        if isinstance(section, dict) and section.get("key") != "meetings":
+            self.leaveMeetingsSection()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if event.type() == QEvent.Close and not self.flushSpeakerWrites():
             event.ignore()
             return True
+        if event.type() in (QEvent.Close, QEvent.Hide):
+            self.leaveMeetingsSection()
         return bool(super().eventFilter(watched, event))
 
     def _speaker_result(self, ok: bool, code: str, text: str = "") -> bool:
@@ -1757,12 +1821,212 @@ class MeetingBridge(QObject):
             if time.monotonic() >= deadline:
                 return False
 
+    def bindDiarizationService(
+        self,
+        service: Any,
+        *,
+        revoked: Callable[[], bool] = lambda: False,
+        catalog_token: Callable[[], object] = lambda: None,
+    ) -> None:
+        """Bind once, before QML can request installation; no network here."""
+        from astra_voice.ui.model_downloads import DiarizationDownloads
+
+        if self._diar_downloads is not None:
+            raise RuntimeError("meeting-model-service-already-bound")
+        self._diar_downloads = DiarizationDownloads(service, self)
+        downloads = self._diar_downloads
+
+        def trusted_models() -> dict[str, str] | None:
+            if downloads._thread is not None and self._diar_code in {
+                "downloading",
+                "verifying",
+                "installing",
+            }:
+                return None
+            return nonblocking_diar_models(service.trusted_models)
+
+        self._diar_models_provider = trusted_models
+        self._diar_revoked, self._diar_catalog_token = revoked, catalog_token
+        self._diar_downloads.jobEvent.connect(self._diar_event)
+        self.diarizationInstallRequested.connect(self._start_diar_install)
+        self.refreshDiarizationModels()
+
+    @pyqtProperty("QVariantMap", notify=diarizationInstallChanged)
+    def diarizationInstall(self) -> dict[str, Any]:
+        return dict(self._diar_install)
+
+    def _publish_diar_install(self) -> None:
+        state = diar_install_presentation(
+            self._diar_code,
+            self._diar_percent,
+            self._diar_source,
+            reason_code=self._diar_reason,
+            busy=self._diar_busy,
+        )
+        state["visible"] = bool(self._effective().settings.meeting_diarization)
+        state["accessiblePercent"] = self._diar_accessible_percent
+        if state != self._diar_install:
+            self._diar_install = state
+            self._card_cache = None
+            self.diarizationInstallChanged.emit()
+            self.cardChanged.emit()
+
+    def _refresh_diar_install_settings(self) -> None:
+        # General meeting changes also carry recording progress. Do not hash the
+        # pair (34 MB) on every UI notification: jobs and explicit model refreshes
+        # validate trust; settings only update row visibility and the network gate.
+        enabled = bool(self._effective().settings.meeting_diarization)
+        was_enabled, self._diar_effective_enabled = self._diar_effective_enabled, enabled
+        if enabled and not was_enabled:
+            self.refreshDiarizationModels()
+            return
+        if self._diar_code in {"missing", "offline-user", "policy"}:
+            refusal = NetworkGate(self._stored, self._policy).refusal("download")
+            self._diar_code = (
+                "policy" if refusal == "admin" else "offline-user" if refusal else "missing"
+            )
+        self._publish_diar_install()
+
+    @pyqtSlot()
+    def refreshDiarizationModels(self) -> None:
+        """Refresh trust/policy after catalog, settings or installation changes."""
+        if self._closed:
+            return
+        self._diar_effective_enabled = bool(self._effective().settings.meeting_diarization)
+        if not self._diar_effective_enabled:
+            self._publish_diar_install()
+            return
+        if self._diar_downloads is None or self._diar_downloads._thread is None:
+            if self._diar_revoked():
+                self._diar_code, self._diar_reason = "broken", "revoked"
+                self._diar_revocation_token = self._diar_catalog_token()
+            elif self._diar_models_provider() is not None:
+                self._diar_code, self._diar_reason = "installed", ""
+            elif self._diar_code in {"missing", "installed", "offline-user", "policy"} or (
+                self._diar_reason == "revoked"
+                and self._diar_catalog_token() != self._diar_revocation_token
+            ):
+                refusal = NetworkGate(self._stored, self._policy).refusal("download")
+                self._diar_code = (
+                    "policy" if refusal == "admin" else "offline-user" if refusal else "missing"
+                )
+                self._diar_reason = ""
+        self._publish_diar_install()
+
+    @pyqtSlot()
+    def leaveMeetingsSection(self) -> None:
+        if self._diar_downloads is not None and self._diar_downloads.cancel.is_set():
+            self._diar_cancel_left = True
+        if self._diar_code == "cancelled":
+            self._diar_code = "missing"
+            self.refreshDiarizationModels()
+
     @pyqtSlot()
     def requestDiarizationInstall(self) -> None:
-        if self._closed or self._card_meeting() is None:
+        if self._closed:
             return
-        if self._effective().settings.meeting_diarization and self._diar_models_provider() is None:
+        self.refreshDiarizationModels()
+        if self._diar_install.get("visible") and self._diar_install.get("action") in {
+            DIAR_INSTALL_TEXTS["install"],
+            DIAR_INSTALL_TEXTS["retry"],
+            DIAR_INSTALL_TEXTS["reinstall"],
+        }:
+            # A settings/policy change after a failure must still close the network.
+            if NetworkGate(self._stored, self._policy).refusal("download"):
+                return
             self.diarizationInstallRequested.emit()
+
+    def _start_diar_install(self) -> None:
+        downloads = self._diar_downloads
+        if (
+            self._closed
+            or downloads is None
+            or downloads._thread is not None
+            or not self._effective().settings.meeting_diarization
+            or NetworkGate(self._stored, self._policy).refusal("download")
+        ):
+            return
+        self._diar_cancel_left = False
+        self._diar_code, self._diar_reason, self._diar_source = "downloading", "", "hf"
+        self._diar_percent = self._diar_accessible_percent = 0
+        self._diar_last_progress = self._diar_last_accessible = self._clock()
+        self._diar_busy = False
+        self._publish_diar_install()
+        downloads.start()
+
+    @pyqtSlot()
+    def cancelDiarizationInstall(self) -> None:
+        if self._diar_downloads is not None:
+            if not self._diar_downloads.cancel.is_set():
+                self._diar_cancel_left = False
+            self._diar_downloads.cancel.set()
+
+    def _diar_progress_flush(self) -> None:
+        now = self._clock()
+        if now - self._diar_last_progress < 0.1 - 1e-9:
+            return
+        updated = False
+        if self._diar_pending_percent is not None:
+            self._diar_percent, self._diar_pending_percent = self._diar_pending_percent, None
+            updated = True
+        if now - self._diar_last_accessible >= 1.0 - 1e-9:
+            if self._diar_accessible_percent != self._diar_percent:
+                self._diar_accessible_percent = self._diar_percent
+                updated = True
+            self._diar_last_accessible = now
+        if updated:
+            self._diar_last_progress = now
+            self._publish_diar_install()
+
+    def _diar_event(self, kind: str, args: Any) -> None:
+        if self._closed:
+            return
+        if kind == "progress":
+            self._diar_pending_percent = max(0, min(100, int(float(args[0]) * 100)))
+            self._diar_progress_flush()
+            return
+        if kind == "source":
+            self._diar_source = str(args[0])
+        elif kind == "stage":
+            if args[0] not in {"downloading", "verifying", "installing"}:
+                return
+            self._diar_code = str(args[0])
+            if self._diar_code in {"verifying", "installing"}:
+                self._diar_percent = 100
+                self._diar_pending_percent = None
+            self._diar_progress_timer.start()
+        elif kind == "finished":
+            code, reason, reason_code = args
+            self._diar_code = (
+                code
+                if code
+                in {
+                    "installed",
+                    "cancelled",
+                    "no-space",
+                    "broken",
+                    "failed:offline",
+                    "failed:settings",
+                    "failed:admin",
+                }
+                else "broken"
+            )
+            self._diar_reason = reason_code
+            if reason_code == "revoked":
+                self._diar_revocation_token = self._diar_catalog_token()
+            self._diar_busy = reason == DIAR_INSTALL_TEXTS["busy"]
+            self._diar_pending_percent = None
+            self._diar_progress_timer.stop()
+            if self._diar_code == "cancelled" and self._diar_cancel_left:
+                self._diar_code = "missing"
+                self._refresh_diar_install_settings()
+                return
+            if self._diar_code == "installed":
+                self._diar_percent = 100
+                meeting = self._card_meeting()
+                if meeting is not None and not meeting.transcription.diarization:
+                    self._diar_card_installed = meeting.id
+        self._publish_diar_install()
 
     @pyqtSlot()
     def retryCard(self) -> None:

@@ -300,3 +300,92 @@ def reply_count(count: int) -> str:
 def echo_label(count: int, *, excluded: bool = False, live: bool = False) -> str:
     label = MARK_TEXTS["excluded" if excluded else "badge"]
     return label if live else f"{label}: {reply_count(count)}"
+
+
+# spec §У.3–У.5. Keep both surfaces on one vocabulary and one state.
+DIAR_INSTALL_TEXTS = {
+    "title": "Модели для разделения по голосам",
+    "missing": "Не установлены — без них все собеседники подписываются «Собеседники» · 34 МБ",
+    "verifying": "Проверяю модели…",
+    "installing": "Устанавливаю модели…",
+    "installed": "Установлены · 34 МБ",
+    "cancelled": "Установка отменена",
+    "broken": "Не удалось установить модели разделения. Попробуйте ещё раз.",
+    "busy": "Уже выполняется установка или удаление моделей разделения. Попробуйте позже.",
+    "damaged": "Файлы моделей не читаются",
+    "offline-user": "Не установлены · Включён офлайн-режим — «Сеть и обновления»",
+    "policy": "Не установлены · Задано администратором: работа без сети",
+    "cardMissing": "Разделение по голосам: модели не установлены",
+    "cardInstalled": "Модели установлены — следующие расшифровки будут разделены по голосам",
+    "prefix": "Разделение по голосам: ",
+    "install": "Установить",
+    "cancel": "Отмена",
+    "retry": "Повторить",
+    "reinstall": "Переустановить",
+    "installName": "Установить модели для разделения по голосам, 34 МБ",
+    "cancelName": "Отменить установку моделей разделения",
+    "retryName": "Повторить установку моделей разделения",
+    "reinstallName": "Переустановить модели для разделения по голосам",
+    "progressName": "Установка моделей разделения",
+}
+
+
+def diar_install_presentation(
+    code: str, percent: int, source: str, *, reason_code: str = "", busy: bool = False
+) -> dict[str, str | int | bool]:
+    """Closed UI vocabulary; service exception/reason strings never reach QML."""
+    from astra_voice.ui.model_downloads import (
+        _FAILURE_MESSAGES,
+        _REVISION_FAILURE_REASONS,
+        _SOURCE_TEXT,
+    )
+
+    texts = DIAR_INSTALL_TEXTS
+    revoked = reason_code == "revoked"
+    if code == "downloading":
+        text = f"{_SOURCE_TEXT.get(source, _SOURCE_TEXT['hf'])} · {percent} %"
+    elif revoked:
+        reasons = _REVISION_FAILURE_REASONS["revoked"]
+        assert isinstance(reasons, dict)
+        text = reasons["update"]
+    elif code.startswith("failed:") or code == "no-space":
+        failure = code.partition(":")[2] if code.startswith("failed:") else code
+        text = _FAILURE_MESSAGES.get(failure, _FAILURE_MESSAGES["server"]).replace(
+            "модель", "модели"
+        )
+    else:
+        text = texts["busy" if code == "broken" and busy else code]
+    action = (
+        ""
+        if revoked or code in {"installed", "offline-user", "policy"}
+        else "cancel"
+        if code in {"downloading", "verifying", "installing"}
+        else "install"
+        if code in {"missing", "cancelled"}
+        else "reinstall"
+        if code == "damaged"
+        else "retry"
+    )
+    card_text = (
+        texts["cardInstalled"]
+        if code == "installed"
+        else texts["cardMissing"]
+        if code in {"missing", "offline-user", "policy"}
+        else texts["prefix"] + text[0].lower() + text[1:]
+    )
+    return {
+        "code": code,
+        "percent": percent,
+        "source": source,
+        "text": text,
+        "action": texts[action] if action else "",
+        "actionName": texts[action + "Name"] if action else "",
+        "cardText": card_text,
+        "title": texts["title"],
+        "progressName": texts["progressName"],
+        "error": revoked
+        or code == "broken"
+        or code == "no-space"
+        or code == "damaged"
+        or code.startswith("failed:"),
+    }

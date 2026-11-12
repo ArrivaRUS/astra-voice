@@ -800,6 +800,21 @@ def _make_meeting_bridge(
         return None
 
 
+def _bind_meeting_diarization(bridge: Any, model: Any) -> None:
+    """Use the model service's verified in-memory catalog for all meeting jobs."""
+    from astra_voice.meetings.diar_models import diar_models_revoked
+
+    factory = getattr(model, "diarization_service", None)
+    if not callable(factory):
+        # ModelPort also supports dictation-only adapters without a pair service.
+        return
+    bridge.bindDiarizationService(
+        factory(),
+        revoked=lambda: diar_models_revoked(lambda: model.catalog),
+        catalog_token=lambda: (id(model._catalog), model.catalog_unavailable),
+    )
+
+
 def _bind_meeting_recording(
     bridge: Any,
     settings_bridge: Any,
@@ -854,7 +869,9 @@ def _bind_meeting_recording(
             audio_retention_days=lambda: int(bridge.settings["meeting_audio_retention_days"]),
             meeting_retention_days=lambda: int(bridge.settings["meeting_retention_days"]),
             notify=job_notifier(),
-            diar_models=lambda: enabled_diar_models(bridge._stored, bridge._parsed),
+            diar_models=lambda: enabled_diar_models(
+                bridge._stored, bridge._parsed, bridge._diar_models_provider
+            ),
             # The catalog's min_ram_mb is known before initialize() -> recover().
             model_probe=(_meeting_model_probe(model) if model is not None else probe_gigaam_model),
         )
@@ -2130,6 +2147,8 @@ def main(argv: list[str] | None = None) -> int:
         _set_context_property(shell, "settingsBridge", settings_bridge)
         meeting_bridge = _make_meeting_bridge(stored, settings, policy, session_kind)
         if meeting_bridge is not None:
+            if model is not None:
+                _bind_meeting_diarization(meeting_bridge, model)
             QQmlEngine.setObjectOwnership(meeting_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "meetingBridge", meeting_bridge)
             meeting_bridge.bind_window(_root_window(shell))
@@ -2143,6 +2162,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             meeting_capture = getattr(meeting_bridge, "_capture", None)
             jobs = getattr(meeting_capture, "jobs", None)
+            if downloads is not None:
+                downloads.modelsChanged.connect(meeting_bridge.refreshDiarizationModels)
             if downloads is not None and jobs is not None:
                 # T-481: an installed/rechecked model starts needs_model jobs by itself.
                 downloads.modelsChanged.connect(jobs.models_changed)

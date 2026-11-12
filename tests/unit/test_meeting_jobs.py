@@ -1084,7 +1084,16 @@ def test_exit_without_role_or_jobs_is_immediate(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_diar_model_seam_controls_admission_and_start(rig: Rig, enabled: bool) -> None:
-    selected = ("/models/segmentation", "/models/embedder") if enabled else None
+    selected = (
+        {
+            "segmentation_dir": "/models/segmentation",
+            "embedder_dir": "/models/embedder",
+            "segmentation_sha256": "a" * 64,
+            "embedder_sha256": "b" * 64,
+        }
+        if enabled
+        else None
+    )
     rig.jobs.diar_models = lambda: selected
     rig.memory = rig.admission.min_ram_mb + meeting_jobs.MEMORY_MARGIN_MB + 899
     rig.create()
@@ -1100,16 +1109,18 @@ def test_diar_model_seam_controls_admission_and_start(rig: Rig, enabled: bool) -
     start = rig.accepted()
     assert start["diarization"] == enabled
     if enabled:
-        assert start["diar_models"] == {
-            "segmentation_dir": selected[0],  # type: ignore[index]
-            "embedder_dir": selected[1],  # type: ignore[index]
-        }
+        assert start["diar_models"] == selected
     else:
         assert "diar_models" not in start
 
 
 def test_diar_failure_finishes_text_without_success_retention_or_audio_deletion(rig: Rig) -> None:
-    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.jobs.diar_models = lambda: {
+        "segmentation_dir": "/models/segmentation",
+        "embedder_dir": "/models/embedder",
+        "segmentation_sha256": "a" * 64,
+        "embedder_sha256": "b" * 64,
+    }
     rig.retention = 0
     rig.create()
     rig.jobs.on_recorded(MID)
@@ -1138,7 +1149,12 @@ def test_diar_failure_finishes_text_without_success_retention_or_audio_deletion(
 
 
 def test_diar_memory_wait_keeps_active_job_until_fallback_or_success(rig: Rig) -> None:
-    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.jobs.diar_models = lambda: {
+        "segmentation_dir": "/models/segmentation",
+        "embedder_dir": "/models/embedder",
+        "segmentation_sha256": "a" * 64,
+        "embedder_sha256": "b" * 64,
+    }
     rig.create()
     rig.jobs.on_recorded(MID)
     rig.running()
@@ -1153,7 +1169,12 @@ def test_diar_memory_wait_keeps_active_job_until_fallback_or_success(rig: Rig) -
 def test_r2_a4_diar_terminal_paths_explicitly_unload_resident_asr(
     rig: Rig, outcome: str, queued: bool
 ) -> None:
-    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.jobs.diar_models = lambda: {
+        "segmentation_dir": "/models/segmentation",
+        "embedder_dir": "/models/embedder",
+        "segmentation_sha256": "a" * 64,
+        "embedder_sha256": "b" * 64,
+    }
     rig.create()
     rig.jobs.on_recorded(MID)
     rig.running()
@@ -1197,7 +1218,12 @@ def test_r2_a4_diar_terminal_paths_explicitly_unload_resident_asr(
 
 
 def test_r2_a4_busy_unload_is_retried_and_stale_ack_does_not_clear_residency(rig: Rig) -> None:
-    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.jobs.diar_models = lambda: {
+        "segmentation_dir": "/models/segmentation",
+        "embedder_dir": "/models/embedder",
+        "segmentation_sha256": "a" * 64,
+        "embedder_sha256": "b" * 64,
+    }
     rig.create()
     rig.jobs.on_recorded(MID)
     rig.running()
@@ -1217,7 +1243,12 @@ def test_r2_a4_busy_unload_is_retried_and_stale_ack_does_not_clear_residency(rig
 
 
 def test_r2_a4_confirmed_role_exit_retires_unload_without_blocking_next_job(rig: Rig) -> None:
-    rig.jobs.diar_models = lambda: ("/models/segmentation", "/models/embedder")
+    rig.jobs.diar_models = lambda: {
+        "segmentation_dir": "/models/segmentation",
+        "embedder_dir": "/models/embedder",
+        "segmentation_sha256": "a" * 64,
+        "embedder_sha256": "b" * 64,
+    }
     rig.create()
     rig.jobs.on_recorded(MID)
     rig.running()

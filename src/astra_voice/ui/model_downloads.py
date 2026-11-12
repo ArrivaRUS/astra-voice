@@ -382,10 +382,10 @@ class _JobChannel:
     взаимно заблокироваться с разрушением очереди событий (урок 026).
     """
 
-    def __init__(self, owner: ModelDownloads) -> None:
+    def __init__(self, owner: ModelDownloads | DiarizationDownloads) -> None:
         # Слабая ссылка разыменовывается только в GUI: последняя ссылка на
         # владельца никогда не отпускается в рабочем потоке.
-        self.owner: Callable[[], ModelDownloads | None] = weakref.ref(owner)
+        self.owner: Callable[[], ModelDownloads | DiarizationDownloads | None] = weakref.ref(owner)
         self.events: Queue[_JobEvent] = Queue()
         self.gate = threading.Lock()
         self.closed = False
@@ -405,7 +405,9 @@ class _JobChannel:
             self.closed = True
 
 
-def _run_job(job: _ModelJob | _RecheckJob | _RevisionJob, channel: _JobChannel) -> None:
+def _run_job(
+    job: _ModelJob | _RecheckJob | _RevisionJob | _DiarizationJob, channel: _JobChannel
+) -> None:
     """Тело рабочего потока: задание, затем признак выхода (как finished у потока)."""
     try:
         job.run()
@@ -921,6 +923,105 @@ class ModelService:
 
 def _ignore_event(kind: str, args: tuple[Any, ...]) -> None:
     """Приёмник по умолчанию для заданий, запущенных без канала."""
+
+
+class _DiarizationJob:
+    """Pair service adapter to the same value-only channel as _ModelJob."""
+
+    def __init__(self, service: Any, cancel: threading.Event, sink: _JobSink) -> None:
+        self.service, self.cancel, self.sink = service, cancel, sink
+
+    def run(self) -> None:
+        terminal = ("broken", "")
+
+        def event(kind: str, args: tuple[Any, ...]) -> None:
+            nonlocal terminal
+            if kind == "finished":
+                terminal = (str(args[0]), str(args[1]))
+            else:
+                self.sink(kind, args)
+
+        try:
+            result = self.service.install(cancel=self.cancel, sink=event)
+        except Exception:  # noqa: BLE001 — fixed UI failure, never exception text
+            self.sink("finished", ("broken", "", ""))
+        else:
+            self.sink("finished", (*terminal, result.reason_code))
+
+
+class DiarizationDownloads(QObject):
+    """One pair installation owned by the application's MeetingBridge.
+
+    Uses the model-job thread/channel lifecycle, including its shutdown gate.
+    No worker thread owns a QObject; terminal results precede thread retirement.
+    """
+
+    jobEvent = pyqtSignal(str, object)
+
+    def __init__(self, service: Any, parent: QObject) -> None:
+        super().__init__(parent)
+        self.service = service
+        self.cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._channel: _JobChannel | None = None
+        self._job: _DiarizationJob | None = None
+        self._closed = False
+        self._join_timer = QTimer(self)
+        self._join_timer.setInterval(10)
+        self._join_timer.timeout.connect(self._retire)
+
+    def start(self) -> bool:
+        if self._closed or self._thread is not None:
+            return False
+        self.cancel = threading.Event()
+        channel = _JobChannel(self)
+        job = _DiarizationJob(self.service, self.cancel, channel.post)
+        thread = threading.Thread(
+            target=_run_job, args=(job, channel), name=_JOB_THREAD_NAME, daemon=True
+        )
+        self._channel, self._job, self._thread = channel, job, thread
+        try:
+            thread.start()
+        except RuntimeError:
+            channel.close()
+            self._thread = self._channel = self._job = None
+            self.jobEvent.emit("finished", ("broken", "", ""))
+        return True
+
+    def _drain_channel(self, channel: _JobChannel) -> None:
+        while self._channel is channel and not self._closed:
+            try:
+                kind, args = channel.events.get_nowait()
+            except Empty:
+                break
+            if kind == "exit":
+                self._retire()
+            else:
+                self.jobEvent.emit(kind, args)
+
+    def _retire(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        thread.join(timeout=0)
+        if thread.is_alive():
+            self._join_timer.start()
+            return
+        self._join_timer.stop()
+        if self._channel is not None:
+            self._channel.close()
+        self._thread = self._channel = self._job = None
+
+    def shutdown(self) -> None:
+        self._closed = True
+        if self._channel is not None:
+            self._channel.close()
+        self.cancel.set()
+        self._join_timer.stop()
+        if self._thread is not None:
+            self._thread.join(timeout=_FINISH_JOIN_S)
+            self._retire()
+            self._join_timer.stop()
 
 
 class _ModelJob:
