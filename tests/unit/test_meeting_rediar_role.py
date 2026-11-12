@@ -7,7 +7,9 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -626,57 +628,104 @@ def trace_run(
     return trace
 
 
-def test_redo_resume_crash_at_each_durable_boundary(tmp_path: Path, monkeypatch: Any) -> None:
-    baseline = Harness(prepare(tmp_path / "baseline"), split=True)
+# Fixed collection size is checked against the live trace: new boundaries must
+# fail the test rather than silently fall outside the parametrized coverage.
+CRASH_BOUNDARY_COUNT = 148
+
+
+@dataclass(frozen=True)
+class CrashReference:
+    template: Path
+    trace: tuple[tuple[str, str, str], ...]
+
+
+@pytest.fixture(scope="module")
+def crash_reference(tmp_path_factory: pytest.TempPathFactory) -> Iterator[CrashReference]:
+    directory = tmp_path_factory.mktemp("rediar-crash-reference")
+    template = prepare(directory / "template")
+    template_before = tree(template)
+    # copytree makes independent private files, including the empty lock files;
+    # no live writer/cache/model or open file description is shared by cases.
+    baseline_root = directory / "baseline" / "meetings"
+    shutil.copytree(template.root, baseline_root)
+    baseline = Harness(store.MeetingStore(baseline_root), split=True)
     try:
-        trace = trace_run(baseline, monkeypatch)
+        with pytest.MonkeyPatch.context() as patch:
+            trace = trace_run(baseline, patch)
         assert baseline.disk.read(MID, WORK).reconcile.used_ms == 5200
         assert len(baseline.calls) == 4
     finally:
         baseline.close()
+    # The baseline precedes function-scoped meeting_threads; check its cleanup
+    # explicitly instead of losing that guard when moving it to module scope.
+    assert not baseline.state.thread.is_alive()
+    assert len(trace) == CRASH_BOUNDARY_COUNT
+    (directory / "boundaries.json").write_text(json.dumps(trace))
+    yield CrashReference(template.root, tuple(trace))
+    assert tree(template) == template_before
+
+
+def test_redo_durable_boundary_trace(crash_reference: CrashReference) -> None:
+    trace = crash_reference.trace
     assert {row[0] for row in trace} == {WORK, CHECK}
     assert {row[1:] for row in trace} == {
         (op, when) for op in ("fsync", "replace", "remove") for when in ("before", "after")
     }
-    for index, boundary in enumerate(trace):
-        disk = prepare(tmp_path / f"boundary-{index}")
-        first = Harness(disk, split=True)
-        before = published(disk)
-        try:
-            assert trace_run(first, monkeypatch, index)[-1] == boundary
-        finally:
-            first.close()
-        work = disk.read(MID, WORK) if (disk.root / MID / WORK).exists() else None
-        reserved = work is not None and work.reconcile.used_ms > 0
-        cp = disk.read(MID, CHECK) if (disk.root / MID / CHECK).exists() else None
-        second = Harness(store.MeetingStore(disk.root), split=True)
-        try:
-            done = second.run()
-            assert done["type"] == "meeting.job.done" and done["diar_status"] == "done", (
-                index,
-                boundary,
-                done,
-            )
-            final = disk.read(MID, WORK)
-            assert final.labels_final and final.reconcile.status == PhaseStatus.DONE
-            assert final.reconcile.used_ms == 5200 and final.reconcile.budget_ms == 6300
-            assert final.reconcile.done_ids == ["source"]
-            assert final.reconcile.inflight_id is None and final.reconcile.pending is None
-            assert published(disk) == before
-            if reserved:
-                assert not second.calls and not second.blocks, (index, boundary)
+    assert set(trace) == {
+        (name, op, when)
+        for name in (WORK, CHECK)
+        for op in ("fsync", "replace")
+        for when in ("before", "after")
+    } | {(CHECK, "remove", when) for when in ("before", "after")}
+
+
+@pytest.mark.parametrize(
+    "index",
+    range(CRASH_BOUNDARY_COUNT),
+    ids=[f"boundary-{index:03d}" for index in range(CRASH_BOUNDARY_COUNT)],
+)
+def test_redo_resume_crash_at_each_durable_boundary(
+    tmp_path: Path, monkeypatch: Any, crash_reference: CrashReference, index: int
+) -> None:
+    trace = crash_reference.trace
+    boundary = trace[index]
+    shutil.copytree(crash_reference.template, tmp_path / "meetings")
+    disk = store.MeetingStore(tmp_path / "meetings")
+    first = Harness(disk, split=True)
+    before = published(disk)
+    try:
+        assert trace_run(first, monkeypatch, index)[-1] == boundary
+    finally:
+        first.close()
+    work = disk.read(MID, WORK) if (disk.root / MID / WORK).exists() else None
+    reserved = work is not None and work.reconcile.used_ms > 0
+    cp = disk.read(MID, CHECK) if (disk.root / MID / CHECK).exists() else None
+    second = Harness(store.MeetingStore(disk.root), split=True)
+    try:
+        done = second.run()
+        assert done["type"] == "meeting.job.done" and done["diar_status"] == "done", (
+            index,
+            boundary,
+            done,
+        )
+        final = disk.read(MID, WORK)
+        assert final.labels_final and final.reconcile.status == PhaseStatus.DONE
+        assert final.reconcile.used_ms == 5200 and final.reconcile.budget_ms == 6300
+        assert final.reconcile.done_ids == ["source"]
+        assert final.reconcile.inflight_id is None and final.reconcile.pending is None
+        assert published(disk) == before
+        if reserved:
+            assert not second.calls and not second.blocks, (index, boundary)
+        else:
+            assert len(second.calls) == 4
+            if cp is not None and cp.diar.status == PhaseStatus.DONE:
+                assert not second.blocks
             else:
-                assert len(second.calls) == 4
-                if cp is not None and cp.diar.status == PhaseStatus.DONE:
-                    assert not second.blocks
-                else:
-                    assert second.blocks == [0]  # interrupted diar restarts the entire track
-            if work is not None:
-                assert final.transcript_revision >= work.transcript_revision
-        finally:
-            second.close()
-    # Stored as inspectable evidence without writing outside this test's temp tree.
-    (tmp_path / "boundaries.json").write_text(json.dumps(trace))
+                assert second.blocks == [0]  # interrupted diar restarts the entire track
+        if work is not None:
+            assert final.transcript_revision >= work.transcript_revision
+    finally:
+        second.close()
 
 
 @pytest.mark.parametrize("revision", [3, 80])
