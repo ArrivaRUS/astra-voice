@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from astra_voice.meetings import MeetingValidationError, diar_link, echo_gate, reconcile
-from astra_voice.meetings.events import PhaseStatus
+from astra_voice.meetings.events import MeetingState, PhaseStatus
 from astra_voice.meetings.model import (
     ID_PATTERN,
     MAX_MEETING_MS,
@@ -53,6 +53,7 @@ from astra_voice.meetings.model import (
     ReconcileReplacement,
     Transcript,
     Utterance,
+    published_generation,
     utterance_order,
 )
 from astra_voice.meetings.segments import SegmentSidecar
@@ -424,6 +425,11 @@ class _Reader:
 class _Job:
     def __init__(self, request: Message) -> None:
         self.request = request
+        # Select once from the operation, never from mutable metadata or IPC paths.
+        self.rediarize = request.get("operation") == "rediarize"
+        self.transcript_name = "rediar-transcript.json" if self.rediarize else "transcript.json"
+        self.checkpoint_name = "rediar-checkpoint.json" if self.rediarize else "checkpoint.json"
+        self.published: Transcript | None = None
         self.identity: Message = {
             "meeting_id": request["meeting_id"],
             "meeting_generation": request["meeting_generation"],
@@ -773,7 +779,7 @@ class MeetingTranscribeState:
         with self.fence:
             if job.cancelled:
                 raise _Cancelled
-            owner.remove("checkpoint.json")
+            owner.remove(job.checkpoint_name)
 
     def _run_job(self, job: _Job) -> None:
         try:
@@ -837,10 +843,6 @@ class MeetingTranscribeState:
     def _job(self, job: _Job) -> None:
         started = self.clock()
         self._check_dir(job)
-        if not self._ensure_model(job):
-            return
-        if job.cancelled:
-            raise _Cancelled
         meeting_id = job.identity["meeting_id"]
         meeting = self.store.read(meeting_id, "meeting.json")
         if (
@@ -849,6 +851,11 @@ class MeetingTranscribeState:
             or meeting.cancelled
         ):
             raise _Failed("io")
+        self._check_operation(job, meeting)
+        if not self._ensure_model(job):
+            return
+        if job.cancelled:
+            raise _Cancelled
         with contextlib.ExitStack() as lease:
             # Taking the lease creates its lock file and fsyncs the directory:
             # behind the fence, so nothing changes on disk after a cancel ack.
@@ -863,6 +870,49 @@ class MeetingTranscribeState:
                     self._pipeline(job, owner, reader, started)
                 finally:
                     reader.close()
+
+    def _check_operation(self, job: _Job, meeting: Meeting) -> None:
+        """R0/R1: fail closed before model load, leases, or any durable write."""
+        request = job.request
+        if not job.rediarize:
+            if "operation" in request or meeting.rediar is not None:
+                raise _Failed("io")
+            return
+        if (
+            request["resume"] is not True
+            or request["diarization"] is not True
+            or not request.get("diar_models")
+            or meeting.state != MeetingState.DONE
+            or meeting.rediar is None
+            or meeting.rediar.generation != meeting.meeting_generation
+            or not meeting.audio.present
+            or meeting.cleanup_pending
+        ):
+            raise _Failed("io")
+        meeting_id = meeting.id
+        state = self.store.transcript_state(meeting_id)
+        if (
+            state.digest != meeting.rediar.base_sha256
+            or state.generation != published_generation(meeting)
+            or not state.labels_final
+        ):
+            raise _Failed("io")
+        published = self.store.read(meeting_id, "transcript.json")
+        if not isinstance(published, Transcript):
+            raise _Failed("io")
+        job.published = published
+        # Pin/probe the actual target, including private-file and WAV checks.
+        with private_directory(
+            self.store.root / meeting_id / "audio", private_from=self.store.root
+        ) as audio:
+            reader = _Reader(audio)
+            try:
+                spans, _, _, _ = self._inventory(job, reader)
+                target = diar_target(published.utterances, spans)
+                if not any(s.track == target and s.end > s.first for s in spans):
+                    raise _Failed("io")
+            finally:
+                reader.close()
 
     # ---- stage 0: inventory ---------------------------------------------
 
@@ -1039,6 +1089,55 @@ class MeetingTranscribeState:
         except MeetingStoreError:
             return None  # an unreadable checkpoint is never trusted
 
+    @staticmethod
+    def _check_rediar_resume(
+        transcript: Transcript | None, checkpoint: Any, on_disk: bool, *, final: bool = False
+    ) -> bool:
+        """I-2: neither document may hide a durable D5 reservation/receipt."""
+        text_progress = transcript.reconcile if transcript is not None else ReconcileProgress()
+        check_progress = (
+            checkpoint.reconcile if isinstance(checkpoint, Checkpoint) else ReconcileProgress()
+        )
+        started = any(p != ReconcileProgress() for p in (text_progress, check_progress))
+        if not started:
+            if transcript is None and on_disk and not isinstance(checkpoint, Checkpoint):
+                raise _Failed("io")  # cannot prove that the lost pair predates D5
+            return False
+        if (
+            transcript is None
+            or not isinstance(checkpoint, Checkpoint)
+            or checkpoint.transcript_revision > transcript.transcript_revision
+            or checkpoint.asr.status != PhaseStatus.DONE
+            or checkpoint.diar.status != PhaseStatus.DONE
+            or text_progress.status == PhaseStatus.PENDING
+            or (
+                check_progress.status == PhaseStatus.PENDING
+                and check_progress != ReconcileProgress()
+            )
+            or text_progress.used_ms < check_progress.used_ms
+            or (
+                (final or check_progress.budget_ms)
+                and text_progress.budget_ms != check_progress.budget_ms
+            )
+            or (
+                (final or check_progress.speech_ms)
+                and text_progress.speech_ms != check_progress.speech_ms
+            )
+            or not set(check_progress.done_ids) <= set(text_progress.done_ids)
+            or not set(check_progress.replaced_ids) <= set(text_progress.replaced_ids)
+            or (
+                check_progress.inflight_id is not None
+                and check_progress.inflight_id != text_progress.inflight_id
+                and check_progress.inflight_id not in text_progress.done_ids
+            )
+            or (
+                checkpoint.transcript_revision == transcript.transcript_revision
+                and check_progress != text_progress
+            )
+        ):
+            raise _Failed("io")
+        return True
+
     def _resume(
         self,
         job: _Job,
@@ -1052,13 +1151,12 @@ class MeetingTranscribeState:
         try:
             # Through the lease: one read + validation also serves the writer's
             # revision cache, so the next publication does not re-read the text.
-            transcript = owner.read_transcript()
+            transcript = owner.read_transcript(job.transcript_name)
         except MeetingStoreError:
             raise _Failed("io") from None  # cannot be superseded safely
-        checkpoint = self._read_optional(meeting_id, "checkpoint.json")
-        on_disk = transcript is not None or os.path.lexists(
-            self.store.root / meeting_id / "checkpoint.json"
-        )
+        checkpoint = self._read_optional(meeting_id, job.checkpoint_name)
+        checkpoint_exists = os.path.lexists(self.store.root / meeting_id / job.checkpoint_name)
+        on_disk = transcript is not None or checkpoint_exists
         same = (
             isinstance(transcript, Transcript)
             and transcript.meeting_id == meeting_id
@@ -1066,13 +1164,35 @@ class MeetingTranscribeState:
         )
         base = transcript.transcript_revision if same and transcript is not None else 0
         fresh = _Resume([], {"mic": 0, "far": 0}, base, True, on_disk)
+        rediar_complete = (
+            job.rediarize
+            and same
+            and transcript is not None
+            and transcript.labels_final
+            and transcript.reconcile.status == PhaseStatus.DONE
+            and transcript.reconcile.pending is None
+            and transcript.reconcile.inflight_id is None
+            and all(u.seq == i for i, u in enumerate(transcript.utterances))
+        )
+        d5_started = False
+        # A missing checkpoint is normal only for a final result whose done was
+        # delivered. An existing (including unreadable) one must pass I-2 first.
+        if job.rediarize and not (rediar_complete and checkpoint is None and not checkpoint_exists):
+            d5_started = self._check_rediar_resume(
+                transcript, checkpoint, on_disk, final=rediar_complete
+            )
+        if rediar_complete:
+            assert transcript is not None
+            return _Resume(
+                list(transcript.utterances), {"mic": 0, "far": 0}, base, False, on_disk, transcript
+            )
         if (
             job.request["resume"]
             and same
             and isinstance(transcript, Transcript)
             and transcript.labels_final
             and checkpoint is None
-            and not os.path.lexists(self.store.root / meeting_id / "checkpoint.json")
+            and not os.path.lexists(self.store.root / meeting_id / job.checkpoint_name)
             and all(u.seq == i for i, u in enumerate(transcript.utterances))
         ):
             # Checkpoint already dropped after done: within one generation the final
@@ -1090,9 +1210,13 @@ class MeetingTranscribeState:
                 transcript,
             )
         if not (job.request["resume"] and same and isinstance(checkpoint, Checkpoint)):
+            if d5_started:
+                raise _Failed("io")
             return fresh
         assert isinstance(transcript, Transcript)
         if checkpoint.transcript_revision > transcript.transcript_revision:
+            if d5_started:
+                raise _Failed("io")
             return fresh  # never trust a checkpoint ahead of durable text
         # Identity fields only: the text itself was validated when it was read.
         view = dataclasses.replace(
@@ -1111,7 +1235,13 @@ class MeetingTranscribeState:
         except MeetingValidationError:
             compatible = False
         kept = list(transcript.utterances)
-        if not compatible or any(u.seq != i for i, u in enumerate(kept)):
+        if (
+            not compatible
+            or any(u.seq != i for i, u in enumerate(kept))
+            or (job.rediarize and checkpoint.asr.status != PhaseStatus.DONE)
+        ):
+            if d5_started:
+                raise _Failed("io")
             return fresh
         cursors = {"mic": 0, "far": 0}
         for utterance in kept:
@@ -1184,6 +1314,12 @@ class MeetingTranscribeState:
                 "grid": "fixed",
                 "max_block_ms": 1_380_000,
             }
+            if job.rediarize:
+                # Bind recovery to the catalog's expected sealed-image hashes too.
+                document["diar"]["expected_sha256"] = {
+                    key: request.get("diar_models", {}).get(key)
+                    for key in ("segmentation_sha256", "embedder_sha256")
+                }
         return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
     def _identity(self, vad_name: str) -> ModelIdentity:
@@ -1237,7 +1373,9 @@ class MeetingTranscribeState:
         request = job.request
         limits = request["limits"]
         spans, damaged, manifest, duration = self._inventory(job, reader)
-        vad_name, probabilities = self.vad_factory()
+        # Re-diarization never initializes VAD or runs the primary ASR pipeline.
+        # D5 retains its existing bounded ASR refinement after diar has exited.
+        vad_name, probabilities = ("rediarize-v1", None) if job.rediarize else self.vad_factory()
         identity = self._identity(vad_name)
         config = self._config(job, identity)
         resume = self._resume(job, owner, manifest, config, identity)
@@ -1257,10 +1395,32 @@ class MeetingTranscribeState:
             if checkpoint.diar.status == PhaseStatus.DONE:
                 durable.diar = deepcopy(checkpoint.diar)
                 durable.reconcile = deepcopy(checkpoint.reconcile)
-        if resume.fresh and resume.on_disk and duration <= int(limits["max_ms"]):
+        if job.rediarize and resume.fresh:
+            assert job.published is not None
+            target = diar_target(job.published.utterances, spans)
+            kept = [
+                dataclasses.replace(
+                    u,
+                    speaker="others" if u.track == target else "me",
+                    multiple_speakers=False,
+                    final=False,
+                )
+                for u in job.published.utterances
+            ]
+            if len(kept) > capacity or duration > int(limits["max_ms"]):
+                raise _Failed("limit")
+            cursors = {"mic": 0, "far": 0}
+            for u in kept:
+                cursors[u.track] = max(cursors[u.track], u.end_ms)
+            durable.revision = max(durable.revision, job.published.transcript_revision)
+            durable.asr_status = PhaseStatus.DONE
+            self._persist(job, owner, durable, kept, cursors)
+        elif resume.fresh and resume.on_disk and duration <= int(limits["max_ms"]):
             # From zero over existing files: our empty text and checkpoint go first,
             # so no older checkpoint can vouch for the text this run writes (D10).
             self._persist(job, owner, durable, [], cursors)
+        if job.rediarize and resume.complete is None and durable.asr_status != PhaseStatus.DONE:
+            raise _Failed("io")
         reply = self._reply(
             "meeting.job.accepted",
             {**job.identity, **{k: request[k] for k in ("req", "request_type")}},
@@ -1286,6 +1446,7 @@ class MeetingTranscribeState:
             self._post_asr(job, owner, reader, spans, kept, cursors, durable, duration, started, 0)
             return
         # Stage 1: VAD per span (deterministic, so resume yields the same list).
+        assert probabilities is not None
         candidates = list(damaged)
         for index, span in enumerate(spans):
             probs = self._span_probabilities(job, span, reader, probabilities, duration, deadline)
@@ -1462,7 +1623,7 @@ class MeetingTranscribeState:
             labels_final=final,
             reconcile=deepcopy(durable.reconcile),
         )
-        self._write(job, owner, "transcript.json", transcript)
+        self._write(job, owner, job.transcript_name, transcript)
         checkpoint = Checkpoint(
             meeting_id=identity_fields["meeting_id"],
             meeting_generation=identity_fields["meeting_generation"],
@@ -1479,7 +1640,7 @@ class MeetingTranscribeState:
                 utterances=durable.capacity, blocks=job.request["limits"]["max_blocks"]
             ),
         )
-        self._write(job, owner, "checkpoint.json", checkpoint)
+        self._write(job, owner, job.checkpoint_name, checkpoint)
         return transcript
 
     def _finish(
@@ -1761,6 +1922,8 @@ class MeetingTranscribeState:
                 raise _Cancelled from None
             # All child failure paths have reaped it before fallback publication.
             job.diar_status = "failed"
+            if job.rediarize:
+                return  # R4: leave the unfinished work pair; never persist fallback
             durable.diar.status = PhaseStatus.PENDING
             durable.diar.turns.clear()
             durable.diar.label_map.clear()
@@ -2013,6 +2176,12 @@ class MeetingTranscribeState:
                 self._diarize(
                     job, owner, reader, spans, utterances, cursors, durable, duration, deadline
                 )
+                if job.rediarize and job.diar_status == "failed":
+                    work = owner.read_transcript(job.transcript_name)
+                    if work is None:
+                        raise _Failed("io")
+                    self._finish(job, owner, work, echo_dropped, started)
+                    return
             else:
                 job.diar_status = "done"
             if job.diar_status == "done":

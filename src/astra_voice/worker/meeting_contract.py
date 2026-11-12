@@ -211,6 +211,7 @@ OPTIONAL: dict[str, dict[str, Any]] = {
     "meeting.capture.resume": {"mic_device": S, "tracks": TRACKS},
     # Missing digests reach the role and fail as model-untrusted, never load.
     "meeting.job.start": {
+        "operation": choices("rediarize"),
         "diar_models": obj(
             {
                 "segmentation_dir": S,
@@ -219,7 +220,7 @@ OPTIONAL: dict[str, dict[str, Any]] = {
                 "embedder_sha256": S,
             },
             required=["segmentation_dir", "embedder_dir"],
-        )
+        ),
     },
     "diar.load": {"segmentation_sha256": S, "embedder_sha256": S},
 }
