@@ -75,6 +75,26 @@ class Writer(StrEnum):
     DIAR = "diar"  # lifetime lease only; diar never writes durable data
 
 
+class RediarPublishResult(StrEnum):
+    """Queue contract: only PUBLISHED permits K6; BUSY/IO_ERROR need backoff.
+
+    WORK_PENDING permits resuming the role. INVALID means failure before K3;
+    REJECTED means the request no longer matches metadata. Neither should be
+    inferred from an exception while acquiring the GUI writer itself.
+    """
+
+    PUBLISHED = "published"
+    WORK_PENDING = "work_pending"
+    BUSY = "busy"
+    REJECTED = "rejected"
+    INVALID = "invalid"
+    IO_ERROR = "io_error"
+
+
+class _RediarCommitUncertain(Exception):
+    """A replacement may be visible but is not confirmed durable: retry."""
+
+
 def new_meeting_id(start: datetime) -> str:
     if start.tzinfo is None:
         raise MeetingValidationError("Нужна временная зона встречи")
@@ -229,6 +249,32 @@ def _transcript_state(transcript: Transcript, raw: bytes) -> _TranscriptState:
     )
 
 
+def _rediar_final(transcript: Transcript, meeting_id: str, generation: int) -> bool:
+    """One final-result validator for both sides of the K3 rename."""
+    return (
+        transcript.meeting_id == meeting_id
+        and transcript.meeting_generation == generation
+        and transcript.labels_final
+        and all(u.final and u.seq == seq for seq, u in enumerate(transcript.utterances))
+        and transcript.reconcile.status == "done"
+        and transcript.reconcile.pending is None
+        and transcript.reconcile.inflight_id is None
+    )
+
+
+def _rediar_unlink(directory: int, names: tuple[str, ...]) -> None:
+    """Unlink fixed entries and only write_private's exact working temp names.
+
+    Never opens entries or follows links; directories are refused by unlink.
+    Writers must have released both lifetime leases before calling this.
+    """
+    temporary = re.compile(r"\.rediar-(?:transcript|checkpoint)-[0-9a-f]{32}\.tmp\Z")
+    for name in (*names, *(n for n in os.listdir(directory) if temporary.fullmatch(n))):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=directory)
+    os.fsync(directory)
+
+
 class MeetingWriter:
     """Valid only inside MeetingStore.writer; all writes recheck tombstone state.
 
@@ -346,6 +392,178 @@ class MeetingWriter:
                 self._persist("speakers.json", _encode(SpeakerMap().to_dict()))
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
+
+    def rediar_publish(self, generation: int) -> RediarPublishResult:
+        """GUI K0–K5 transaction; caller performs K6 only after PUBLISHED.
+
+        All leases are nonblocking, in DIAR/TRANSCRIBE/store order. After K3
+        only commit recovery is allowed, even if the published file is damaged
+        (IO_ERROR, never WORK_PENDING/INVALID). No metadata is changed here.
+        A same-UID process can still swap the source between validation and
+        rename: accepted P26 boundary, not isolation against that process.
+        """
+        if not self._active or self._role != Writer.GUI:
+            return RediarPublishResult.REJECTED
+        try:
+            with contextlib.ExitStack() as resources:
+                resources.enter_context(_lease(self._directory, Writer.DIAR))
+                resources.enter_context(_lease(self._directory, Writer.TRANSCRIBE))
+                resources.enter_context(_lock(self._directory, ".store.lock"))
+                meeting = _metadata(self._directory, self._meeting_id)
+                if (
+                    meeting.state != MeetingState.DONE
+                    or meeting.cancelled
+                    or meeting.rediar is None
+                    or generation != meeting.rediar.generation
+                    or generation != meeting.meeting_generation
+                ):
+                    return RediarPublishResult.REJECTED
+                raw = read_private(
+                    Path("transcript.json"),
+                    MAX_DOCUMENT_BYTES,
+                    directory_fd=self._directory,
+                    private=True,
+                )
+                published = Transcript.from_dict(json.loads(raw, object_pairs_hook=_pairs))
+                if published.meeting_generation == generation:
+                    # K0: generation establishes that K3 occurred. A damaged
+                    # commit must never be mistaken for resumable role work.
+                    if not _rediar_final(published, self._meeting_id, generation):
+                        return RediarPublishResult.IO_ERROR
+                    self._rediar_sync()
+                else:
+                    if (
+                        published.meeting_id != self._meeting_id
+                        or published.meeting_generation != published_generation(meeting)
+                        or hashlib.sha256(raw).hexdigest() != meeting.rediar.base_sha256
+                    ):
+                        return RediarPublishResult.INVALID
+                    try:
+                        work_raw = read_private(
+                            Path("rediar-transcript.json"),
+                            MAX_DOCUMENT_BYTES,
+                            directory_fd=self._directory,
+                            private=True,
+                        )
+                    except FileNotFoundError:
+                        return RediarPublishResult.WORK_PENDING
+                    try:
+                        work = Transcript.from_dict(json.loads(work_raw, object_pairs_hook=_pairs))
+                    except (ValueError, TypeError, RecursionError):
+                        return RediarPublishResult.INVALID
+                    if not _rediar_final(work, self._meeting_id, generation):
+                        # The role persists reconcile=done before its separate
+                        # labels_final write. Any typed snapshot of this job
+                        # without labels_final can still resume that work.
+                        if (
+                            work.meeting_id == self._meeting_id
+                            and work.meeting_generation == generation
+                            and not work.labels_final
+                        ):
+                            return RediarPublishResult.WORK_PENDING
+                        return RediarPublishResult.INVALID
+                    # K2 is the sole internal exception to I3, like reset_speakers.
+                    names = _read(self._directory, "speakers.json")
+                    assert isinstance(names, SpeakerMap)
+                    if names.transcript_generation is None:
+                        names.transcript_generation = published.meeting_generation
+                        self._rediar_names(names)
+                    elif names.transcript_generation != published.meeting_generation:
+                        return RediarPublishResult.IO_ERROR
+                    # Confirm K2 also after an uncertain prior write_private.
+                    self._rediar_sync()
+                    # K3: recheck the source without reading it or following
+                    # symlinks/FIFOs, then rename fixed names under pinned fd.
+                    source = os.open(
+                        "rediar-transcript.json",
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                        dir_fd=self._directory,
+                    )
+                    try:
+                        check_private_file(os.fstat(source))
+                        try:
+                            os.replace(
+                                "rediar-transcript.json",
+                                "transcript.json",
+                                src_dir_fd=self._directory,
+                                dst_dir_fd=self._directory,
+                            )
+                        except OSError:
+                            # A wrapper/syscall may report failure after rename.
+                            if (
+                                read_private(
+                                    Path("transcript.json"),
+                                    MAX_DOCUMENT_BYTES,
+                                    directory_fd=self._directory,
+                                    private=True,
+                                )
+                                == work_raw
+                            ):
+                                raise _RediarCommitUncertain from None
+                            raise
+                    finally:
+                        os.close(source)
+                    self._rediar_sync()
+                # K4: avoid a second name replacement on an idempotent call.
+                empty = SpeakerMap(transcript_generation=generation)
+                if _read(self._directory, "speakers.json") != empty:
+                    self._rediar_names(empty)
+                # K5 also confirms a prior uncertain K4 and interrupted unlink.
+                _rediar_unlink(self._directory, ("rediar-checkpoint.json", "checkpoint.json"))
+                return RediarPublishResult.PUBLISHED
+        except (BlockingIOError, _RediarCommitUncertain):
+            return RediarPublishResult.BUSY
+        except (OSError, ValueError, TypeError, RecursionError, MeetingStoreError):
+            return RediarPublishResult.IO_ERROR
+        finally:
+            self._transcripts.clear()  # K3 can have committed even on an exception.
+
+    def _rediar_sync(self) -> None:
+        try:
+            os.fsync(self._directory)
+        except OSError:
+            raise _RediarCommitUncertain from None
+
+    def _rediar_names(self, names: SpeakerMap) -> None:
+        raw = _encode(names.to_dict())
+        try:
+            self._persist("speakers.json", raw)
+        except OSError:
+            # write_private may have replaced the file before directory-fsync
+            # failed. Do not roll back or discard; recognize K2/K4 next time.
+            if (
+                read_private(
+                    Path("speakers.json"),
+                    MAX_DOCUMENT_BYTES,
+                    directory_fd=self._directory,
+                    private=True,
+                )
+                == raw
+            ):
+                raise _RediarCommitUncertain from None
+            raise
+
+    def rediar_discard(self) -> None:
+        """GUI cleanup after cancellation/K6; refuses any active rediar commit.
+
+        Unlinks only the working pair and exact write_private temp templates,
+        without following links. Errors have no document/path information.
+        """
+        try:
+            if not self._active or self._role != Writer.GUI:
+                raise MeetingStoreError("Неверный писатель файла встречи")
+            with contextlib.ExitStack() as resources:
+                resources.enter_context(_lease(self._directory, Writer.DIAR))
+                resources.enter_context(_lease(self._directory, Writer.TRANSCRIBE))
+                resources.enter_context(_lock(self._directory, ".store.lock"))
+                meeting = _metadata(self._directory, self._meeting_id)
+                if meeting.rediar is not None or meeting.state == MeetingState.DELETING:
+                    raise MeetingStoreError("Рабочий результат ещё занят")
+                _rediar_unlink(
+                    self._directory, ("rediar-transcript.json", "rediar-checkpoint.json")
+                )
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось удалить рабочий результат") from None
 
     def remove(self, filename: str) -> None:
         """Drop a checkpoint only after its final text is durable (T-414)."""
@@ -819,6 +1037,27 @@ class MeetingStore:
                 return document
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось прочитать данные встречи") from None
+
+    def transcript_state(self, meeting_id: str) -> _TranscriptState:
+        """Typed private snapshot of published bytes, including their SHA256.
+
+        No utterance text escapes in the return value or an error. The digest
+        is of the exact bytes validated, not of a re-encoded model.
+        """
+        try:
+            with self._directory(meeting_id) as directory:
+                raw = read_private(
+                    Path("transcript.json"),
+                    MAX_DOCUMENT_BYTES,
+                    directory_fd=directory,
+                    private=True,
+                )
+                text = Transcript.from_dict(json.loads(raw, object_pairs_hook=_pairs))
+                if text.meeting_id != meeting_id:
+                    raise MeetingStoreError("Не совпадает идентичность встречи")
+                return _transcript_state(text, raw)
+        except (OSError, ValueError, TypeError, RecursionError):
+            raise MeetingStoreError("Не удалось прочитать состояние текста встречи") from None
 
     def list(self, *, include_deleting: bool = False) -> list[Meeting]:
         """Read metadata only, newest first, without creating a data directory.
