@@ -17,7 +17,7 @@ from typing import Literal, cast
 from uuid import uuid4
 
 from astra_voice.core import paths
-from astra_voice.models.catalog import ID_RE
+from astra_voice.models.catalog import DIARIZATION_MODEL_IDS, ID_RE
 
 log = logging.getLogger(__name__)
 MEMINFO_PATH = Path("/proc/meminfo")
@@ -338,7 +338,7 @@ class ModelStore:
     def current(self) -> ModelRecord | None:
         """Возвращает текущую исправную ревизию; порча указателя не мешает старту."""
         ids = self._current_ids()
-        if ids is None:
+        if ids is None or ids[0] in DIARIZATION_MODEL_IDS:
             return None
         try:
             directory = self._installed(*ids)
@@ -347,7 +347,10 @@ class ModelStore:
             return None
         return (
             record
-            if record.state == "ok" and record.recheck is not True and record.metadata_ok
+            if record.state == "ok"
+            and record.recheck is not True
+            and record.metadata_ok
+            and not record.layout.startswith("sherpa-onnx-")
             else None
         )
 
@@ -383,7 +386,7 @@ class ModelStore:
                     continue
                 yield model.name, self._checked(directory)
 
-    def records(self) -> tuple[ModelRecord, ...]:
+    def records(self, *, include_diarization: bool = False) -> tuple[ModelRecord, ...]:
         """Перечисляет установленные ревизии, включая ревизии с испорченным состоянием."""
         result: list[ModelRecord] = []
         with _store_errors():
@@ -392,7 +395,12 @@ class ModelStore:
                 if revision.endswith(".partial") or ".old-" in revision:
                     continue
                 self._revision_path(model_id, revision)
-                result.append(self._record(model_id, revision, directory))
+                record = self._record(model_id, revision, directory)
+                if not include_diarization and (
+                    model_id in DIARIZATION_MODEL_IDS or record.layout.startswith("sherpa-onnx-")
+                ):
+                    continue
+                result.append(record)
         return tuple(result)
 
     def set_current(
@@ -400,7 +408,11 @@ class ModelStore:
     ) -> None:
         """Атомарно записывает указатель на существующую ревизию."""
         with _store_errors():
-            self._installed(model_id, revision)
+            directory = self._installed(model_id, revision)
+            if model_id in DIARIZATION_MODEL_IDS or self._record(
+                model_id, revision, directory, migrate_legacy=False
+            ).layout.startswith("sherpa-onnx-"):
+                raise StoreError("bad-id", "Эта модель не предназначена для диктовки.")
             data: dict[str, object] = {"id": model_id, "revision": revision}
             if previous_revision is not None:
                 if not isinstance(previous_revision, str) or previous_revision == revision:

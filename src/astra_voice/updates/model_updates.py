@@ -48,7 +48,11 @@ class WatchTarget:
 
 
 def watch_target(entry: CatalogEntry) -> WatchTarget | None:
-    if entry.removed_from_catalog or entry.host not in ("huggingface.co", "hf.co"):
+    if (
+        entry.kind != "dictation"
+        or entry.removed_from_catalog
+        or entry.host not in ("huggingface.co", "hf.co")
+    ):
         return None
     repos = {hf.repo_from_url_path(file.url_path) for file in entry.files}
     if len(repos) != 1 or None in repos:
@@ -195,6 +199,7 @@ class ModelRevisionUpdater:
         if (
             ID_RE.fullmatch(model_id) is None
             or entry is None
+            or entry.kind != "dictation"
             or entry.removed_from_catalog
             or current is None
             or current.id != model_id

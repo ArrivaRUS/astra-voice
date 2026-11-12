@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from tools.meeting_diar_check import RoleProcess, measure, sealed_pcm, wav_blocks
+from tools.meeting_diar_check import RoleProcess, measure, model_paths, sealed_pcm, wav_blocks
 
 pytestmark = [pytest.mark.engine, pytest.mark.usefixtures("filesystem_euid")]
 
@@ -27,7 +27,10 @@ def inputs() -> tuple[Path, Path]:
     if any(not os.environ.get(name) for name in names):
         pytest.skip("Задайте ASTRA_VOICE_DIAR_MODELS и ASTRA_VOICE_DIAR_CORPUS")
     models, corpus = (Path(os.environ[name]) for name in names)
-    required = [models / name for name in ("segmentation.onnx", "embedder.onnx")]
+    try:
+        required = list(model_paths(models))
+    except OSError:
+        pytest.fail("Неполный явно заданный комплект моделей диаризации")
     required += [
         corpus / name / file for name in ("dion", "synth") for file in ("far.wav", "ref.rttm")
     ]

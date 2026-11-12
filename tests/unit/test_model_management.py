@@ -1391,7 +1391,7 @@ def test_service_appends_only_non_revoked_models_missing_from_catalog() -> None:
     record = ModelRecord("old-model", "r1", Path("/unused"), "layout", "int8", 42_000_000)
     revoked = replace(record, id="revoked-model")
     service._store = Mock(records=Mock(return_value=[record, revoked]))
-    service._catalog = Mock(entries=(GIGAAM,))
+    service._catalog = Mock(entries=(GIGAAM,), dictation_entries=(GIGAAM,))
     service._catalog.is_revoked.side_effect = lambda model_id, _revision: (
         model_id == "revoked-model"
     )
@@ -1421,7 +1421,7 @@ def test_service_selects_one_removed_revision(
     service._store = Mock()
     service._store.records.return_value = [r1, r2]
     service._store.current.return_value = r2 if current_revision == "r2" else None
-    service._catalog = Mock(entries=(GIGAAM,))
+    service._catalog = Mock(entries=(GIGAAM,), dictation_entries=(GIGAAM,))
     service._catalog.is_revoked.return_value = False
 
     entries = service.entries()
@@ -1438,7 +1438,7 @@ def test_removed_model_two_revisions_have_one_manageable_card() -> None:
     service._store = Mock()
     service._store.records.return_value = [r1, r2]
     service._store.current.return_value = r1
-    service._catalog = Mock(entries=(GIGAAM,))
+    service._catalog = Mock(entries=(GIGAAM,), dictation_entries=(GIGAAM,))
     service._catalog.is_revoked.return_value = False
     port = FakeManagedPort()
     port.catalog = service.entries()
@@ -1466,7 +1466,7 @@ def test_removed_catalog_model_uses_fallback_memory_and_skips_recheck() -> None:
         "old-model", "r1", Path("/unused"), "layout", "int8", 42_000_000, recheck=True
     )
     service._store = Mock(records=Mock(return_value=[record]))
-    service._catalog = Mock(entries=())
+    service._catalog = Mock(entries=(), dictation_entries=())
     service._catalog.is_revoked.return_value = False
 
     entries = service.entries()
@@ -1859,6 +1859,8 @@ def test_model_service_reads_catalog_rtfx() -> None:
             TONE,
         )
     )
+
+    service._catalog.dictation_entries = service._catalog.entries
 
     assert service.catalog_rtfx("gigaam") == 42.5
     assert service.catalog_rtfx("t-one") is None

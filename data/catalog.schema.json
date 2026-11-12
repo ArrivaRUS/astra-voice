@@ -136,7 +136,9 @@
             "onnx-asr-t-one",
             "onnx-asr-vosk",
             "onnx-community-whisper",
-            "onnx-asr-nemo"
+            "onnx-asr-nemo",
+            "sherpa-onnx-pyannote-segmentation",
+            "sherpa-onnx-campplus"
           ]
         },
         "variant": {
@@ -154,7 +156,9 @@
             "vosk-am-onnx",
             "vosk-am",
             "whisper-hf",
-            "nemo-fastconformer-ru-ctc"
+            "nemo-fastconformer-ru-ctc",
+            "pyannote-segmentation-3.0",
+            "3dspeaker-campplus"
           ]
         },
         "recommended": {
@@ -240,8 +244,127 @@
               "$ref": "#/$defs/metric"
             }
           }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "dictation",
+            "diarization"
+          ],
+          "default": "dictation"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "diarization"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "license"
+            ],
+            "properties": {
+              "recommended": {
+                "const": false
+              }
+            },
+            "oneOf": [
+              {
+                "properties": {
+                  "layout": {
+                    "const": "sherpa-onnx-pyannote-segmentation"
+                  },
+                  "variant": {
+                    "const": "pyannote-segmentation-3.0"
+                  },
+                  "files": {
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/file"
+                        },
+                        {
+                          "properties": {
+                            "path": {
+                              "const": "model.onnx"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "layout": {
+                    "const": "sherpa-onnx-campplus"
+                  },
+                  "variant": {
+                    "const": "3dspeaker-campplus"
+                  },
+                  "files": {
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/file"
+                        },
+                        {
+                          "properties": {
+                            "path": {
+                              "const": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "else": {
+            "properties": {
+              "layout": {
+                "enum": [
+                  "onnx-asr-gigaam-v3",
+                  "onnx-asr-gigaam-multilingual",
+                  "onnx-asr-t-one",
+                  "onnx-asr-vosk",
+                  "onnx-community-whisper",
+                  "onnx-asr-nemo"
+                ]
+              },
+              "variant": {
+                "enum": [
+                  "gigaam-v3-e2e-rnnt",
+                  "gigaam-v3-e2e-ctc",
+                  "gigaam-v3-rnnt",
+                  "gigaam-v3-ctc",
+                  "gigaam-multilingual-ctc",
+                  "gigaam-multilingual-large-ctc",
+                  "t-one-ctc",
+                  "vosk-am-onnx",
+                  "vosk-am",
+                  "whisper-hf",
+                  "nemo-fastconformer-ru-ctc"
+                ]
+              }
+            }
+          }
+        }
+      ]
     },
     "file": {
       "type": "object",

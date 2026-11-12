@@ -10,7 +10,14 @@ import pytest
 pytest.importorskip("jsonschema")
 
 # ruff: noqa: E402
-from astra_voice.models.catalog import Catalog, Metric, Metrics, load_builtin, merge_measurement
+from astra_voice.models.catalog import (
+    DIARIZATION_MODEL_IDS,
+    Catalog,
+    Metric,
+    Metrics,
+    load_builtin,
+    merge_measurement,
+)
 from astra_voice.security.verify import Verifier
 from astra_voice.ui.formatting import format_accuracy, format_rtfx
 from astra_voice.ui.model_downloads import _vendor_short, catalog_best, entry_metrics, entry_tags
@@ -27,7 +34,7 @@ def catalog() -> Catalog:
 
 
 def test_recommended_card_tags(catalog: Catalog) -> None:
-    entry = catalog.entries[0]
+    entry = catalog.dictation_entries[0]
     assert entry.recommended is True
     assert entry_tags(entry) == [
         "Только русский",
@@ -47,9 +54,9 @@ def test_tags_skip_what_the_model_does_not_have(catalog: Catalog) -> None:
 
 
 def test_metrics_fill_and_levels(catalog: Catalog) -> None:
-    best_rtfx = catalog_best(catalog.entries)
+    best_rtfx = catalog_best(catalog.dictation_entries)
     assert best_rtfx == 83.5  # Vosk small ru
-    entry = catalog.entries[0]
+    entry = catalog.dictation_entries[0]
     quality, speed = entry_metrics(entry, best_rtfx)
     assert quality == {
         "kind": "quality",
@@ -72,7 +79,7 @@ def test_metrics_fill_and_levels(catalog: Catalog) -> None:
 
 
 def test_accuracy_uses_absolute_scale_and_fastest_speed_fills_bar(catalog: Catalog) -> None:
-    best_rtfx = catalog_best(catalog.entries)
+    best_rtfx = catalog_best(catalog.dictation_entries)
     leader = catalog.entry("gigaam-v3-rnnt-int8")
     fastest = catalog.entry("vosk-small-ru-int8")
     assert leader is not None and fastest is not None
@@ -82,7 +89,7 @@ def test_accuracy_uses_absolute_scale_and_fastest_speed_fills_bar(catalog: Catal
 
 def test_missing_numbers_are_not_invented(catalog: Catalog) -> None:
     """Whisper small не замерен по протоколу — полоски пустые, а не выдуманные."""
-    best_rtfx = catalog_best(catalog.entries)
+    best_rtfx = catalog_best(catalog.dictation_entries)
     entry = catalog.entry("whisper-small-int8")
     assert entry is not None
     for row in entry_metrics(entry, best_rtfx):
@@ -94,7 +101,7 @@ def test_missing_numbers_are_not_invented(catalog: Catalog) -> None:
 
 def test_speed_alone_is_enough_for_one_bar(catalog: Catalog) -> None:
     """У многоязычных есть WER, но нет int8-замера скорости: одна полоска из двух."""
-    best_rtfx = catalog_best(catalog.entries)
+    best_rtfx = catalog_best(catalog.dictation_entries)
     entry = catalog.entry("gigaam-multilingual-ctc-int8")
     assert entry is not None
     quality, speed = entry_metrics(entry, best_rtfx)
@@ -103,8 +110,8 @@ def test_speed_alone_is_enough_for_one_bar(catalog: Catalog) -> None:
 
 
 def test_every_card_has_two_bars_and_a_vendor(catalog: Catalog) -> None:
-    best_rtfx = catalog_best(catalog.entries)
-    for entry in catalog.entries:
+    best_rtfx = catalog_best(catalog.dictation_entries)
+    for entry in catalog.dictation_entries:
         rows = entry_metrics(entry, best_rtfx)
         assert [row["label"] for row in rows] == ["Точность", "Скорость"]
         assert all(0.0 <= row["fill"] <= 1.0 for row in rows)
@@ -115,14 +122,23 @@ def test_every_card_has_two_bars_and_a_vendor(catalog: Catalog) -> None:
 
 
 def test_vendor_short_names_come_from_catalog(catalog: Catalog) -> None:
-    assert {entry.vendor_short for entry in catalog.entries} == {
+    assert {entry.vendor_short for entry in catalog.dictation_entries} == {
         "Сбер",
         "Т-Банк",
         "Alpha Cephei",
         "OpenAI",
         "NVIDIA",
     }
-    assert _vendor_short(replace(catalog.entries[0], vendor_short="")) == "Сбер"
+    assert _vendor_short(replace(catalog.dictation_entries[0], vendor_short="")) == "Сбер"
+
+
+def test_diarization_pair_is_catalogued_but_excluded_from_model_cards(catalog: Catalog) -> None:
+    diarization_ids = {entry.id for entry in catalog.entries if entry.kind == "diarization"}
+    assert diarization_ids == set(DIARIZATION_MODEL_IDS)
+    cards = catalog.dictation_entries
+    assert len(cards) == 12
+    assert all(entry.kind == "dictation" for entry in cards)
+    assert diarization_ids.isdisjoint(entry.id for entry in cards)
 
 
 @pytest.mark.parametrize(
@@ -130,7 +146,9 @@ def test_vendor_short_names_come_from_catalog(catalog: Catalog) -> None:
     [(92, "good"), (91.9, "fair"), (88, "fair"), (87.9, "weak")],
 )
 def test_accuracy_levels(catalog: Catalog, accuracy: float, level: str) -> None:
-    entry = replace(catalog.entries[0], metrics=Metrics(wer_ru=Metric(100 - accuracy, "source")))
+    entry = replace(
+        catalog.dictation_entries[0], metrics=Metrics(wer_ru=Metric(100 - accuracy, "source"))
+    )
     assert entry_metrics(entry, 0)[0]["level"] == level
 
 
@@ -139,7 +157,7 @@ def test_accuracy_levels(catalog: Catalog, accuracy: float, level: str) -> None:
     [(20, "good"), (19.9, "fair"), (5, "fair"), (4.9, "weak")],
 )
 def test_speed_levels(catalog: Catalog, rtfx: float, level: str) -> None:
-    entry = replace(catalog.entries[0], metrics=Metrics(rtfx=Metric(rtfx, "source")))
+    entry = replace(catalog.dictation_entries[0], metrics=Metrics(rtfx=Metric(rtfx, "source")))
     assert entry_metrics(entry, 20)[1]["level"] == level
 
 
@@ -154,7 +172,7 @@ def test_formatters_use_russian_decimal_comma() -> None:
 
 
 def test_merge_measurements_and_thread_matching(catalog: Catalog) -> None:
-    entry = catalog.entries[0]
+    entry = catalog.dictation_entries[0]
     fallback = merge_measurement(entry, {})
     assert fallback == {"ramMb": entry.min_ram_mb, "ramMeasured": False, "measuredRtfx": None}
     key = f"{entry.id}@{entry.revision}"
@@ -184,7 +202,7 @@ def test_merge_missing_measurement(catalog: Catalog) -> None:
 
 @pytest.mark.parametrize(("wer", "level"), [(8.04, "good"), (8.06, "fair")])
 def test_accuracy_level_uses_displayed_value(catalog: Catalog, wer: float, level: str) -> None:
-    entry = replace(catalog.entries[0], metrics=Metrics(wer_ru=Metric(wer, "source")))
+    entry = replace(catalog.dictation_entries[0], metrics=Metrics(wer_ru=Metric(wer, "source")))
     row = entry_metrics(entry, 0)[0]
     assert row["level"] == level
     assert row["text"] == ("92,0 %" if wer == 8.04 else "91,9 %")
@@ -192,7 +210,7 @@ def test_accuracy_level_uses_displayed_value(catalog: Catalog, wer: float, level
 
 @pytest.mark.parametrize(("rtfx", "level"), [(19.96, "good"), (19.94, "fair")])
 def test_speed_level_uses_displayed_value(catalog: Catalog, rtfx: float, level: str) -> None:
-    entry = replace(catalog.entries[0], metrics=Metrics(rtfx=Metric(rtfx, "source")))
+    entry = replace(catalog.dictation_entries[0], metrics=Metrics(rtfx=Metric(rtfx, "source")))
     row = entry_metrics(entry, 20)[1]
     assert row["level"] == level
     assert row["text"] == ("20,0× быстрее речи" if rtfx == 19.96 else "19,9× быстрее речи")

@@ -50,6 +50,20 @@ IDENTITY = {"meeting_id": "2026-11-10_120000-d1a2", "meeting_generation": 1}
 Turn = tuple[float, float, str]
 
 
+def model_paths(models: Path) -> tuple[Path, Path]:
+    """Accept corpus aliases, but pass resolved canonical filenames to the role."""
+    result = []
+    for name, legacy in (
+        ("model.onnx", "segmentation.onnx"),
+        ("3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx", "embedder.onnx"),
+    ):
+        source = models / name
+        if not source.exists():
+            source = models / legacy
+        result.append(source.resolve(strict=True))
+    return result[0], result[1]
+
+
 def read_rttm(path: Path, start: float, duration: float) -> list[Turn]:
     rows = []
     with path.open(encoding="utf-8") as source:
@@ -245,15 +259,31 @@ class RoleProcess:
             if event["type"] == kind:
                 return event
 
-    def load(self, models: Path, threads: int = 2) -> None:
+    def load(
+        self,
+        models: Path,
+        threads: int = 2,
+        *,
+        segmentation_sha256: str | None = None,
+        embedder_sha256: str | None = None,
+    ) -> None:
         # Development corpus models are symlinks. Resolve them in the driver;
         # the role still rejects every symlink in its OWN supplied directories.
-        segmentation = (models / "segmentation.onnx").resolve(strict=True)
-        embedder = (models / "embedder.onnx").resolve(strict=True)
+        segmentation, embedder = model_paths(models)
+        if segmentation_sha256 is None or embedder_sha256 is None:
+            from astra_voice.models.diarization import catalog_diarization_hashes
+
+            hashes = catalog_diarization_hashes()
+            if segmentation_sha256 is None:
+                segmentation_sha256 = hashes["segmentation_sha256"]
+            if embedder_sha256 is None:
+                embedder_sha256 = hashes["embedder_sha256"]
         profile = DIAR_PROFILES["3dspeaker-campplus"]
         self.send(
             "diar.load",
             segmentation_dir=str(segmentation.parent),
+            segmentation_sha256=segmentation_sha256,
+            embedder_sha256=embedder_sha256,
             embedder_dir=str(embedder.parent),
             threshold=profile.seed_threshold,
             tau=profile.merge_ceiling,
@@ -368,6 +398,8 @@ def measure(
     start: float = 0,
     duration: float | None = None,
     trace: Path | None = None,
+    segmentation_sha256: str | None = None,
+    embedder_sha256: str | None = None,
 ) -> dict[str, Any]:
     if not math.isfinite(block_s) or not 0 < block_s <= 1200:
         raise ValueError("block-duration-limit-1200s")
@@ -383,7 +415,7 @@ def measure(
     blocks = []
     samples = 0
     with RoleProcess(trace=trace) as role:
-        role.load(models)
+        role.load(models, segmentation_sha256=segmentation_sha256, embedder_sha256=embedder_sha256)
         for index, audio in enumerate(wav_blocks(wav, start, duration, block_s)):
             block_started = time.monotonic()
             block_turns = role.block(audio, index, round(samples * 1000 / RATE))
@@ -432,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("wav", type=Path)
     parser.add_argument("--models", required=True, type=Path)
     parser.add_argument("--reference", type=Path)
+    parser.add_argument("--segmentation-sha256")
+    parser.add_argument("--embedder-sha256")
     parser.add_argument("--block-s", type=float, default=1200)
     parser.add_argument("--start", type=float, default=0)
     parser.add_argument("--duration", type=float)
@@ -449,6 +483,8 @@ def main(argv: list[str] | None = None) -> int:
             start=args.start,
             duration=args.duration,
             trace=args.trace,
+            segmentation_sha256=args.segmentation_sha256,
+            embedder_sha256=args.embedder_sha256,
         )
     except (OSError, ValueError, RuntimeError, TimeoutError) as error:
         print(str(error), file=sys.stderr)

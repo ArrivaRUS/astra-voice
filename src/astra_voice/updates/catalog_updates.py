@@ -502,9 +502,9 @@ class NewModelTracker:
         with self._lock:
             seen = self._read()
             if seen is None:
-                seen = {entry.id: None for entry in catalog.entries}
+                seen = {entry.id: None for entry in catalog.dictation_entries}
             else:
-                for entry in catalog.entries:
+                for entry in catalog.dictation_entries:
                     seen.setdefault(entry.id, now)
             raw = json.dumps({"schema_version": 1, "seen": seen}, separators=(",", ":")).encode()
             if len(raw) > _TRACKER_MAX_BYTES:
@@ -525,19 +525,24 @@ class NewModelTracker:
             seen = self._read() or {}
             return frozenset(
                 entry.id
-                for entry in catalog.entries
+                for entry in catalog.dictation_entries
                 if (stamp := seen.get(entry.id)) is not None
                 and 0 <= now - stamp <= NEW_BADGE_WINDOW_S
             )
 
 
 def removed_installed(catalog: Catalog, records: Iterable[ModelRecord]) -> frozenset[str]:
-    present = {entry.id for entry in catalog.entries if not entry.removed_from_catalog}
+    present = {entry.id for entry in catalog.dictation_entries if not entry.removed_from_catalog}
     return frozenset(
         record.id
         for record in records
         if record.state == "ok"
         and record.metadata_ok
         and not record.recheck
+        and not record.layout.startswith("sherpa-onnx-")
+        and (
+            catalog.entry(record.id) is None
+            or catalog.entry(record.id) in catalog.dictation_entries
+        )
         and record.id not in present
     )

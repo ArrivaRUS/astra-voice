@@ -1,9 +1,9 @@
 {
   "manifest_version": 1,
-  "schema_sha256": "5e7f8390b0cf3b442b22a54e7b6052e2868cdaa22e2e5a9fe5dba858d8a026f3",
-  "serial": 4,
+  "schema_sha256": "3f78990acce3cc32957242c5ebe0ce7cdf94c6376273b89b00c1f47b3451326a",
+  "serial": 5,
   "trust_epoch": 1,
-  "generated_at": "2026-09-22T11:15:00Z",
+  "generated_at": "2026-11-10T15:42:49Z",
   "publisher": "astra-voice",
   "revoked": [],
   "models": [
@@ -694,6 +694,68 @@
           "sha256": "fcf5e202e9a95a895f89033506082f5bcc1e529c9f4f596fcd6673ca0b97e509",
           "size": 131562193,
           "url_path": "/istupakov/stt_ru_fastconformer_hybrid_large_pc_onnx/resolve/fb6753736c56de3259d78a26a488548c84b9dccb/model.int8.onnx"
+        }
+      ]
+    },
+    {
+      "id": "sherpa-onnx-pyannote-segmentation-3-0",
+      "revision": "9403a6902bb58e3d5ae8c7e77c3422de279db2e0",
+      "name": "Сегментация pyannote 3.0",
+      "description": "Разделение собеседников по голосам; устанавливается вместе со второй моделью.",
+      "size_bytes": 5992913,
+      "min_ram_mb": 900,
+      "ram_estimated": true,
+      "layout": "sherpa-onnx-pyannote-segmentation",
+      "variant": "pyannote-segmentation-3.0",
+      "recommended": false,
+      "host": "huggingface.co",
+      "vendor": "pyannote (экспорт sherpa-onnx)",
+      "vendor_short": "pyannote",
+      "languages": [
+        "multi"
+      ],
+      "language_tag": "Много языков",
+      "punctuation": false,
+      "license": "MIT",
+      "domestic": false,
+      "kind": "diarization",
+      "files": [
+        {
+          "path": "model.onnx",
+          "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+          "size": 5992913,
+          "url_path": "/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/9403a6902bb58e3d5ae8c7e77c3422de279db2e0/model.onnx"
+        }
+      ]
+    },
+    {
+      "id": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced",
+      "revision": "0743f301363dec56491a490f6d6cbc9d67f9a3bf",
+      "name": "Эмбеддер 3D-Speaker CAM++",
+      "description": "Разделение собеседников по голосам; устанавливается вместе со второй моделью.",
+      "size_bytes": 28281164,
+      "min_ram_mb": 900,
+      "ram_estimated": true,
+      "layout": "sherpa-onnx-campplus",
+      "variant": "3dspeaker-campplus",
+      "recommended": false,
+      "host": "huggingface.co",
+      "vendor": "3D-Speaker, Alibaba (экспорт sherpa-onnx)",
+      "vendor_short": "3D-Speaker",
+      "languages": [
+        "multi"
+      ],
+      "language_tag": "Много языков",
+      "punctuation": false,
+      "license": "Apache-2.0",
+      "domestic": false,
+      "kind": "diarization",
+      "files": [
+        {
+          "path": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+          "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+          "size": 28281164,
+          "url_path": "/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
         }
       ]
     }

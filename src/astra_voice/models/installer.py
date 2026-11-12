@@ -194,6 +194,22 @@ def _check_files(
 
 def _check_model_layout(directory: Path, entry: CatalogEntry) -> None:
     try:
+        if entry.kind == "diarization":
+            from astra_voice.worker.onnx_scan import collect_external_locations
+
+            expected = {
+                "sherpa-onnx-pyannote-segmentation": "model.onnx",
+                "sherpa-onnx-campplus": (
+                    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+                ),
+            }.get(entry.layout)
+            if expected is None or tuple(file.path for file in entry.files) != (expected,):
+                raise ValueError("diar-layout")
+            # The role loads a sealed single-file image: external tensors are
+            # forbidden even when a location would remain inside the directory.
+            if collect_external_locations(directory / expected):
+                raise ValueError("diar-external-data")
+            return
         check_layout(directory, entry.layout, entry.variant)
     except (EngineError, ValueError) as exc:
         log.exception("Набор файлов не соответствует раскладке модели")
@@ -327,6 +343,8 @@ class Installer:
         activate: bool = True,
     ) -> InstallResult:
         """Проверяет и устанавливает набор; activate=False оставляет current владельцу."""
+        if activate and entry.kind != "dictation":
+            return InstallResult("error", _LAYOUT_REASON, reason_code="layout")
         try:
             self._check_revoked(entry)
             staging = self._staging_path(entry)
@@ -404,6 +422,8 @@ class Installer:
             return InstallResult(
                 "error", "Не удалось определить, какая это модель. Выберите её в списке."
             )
+        if entry.kind != "dictation":
+            return InstallResult("error", _LAYOUT_REASON, reason_code="layout")
         staging: Path | None = None
         try:
             self._check_revoked(entry)

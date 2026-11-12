@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import importlib.util
 import os
 import threading
@@ -187,7 +188,7 @@ def test_symlink_parent_dir_rejected_before_native(tmp_path: Path) -> None:
     actual.mkdir()
     (tmp_path / "alias").symlink_to(actual, target_is_directory=True)
     with pytest.raises(OSError):
-        with diar.checked_models([str(tmp_path / "alias"), str(actual)]):
+        with diar.checked_models([str(tmp_path / "alias"), str(actual)], ["0" * 64] * 2):
             pytest.fail("symlink parent accepted")
 
 
@@ -200,9 +201,10 @@ def test_external_tensor_real_protobuf_refused_before_session(
     # Model.graph.initializer TensorProto; scanner sees the reference regardless
     # of the external file's existence. Also refuse a legitimate in-dir file.
     for location in ("../escape", "weights.bin"):
-        (tmp_path / "segmentation.onnx").write_bytes(_field(7, _field(5, _tensor(location))))
-        (tmp_path / "embedder.onnx").write_bytes(b"\x08\x01")
-        (tmp_path / "weights.bin").write_bytes(b"unused")
+        (tmp_path / "model.onnx").write_bytes(_field(7, _field(5, _tensor(location))))
+        (tmp_path / "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx").write_bytes(
+            b"\x08\x01"
+        )
 
         def refuse(*args: Any, **kwargs: Any) -> Any:
             pytest.fail("native runtime reached before external-data refusal")
@@ -214,13 +216,19 @@ def test_external_tensor_real_protobuf_refused_before_session(
                 command(
                     "diar.load",
                     segmentation_dir=str(tmp_path),
+                    segmentation_sha256=hashlib.sha256(
+                        (tmp_path / "model.onnx").read_bytes()
+                    ).hexdigest(),
+                    embedder_sha256=hashlib.sha256(
+                        (tmp_path / diar.MODEL_FILES[1][0]).read_bytes()
+                    ).hexdigest(),
                     embedder_dir=str(tmp_path),
                     threshold=0.5,
                     tau=0.45,
                     threads=2,
                 )
             )
-            assert drain(state)[-1]["code"] == "model"
+            assert drain(state)[-1]["code"] == "external-data"
         finally:
             state.cleanup()
 
@@ -419,7 +427,7 @@ def test_model_snapshot_survives_source_inode_rewrite(
     from test_engine_scan import _field, _tensor
 
     original = b"\x08\x01"
-    for name in ("segmentation.onnx", "embedder.onnx"):
+    for name in ("model.onnx", "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"):
         (tmp_path / name).write_bytes(original)
     parser = collect_external_locations
     checked: list[Path] = []
@@ -428,13 +436,19 @@ def test_model_snapshot_survives_source_inode_rewrite(
         locations = parser(path)
         checked.append(path)
         # Keep the same inode; a pathname/descriptor pin alone does not help.
-        with (tmp_path / "segmentation.onnx").open("r+b") as source:
+        with (tmp_path / "model.onnx").open("r+b") as source:
             source.write(_field(7, _field(5, _tensor("../forbidden"))))
             source.truncate()
         return locations
 
     monkeypatch.setattr(diar, "collect_external_locations", checked_then_overwritten)
-    with diar.checked_models([str(tmp_path), str(tmp_path)]) as paths:
+    with diar.checked_models(
+        [str(tmp_path), str(tmp_path)],
+        [
+            hashlib.sha256((tmp_path / names[0]).read_bytes()).hexdigest()
+            for names in diar.MODEL_FILES
+        ],
+    ) as paths:
         assert len(checked) == 2
         assert Path(paths[0]).read_bytes() == original
         for path in paths:
