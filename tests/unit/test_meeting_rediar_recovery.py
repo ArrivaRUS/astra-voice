@@ -902,3 +902,42 @@ def test_delayed_descriptor_repair_applies_ordinary_recovery_conditions(
         jobs.recover()
         assert jobs.queued_ids == [MID]  # Recovery stays idempotent after repair.
     assert MID not in jobs._redo_recovery and not rig.roles
+
+
+@pytest.mark.parametrize("already_pending", [False, True])
+def test_retention_publishes_disk_marker_when_unlink_fails_and_retries_in_five_seconds(
+    rig: RedoRig, already_pending: bool
+) -> None:
+    expire(rig)
+    meeting = rig.meeting()
+    meeting.transcription.diarization = False
+    meeting.transcription.diar_status = "skipped"
+    meeting.cleanup_pending = already_pending
+    rig.store.write(MID, "meeting.json", meeting, writer=store.Writer.GUI)
+    rig.jobs.meetings[MID] = meeting
+    obstacle = rig.store.root / MID / "audio" / "directory-blocking-unlink"
+    obstacle.mkdir(mode=0o700)
+    before = rig.jobs.revision
+    rig.jobs.start_retention()
+    rig.jobs.tick()
+    assert obstacle.is_dir()
+    assert rig.meeting().cleanup_pending and rig.meeting().audio.present
+    assert rig.jobs.meetings[MID].cleanup_pending
+    assert rig.jobs.meetings[MID].audio.present
+    assert rig.jobs.revision > before
+    assert rig.jobs._audio_retry_at[MID] == rig.now + 5
+    obstacle.rmdir()
+    rig.now += 4.9
+    for _ in range(3):
+        rig.jobs.tick()
+    assert rig.meeting().audio.present and rig.meeting().cleanup_pending
+    rig.now += 0.1
+    rig.jobs.tick()
+    assert not rig.meeting().audio.present and not rig.meeting().cleanup_pending
+    assert not rig.jobs.meetings[MID].audio.present
+    assert not rig.jobs.meetings[MID].cleanup_pending
+    assert MID not in rig.jobs._audio_retry_at
+    deleted = rig.meeting().audio.deleted_at
+    rig.now += 5
+    rig.jobs.tick()
+    assert rig.meeting().audio.deleted_at == deleted

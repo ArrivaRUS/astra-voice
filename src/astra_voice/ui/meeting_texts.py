@@ -389,3 +389,96 @@ def diar_install_presentation(
         or code == "damaged"
         or code.startswith("failed:"),
     }
+
+
+# «Разделить заново», spec §Р.2–Р.6. Only closed codes enter this vocabulary.
+REDO_TEXTS = {
+    "prefix": "Разделение по голосам: ",
+    "failed": "не удалось — {labels}. Звук сохранён, можно попробовать ещё раз",
+    "queued": "начнётся после текущей расшифровки",
+    "wait-memory": "подождёт — сейчас мало свободной памяти",
+    "running": "разделяю заново · {percent} %",
+    "running-first": "разделяю · {percent} %",
+    "reconcile": "уточняю реплики · {percent} %",
+    "cancelled": "отменено — {labels}",
+    "cancelled-named": "отменено — оставлены прежнее разделение и имена",
+    "failed-again": "снова не удалось — {labels}. Звук сохранён, можно повторить позже",
+    "no-audio": "не удалось — {labels}. Записи звука нет, разделить заново нельзя",
+    "done": "Собеседники разделены по голосам — можно вписать имена участников",
+    "redo-failed": "разделить заново не удалось — оставлены прежнее разделение и имена",
+    "offer": "эту встречу можно разделить, пока хранится звук (до {date})",
+    "offer-installed": "Модели установлены — эту встречу тоже можно разделить по голосам",
+    "kept-deleted": "оставлено как есть. Звук удалён по настройке хранения",
+    "kept-retained": (
+        "оставлено как есть. Звук хранится до {date} — до этого встречу можно разделить"
+    ),
+    "kept-pending": "оставлено как есть. Звук удаляется по настройке хранения",
+    "recovery_error": "не удалось завершить — программа повторит попытку сама",
+    "readError": "Не удалось прочитать расшифровку. Попробуйте ещё раз.",
+    "again": "Разделить заново",
+    "divide": "Разделить по голосам",
+    "cancel": "Отменить",
+    "keep": "Оставить так",
+    "againName": "Разделить собеседников по голосам заново",
+    "divideName": "Разделить собеседников этой встречи по голосам",
+    "cancelName": "Отменить разделение по голосам",
+    "keepName": "Оставить без разделения по голосам",
+    "keepDeleteDescription": "Звук удалится сразу, разделить заново будет нельзя",
+    "keepRetainDescription": "Звук будет храниться до {date}",
+    "divideDescription": "Звук хранится до {date}",
+    "namesLater": "Имена можно вписать после разделения по голосам.",
+    "progressName": "Разделение по голосам",
+    "badge": "Разделение по голосам · {percent} %",
+    "warningHeading": "Разделить заново",
+    "warningTitle": "Разделить встречу „{title}“ по голосам заново?",
+    "warningText": (
+        "Имена участников и объединения «Это один человек» сбросятся: номера спикеров "
+        "могут поменяться, поэтому имена не переносятся сами."
+    ),
+    "warningNames": " Сейчас заданы: {names}.",
+    "warningCaption": (
+        "Пока идёт разделение, встречу можно читать и сохранять. Если отменить или "
+        "разделить не получится — всё останется как сейчас."
+    ),
+    "warningCancel": "Отмена",
+    "exit": "Разделение продолжится; если разделение не успело — начнётся с начала",
+}
+
+
+def redo_presentation(
+    code: str,
+    percent: int,
+    *,
+    room: bool = False,
+    first: bool = False,
+    date: str = "",
+    installed: bool = False,
+    separated: bool = False,
+) -> dict[str, str | int | bool]:
+    """Literal row and accessibility text, independent of transient worker replies."""
+    key = code
+    if code == "running" and first:
+        key = "running-first"
+    elif code == "offer" and installed:
+        key = "offer-installed"
+    elif code == "cancelled" and separated:
+        key = "cancelled-named"
+    elif code in {"kept-7", "kept-30", "kept-retained"}:
+        key = "kept-retained"
+    labels = "все реплики подписаны «Участники»" if room else "собеседники подписаны «Собеседники»"
+    text = REDO_TEXTS.get(key, "").format(labels=labels, percent=percent, date=date)
+    if text and key not in {"done", "offer-installed"}:
+        text = REDO_TEXTS["prefix"] + text
+    error = code in {"failed", "failed-again", "redo-failed", "recovery_error"}
+    success = code == "done" or code.startswith("kept-") or (code == "offer" and installed)
+    return {
+        "code": code,
+        "percent": percent,
+        "text": text,
+        "visible": bool(text),
+        "tone": "danger" if error else "muted",
+        "icon": "alert" if error else "check" if success else "",
+        "iconTone": "danger" if error else "success" if success else "muted",
+        "showProgress": code in {"running", "reconcile"},
+        "progressName": REDO_TEXTS["progressName"],
+    }

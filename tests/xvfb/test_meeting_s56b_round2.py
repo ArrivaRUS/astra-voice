@@ -97,7 +97,8 @@ def test_long_drawer_reveals_tab_targets_and_accepts_mouse_wheel(tmp_path: Path)
 from copy import deepcopy
 from PyQt5.QtCore import QPoint
 from PyQt5.QtGui import QWheelEvent
-names = SpeakerMap(labels={'S'+str(i): Speaker(name='Имя '+str(i)) for i in range(1,11)})
+names = SpeakerMap(labels={'S'+str(i): Speaker(name='Имя '+str(i)) for i in range(1,11)},
+                   transcript_generation=transcript.meeting_generation)
 long_rows = [replace(transcript.utterances[1], id='u'+str(i), seq=i-1, speaker='S'+str(i),
                      start_ms=i*10000, end_ms=i*10000+5000) for i in range(1,11)]
 b._speakers = names
@@ -106,6 +107,7 @@ b._card_transcript = replace(transcript, utterances=long_rows)
 b._card_builder.speakers = names
 b._card_builder.load(long_rows, complete=True)
 b.changed.emit()
+assert b.card['namesEditable']
 window.setWidth(716); window.setHeight(520)
 one('probeCard').setProperty('width',672)
 QTest.qWait(50)
@@ -184,5 +186,52 @@ assert expected
 numbers = [i.property('num') for i in items('meetingSavePreviewNumber')]
 assert numbers==expected, (numbers,expected)
 QMetaObject.invokeMethod(dialog,'close')
+""",
+    )
+
+
+def test_loaded_named_meeting_drawer_fields_accept_tab_and_edits(tmp_path: Path) -> None:
+    """Use the actual disk loader, including its legacy map generation binding."""
+    run_probe(
+        tmp_path,
+        r"""
+long_rows = [replace(transcript.utterances[1], id='u'+str(i), seq=i-1, speaker='S'+str(i),
+                     start_ms=i*10000, end_ms=i*10000+5000) for i in range(1,11)]
+saved_text = replace(transcript, utterances=long_rows,
+                     transcript_revision=transcript.transcript_revision+1)
+saved_names = SpeakerMap(labels={'S'+str(i): Speaker(name='Имя '+str(i))
+                                for i in range(1,11)})
+rig.store.write(meeting.id, 'transcript.json', saved_text, writer=Writer.TRANSCRIBE)
+rig.store.write(meeting.id, 'speakers.json', saved_names, writer=Writer.GUI)
+b.retryCard()
+while rig.tasks:
+    rig.tasks.pop(0)()
+b._card_poll()
+assert b.card['namesEditable'] and b._card_meeting().rediar is None
+assert b._speakers.transcript_generation == saved_text.meeting_generation
+window.setWidth(716); window.setHeight(520)
+one('probeCard').setProperty('width',672)
+QTest.qWait(50)
+click(one('meetingCardNames'))
+drawer = window.findChild(QObject,'meetingParticipantsDrawer')
+wait(lambda: drawer.property('opened'), 'loaded drawer opens')
+wait(lambda: len(fields())==10, 'ten loaded name fields')
+for index in range(10):
+    field = fields()[index]
+    wait(lambda: field.hasActiveFocus(), 'Tab reaches loaded S'+str(index+1))
+    assert field.isEnabled()
+    if index == 0:
+        QTest.keyClick(window, Qt.Key_A, Qt.ControlModifier)
+        QTest.keyClick(window, Qt.Key_Z)
+        wait(lambda: b.card['participants'][1]['name']=='z', 'loaded name edits')
+        assert field.hasActiveFocus()
+        assert b.flushSpeakerWrites()
+        assert rig.store.read(meeting.id, 'speakers.json').labels['S1'].name == 'z'
+        assert b.cardRows.get(0)['who']=='z'
+        assert 'z' in b.savePreviewText('txt')
+    QTest.keyClick(window, Qt.Key_Tab)
+wait(lambda: one('meetingMergeOpen').hasActiveFocus(), 'loaded names Tab reaches merge')
+QTest.keyClick(window, Qt.Key_Escape)
+wait(lambda: not drawer.property('opened'), 'close loaded drawer')
 """,
     )

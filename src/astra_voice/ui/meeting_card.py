@@ -108,6 +108,7 @@ TEXTS = {
     ),
     "readError": "Не удалось прочитать папку встреч. Проверьте, что диск подключён и доступен.",
     "retry": "Повторить",
+    "audioDeleting": "звук удаляется по настройке хранения",
     # D4 «Сохранить как…» (spec §4.7; four local templates, .md/.txt).
     "saveTitle": "Сохранить как — ",
     "previewDuration": "Длительность ",
@@ -626,17 +627,9 @@ def subtitle(meeting: Meeting, view: str) -> dict[str, Any]:
     if view == "transcribing":
         suffix += " · звук хранится до конца расшифровки"
     elif meeting.state == MeetingState.DONE:
-        if not meeting.audio.present:
-            suffix += " · звук удалён"
-        elif meeting.transcription.finished_at and meeting.audio.retain_days:
-            finished = _local(meeting.transcription.finished_at)
-            if finished is not None:
-                try:
-                    until = finished + timedelta(days=meeting.audio.retain_days)
-                except OverflowError:
-                    until = None
-                if until is not None:
-                    suffix += f" · звук хранится до {until:%d.%m}"
+        storage = audio_storage(meeting)
+        if storage:
+            suffix += " · " + storage
     return {"prefix": f"{span} · " if span else "", "mono": duration, "suffix": suffix}
 
 
@@ -984,3 +977,31 @@ def presentation(
         "policyOff": policy_off and table,
         "panel": panel(meeting, view, can_transcribe=can_transcribe, failure=failure),
     }
+
+
+def audio_expiry(meeting: Meeting) -> str:
+    """The actual disk retention clock, also used by list rows and accessibility."""
+    if meeting.cleanup_pending or not meeting.audio.present:
+        return ""
+    finished = _local(meeting.transcription.finished_at)
+    if finished is None or not meeting.audio.retain_days:
+        return ""
+    try:
+        return f"{finished + timedelta(days=meeting.audio.retain_days):%d.%m}"
+    except OverflowError:
+        return ""
+
+
+def audio_storage(meeting: Meeting, *, short: bool = False) -> str:
+    if not meeting.audio.present:
+        return "звук удалён"
+    if meeting.cleanup_pending:
+        return TEXTS["audioDeleting"]
+    if meeting.rediar is not None:
+        return "звук хранится до конца разделения"
+    if meeting.transcription.diar_status == "failed":
+        return "звук хранится до разделения"
+    date = audio_expiry(meeting)
+    if date:
+        return f"звук до {date}" if short else f"звук хранится до {date}"
+    return ""  # cleanup_pending is not proof of deletion

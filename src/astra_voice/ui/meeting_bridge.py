@@ -36,6 +36,7 @@ from astra_voice.meetings.model import (
     Transcript,
     normalize_self_label,
     normalize_text,
+    published_generation,
 )
 from astra_voice.meetings.policy import RecordMode, parse_policy, validate_endpoint
 from astra_voice.meetings.settings_ext import (
@@ -62,12 +63,14 @@ from astra_voice.ui.meeting_texts import (
     DELETE_TEXTS,
     DIAR_INSTALL_TEXTS,
     EXIT_TEXTS,
+    REDO_TEXTS,
     RENAME_TEXTS,
     RESPONSIBILITY_ITEMS,
     TEXTS,
     W2_TEXTS,
     W4_TEXTS,
     diar_install_presentation,
+    redo_presentation,
 )
 
 RENAME_ACTION = "Переименовать"
@@ -214,6 +217,32 @@ class _SpeakerWrite:
     text: str
 
 
+@dataclass(frozen=True)
+class _CardRead:
+    serial: int
+    transcript: Transcript | None
+    speakers: SpeakerMap | None = None
+    failed: bool = False
+    speaker_revision: int = -1
+
+
+def _legacy_base_matches(store: Any, meeting: Meeting, transcript: Transcript) -> bool:
+    """I-3: check the exact private bytes used by the enqueue descriptor."""
+    if meeting.rediar is None:
+        return transcript.meeting_generation == published_generation(meeting)
+    if transcript.meeting_generation != published_generation(meeting):
+        return False
+    try:
+        state = store.transcript_state(meeting.id)
+        return bool(
+            state.digest == meeting.rediar.base_sha256
+            and state.generation == transcript.meeting_generation
+            and state.revision == transcript.transcript_revision
+        )
+    except Exception:
+        return False
+
+
 class MeetingBridge(QObject):
     changed = pyqtSignal()
     enabledChanged = pyqtSignal(bool)
@@ -270,6 +299,7 @@ class MeetingBridge(QObject):
         self._speaker_busy = False
         self._speaker_closing = False
         self._speaker_pending = 0
+        self._speaker_revision = 0
         self._speaker_writes: deque[_SpeakerWrite] = deque()
         self._speaker_writer = MetadataWriter()
         self._speaker_results: queue.SimpleQueue[tuple[_SpeakerWrite, bool]] = queue.SimpleQueue()
@@ -308,9 +338,12 @@ class MeetingBridge(QObject):
         self._card_loaded = self._card_error = False
         self._card_transcript: Transcript | None = None
         self._card_serial = 0
-        self._card_results: queue.SimpleQueue[tuple[int, Transcript | None, bool]] = (
+        self._card_results: queue.SimpleQueue[_CardRead | tuple[int, Transcript | None, bool]] = (
             queue.SimpleQueue()
         )
+        self._redo_local: dict[str, str] = {}
+        self._redo_requests: dict[str, tuple[int, str]] = {}
+        self._redo_progress: dict[str, tuple[int, int]] = {}
         self._card_timer = QTimer(self)
         self._card_timer.setInterval(20)
         self._card_timer.timeout.connect(self._card_poll)
@@ -627,20 +660,17 @@ class MeetingBridge(QObject):
         elif state == MeetingState.INTERRUPTED:
             subtitle = f"Сохранено {duration} — программа закрылась во время записи"
         elif state == MeetingState.DONE:
-            if not meeting.audio.present:
-                subtitle += " · звук удалён"
-            elif meeting.transcription.finished_at and meeting.audio.retain_days:
-                try:
-                    until = datetime.fromisoformat(
-                        meeting.transcription.finished_at.replace("Z", "+00:00")
-                    ) + timedelta(days=meeting.audio.retain_days)
-                except OverflowError:
-                    pass  # A valid year-9999 timestamp may have no representable expiry.
-                else:
-                    subtitle += f" · звук до {until:%d.%m}"
+            storage = meeting_card.audio_storage(meeting, short=True)
+            if storage:
+                subtitle += " · " + storage
         if not self.enabled:
             action = "Открыть" if state == MeetingState.DONE else ""
             actions = ["Сохранить как…", "Удалить"] if state == MeetingState.DONE else ["Удалить"]
+        redo = self._redo_snapshot(meeting)
+        if redo["busy"]:
+            progress = int(redo["percent"])
+            badge, kind = REDO_TEXTS["badge"].format(percent=progress), "warning"
+            actions = [a for a in actions if a != "Имена участников"]
         saving = bool(
             self._capture is not None
             and self._capture.controller.meeting is not None
@@ -660,7 +690,7 @@ class MeetingBridge(QObject):
             "subtitle": subtitle,
             "badge": badge,
             "badgeKind": kind,
-            "badgeIcon": "" if saving else _BADGE_ICONS.get(state, ""),
+            "badgeIcon": "" if saving else "clock" if redo["busy"] else _BADGE_ICONS.get(state, ""),
             "openable": not saving and state in CARD_STATES,
             "action": action,
             "actionEnabled": bool(
@@ -682,6 +712,7 @@ class MeetingBridge(QObject):
             "progress": progress,
             "active": not saving and state in {MeetingState.RECORDING, MeetingState.PAUSED},
             "transcribing": state == MeetingState.TRANSCRIBING,
+            "diarizationRedo": redo,
         }
 
     @pyqtSlot()
@@ -902,6 +933,7 @@ class MeetingBridge(QObject):
     def _capture_changed(self) -> None:
         self._overlay_capture()
         self._sync_card()
+        self._observe_redo_results()
         if self._exit_confirm and not self._exit_needs_confirmation():
             # The recording ended by itself: the question no longer applies.
             self._exit_confirm = False
@@ -1139,6 +1171,9 @@ class MeetingBridge(QObject):
         self.setSaveExcludeEcho(False)
         self._diar_card_installed = ""
         self.refreshDiarizationModels()
+        self._clear_redo_outcome()
+        self._card_builder = None
+        self._card_loaded = False
         self._card_id = meeting_id
         self._card_key = None
         self._card_save_error = ""
@@ -1173,6 +1208,7 @@ class MeetingBridge(QObject):
             self.savePreviewOpenChanged.emit()
         self.setSaveExcludeEcho(False)
         self._diar_card_installed = ""
+        self._clear_redo_outcome()
         self._card_id = ""
         self._card_key = None
         self._card_builder = None
@@ -1349,6 +1385,18 @@ class MeetingBridge(QObject):
         result["diarizationInstallVisible"] = show
         result["diarizationHint"] = self._diar_install["cardText"] if show else ""
         result["diarizationAction"] = self._diar_install["action"] if show else ""
+        redo = self._redo_snapshot(meeting)
+        result["diarizationRedo"] = redo
+        result["expectedGeneration"] = redo["expectedGeneration"]
+        if redo["busy"]:
+            result["badge"] = {
+                "text": REDO_TEXTS["badge"].format(percent=redo["percent"]),
+                "kind": "warning",
+                "icon": "clock",
+            }
+            result["namesHint"] = REDO_TEXTS["namesLater"]
+        if redo["visible"]:
+            result["diarizationInstallVisible"] = False
         return result
 
     def _sync_card(self) -> None:
@@ -1362,7 +1410,14 @@ class MeetingBridge(QObject):
             self._card_rows.reset()
             self.savePreviewChanged.emit()
             return
-        key = (str(meeting.state), meeting.meeting_generation)
+        generation = published_generation(meeting)
+        if (
+            meeting.rediar is not None
+            and self._card_transcript is not None
+            and self._card_transcript.meeting_generation == meeting.meeting_generation
+        ):
+            generation = meeting.meeting_generation  # K3 observed before K6
+        key = (str(meeting.state), generation)
         if key != self._card_key:
             previous, self._card_key = self._card_key, key
             live = (str(MeetingState.TRANSCRIBING), meeting.meeting_generation)
@@ -1379,6 +1434,15 @@ class MeetingBridge(QObject):
                 self._card_tail = True
                 self._load_transcript(meeting)
                 self.savePreviewChanged.emit()
+                return
+            if (
+                meeting.state == MeetingState.DONE
+                and self._card_loaded
+                and self._card_builder is not None
+                and not self._card_error
+            ):
+                # I-4: keep the entire previous pair while the new pair is being read.
+                self._load_transcript(meeting)
                 return
             self._card_tail = False
             self._card_builder = CardRows(meeting, self._card_rows)
@@ -1419,32 +1483,81 @@ class MeetingBridge(QObject):
     def _load_transcript(self, meeting: Meeting) -> None:
         self._card_serial += 1
         serial, output = self._card_serial, self._card_results
+        speaker_revision = self._speaker_revision
         store, meeting_id = self._store, meeting.id
-        generation = meeting.meeting_generation
         root = getattr(store, "root", None)
 
         def work() -> None:
             reader = getattr(store, "read", None)
-            transcript: Transcript | None = None
-            failed = False
-            if reader is None:
-                failed = True
-            else:
-                try:
-                    value = reader(meeting_id, "transcript.json")
-                    if isinstance(value, Transcript):
-                        transcript = value
-                except Exception:
-                    missing = root is not None and not os.path.lexists(
-                        Path(root) / meeting_id / "transcript.json"
-                    )
-                    failed = not missing  # no transcript yet is not an error
-            if transcript is not None:
-                if transcript.meeting_id != meeting_id:
-                    transcript, failed = None, True
-                elif transcript.meeting_generation != generation:
-                    transcript = None  # a previous run is not a read error
-            output.put((serial, transcript, failed))
+            result = _CardRead(serial, None, failed=True)
+            if reader is not None:
+                for attempt in range(3):
+                    try:
+                        current = reader(meeting_id, "meeting.json")
+                        if not isinstance(current, Meeting) or current.id != meeting_id:
+                            break
+                        transcript = reader(meeting_id, "transcript.json")
+                        if not isinstance(transcript, Transcript):
+                            break
+                        try:
+                            saved = reader(meeting_id, "speakers.json")
+                        except Exception:
+                            saved = None  # Optional names are never repaired on read.
+                        after = reader(meeting_id, "meeting.json")
+                        verify = reader(meeting_id, "transcript.json")
+                        if not isinstance(after, Meeting) or after.id != meeting_id:
+                            continue
+                        if current != after or transcript != verify:
+                            continue
+                        accepted = transcript.meeting_id == meeting_id and (
+                            transcript.meeting_generation == published_generation(after)
+                            or (
+                                after.state == MeetingState.DONE
+                                and transcript.labels_final
+                                and transcript.meeting_generation == after.meeting_generation
+                            )
+                        )
+                        if not accepted:
+                            if after.state != MeetingState.DONE:
+                                result = _CardRead(serial, None)
+                            continue
+                        bound = isinstance(saved, SpeakerMap) and (
+                            saved.transcript_generation == transcript.meeting_generation
+                            or (
+                                saved.transcript_generation is None
+                                and _legacy_base_matches(store, after, transcript)
+                            )
+                        )
+                        if isinstance(saved, SpeakerMap) and not bound:
+                            if attempt < 2:
+                                continue
+                            # K3 before K4: only the NEW final text may lose stale names.
+                            if not (
+                                transcript.labels_final
+                                and transcript.meeting_generation == after.meeting_generation
+                                and (
+                                    after.rediar is None
+                                    or transcript.meeting_generation != published_generation(after)
+                                )
+                                and (
+                                    saved.transcript_generation is None
+                                    or saved.transcript_generation < transcript.meeting_generation
+                                )
+                            ):
+                                continue
+                        names = speaker_ops.speaker_map(
+                            transcript.utterances, saved if bound else None
+                        )
+                        names.transcript_generation = transcript.meeting_generation
+                        result = _CardRead(serial, transcript, names)
+                        break
+                    except Exception:
+                        missing = root is not None and not os.path.lexists(
+                            Path(root) / meeting_id / "transcript.json"
+                        )
+                        if missing and meeting.state != MeetingState.DONE:
+                            result = _CardRead(serial, None)
+            output.put(replace(result, speaker_revision=speaker_revision))
 
         self._submit(work)
         self._card_timer.start()
@@ -1453,19 +1566,43 @@ class MeetingBridge(QObject):
         if self._closed:
             self._card_timer.stop()
             return
-        try:
-            serial, transcript, failed = self._card_results.get_nowait()
-        except queue.Empty:
-            return
-        if serial != self._card_serial:
-            return
+        if self._speaker_pending:
+            return  # A read may predate an accepted name that is still being written.
+        while True:
+            try:
+                result = self._card_results.get_nowait()
+                if isinstance(result, tuple):  # Existing live-publication seam.
+                    result = _CardRead(result[0], result[1], failed=result[2])
+                serial, transcript, failed = result.serial, result.transcript, result.failed
+            except queue.Empty:
+                return
+            if serial == self._card_serial:
+                break  # Retire stale reads before adopting the current completed pair.
+            if not self._card_loaded:
+                return  # Preserve the deferred initial «Save as» delivery contract.
         self._card_timer.stop()
         meeting = self._card_meeting()
         if meeting is None or self._card_builder is None:
             return
+        if result.speaker_revision >= 0 and result.speaker_revision != self._speaker_revision:
+            # Never combine a stale map with newer optimistic or committed names.
+            # Re-read the whole pair, retaining the completed snapshot until it arrives.
+            self._load_transcript(meeting)
+            return
+        if failed and self._card_loaded and self._card_transcript is not None:
+            # Keep the completed pair; retry is explicit, never a partial names update.
+            self._card_save_error = REDO_TEXTS["readError"]
+            self.changed.emit()
+            return
+        self._card_save_error = ""
         self._card_transcript = transcript
         self._card_loaded, self._card_error = True, failed
-        self._read_speakers(meeting)
+        self._speakers = result.speakers or SpeakerMap()
+        self._saved_speakers = deepcopy(self._speakers)
+        self._speaker_group = _SpeakerGroup()
+        self._speakers_error = False
+        if transcript is not None:
+            self._card_key = (str(meeting.state), transcript.meeting_generation)
         utterances = visible_utterances(transcript)
         done = meeting.state == MeetingState.DONE
         tail, self._card_tail = self._card_tail, False
@@ -1477,12 +1614,12 @@ class MeetingBridge(QObject):
         if meeting.state == MeetingState.TRANSCRIBING:
             self._append_live(meeting)
         self.savePreviewChanged.emit()
+        self._observe_redo_results()
         self.changed.emit()
         self._flush_card_save()
 
     def _published_names(self) -> bool:
         meeting, transcript = self._card_meeting(), self._card_transcript
-        jobs = self._jobs()
         return bool(
             meeting is not None
             and meeting.state == MeetingState.DONE
@@ -1493,30 +1630,14 @@ class MeetingBridge(QObject):
             and not self._card_tail
             and transcript is not None
             and transcript.labels_final
-            and transcript.meeting_generation == meeting.meeting_generation
+            and self._speakers.transcript_generation == transcript.meeting_generation
             and transcript.reconcile.status == PhaseStatus.DONE
             and transcript.reconcile.pending is None
             and transcript.reconcile.inflight_id is None
-            and (jobs is None or not jobs.names_busy(meeting.id))
         )
 
     def _display_speakers(self) -> SpeakerMap | None:
         return self._speakers if self._published_names() and not self._speakers_error else None
-
-    def _read_speakers(self, meeting: Meeting) -> None:
-        saved: SpeakerMap | None = None
-        reader = getattr(self._store, "read", None)
-        if reader is not None and meeting.state == MeetingState.DONE:
-            try:
-                value = reader(meeting.id, "speakers.json")
-                saved = value if isinstance(value, SpeakerMap) else None
-            except Exception:
-                pass  # Corrupt/unreadable optional names are ignored, never repaired on read.
-        rows = self._card_transcript.utterances if self._card_transcript is not None else ()
-        self._speakers = speaker_ops.speaker_map(rows, saved)
-        self._saved_speakers = deepcopy(self._speakers)
-        self._speaker_group = _SpeakerGroup()
-        self._speakers_error = False
 
     def _names_editable(self) -> bool:
         meeting = self._card_meeting()
@@ -1528,6 +1649,8 @@ class MeetingBridge(QObject):
             and self._parsed.recording_allowed
             and meeting is not None
             and not meeting.cancelled
+            and meeting.rediar is None
+            and (self._jobs() is None or not self._jobs().names_busy(meeting.id))
             and meeting.id not in self._delete_pending
             and (self._jobs() is None or meeting.id not in self._jobs().tombstones)
         )
@@ -1604,6 +1727,7 @@ class MeetingBridge(QObject):
 
     def _apply_speakers(self, updated: SpeakerMap) -> None:
         """Optimistic view/rollback; normal renames never reset the reply model."""
+        self._speaker_revision += 1
         previous = self._speakers
         self._speakers = updated
         builder = self._card_builder
@@ -1684,6 +1808,15 @@ class MeetingBridge(QObject):
                 ok = False
                 if not write.group.failed.is_set():
                     try:
+                        jobs = self._jobs()
+                        if jobs is not None and jobs.names_busy(write.meeting_id):
+                            raise RuntimeError("meeting-names-busy")
+                        reader = getattr(store, "read", None)
+                        if reader is None:
+                            raise RuntimeError("meeting-reader-unavailable")
+                        current = reader(write.meeting_id, "meeting.json")
+                        if current.rediar is not None:
+                            raise RuntimeError("meeting-names-busy")
                         write_file = getattr(store, "write", None)
                         if write_file is None:
                             raise RuntimeError("meeting-writer-unavailable")
@@ -1779,12 +1912,14 @@ class MeetingBridge(QObject):
                 except queue.Empty:
                     break
                 self._speaker_pending -= 1
+                self._speaker_revision += 1  # Also retire reads made during the write.
                 meeting = self._card_meeting()
                 current = (
                     meeting is not None
                     and meeting.id == write.meeting_id
-                    and meeting.meeting_generation == write.generation
-                    and self._published_names()
+                    and self._card_transcript is not None
+                    and self._card_transcript.meeting_generation
+                    == write.speakers.transcript_generation
                 )
                 if current and ok:
                     self._saved_speakers = write.speakers
@@ -2027,6 +2162,325 @@ class MeetingBridge(QObject):
                 if meeting is not None and not meeting.transcription.diarization:
                     self._diar_card_installed = meeting.id
         self._publish_diar_install()
+
+    def _clear_redo_outcome(self) -> None:
+        jobs = self._jobs()
+        if jobs is not None:
+            jobs.redo_results.pop(self._card_id, None)
+        self._redo_local.pop(self._card_id, None)
+
+    def _observe_redo_results(self) -> None:
+        """Turn a failed enqueue into the same card-local outcome as a failed run.
+
+        Requests outlive D4 and card navigation while the queue still owns them;
+        terminal outcomes use the existing close-card lifetime, independently of exports.
+        """
+        if not self._redo_requests or self._closed:
+            return
+        jobs = self._jobs()
+        if jobs is None:
+            return
+        meetings = {meeting.id: meeting for meeting in self._documents}
+        meetings.update(jobs.meetings)
+        for meeting_id, (generation, outcome) in list(self._redo_requests.items()):
+            meeting = meetings.get(meeting_id)
+            if (
+                meeting is None
+                or meeting_id in jobs.tombstones
+                or published_generation(meeting) != generation
+                or meeting.rediar is not None
+            ):
+                self._redo_requests.pop(meeting_id, None)
+                continue
+            snapshot = jobs.redo_snapshot(meeting_id)
+            if snapshot.get("outcome"):
+                self._redo_requests.pop(meeting_id, None)
+            elif not snapshot.get("busy") and jobs.failures.get(meeting_id) == "io":
+                self._redo_local[meeting_id] = outcome
+                self._redo_requests.pop(meeting_id, None)
+
+    def _redo_snapshot(self, meeting: Meeting) -> dict[str, Any]:
+        jobs = self._jobs()
+        snapshot = jobs.redo_snapshot(meeting.id) if jobs is not None else {}
+        busy = bool(snapshot.get("busy") or meeting.rediar is not None)
+        status = snapshot.get("status", "")
+        separated = (
+            meeting.transcription.diarization and meeting.transcription.diar_status == "done"
+        )
+        failed = meeting.transcription.diar_status == "failed"
+        available = bool(
+            self.enabled
+            and self._effective().settings.meeting_diarization
+            and self._diar_code == "installed"
+            and meeting.audio.present
+            and not meeting.cleanup_pending
+            and not meeting.cancelled
+            and meeting.state == MeetingState.DONE
+            and meeting.id not in self._delete_pending
+            and (jobs is None or meeting.id not in jobs.tombstones)
+        )
+        outcome = self._redo_local.get(meeting.id, "") or snapshot.get("outcome", "")
+        percent = max(0, min(100, int(snapshot.get("percent", 0))))
+        if busy:
+            old_generation, old_percent = self._redo_progress.get(meeting.id, (-1, 0))
+            if old_generation == meeting.meeting_generation:
+                percent = max(percent, old_percent)
+            self._redo_progress[meeting.id] = (meeting.meeting_generation, percent)
+            code = (
+                "recovery_error"
+                if status == "recovery_error"
+                else "queued"
+                if status == "queued"
+                else "wait-memory"
+                if status == "waiting_memory"
+                else "reconcile"
+                if snapshot.get("stage") == "reconcile" or status == "committing"
+                else "running"
+            )
+        elif outcome:
+            code = str(outcome)
+            if code == "cancelled" and not failed and not separated:
+                code = "offer" if available else ""
+            if code == "kept":
+                code = (
+                    "kept-deleted"
+                    if not meeting.audio.present
+                    else "kept-pending"
+                    if meeting.cleanup_pending
+                    else f"kept-{meeting.audio.retain_days}"
+                    if meeting.audio.retain_days in {7, 30}
+                    else "kept-retained"
+                )
+        elif meeting.state == MeetingState.DONE and failed:
+            code = "failed" if meeting.audio.present else "no-audio"
+        elif (
+            available
+            and not separated
+            and not meeting.transcription.diarization
+            and meeting.processing_status.value == "succeeded"
+        ):
+            code = "offer"
+        else:
+            code = ""
+        if not busy and meeting.cleanup_pending:
+            code = "no-audio" if failed else ""
+        elif not busy and not meeting.audio.present:
+            if failed:
+                code = "no-audio"
+            elif not separated:
+                if code in {"failed-again", "cancelled", "offer"}:
+                    code = ""
+                elif code.startswith("kept-"):
+                    # §Р.2б keeps the immediate zero-day receipt; an expired offer
+                    # under §Р.2а disappears, even while its transient outcome lives.
+                    code = "kept-deleted" if meeting.audio.retain_days == 0 else ""
+        date = meeting_card.audio_expiry(meeting)
+        state: dict[str, Any] = dict(
+            redo_presentation(
+                code,
+                percent,
+                room=meeting.variant == "mic_only",
+                first=not separated and not failed,
+                date=date,
+                installed=self._diar_card_installed == meeting.id,
+                separated=separated,
+            )
+        )
+        if code == "no-audio" and meeting.cleanup_pending and meeting.audio.present:
+            state["text"] = REDO_TEXTS["prefix"] + meeting_card.TEXTS["audioDeleting"]
+        generation = (
+            self._card_transcript.meeting_generation
+            if meeting.id == self._card_id and self._card_transcript is not None
+            else published_generation(meeting)
+        )
+        names = self._display_speakers() if meeting.id == self._card_id else None
+        warning = bool(names and any(r.name or r.merged_into for r in names.labels.values()))
+        listed_names = ", ".join(r.name for r in names.labels.values() if r.name) if names else ""
+        can_start = available and not busy and jobs is not None
+        can_keep = bool(
+            not busy
+            and meeting.state == MeetingState.DONE
+            and meeting.audio.present
+            and not meeting.cleanup_pending
+            and (failed or code == "failed-again")
+            and jobs is not None
+        )
+        action = (
+            "cancel"
+            if busy and code != "recovery_error"
+            else "again"
+            if can_start and code in {"failed", "failed-again", "cancelled"}
+            else "divide"
+            if can_start and (code == "offer" or code.startswith("kept-"))
+            else ""
+        )
+        retain = self._effective().settings.meeting_audio_retention_days
+        try:
+            now = jobs.wall_clock() if jobs is not None else datetime.now().astimezone()
+            keep_date = f"{now.astimezone() + timedelta(days=retain):%d.%m}"
+        except OverflowError:
+            keep_date = ""
+        state.update(
+            {
+                "meetingId": meeting.id,
+                "expectedGeneration": generation,
+                "busy": busy,
+                "stage": str(snapshot.get("stage", "")),
+                "canStart": can_start,
+                "canCancel": busy and status not in {"recovery_error", "committing", "cancelling"},
+                "canKeep": can_keep,
+                "menuVisible": available and separated,
+                "menuEnabled": can_start and separated,
+                "menuText": REDO_TEXTS["again"] + ("…" if warning else ""),
+                "needsWarning": warning,
+                "warningTitle": REDO_TEXTS["warningTitle"].format(title=meeting.title),
+                "warningText": REDO_TEXTS["warningText"]
+                + (REDO_TEXTS["warningNames"].format(names=listed_names) if listed_names else ""),
+                "warningCaption": REDO_TEXTS["warningCaption"],
+                "action": REDO_TEXTS[action] if action else "",
+                "actionName": REDO_TEXTS[action + "Name"] if action else "",
+                "actionDescription": (
+                    REDO_TEXTS["divideDescription"].format(date=date)
+                    if action == "divide"
+                    else state["text"]
+                ),
+                "keepAction": REDO_TEXTS["keep"] if can_keep else "",
+                "keepName": REDO_TEXTS["keepName"],
+                "keepDescription": (
+                    REDO_TEXTS["divideDescription"].format(date=date)
+                    if not failed
+                    else REDO_TEXTS["keepRetainDescription"].format(date=keep_date)
+                    if retain
+                    else REDO_TEXTS["keepDeleteDescription"]
+                ),
+                "audioPresent": meeting.audio.present,
+                "cleanupPending": meeting.cleanup_pending,
+                "audioUntil": date,
+                "storageText": meeting_card.audio_storage(meeting),
+                "namesEnabled": self._names_editable() if meeting.id == self._card_id else False,
+                "saveEnabled": meeting.state == MeetingState.DONE,
+                "renameEnabled": meeting.state in meeting_card.RENAME_STATES,
+                "deleteEnabled": meeting.state == MeetingState.DONE,
+            }
+        )
+        return state
+
+    @pyqtProperty("QVariantMap", notify=cardChanged)
+    def diarizationRedo(self) -> dict[str, Any]:
+        meeting = self._card_meeting()
+        return self._redo_snapshot(meeting) if meeting is not None else {}
+
+    @pyqtProperty("QVariantMap", constant=True)
+    def diarizationRedoTexts(self) -> dict[str, str]:
+        return dict(REDO_TEXTS)
+
+    def _redo_target(self, meeting_id: str, expected_generation: int) -> Meeting | None:
+        if (
+            self._closed
+            or self._card_id != meeting_id
+            or self._card_transcript is None
+            or self._card_transcript.meeting_generation != expected_generation
+            or self._jobs() is None
+            or meeting_id in self._delete_pending
+            or meeting_id in self._jobs().tombstones
+        ):
+            return None
+        try:
+            meeting = self._store.read(meeting_id, "meeting.json")  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        return (
+            meeting
+            if (
+                isinstance(meeting, Meeting)
+                and meeting.id == meeting_id
+                and meeting.state == MeetingState.DONE
+                and not meeting.cancelled
+                and published_generation(meeting) == expected_generation
+            )
+            else None
+        )
+
+    def _start_redo(self, meeting_id: str, expected_generation: int, *, confirmed: bool) -> bool:
+        self.refreshDiarizationModels()
+        meeting = self._redo_target(meeting_id, expected_generation)
+        if meeting is None or not self.flushSpeakerWrites():
+            return False
+        # Re-read after the names barrier: policy, disk and the open card may have changed.
+        meeting = self._redo_target(meeting_id, expected_generation)
+        if meeting is None:
+            return False
+        state = self._redo_snapshot(meeting)
+        if (
+            not state["canStart"]
+            or self._jobs().names_busy(meeting_id)
+            or (state["needsWarning"] and not confirmed)
+            or self._diar_models_provider() is None
+        ):
+            return False
+        self._redo_local.pop(meeting_id, None)
+        self._redo_progress.pop(meeting_id, None)
+        separated = (
+            meeting.transcription.diarization and meeting.transcription.diar_status == "done"
+        )
+        self._redo_requests[meeting_id] = (
+            expected_generation,
+            "redo-failed" if separated else "failed-again",
+        )
+        self._jobs().failures.pop(meeting_id, None)  # Only errors of this new attempt count.
+        self._jobs().rediarize(meeting_id)
+        self._observe_redo_results()
+        self.changed.emit()
+        return True
+
+    @pyqtSlot(str, int, bool, result=bool)
+    def rediarizeMeeting(self, meeting_id: str, expected_generation: int, confirmed: bool) -> bool:
+        return self._start_redo(meeting_id, expected_generation, confirmed=confirmed)
+
+    @pyqtSlot(str, int, result=bool)
+    def divideMeeting(self, meeting_id: str, expected_generation: int) -> bool:
+        meeting = self._redo_target(meeting_id, expected_generation)
+        if meeting is None or meeting.transcription.diarization:
+            return False
+        return self._start_redo(meeting_id, expected_generation, confirmed=False)
+
+    @pyqtSlot(str, int, result=bool)
+    def cancelDiarizationRedo(self, meeting_id: str, expected_generation: int) -> bool:
+        meeting = self._redo_target(meeting_id, expected_generation)
+        if meeting is None or not self._redo_snapshot(meeting)["canCancel"]:
+            return False
+        self._jobs().cancel(meeting_id)
+        self.changed.emit()
+        return True
+
+    @pyqtSlot(str, int, result=bool)
+    def keepDiarizationAsIs(self, meeting_id: str, expected_generation: int) -> bool:
+        meeting = self._redo_target(meeting_id, expected_generation)
+        if meeting is None or not self._redo_snapshot(meeting)["canKeep"]:
+            return False
+        if meeting.rediar is not None or self._jobs().names_busy(meeting_id):
+            return False
+        if meeting.transcription.diar_status != "failed":
+            # §Р.2а: close only the transient error, without touching its retention clock.
+            self._redo_local.pop(meeting_id, None)
+            self._jobs().redo_results.pop(meeting_id, None)
+            self.changed.emit()
+            return True
+        serial = self._card_serial
+
+        def completed(ok: bool) -> None:
+            if (
+                ok
+                and not self._closed
+                and serial == self._card_serial
+                and self._card_id == meeting_id
+            ):
+                self._redo_local[meeting_id] = "kept"
+                self._overlay_capture()
+                self.changed.emit()
+
+        self._jobs().keep_as_is(meeting_id, meeting.meeting_generation, completed)
+        return True
 
     @pyqtSlot()
     def retryCard(self) -> None:

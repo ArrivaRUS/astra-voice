@@ -673,9 +673,9 @@ class MeetingJobs:
                         continue  # delete the meeting once, without a separate audio cleanup
                     if meeting.cleanup_pending and self._audio_succeeded(meeting):
                         updated = self._remove_audio(meeting.id)
-                        if updated is not None:
-                            meeting = updated
-                            updates.append(updated)
+                        meeting = updated or meeting
+                        # Publish the confirmed pending marker even on refusal.
+                        updates.append(meeting)
                     if (
                         self._audio_succeeded(meeting)
                         and meeting.audio.present
@@ -687,8 +687,7 @@ class MeetingJobs:
                         marked = self.store.mark_audio_cleanup(meeting.id, now)
                         if marked is not None:
                             updated = self._remove_audio(meeting.id)
-                            if updated is not None:
-                                updates.append(updated)
+                            updates.append(updated or marked)
                 except (MeetingStoreError, OSError, ValueError):
                     continue  # one private/unreadable meeting cannot stop the pass
 
