@@ -13,7 +13,15 @@ Rectangle {
     property string highlightedSpeaker: ""
     property string operationError: ""
     readonly property var card: bridge && bridge.card !== undefined ? bridge.card : ({})
-    readonly property var participants: card.participants || []
+    readonly property bool redoBusy: !!card.diarizationRedo && card.diarizationRedo.busy === true
+    readonly property var participants: {
+        var source = card.participants || []
+        if (!redoBusy) return source
+        var me = source.filter(function(p) { return p.kind === "me" })
+        var far = source.filter(function(p) { return p.kind !== "me" })
+        if (far.length) me.push({id: "others", kind: "others", label: me.length ? "Собеседники" : "Участники", minutes: far.reduce(function(total, p) { return total + (parseInt(p.minutes, 10) || 0) }, 0) + " мин"})
+        return me
+    }
     readonly property var texts: bridge && bridge.speakerTexts !== undefined ? bridge.speakerTexts : ({})
     readonly property var cardTexts: bridge && bridge.cardTexts !== undefined ? bridge.cardTexts : ({})
     property alias mergeButton: mergeButton
@@ -325,9 +333,35 @@ Rectangle {
                 }
             }
         }
+        Item {
+            objectName: "meetingRedoNamesCaption"
+            visible: root.redoBusy
+            width: parent.width
+            height: visible ? 1 + 8 + namesLater.height * namesLater.scale + 10 : 0
+            Rectangle { width: parent.width; height: 1; color: Theme.borderSoft }
+            FontMetrics { id: redoCaptionMetrics; font: namesLater.font }
+            Text {
+                id: namesLater
+                objectName: root.redoBusy ? "meetingCardNamesLater" : "meetingRedoNamesLater"
+                x: 12; y: 9
+                transform: Translate { y: Math.max(0, (namesLater.lineHeight - redoCaptionMetrics.height) / 2) + 0.5 }
+                transformOrigin: Item.TopLeft
+                scale: Theme.participantsCaptionSize / Math.ceil(Theme.participantsCaptionSize)
+                width: (parent.width - 24) / scale
+                text: root.card.namesHint || ""
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Math.ceil(Theme.participantsCaptionSize)
+                lineHeight: Theme.participantsCaptionSize * Theme.fontBodyLineHeight / scale
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+            }
+        }
         Text {
-            objectName: "meetingCardNamesLater"
-            visible: root.card.live === true || root.participants.some(function(p) { return p.kind === "speaker" })
+            objectName: root.redoBusy ? "meetingIdleNamesLater" : "meetingCardNamesLater"
+            visible: !root.redoBusy && (root.card.live === true || root.participants.some(function(p) { return p.kind === "speaker" }))
             x: Theme.participantsCaptionPaddingX
             width: parent.width - x * 2
             topPadding: root.card.live === true ? Theme.participantsFootPaddingY : Theme.participantsCaptionPaddingTop

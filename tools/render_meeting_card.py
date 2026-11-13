@@ -71,6 +71,74 @@ REFERENCE_BOUNDS.update(
         "section-offline": ("09-diar-install", 100, 3809, 840, 155, 22, 4),
     }
 )
+# 10: measured against both complete 1280 × 10087 sheets. Rejected B/B′
+# proposals are deliberately excluded. Fragments retain their literal origin.
+REFERENCE_BOUNDS.update(
+    {
+        "redo-failed-1024": ("10-rediarize", 312, 329, 840, 552, 22, 12),
+        "redo-failed-900": ("10-rediarize", 374, 1087, 716, 520, 22, 12),
+        "redo-failed": ("10-rediarize", 100, 1728, 840, 149, 22, 14),
+        "redo-room": ("10-rediarize", 100, 1941, 840, 149, 22, 14),
+        "redo-queued": ("10-rediarize", 100, 2154, 840, 138, 22, 14),
+        "redo-wait-memory": ("10-rediarize", 100, 2356, 840, 139, 22, 14),
+        "redo-running": ("10-rediarize", 100, 2559, 840, 139, 22, 14),
+        "redo-reconcile": ("10-rediarize", 100, 2762, 840, 139, 22, 14),
+        "redo-cancelled": ("10-rediarize", 100, 2965, 840, 138, 22, 14),
+        "redo-failed-again": ("10-rediarize", 100, 3167, 840, 149, 22, 14),
+        "redo-no-audio": ("10-rediarize", 100, 3380, 840, 130, 22, 14),
+        "redo-done": ("10-rediarize", 100, 3574, 840, 130, 22, 14),
+        "redo-running-900": ("10-rediarize", 100, 3768, 716, 145, 22, 14),
+        "redo-failed-again-900": ("10-rediarize", 100, 3933, 716, 169, 22, 14),
+        "redo-running-1024": ("10-rediarize", 312, 4197, 840, 552, 22, 12),
+        "redo-menu": ("10-rediarize", 284, 4976, 840, 552, 22, 12),
+        "redo-dialog": ("10-rediarize", 430, 5586, 420, 307, 0, 0),
+        "redo-redo-failed": ("10-rediarize", 100, 5993, 840, 130, 22, 14),
+        "redo-offer": ("10-rediarize", 100, 7794, 840, 209, 22, 4),
+        "redo-offer-installed": ("10-rediarize", 100, 8042, 840, 138, 22, 14),
+        "redo-first": ("10-rediarize", 100, 8219, 840, 139, 22, 14),
+        "redo-before-keep": ("10-rediarize", 100, 8517, 840, 219, 22, 4),
+        "redo-kept-deleted": ("10-rediarize", 100, 8775, 840, 199, 22, 4),
+        "redo-kept-7": ("10-rediarize", 100, 9038, 840, 209, 22, 4),
+        "redo-kept-30": ("10-rediarize", 100, 9311, 840, 209, 22, 4),
+    }
+)
+# Match product content only, excluding the HTML stand's rounded frame/shadow.
+# Rendering retains the original viewport so control widths and wrapping cannot
+# be changed by a crop. Only the final image and reference rectangle are inset.
+REDO_RENDER_BOUNDS = {
+    name: bounds for name, bounds in REFERENCE_BOUNDS.items() if name.startswith("redo-")
+}
+REDO_FULL_VIEWS = {
+    "redo-failed-1024",
+    "redo-failed-900",
+    "redo-running-1024",
+    "redo-menu",
+    "redo-dialog",
+}
+REDO_HEADER_FRAGMENTS = {
+    "redo-offer",
+    "redo-before-keep",
+    "redo-kept-deleted",
+    "redo-kept-7",
+    "redo-kept-30",
+}
+REDO_CROP_INSETS = {
+    name: (8, 2 if name in REDO_HEADER_FRAGMENTS else 8, 8, 8)
+    for name in REDO_RENDER_BOUNDS
+    if name not in REDO_FULL_VIEWS
+}
+for _name, (_left, _top, _right, _bottom) in REDO_CROP_INSETS.items():
+    _sheet, _x, _y, _w, _h, _cx, _cy = REFERENCE_BOUNDS[_name]
+    REFERENCE_BOUNDS[_name] = (
+        _sheet,
+        _x + _left,
+        _y + _top,
+        _w - _left - _right,
+        _h - _top - _bottom,
+        _cx - _left,
+        _cy - _top,
+    )
+
 # No corresponding frame exists in the committed reference. Dimensions describe
 # the requested product viewport; the manifest explicitly records the missing crop.
 MISSING_REFERENCES = {
@@ -81,6 +149,7 @@ MISSING_REFERENCES = {
 # 06 shows state fragments; render the product at its real content width,
 # and compare only the common header/banner/table fragment, not whole frames.
 RENDER_VIEWPORTS = {
+    "redo-dialog": (840, 552),
     "room": (716, 520),
     "no-diarization": (840, 552),
     "policy-off": (716, 520),
@@ -283,6 +352,32 @@ def make_bridge() -> Any:
             percent = 100 if code in {"verifying", "installing", "installed"} else 42
             result = diar_install_presentation(code, percent, "hf")
             return {**result, "visible": True, "accessiblePercent": 100 if percent == 100 else 40}
+
+        @pyqtProperty("QVariantMap", constant=True)
+        def diarizationRedoTexts(self) -> dict[str, str]:  # noqa: N802
+            from astra_voice.ui.meeting_texts import REDO_TEXTS
+
+            return dict(REDO_TEXTS)
+
+        @pyqtSlot(str, int, bool, result=bool)
+        def rediarizeMeeting(self, mid: str, generation: int, confirmed: bool) -> bool:  # noqa: N802
+            self.actions.append(f"redo:{mid}:{generation}:{confirmed}")
+            return True
+
+        @pyqtSlot(str, int, result=bool)
+        def divideMeeting(self, mid: str, generation: int) -> bool:  # noqa: N802
+            self.actions.append(f"divide:{mid}:{generation}")
+            return True
+
+        @pyqtSlot(str, int, result=bool)
+        def cancelDiarizationRedo(self, mid: str, generation: int) -> bool:  # noqa: N802
+            self.actions.append(f"cancel-redo:{mid}:{generation}")
+            return True
+
+        @pyqtSlot(str, int, result=bool)
+        def keepDiarizationAsIs(self, mid: str, generation: int) -> bool:  # noqa: N802
+            self.actions.append(f"keep-redo:{mid}:{generation}")
+            return True
 
         card = pyqtProperty("QVariantMap", _get_card, notify=changed)
         cardRows = pyqtProperty(QObject, _get_rows, constant=True)  # noqa: N815
@@ -705,7 +800,194 @@ def visual_states() -> dict[str, dict[str, Any]]:
             )
         )
     fixtures["save-statistics"]["utterances"] = generated
+    fixtures.update(redo_states())
     return fixtures
+
+
+def redo_states() -> dict[str, dict[str, Any]]:
+    """All accepted visual sections of reference 10; B/B′ are rejected."""
+    from dataclasses import replace
+
+    from astra_voice.meetings.model import Speaker, SpeakerMap
+    from astra_voice.ui.meeting_texts import REDO_TEXTS, redo_presentation
+
+    result = {}
+    for name in REFERENCE_BOUNDS:
+        if not name.startswith("redo-"):
+            continue
+        code = name.removeprefix("redo-")
+        for suffix in ("-1024", "-900"):
+            code = code.removesuffix(suffix)
+        code = {
+            "room": "failed",
+            "before-keep": "failed",
+            "first": "running",
+            "menu": "",
+            "dialog": "",
+            "offer-installed": "offer",
+        }.get(code, code)
+        busy = code in {"queued", "wait-memory", "running", "reconcile"}
+        keep = code in {"failed", "failed-again", "cancelled"}
+        divide = code == "offer" or code in {"kept-7", "kept-30"}
+        action = "cancel" if busy else "again" if keep else "divide" if divide else ""
+        percent = 92 if code == "reconcile" else 35
+        date = "12.12" if code == "kept-30" else "19.11"
+        redo = redo_presentation(
+            code,
+            percent,
+            room=name == "redo-room",
+            first=name == "redo-first",
+            date=date,
+            installed=name == "redo-offer-installed",
+        )
+        redo.update(
+            meetingId=MEETING_ID,
+            expectedGeneration=1,
+            busy=busy,
+            canStart=not busy,
+            canCancel=busy,
+            canKeep=keep,
+            action=REDO_TEXTS.get(action, ""),
+            actionName=REDO_TEXTS.get(action + "Name", ""),
+            actionDescription=redo["text"],
+            keepAction=REDO_TEXTS["keep"] if keep else "",
+            keepName=REDO_TEXTS["keepName"],
+            keepDescription=REDO_TEXTS["keepDeleteDescription"],
+            menuVisible=name in {"redo-menu", "redo-dialog"},
+            menuEnabled=True,
+            menuText="Разделить заново…",
+            needsWarning=True,
+            warningTitle=REDO_TEXTS["warningTitle"].format(title=TITLE),
+            warningText=REDO_TEXTS["warningText"]
+            + REDO_TEXTS["warningNames"].format(names="Ирина Соколова, Олег Ли"),
+            warningCaption=REDO_TEXTS["warningCaption"],
+        )
+        full = name in {
+            "redo-failed-1024",
+            "redo-failed-900",
+            "redo-running-1024",
+            "redo-menu",
+            "redo-dialog",
+        }
+        header = full or name in {
+            "redo-offer",
+            "redo-before-keep",
+            "redo-kept-deleted",
+            "redo-kept-7",
+            "redo-kept-30",
+        }
+        meeting = fixture_meeting()
+        meeting.marks = []
+        meeting.intervals = []
+        result[name] = {
+            "meeting": meeting,
+            "utterances": fixture_utterances() if full else fixture_utterances(LINES[:2]),
+            "redo_focus": "meetingRedoKeep"
+            if name == "redo-before-keep"
+            else "meetingRedoAction"
+            if name
+            in {
+                "redo-failed-1024",
+                "redo-running",
+                "redo-failed-again",
+                "redo-running-1024",
+                "redo-offer",
+                "redo-first",
+                "redo-kept-7",
+            }
+            else "",
+            "redo": redo,
+            "redo_fragment": not header,
+            "redo_header": header,
+            "redo_action": name if name in {"redo-menu", "redo-dialog"} else "",
+        }
+    result["redo-room"]["meeting"].variant = "mic_only"
+    for row in result["redo-room"]["utterances"]:
+        row.speaker = "others"
+    for name in ("redo-menu", "redo-dialog", "redo-redo-failed", "redo-done"):
+        fixture = result[name]
+        fixture["meeting"].transcription.diarization = True
+        fixture["meeting"].transcription.diar_status = "done"
+        fixture["utterances"] = [
+            replace(u, speaker="S1" if u.speaker != "me" else "me") for u in fixture["utterances"]
+        ]
+        fixture["speakers"] = SpeakerMap(
+            labels={
+                "S1": Speaker(name="" if name == "redo-done" else "Ирина Соколова"),
+                "S2": Speaker(name="Олег Ли"),
+            }
+        )
+    for name in ("redo-menu", "redo-dialog"):
+        fixture = result[name]
+        fixture["meeting"] = fixture_meeting()
+        fixture["meeting"].transcription.diarization = True
+        fixture["meeting"].transcription.diar_status = "done"
+        fixture["utterances"] = [
+            replace(u, speaker=w.upper() if w != "me" else "me")
+            for u, (_t, w, _text) in zip(fixture_utterances(LINES[:7]), LINES[:7], strict=True)
+        ]
+        fixture["speakers"] = SpeakerMap(
+            labels={
+                "S1": Speaker(name="Ирина Соколова"),
+                "S2": Speaker(name="Олег Ли"),
+                "S3": Speaker(),
+            }
+        )
+        sys.path.insert(0, str(REPO / "design/meetings/mockups"))
+        from _p3 import SPK
+
+        fixture["panel_fixture"] = SPK
+    return result
+
+
+def apply_redo_fixture(bridge: Any, fixture: dict[str, Any]) -> None:
+    from astra_voice.ui.meeting_texts import REDO_TEXTS
+
+    redo = fixture["redo"]
+    card = bridge._card
+    old_participants = card.get("participants", [])
+    old_marks = card.get("marks", [])
+    card.update(
+        diarizationRedo=redo,
+        diarizationInstallVisible=False,
+        marks=[],
+        namesEditable=False,
+        namesHint=REDO_TEXTS["namesLater"] if redo["busy"] else "",
+    )
+    card["subtitle"]["suffix"] = " · Звонок в DION · " + (
+        "звук хранится до конца разделения"
+        if redo["busy"]
+        else "звук удалён"
+        if redo["code"] in {"kept-deleted", "done", "no-audio"}
+        else "звук хранится до " + ("12.12" if redo["code"] == "kept-30" else "19.11")
+        if redo["code"] == "offer" or redo["code"].startswith("kept-")
+        else "звук хранится до разделения"
+    )
+    if redo["busy"]:
+        card["badge"] = {
+            "kind": "warning",
+            "icon": "clock",
+            "text": REDO_TEXTS["badge"].format(percent=redo["percent"]),
+        }
+    if (
+        fixture.get("redo_fragment")
+        or fixture.get("redo_header")
+        and not fixture.get("redo_action")
+        and len(fixture["utterances"]) == 2
+    ):
+        # Fragments in §2/5/6 have no participants panel or strip.
+        card["participants"] = []
+    else:
+        card["participants"] = [
+            {"kind": "me", "id": "me", "label": "Я", "minutes": "18 мин"},
+            {"kind": "others", "id": "others", "label": "Собеседники", "minutes": "54 мин"},
+        ]
+    if fixture.get("redo_action"):
+        card["participants"] = old_participants
+        card["marks"] = old_marks
+        card["namesEditable"] = True
+        card["subtitle"]["suffix"] = " · Звонок в DION · звук хранится до 19.10"
+    bridge.changed.emit()
 
 
 def d4_preview_fixture(meeting: Any, speakers: Any, *, checked: bool) -> dict[str, Any]:
@@ -816,7 +1098,7 @@ def _jsonable(value: Any) -> Any:
     return value if isinstance(value, str | int | float | bool) or value is None else str(value)
 
 
-def render(out: Path) -> dict[str, Any]:
+def render(out: Path, *, redo_only: bool = False, canon_only: bool = False) -> dict[str, Any]:
     for key in ("DISPLAY", "WAYLAND_DISPLAY", "QT_ACCESSIBILITY", "AT_SPI_BUS_ADDRESS"):
         os.environ.pop(key, None)
     os.environ.update(
@@ -872,18 +1154,27 @@ Window {
     id: window
     property real padX: 22
     property real padY: 12
+    property real clipFrom: 0
+    readonly property real focusInset: Theme.focusOffset + Theme.focusWidth
+    readonly property color focusColor: Theme.stateFocusRing
     width: 840; height: 552
     visible: true
     Rectangle {
         anchors.fill: parent
         color: Theme.bgApp
         clip: true
+        Item {
+            y: window.clipFrom
+            width: parent.width
+            height: parent.height - y
+            clip: true
         MeetingCard {
             id: card
             objectName: "renderCard"
-            x: window.padX; y: window.padY
+            x: window.padX; y: window.padY - window.clipFrom
             width: window.width - window.padX * 2
             bridge: cardBridge
+        }
         }
     }
 }""",
@@ -913,20 +1204,33 @@ Window {
     for theme_name in ("light", "dark"):
         theme.value = theme_name == "dark"
         theme.changed.emit()
-        for name, fixture in visual_states().items():
+        fixtures = redo_states() if redo_only else visual_states()
+        if canon_only:
+            fixtures = {name: f for name, f in fixtures.items() if not name.startswith("redo-")}
+        for name, fixture in fixtures.items():
             if name in REFERENCE_BOUNDS:
-                _sheet, _x, _y, width, height, pad_x, pad_y = REFERENCE_BOUNDS[name]
+                _sheet, _x, _y, width, height, pad_x, pad_y = REDO_RENDER_BOUNDS.get(
+                    name, REFERENCE_BOUNDS[name]
+                )
             else:
                 width, height, _reason = MISSING_REFERENCES[name]
                 pad_x, pad_y = 22, 12
             if name in RENDER_VIEWPORTS:
                 width, height = RENDER_VIEWPORTS[name]
                 pad_x, pad_y = 22, 12
+            window.setProperty(
+                "clipFrom",
+                max(0, pad_y - window.property("focusInset"))
+                if fixture.get("redo_fragment")
+                else 0,
+            )
             window.setProperty("padX", pad_x)
             window.setProperty("padY", pad_y)
             window.setWidth(width)
             window.setHeight(height)
             for popup_name in (
+                "meetingCardMenu",
+                "meetingRediarizeDialog",
                 "meetingSaveDialog",
                 "meetingMergePopover",
                 "meetingParticipantsDrawer",
@@ -964,8 +1268,17 @@ Window {
                     ]
                 )
             apply_panel_fixture(bridge, fixture)
+            if "redo" in fixture:
+                apply_redo_fixture(bridge, fixture)
             QTest.qWait(80)
-            if fixture.get("install_fragment"):
+            if fixture.get("redo_fragment"):
+                row = window.findChild(QObject, "meetingDiarizationRedo")
+                from PyQt5.QtCore import QPointF
+
+                card.setY(
+                    pad_y - window.property("clipFrom") - row.mapToItem(card, QPointF(0, 0)).y()
+                )
+            elif fixture.get("install_fragment"):
                 row = window.findChild(QObject, "meetingDiarizationMissing")
                 from PyQt5.QtCore import QPointF
 
@@ -974,6 +1287,15 @@ Window {
                 card.setY(pad_y)
             from PyQt5.QtCore import QMetaObject
 
+            redo_action = fixture.get("redo_action")
+            if redo_action == "redo-menu":
+                menu = window.findChild(QObject, "meetingCardMenu")
+                QMetaObject.invokeMethod(menu, "open")
+                menu.setProperty("currentIndex", 2)
+            elif redo_action == "redo-dialog":
+                QMetaObject.invokeMethod(
+                    card, "requestRedo", Qt.DirectConnection, Q_ARG("QVariant", None)
+                )
             action = fixture.get("action")
             if action == "names-edit":
                 window.requestActivate()
@@ -1038,7 +1360,7 @@ Window {
                     ),
                 )
                 QTest.qWait(40)
-            if action not in {
+            if not redo_action and action not in {
                 "names-edit",
                 "merge",
                 "save-echo",
@@ -1054,6 +1376,11 @@ Window {
                 ]
                 if leaked:
                     raise RuntimeError(f"Focus leaked into {name}/{theme_name}: {leaked}")
+            if fixture.get("redo_focus"):
+                target = window.findChild(QObject, fixture["redo_focus"])
+                window.requestActivate()
+                target.forceActiveFocus(Qt.TabFocusReason)
+                QTest.qWait(20)
             # Reassert keyboard focus after theme/state changes, in both palettes.
             if action == "merge":
                 window.requestActivate()
@@ -1082,6 +1409,39 @@ Window {
                 raise RuntimeError(f"Invalid image {name}/{theme_name}")
             if warnings:
                 raise RuntimeError("\n".join(warnings))
+            if redo_action == "redo-dialog":
+                dialog = window.findChild(QObject, "meetingRediarizeDialog")
+                image = image.copy(
+                    round(dialog.property("x")),
+                    round(dialog.property("y")),
+                    round(dialog.property("width")),
+                    round(dialog.property("height")),
+                )
+                width, height = image.width(), image.height()
+            crop_rect = None
+            if name in REDO_CROP_INSETS:
+                left, top, right, bottom = REDO_CROP_INSETS[name]
+                crop_rect = {
+                    "x": left,
+                    "y": top,
+                    "width": width - left - right,
+                    "height": height - top - bottom,
+                }
+                background = image.pixelColor(0, 0)
+                image = image.copy(left, top, crop_rect["width"], crop_rect["height"])
+                if any(image.pixelColor(x, 0) != background for x in range(image.width())):
+                    raise RuntimeError(f"Header leaked into content crop: {name}/{theme_name}")
+                if name in {"redo-running", "redo-first"}:
+                    focus_color = window.property("focusColor")
+                    right_strip = range(max(0, image.width() - 124), image.width())
+                    for band in ((2, 3), (37, 38)):
+                        if not any(
+                            image.pixelColor(x, y) == focus_color for y in band for x in right_strip
+                        ):
+                            raise RuntimeError(f"Focus ring clipped: {name}/{theme_name}/{band}")
+                width, height = image.width(), image.height()
+                pad_x -= left
+                pad_y -= top
             filename = f"{name}-{theme_name}.png"
             if not image.save(str(out / filename), "PNG"):
                 raise RuntimeError(f"Cannot write {filename}")
@@ -1090,6 +1450,7 @@ Window {
                 {
                     "file": filename,
                     "kind": "render",
+                    "crop_rect": crop_rect,
                     "scale": 1,
                     "width": width,
                     "height": height,
@@ -1135,8 +1496,26 @@ Window {
                     else None,
                 }
             )
-    rows.extend(render_sections(out, app, theme))
+    if not redo_only:
+        rows.extend(render_sections(out, app, theme))
     rows.extend(reference_crops(out))
+    from PyQt5.QtGui import QImage, QPainter
+
+    for row in list(rows):
+        if row["kind"] != "render" or not row["file"].startswith("redo-"):
+            continue
+        name, palette = row["file"].removesuffix(".png").rsplit("-", 1)
+        actual = QImage(str(out / row["file"]))
+        ref = QImage(str(out / f"{name}-ref-{palette}.png"))
+        pair = QImage(
+            actual.width() + ref.width(), max(actual.height(), ref.height()), QImage.Format_ARGB32
+        )
+        pair.fill(0xFF888888)
+        painter = QPainter(pair)
+        painter.drawImage(0, 0, actual)
+        painter.drawImage(actual.width(), 0, ref)
+        painter.end()
+        pair.save(str(out / f"{name}-{palette}-pair.png"))
     window.hide()
     sip.delete(engine)
     if warnings:
@@ -1344,8 +1723,14 @@ Window { width:840; height:164; visible:true
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True, help="Destination for PNGs and manifest")
+    parser.add_argument(
+        "--redo-only", action="store_true", help="Only accepted reference 10 states"
+    )
+    parser.add_argument("--canon-only", action="store_true", help="Only pre-10 canonical frames")
     options = parser.parse_args()
-    manifest = render(options.out.resolve())
+    manifest = render(
+        options.out.resolve(), redo_only=options.redo_only, canon_only=options.canon_only
+    )
     for row in manifest["pngs"]:
         if row["kind"] != "render":
             print(f"{row['file']}: {row['width']}x{row['height']}")

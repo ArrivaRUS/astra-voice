@@ -19,7 +19,8 @@ Column {
     readonly property bool showList: !loading && (featureEnabled || rows.length > 0) || (bridge && bridge.loadingVisible) || readError
     // E13.M4: карточка встречи A заменяет содержимое раздела (spec §2.6, «← Все встречи»).
     property Item sectionHeaderFocusItem: null
-    readonly property bool cardOpen: bridge ? bridge.cardOpen === true : false
+    property bool listRedoActive: false
+    readonly property bool cardOpen: bridge ? bridge.cardOpen === true && !listRedoActive : false
     width: parent ? parent.width : Theme.sizeContentColMax
     spacing: Theme.spaceGroupGap
     function txt(key, fallback) { return bridge && bridge.texts[key] !== undefined ? bridge.texts[key] : fallback }
@@ -36,6 +37,62 @@ Column {
         // AvDialog's deferred restore may run before or after this one: both use the fresh item.
         renameDialog.returnFocusItem = target
         if (target && target.visible && target.enabled) target.forceActiveFocus(Qt.TabFocusReason)
+    }
+    property var redoListRequest: null
+    property bool listRedoOpening: false
+    property string listRedoMeetingId: ""
+    function requestListRedo(snapshot, origin) {
+        if (!bridge || snapshot.menuEnabled !== true) return
+        listRedoActive = true
+        listRedoMeetingId = snapshot.meetingId
+        redoListRequest = {meetingId: snapshot.meetingId, expectedGeneration: snapshot.expectedGeneration, origin: origin}
+        listRedoOpening = true
+        bridge.openMeeting(snapshot.meetingId)
+        listRedoOpening = false
+        continueListRedo()
+    }
+    function continueListRedo() {
+        if (!redoListRequest || !bridge || listRedoOpening) return
+        var card = bridge.card || ({})
+        var redo = card.diarizationRedo || ({})
+        if (card.id !== redoListRequest.meetingId) { finishListRedo(); return }
+        if (card.view === "loading") return
+        if (card.showTable !== true) {
+            // A terminal read failure belongs on screen, with its retry action.
+            // Keep this card open; only stop the pending list action.
+            redoListRequest = null
+            listRedoActive = false
+            return
+        }
+        if (redo.expectedGeneration !== redoListRequest.expectedGeneration) { finishListRedo(); return }
+        if (redo.meetingId === undefined) return
+        var origin = redoListRequest.origin
+        redoListRequest = null
+        if (redo.needsWarning) {
+            if (!listRedoDialog.visible) listRedoDialog.showWarning(redo, origin)
+        } else {
+            bridge.rediarizeMeeting(redo.meetingId, redo.expectedGeneration, false)
+            finishListRedo()
+        }
+    }
+    function finishListRedo() {
+        var targetId = listRedoMeetingId
+        redoListRequest = null
+        if (bridge && bridge.card.id === targetId) bridge.closeMeeting()
+        listRedoActive = false
+        Qt.callLater(function() {
+            for (var i = 0; i < meetingRows.count; ++i) {
+                var row = meetingRows.itemAt(i)
+                if (row && row.row.id === targetId) row.moreButton.forceActiveFocus(Qt.TabFocusReason)
+            }
+        })
+    }
+    MeetingRediarizeDialog {
+        id: listRedoDialog
+        objectName: "meetingListRediarizeDialog"
+        bridge: root.bridge
+        current: root.bridge && root.bridge.card ? (root.bridge.card.diarizationRedo || ({})) : ({})
+        onClosed: if (root.listRedoActive) root.finishListRedo()
     }
     function value(key, fallback) { return bridge && bridge.settings[key] !== undefined ? bridge.settings[key] : fallback }
     function editable(key) { return bridge ? bridge.locked[key] !== true : true }
@@ -59,6 +116,7 @@ Column {
             deleteDialog.meetingTitle = title
             deleteDialog.open()
         }
+        function onCardChanged() { root.continueListRedo() }
         function onChanged() {
             if (root.bridge && root.bridge.saveError !== undefined && root.bridge.saveError !== "") {
                 Qt.callLater(function() {
@@ -262,6 +320,7 @@ Column {
             delegate: Item {
                 id: meetingRow
                 readonly property var row: modelData
+                readonly property var redo: row.diarizationRedo || ({})
                 readonly property Item moreButton: rowMore
                 width: parent.width
                 height: Math.max(Theme.meetingRowMinH, rowBody.implicitHeight + Theme.meetingRowPaddingTop + Theme.meetingRowPaddingBottom)
@@ -349,25 +408,82 @@ Column {
                         iconName: "more"
                         iconFill: true
                         variant: "ghost"
-                        visible: meetingRow.row.actions.length > 0
+                        visible: meetingRow.row.actions.length > 0 || meetingRow.redo.menuVisible === true
                         Accessible.name: "⋯"
                         onClicked: rowMenu.open()
                         Menu {
                             id: rowMenu
                             width: Theme.popoverMinW
+                            padding: Theme.menuPadding + 1
+                            background: Item {
+                                OverlaySurface {
+                                    anchors.fill: parent
+                                    surfaceWidth: parent.width; surfaceHeight: parent.height
+                                    surfaceRadius: Theme.menuRadius
+                                    surfaceColor: Theme.bgSurface
+                                    borderWidth: 1
+                                    borderColor: Qt.tint(Theme.bgSurface, Theme.border)
+                                    shadowSourceColor: Theme.bgSurface
+                                    shadowX: Theme.shadowMenuX; shadowY: Theme.shadowMenuY
+                                    shadowRadius: Theme.shadowMenuRadius; shadowColor: Theme.shadowMenuColor
+                                }
+                            }
+                            onClosed: rowMore.forceActiveFocus(Qt.TabFocusReason)
+                            MenuSeparator {
+                                id: listSeparator
+                                objectName: "meetingRedoMenuSeparator"
+                                visible: rowMenu.count > 2
+                                height: visible ? implicitHeight : 0
+                                implicitHeight: 9
+                                leftPadding: 6; rightPadding: 6
+                                topPadding: 4; bottomPadding: 4
+                                contentItem: Rectangle {
+                                    implicitHeight: 1; color: Theme.borderSoft
+                                    transform: Translate { y: Math.ceil(listSeparator.y) - listSeparator.y }
+                                }
+                            }
                             Instantiator {
-                                model: meetingRow.row.actions
+                                model: {
+                                    var entries = []
+                                    var actions = meetingRow.row.actions || []
+                                    for (var i = 0; i < actions.length; ++i) {
+                                        entries.push({text: actions[i], key: (meetingRow.row.actionKeys || [])[i] || "", enabled: true})
+                                        if (actions[i] === "Имена участников" || (meetingRow.redo.busy === true && i === 0)) {
+                                            if (meetingRow.redo.busy === true)
+                                                entries.push({text: "Имена участников", key: "names", enabled: false})
+                                            if (meetingRow.redo.menuVisible === true)
+                                                entries.push({text: meetingRow.redo.menuText || "", key: "rediarize", enabled: meetingRow.redo.menuEnabled === true})
+                                        }
+                                    }
+                                    return entries
+                                }
                                 delegate: MenuItem {
-                                    readonly property string actionId: meetingRow.row.actionKeys !== undefined
-                                        ? meetingRow.row.actionKeys[index] : ""
-                                    readonly property string actionText: modelData
+                                    id: listMenuItem
+                                    implicitHeight: Theme.fontMenuItemSize * Theme.fontBodyLineHeight + Theme.menuItemPaddingY * 2
+                                    leftPadding: 9; rightPadding: 9
+                                    contentItem: Text {
+                                        transform: Translate { y: Math.ceil(listMenuItem.y) - listMenuItem.y }
+                                        text: listMenuItem.text; textFormat: Text.PlainText
+                                        color: listMenuItem.enabled ? Theme.fg : Theme.fgDisabled
+                                        font.family: Theme.fontUi; font.pixelSize: 13
+                                        verticalAlignment: Text.AlignVCenter
+                                        renderType: Text.NativeRendering
+                                    }
+                                    background: Rectangle { color: listMenuItem.highlighted ? Theme.stateHoverOnSurface : "transparent"; radius: Theme.menuItemRadius }
+                                    readonly property string actionId: modelData.key
+                                    readonly property string actionText: modelData.text
+                                    objectName: actionId === "rediarize" ? "meetingListRedoMenu" : "meetingListMenuAction"
                                     text: actionText
+                                    enabled: modelData.enabled
                                     onTriggered: if (root.bridge) {
-                                        if (actionId === "rename") renameDialog.returnFocusItem = rowMore
-                                        root.bridge.requestMeetingAction(meetingRow.row.id, actionText)
+                                        if (actionId === "rediarize") root.requestListRedo(meetingRow.redo, rowMore)
+                                        else {
+                                            if (actionId === "rename") renameDialog.returnFocusItem = rowMore
+                                            root.bridge.requestMeetingAction(meetingRow.row.id, actionText)
+                                        }
                                     }
                                 }
-                                onObjectAdded: rowMenu.insertItem(index, object)
+                                onObjectAdded: rowMenu.insertItem(object.actionText === "Удалить" ? index + 1 : index, object)
                                 onObjectRemoved: rowMenu.removeItem(object)
                             }
                         }

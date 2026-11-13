@@ -15,12 +15,13 @@ FocusScope {
 
     property var bridge: null
     readonly property var card: bridge && bridge.card !== undefined && bridge.card.open === true ? bridge.card : ({})
+    readonly property var redo: card.diarizationRedo || ({})
     readonly property var diarInstall: bridge && bridge.diarizationInstall !== undefined ? bridge.diarizationInstall : ({})
     readonly property var texts: bridge && bridge.cardTexts !== undefined ? bridge.cardTexts : ({})
     readonly property var rowsModel: bridge && bridge.cardRows !== undefined ? bridge.cardRows : null
     readonly property string view: card.view !== undefined ? card.view : ""
     // Точка 760 по ширине контента (spec §5.2): шире — панель «Участники» справа.
-    readonly property bool hasParticipants: card.diarizationInstallVisible !== true
+    readonly property bool hasParticipants: card.diarizationInstallVisible !== true && (card.participants || []).length > 0
     readonly property bool wide: width >= Theme.sizeMeetingSplitContentW
     readonly property bool panelState: card.panel !== undefined && card.panel.title !== undefined
     readonly property real tableWidth: wide && hasParticipants ? width - Theme.participantsPanelGap - Theme.participantsPanelW : width
@@ -28,6 +29,7 @@ FocusScope {
     // поэтому смешиваем его с bgSurface заранее (CSS border-box), как OverlaySurface (M3).
     readonly property color cardBorderColor: Qt.tint(Theme.bgSurface, Theme.border)
     // Сколько строк таблицы создано: инкрементальная модель не пересоздаёт старые.
+    readonly property Item moreFocusItem: moreButton
     property int rowsCreated: 0
     property int currentRow: 0
 
@@ -35,14 +37,28 @@ FocusScope {
         if (!visible) closeOverlays()
     }
     onCardChanged: {
+        redoDialog.invalidate()
         if (card.open !== true) closeOverlays()
         else if (card.namesEditable !== true && mergePopover) mergePopover.close()
     }
     function closeOverlays() {
+        if (moreMenu) moreMenu.close()
+        if (redoDialog) redoDialog.close()
         if (namesDrawer) namesDrawer.close()
         if (mergePopover) mergePopover.close()
         if (saveDialog) saveDialog.close()
         if (speakerToast) speakerToast.visible = false
+    }
+
+    function requestRedo(origin) {
+        if (!bridge || redo.menuEnabled !== true) return
+        if (redo.needsWarning) redoDialog.showWarning(redo, origin)
+        else if (bridge.rediarizeMeeting(redo.meetingId, redo.expectedGeneration, false))
+            Qt.callLater(focusRedo)
+    }
+    function focusRedo() {
+        if (redoAction.visible) redoAction.forceActiveFocus(Qt.TabFocusReason)
+        else table.forceActiveFocus(Qt.TabFocusReason)
     }
 
     signal backRequested()
@@ -50,6 +66,12 @@ FocusScope {
     width: parent ? parent.width : Theme.sizeContentColMax
     implicitHeight: column.implicitHeight
 
+    function inlineLineTop(labelHeight, controlsHeight) {
+        return (Math.max(labelHeight, controlsHeight) - labelHeight) / 2
+    }
+    function inlineHalfLeading(lineHeight, fontHeight) {
+        return Math.max(0, (lineHeight - fontHeight) / 2)
+    }
     function txt(key) { return texts[key] !== undefined ? texts[key] : "" }
     function focusBack(reason) { back.forceActiveFocus(reason === undefined ? Qt.TabFocusReason : reason) }
     function openSaveDialog() { if (root.card.showActions === true) saveDialog.open() }
@@ -222,7 +244,9 @@ FocusScope {
         Item {
             id: head
             width: parent.width
-            height: Math.max(headText.height, headActions.visible ? headActions.height : 0)
+            height: subtitle.wordWrap && subtitle.height > Theme.fontSmallSize * Theme.fontBodyLineHeight
+                ? Math.floor(head.y + Math.max(headText.height, headActions.visible ? headActions.height : 0)) - head.y
+                : Math.max(headText.height, headActions.visible ? headActions.height : 0)
 
             Column {
                 id: headText
@@ -300,7 +324,41 @@ FocusScope {
                     objectName: "meetingCardSubtitle"
                     width: parent.width
                     readonly property var parts: root.card.subtitle !== undefined ? root.card.subtitle : ({})
+                    readonly property bool wordWrap: root.redo.visible === true && !root.wide
+                    readonly property var words: {
+                        var result = []
+                        function add(value, mono) {
+                            var leading = (value || "").match(/^\s+/)
+                            var pieces = (value || "").match(/\S+\s*/g) || []
+                            // Fragment separators always use the UI font, never the clock's mono font.
+                            if (leading && pieces.length && !mono) pieces[0] = leading[0] + pieces[0]
+                            else if (leading) result.push({text: leading[0], mono: false})
+                            for (var i = 0; i < pieces.length; ++i) result.push({text: pieces[i], mono: mono})
+                        }
+                        add(parts.prefix, false)
+                        add(parts.mono, true)
+                        add(parts.suffix, false)
+                        return result
+                    }
+                    Repeater {
+                        model: subtitle.wordWrap ? subtitle.words : []
+                        Text {
+                            id: subtitleWord
+                            // Keep the half-pixel phase of wrapped inline lines.
+                            transform: Translate { y: subtitleWord.y % 1 }
+                            text: modelData.text
+                            textFormat: Text.PlainText
+                            color: Theme.fgMuted
+                            font.family: modelData.mono ? Theme.fontMono : Theme.fontUi
+                            font.pixelSize: Theme.fontSmallSize
+                            font.letterSpacing: modelData.mono ? Theme.fontSmallSize * Theme.fontMonoInlineTracking : 0
+                            lineHeight: Theme.fontSmallSize * Theme.fontBodyLineHeight
+                            lineHeightMode: Text.FixedHeight
+                            renderType: Text.NativeRendering
+                        }
+                    }
                     Text {
+                        visible: !subtitle.wordWrap
                         text: subtitle.parts.prefix !== undefined ? subtitle.parts.prefix : ""
                         textFormat: Text.PlainText
                         color: Theme.fgMuted
@@ -311,6 +369,7 @@ FocusScope {
                         renderType: Text.NativeRendering
                     }
                     Text {
+                        visible: !subtitle.wordWrap
                         text: subtitle.parts.mono !== undefined ? subtitle.parts.mono : ""
                         textFormat: Text.PlainText
                         color: Theme.fgMuted
@@ -322,6 +381,7 @@ FocusScope {
                         renderType: Text.NativeRendering
                     }
                     Text {
+                        visible: !subtitle.wordWrap
                         text: subtitle.parts.suffix !== undefined ? subtitle.parts.suffix : ""
                         textFormat: Text.PlainText
                         color: Theme.fgMuted
@@ -350,7 +410,7 @@ FocusScope {
                 AvButton {
                     id: moreButton
                     objectName: "meetingCardMore"
-                    KeyNavigation.tab: installButton.visible ? installButton : table
+                    KeyNavigation.tab: keepAction.visible ? keepAction : redoAction.visible ? redoAction : installButton.visible ? installButton : table
                     width: Theme.meetingHeadIconButton
                     height: Theme.meetingHeadIconButton
                     leftPadding: 0
@@ -373,23 +433,120 @@ FocusScope {
                         y: moreButton.height + 4
                         x: moreButton.width - width
                         width: Theme.popoverMinW
+                        padding: Theme.menuPadding + 1
+                        background: Item {
+                            OverlaySurface {
+                                anchors.fill: parent
+                                surfaceWidth: parent.width; surfaceHeight: parent.height
+                                surfaceRadius: Theme.menuRadius
+                                surfaceColor: Theme.bgSurface
+                                borderWidth: 1
+                                borderColor: Qt.tint(Theme.bgSurface, Theme.border)
+                                shadowSourceColor: Theme.bgSurface
+                                shadowX: Theme.shadowMenuX; shadowY: Theme.shadowMenuY
+                                shadowRadius: Theme.shadowMenuRadius; shadowColor: Theme.shadowMenuColor
+                            }
+                        }
                         // Esc закрывает меню, фокус — обратно на «⋯» (spec §5.2).
                         onClosed: moreButton.forceActiveFocus(Qt.TabFocusReason)
                         MenuItem {
+                            id: renameItem
                             objectName: "meetingCardRenameAction"
+                            implicitHeight: Theme.fontMenuItemSize * Theme.fontBodyLineHeight + Theme.menuItemPaddingY * 2
+                            leftPadding: 9; rightPadding: 9
+                            contentItem: Row {
+                                transform: Translate { y: Math.ceil(renameItem.y) - renameItem.y }
+                                spacing: 9
+                                Icon { name: "edit"; size: 16; color: renameItem.enabled ? Theme.fg : Theme.fgDisabled; anchors.verticalCenter: parent.verticalCenter }
+                                Text {
+                                    text: renameItem.text; textFormat: Text.PlainText
+                                    font.family: Theme.fontUi; font.pixelSize: 13
+                                    color: renameItem.enabled ? Theme.fg : Theme.fgDisabled
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    renderType: Text.NativeRendering
+                                }
+                            }
+                            background: Rectangle { color: renameItem.highlighted ? Theme.stateHoverOnSurface : "transparent"; radius: Theme.menuItemRadius }
                             text: root.txt("rename")
                             enabled: root.card.renameEnabled === true
                             onTriggered: root.requestRename(moreButton)
                         }
                         MenuItem {
+                            id: namesItem
                             objectName: "meetingCardNamesAction"
+                            implicitHeight: Theme.fontMenuItemSize * Theme.fontBodyLineHeight + Theme.menuItemPaddingY * 2
+                            leftPadding: 9; rightPadding: 9
+                            contentItem: Row {
+                                transform: Translate { y: Math.ceil(namesItem.y) - namesItem.y }
+                                spacing: 9
+                                Icon { name: "people"; size: 16; color: namesItem.enabled ? Theme.fg : Theme.fgDisabled; anchors.verticalCenter: parent.verticalCenter }
+                                Text {
+                                    text: namesItem.text; textFormat: Text.PlainText
+                                    font.family: Theme.fontUi; font.pixelSize: 13
+                                    color: namesItem.enabled ? Theme.fg : Theme.fgDisabled
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    renderType: Text.NativeRendering
+                                }
+                            }
+                            background: Rectangle { color: namesItem.highlighted ? Theme.stateHoverOnSurface : "transparent"; radius: Theme.menuItemRadius }
                             text: root.txt("names")
-                            enabled: root.card.live !== true && root.card.showTable === true && (root.card.participants || []).some(function(p) { return p.kind === "speaker" })
+                            enabled: root.redo.busy !== true && root.card.live !== true && root.card.showTable === true && (root.card.participants || []).some(function(p) { return p.kind === "speaker" })
                             onTriggered: Qt.callLater(function() { root.openNames(moreButton) })
                         }
-                        MenuSeparator {}
+                        MenuItem {
+                            id: redoItem
+                            objectName: "meetingCardRedoMenu"
+                            implicitHeight: Theme.fontMenuItemSize * Theme.fontBodyLineHeight + Theme.menuItemPaddingY * 2
+                            leftPadding: 9; rightPadding: 9
+                            contentItem: Row {
+                                transform: Translate { y: Math.ceil(redoItem.y) - redoItem.y }
+                                spacing: 9
+                                Icon { name: "refresh"; size: 16; color: redoItem.enabled ? Theme.fg : Theme.fgDisabled; anchors.verticalCenter: parent.verticalCenter }
+                                Text {
+                                    text: redoItem.text; textFormat: Text.PlainText
+                                    font.family: Theme.fontUi; font.pixelSize: 13
+                                    color: redoItem.enabled ? Theme.fg : Theme.fgDisabled
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    renderType: Text.NativeRendering
+                                }
+                            }
+                            background: Rectangle { color: redoItem.highlighted ? Theme.stateHoverOnSurface : "transparent"; radius: Theme.menuItemRadius }
+                            visible: root.redo.menuVisible === true
+                            height: visible ? implicitHeight : 0
+                            enabled: root.redo.menuEnabled === true
+                            text: root.redo.menuText || ""
+                            Accessible.name: text
+                            onTriggered: Qt.callLater(function() { root.requestRedo(moreButton) })
+                        }
+                        MenuSeparator {
+                            id: redoSeparator
+                            objectName: "meetingRedoMenuSeparator"
+                            implicitHeight: 9
+                            leftPadding: 6; rightPadding: 6
+                            topPadding: 4; bottomPadding: 4
+                            contentItem: Rectangle {
+                                implicitHeight: 1; color: Theme.borderSoft
+                                transform: Translate { y: Math.ceil(redoSeparator.y) - redoSeparator.y }
+                            }
+                        }
                         // D2 «Удалить встречу» — M5.
                         MenuItem {
+                            id: deleteItem
+                            objectName: "meetingCardDeleteAction"
+                            implicitHeight: Theme.fontMenuItemSize * Theme.fontBodyLineHeight + Theme.menuItemPaddingY * 2
+                            leftPadding: 9; rightPadding: 9
+                            contentItem: Row {
+                                transform: Translate { y: Math.ceil(deleteItem.y) - deleteItem.y }
+                                spacing: 9
+                                Icon { name: "trash"; size: 16; color: Theme.dangerInk; anchors.verticalCenter: parent.verticalCenter }
+                                Text {
+                                    text: deleteItem.text; textFormat: Text.PlainText
+                                    font.family: Theme.fontUi; font.pixelSize: 13; color: Theme.dangerInk
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    renderType: Text.NativeRendering
+                                }
+                            }
+                            background: Rectangle { color: deleteItem.highlighted ? Theme.stateHoverOnSurface : "transparent"; radius: Theme.menuItemRadius }
                             text: root.txt("delete")
                             enabled: root.card.deleteEnabled === true
                             onTriggered: if (root.bridge) root.bridge.cardAction("delete")
@@ -695,7 +852,7 @@ FocusScope {
             variant: "error"
             iconName: "alert"
             body: root.txt("readError")
-            AvButton { small: true; text: root.txt("retry"); onClicked: if (root.bridge) root.bridge.retryCard() }
+            AvButton { objectName: "meetingCardReadRetry"; small: true; text: root.txt("retry"); onClicked: if (root.bridge) root.bridge.retryCard() }
         }
 
         // policy-off: только чтение (06, tokens.md §3.9).
@@ -708,6 +865,122 @@ FocusScope {
                 objectName: "meetingCardPolicy"
                 iconName: "lock"
                 body: root.txt("policyOff")
+            }
+        }
+
+        Item {
+            id: redoRow
+            objectName: "meetingDiarizationRedo"
+            visible: root.redo.visible === true
+            width: parent.width
+            height: visible ? Math.max(redoLabel.height, redoControls.height) + Theme.diarInstallCardBottom : 0
+            readonly property real lineTop: root.inlineLineTop(redoLabel.height, redoControls.height)
+            readonly property real halfLeading: root.inlineHalfLeading(19.5, redoMetrics.height)
+            FontMetrics { id: redoMetrics; font: redoLabel.font }
+            Text {
+                id: redoLabel
+                objectName: "meetingRedoLabel"
+                x: redoIcon.visible ? redoIcon.width + Theme.diarInstallIconGap : 0
+                y: redoRow.lineTop + redoRow.halfLeading - 0.5
+                width: Math.max(0, parent.width - x - (redoControls.width > 0 ? redoControls.width + 8 : 0))
+                text: root.redo.text || ""
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: root.redo.tone === "danger" ? Theme.dangerInk : Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: 13
+                lineHeight: 19.5
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                Accessible.role: root.redo.code === "cancelled" || root.redo.code === "done"
+                    || root.redo.code === "no-audio" || root.redo.tone === "danger"
+                    || (root.redo.code || "").indexOf("kept-") === 0 ? Accessible.AlertMessage : Accessible.StaticText
+                Accessible.name: text
+                Accessible.description: root.redo.storageText || ""
+            }
+            Icon {
+                id: redoIcon
+                objectName: "meetingRedoIcon"
+                visible: (root.redo.icon || "") !== ""
+                name: root.redo.icon || ""
+                size: 12
+                y: root.redo.icon === "alert" ? redoRow.lineTop + 3
+                    : redoLabel.y + redoLabel.baselineOffset - height + 3 + 3 / 2
+                color: root.redo.iconTone === "danger" ? Theme.dangerInk : Theme.successInk
+                Accessible.ignored: true
+            }
+            Row {
+                id: redoControls
+                anchors.right: parent.right
+                y: (parent.height - Theme.diarInstallCardBottom - height) / 2
+                spacing: 8
+                ProgressBar {
+                    id: redoProgress
+                    objectName: "meetingRedoProgress"
+                    visible: root.redo.showProgress === true
+                    width: 160
+                    height: 4
+                    padding: 0
+                    anchors.verticalCenter: parent.verticalCenter
+                    from: 0; to: 100
+                    property int announcedPercent: 0
+                    value: announcedPercent
+                    onVisibleChanged: if (visible) announcedPercent = root.redo.percent || 0
+                    Timer {
+                        interval: 1000; repeat: true; running: redoProgress.visible
+                        onTriggered: redoProgress.announcedPercent = root.redo.percent || 0
+                    }
+                    Accessible.role: Accessible.ProgressBar
+                    Accessible.name: root.redo.progressName || ""
+                    Accessible.ignored: !visible
+                    background: Rectangle { color: Theme.bgSurface2; radius: Theme.progressRadius }
+                    contentItem: Item {
+                        Rectangle {
+                            width: parent.width * (root.redo.percent || 0) / 100
+                            height: 4; radius: Theme.progressRadius; color: Theme.primary
+                        }
+                    }
+                }
+                AvButton {
+                    id: keepAction
+                    objectName: "meetingRedoKeep"
+                    visible: redoRow.visible && root.redo.canKeep === true
+                    small: true
+                    text: root.redo.keepAction || ""
+                    Accessible.name: root.redo.keepName || ""
+                    Accessible.description: root.redo.keepDescription || ""
+                    KeyNavigation.backtab: moreButton
+                    KeyNavigation.tab: redoAction
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEnterPressed: clicked()
+                    onClicked: if (root.bridge && root.bridge.keepDiarizationAsIs(root.redo.meetingId, root.redo.expectedGeneration))
+                        Qt.callLater(root.focusRedo)
+                }
+                AvButton {
+                    id: redoAction
+                    objectName: "meetingRedoAction"
+                    property bool ownedFocus: false
+                    onActiveFocusChanged: if (activeFocus) ownedFocus = true; else if (visible) ownedFocus = false
+                    onVisibleChanged: if (!visible && ownedFocus) {
+                        ownedFocus = false
+                        Qt.callLater(function() { table.forceActiveFocus(Qt.TabFocusReason) })
+                    }
+                    visible: redoRow.visible && text !== ""
+                    enabled: root.redo.busy === true ? root.redo.canCancel === true : root.redo.canStart === true
+                    small: true
+                    text: root.redo.action || ""
+                    Accessible.name: root.redo.actionName || ""
+                    Accessible.description: root.redo.actionDescription || ""
+                    KeyNavigation.backtab: keepAction.visible ? keepAction : moreButton
+                    KeyNavigation.tab: table
+                    Keys.onReturnPressed: if (enabled) clicked()
+                    Keys.onEnterPressed: if (enabled) clicked()
+                    onClicked: if (root.bridge) {
+                        if (root.redo.busy === true) root.bridge.cancelDiarizationRedo(root.redo.meetingId, root.redo.expectedGeneration)
+                        else if (root.redo.action === "Разделить по голосам") root.bridge.divideMeeting(root.redo.meetingId, root.redo.expectedGeneration)
+                        else root.bridge.rediarizeMeeting(root.redo.meetingId, root.redo.expectedGeneration, false)
+                    }
+                }
             }
         }
 
@@ -749,7 +1022,7 @@ FocusScope {
                             renderType: Text.NativeRendering
                         }
                         Repeater {
-                            model: root.card.participants !== undefined ? root.card.participants : []
+                            model: participants.participants
                             Row {
                                 spacing: Theme.speakerNumGap
                                 MeetingSpeakerNumber { num: modelData.num || ""; anchors.verticalCenter: parent.verticalCenter }
@@ -777,7 +1050,7 @@ FocusScope {
                         small: true
                         iconName: "people"
                         text: root.txt("names")
-                        enabled: root.card.live !== true && (root.card.participants || []).some(function(p) { return p.kind === "speaker" })
+                        enabled: root.redo.busy !== true && root.card.live !== true && (root.card.participants || []).some(function(p) { return p.kind === "speaker" })
                         onClicked: root.openNames(namesButton)
                         Layout.alignment: Qt.AlignVCenter
                     }
@@ -794,10 +1067,10 @@ FocusScope {
             readonly property bool progressVisible: ["downloading", "verifying", "installing"].indexOf(root.diarInstall.code) >= 0
             readonly property bool hasIcon: root.diarInstall.error === true || root.diarInstall.code === "installed"
             // Fixed line-height in Qt5 does not add CSS half-leading to the glyph baseline.
-            readonly property real lineTop: (Math.max(installLabel.height,
-                installButton.visible ? Theme.diarInstallCardControlH : 0) - installLabel.height) / 2
-            readonly property real halfLeading: Math.max(0,
-                (Theme.fontSmallSize * Theme.fontBodyLineHeight - installMetrics.height) / 2)
+            readonly property real lineTop: root.inlineLineTop(installLabel.height,
+                installButton.visible ? Theme.diarInstallCardControlH : 0)
+            readonly property real halfLeading: root.inlineHalfLeading(
+                Theme.fontSmallSize * Theme.fontBodyLineHeight, installMetrics.height)
             FontMetrics { id: installMetrics; font: installLabel.font }
             Icon {
                 objectName: "meetingDiarizationStatusIcon"
@@ -903,7 +1176,8 @@ FocusScope {
                         if (activeFocus && (!item || !item.activeFocus)) root.moveRow(0)
                     }
                     Keys.onBacktabPressed: {
-                        if (installButton.visible) installButton.forceActiveFocus(Qt.BacktabFocusReason)
+                        if (redoAction.visible) redoAction.forceActiveFocus(Qt.BacktabFocusReason)
+                        else if (installButton.visible) installButton.forceActiveFocus(Qt.BacktabFocusReason)
                         else if (root.card.showActions === true) moreButton.forceActiveFocus(Qt.BacktabFocusReason)
                         else {
                             var previous = table.nextItemInFocusChain(false)
@@ -1018,6 +1292,13 @@ FocusScope {
         }
     }
 
+    MeetingRediarizeDialog {
+        id: redoDialog
+        bridge: root.bridge
+        current: root.redo
+        onStarted: Qt.callLater(root.focusRedo)
+    }
+
     Popup {
         id: namesDrawer
         objectName: "meetingParticipantsDrawer"
@@ -1106,7 +1387,7 @@ FocusScope {
     MeetingSpeakerToast {
         id: speakerToast
         bridge: root.bridge
-        parent: root.overlayViewport
+        parent: root.overlayViewport || root
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Theme.toastBottom
