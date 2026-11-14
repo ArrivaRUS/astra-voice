@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -41,42 +42,75 @@ class SigningUnavailable(RuntimeError):
 class SignedDiarPair:
     """Real Verifier, catalog loader, installed metadata and trust provider.
 
-    Signing keys and tiny ONNX wire images belong only to this temporary fixture.
-    The models are sufficient for hash/layout checks and scripted/paused roles;
-    no test claims they can perform native inference.
+    By default the tiny ONNX images serve unit hash/layout checks only. Optional
+    model_files install actual corpus ONNX bytes for native integrations, using
+    the same signing and genuine trust provider. Defaults preserve unit behavior.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, model_root: Path | None = None) -> None:
         self.root = root.resolve()
+        self.model_root = self.root / "models" if model_root is None else model_root.resolve()
 
     @classmethod
-    def prepare(cls, root: Path) -> SignedDiarPair:
+    def prepare(
+        cls,
+        root: Path,
+        *,
+        model_files: Mapping[str, Path] | None = None,
+        model_root: Path | None = None,
+        signing_home: Path | None = None,
+    ) -> SignedDiarPair:
+        pair = cls.stage(root, model_files=model_files, model_root=model_root)
+        pair.sign(signing_home)
+        assert pair.models() is not None, "real provider rejected the signed fixture"
+        return pair
+
+    @classmethod
+    def stage(
+        cls,
+        root: Path,
+        *,
+        model_files: Mapping[str, Path] | None = None,
+        model_root: Path | None = None,
+    ) -> SignedDiarPair:
+        """Install bytes/metadata and write the catalog; no signing or trust claim yet."""
         from astra_voice.models.catalog import DIARIZATION_MODEL_IDS
         from astra_voice.models.store import ModelStore
         from astra_voice.security.files import write_private
 
-        pair = cls(root)
+        pair = cls(root, model_root=model_root)
+        root = pair.root
         root.mkdir(mode=0o700, parents=True)
         catalog = root / "catalog"
         catalog.mkdir(mode=0o700)
         document = json.loads((ROOT / "data/catalog.json").read_bytes())
-        digest = hashlib.sha256(RAW_MODEL).hexdigest()
         entries = [e for e in document["models"] if e["id"] in DIARIZATION_MODEL_IDS]
-        generation = root / "models/.diarization" / ("a" * 32)
+        if model_root is not None:
+            from astra_voice.core.paths import ensure_private_dir
+
+            ensure_private_dir(pair.model_root)
+            ensure_private_dir(pair.model_root / ".diarization")
+        generation = pair.model_root / ".diarization" / ("a" * 32)
         generation.mkdir(mode=0o700, parents=True)
         store = ModelStore(generation)
         for entry in entries:
-            entry["size_bytes"] = len(RAW_MODEL)
-            entry["files"][0].update(size=len(RAW_MODEL), sha256=digest)
+            name = entry["files"][0]["path"]
+            raw = (
+                RAW_MODEL
+                if model_files is None
+                else model_files[name].resolve(strict=True).read_bytes()
+            )
+            entry["size_bytes"] = len(raw)
+            entry["files"][0].update(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
             directory = store.staging_dir(entry["id"], entry["revision"])
-            write_private(directory / entry["files"][0]["path"], RAW_MODEL)
+            write_private(directory / name, raw)
             write_private(
                 directory / "state.json",
                 json.dumps(
                     {
                         "layout": entry["layout"],
                         "variant": entry["variant"],
-                        "size_bytes": len(RAW_MODEL),
+                        "size_bytes": len(raw),
                     }
                 ).encode(),
             )
@@ -94,7 +128,14 @@ class SignedDiarPair:
         write_private(
             catalog / "catalog.schema.json", (ROOT / "data/catalog.schema.json").read_bytes()
         )
-        home = root / "gnupg"
+        return pair
+
+    def sign(self, signing_home: Path | None = None) -> None:
+        from astra_voice.security.files import write_private
+
+        root = self.root
+        catalog = root / "catalog"
+        home = root / "gnupg" if signing_home is None else signing_home
         home.mkdir(mode=0o700)
 
         def gpg(*args: str) -> subprocess.CompletedProcess[bytes]:
@@ -148,8 +189,6 @@ class SignedDiarPair:
                 check=False,
                 timeout=5,
             )
-        assert pair.models() is not None, "real provider rejected the signed fixture"
-        return pair
 
     def catalog(self) -> Any:
         from astra_voice.models.catalog import load_builtin
@@ -166,6 +205,4 @@ class SignedDiarPair:
         from astra_voice.meetings.diar_models import installed_diar_models
         from astra_voice.models.store import ModelStore
 
-        return installed_diar_models(
-            ModelStore(self.root / "models"), catalog_provider=self.catalog
-        )
+        return installed_diar_models(ModelStore(self.model_root), catalog_provider=self.catalog)

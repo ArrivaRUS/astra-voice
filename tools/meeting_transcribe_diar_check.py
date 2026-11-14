@@ -4,22 +4,26 @@
 Uses the production transcriber and real hardened child role. --fake-asr replaces
 only speech recognition with fixed text, useful for isolated diar corpus checks.
 No transcript text is printed. Output folders are private; defaults live beneath
-.artifacts/e13-m7/tmp. This does not install models or alter user settings.
+.artifacts/e13-m7/tmp. Installed copies live only in a private test XDG;
+user settings are not changed.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import tempfile
 import time
 import wave
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 if __name__ == "__main__":
-    import sys
-
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from astra_voice.meetings.model import Meeting, Transcript
@@ -27,6 +31,70 @@ from astra_voice.meetings.segments import ClockAnchor, SegmentSidecar
 from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.worker.engine import CancelToken, LoadResult, TranscribeResult
 from astra_voice.worker.meeting_transcribe import MeetingTranscribeState, energy_probabilities
+
+if TYPE_CHECKING:
+    from helpers.meeting_trust import SignedDiarPair
+
+
+def load_installed_pair(root: Path) -> SignedDiarPair:
+    # Standalone tools do not start with tests/ on sys.path, unlike pytest.
+    tests = str(Path(__file__).resolve().parents[1] / "tests")
+    if tests not in sys.path:
+        sys.path.insert(0, tests)
+    from astra_voice.core import paths
+    from helpers.meeting_trust import SignedDiarPair
+
+    return SignedDiarPair(root, model_root=paths.model_store_dir_path())
+
+
+@contextmanager
+def isolated_diar_xdg(root: Path) -> Iterator[None]:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    values = {
+        "XDG_DATA_HOME": root / "data",
+        "XDG_CONFIG_HOME": root / "config",
+        "XDG_CACHE_HOME": root / "cache",
+        "XDG_STATE_HOME": root / "state",
+        "XDG_RUNTIME_DIR": root / "runtime",
+    }
+    previous = {name: os.environ.get(name) for name in values}
+    try:
+        for name, directory in values.items():
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.environ[name] = str(directory.resolve())
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
+def installed_pair(root: Path, models: dict[str, str]) -> Iterator[SignedDiarPair]:
+    """Install corpus bytes and sign their catalog in a private, inherited XDG."""
+    # Resolve aliases only in the driver; installed files are ordinary private
+    # copies and both the provider and hardened role retain their own checks.
+    source = {
+        "model.onnx": Path(models["segmentation_dir"]) / "model.onnx",
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": Path(models["embedder_dir"])
+        / "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+    }
+    session = root / uuid4().hex
+    with isolated_diar_xdg(session):
+        pair = load_installed_pair(session / "signed")
+        # AF_UNIX sockets of gpg-agent need a short path even when pytest's
+        # meeting directory is deeply nested. Unit fixture defaults stay intact.
+        with tempfile.TemporaryDirectory(prefix="av-diar-sign-", dir="/tmp") as signing:
+            pair = type(pair).prepare(
+                pair.root,
+                model_files=source,
+                model_root=pair.model_root,
+                signing_home=Path(signing) / "gnupg",
+            )
+        yield pair
+
 
 RATE = 16000
 MID = "2026-11-10_120000-d1a2"
@@ -129,9 +197,15 @@ def run_job(
     asr_model: Path | None = None,
     fake_asr: bool = False,
     resume: bool = False,
+    trusted_pair: SignedDiarPair | None = None,
 ) -> dict[str, Any]:
     from astra_voice.worker.engine import make_engine
 
+    if trusted_pair is not None:
+        admitted = trusted_pair.models()
+        if admitted is None:
+            raise ValueError("installed-diar-pair-not-trusted")
+        models = admitted
     models = dict(models)
     fields = ("segmentation_sha256", "embedder_sha256")
     if any(field not in models for field in fields):
@@ -149,6 +223,8 @@ def run_job(
     if not tracks:
         raise ValueError("meeting-has-no-audio")
     options: dict[str, Any] = {}
+    if trusted_pair is not None:
+        options["diar_models_provider"] = trusted_pair.models
     if fake_asr:
         options["vad_factory"] = lambda: ("energy-rms", energy_probabilities)
     state = MeetingTranscribeState(
@@ -310,9 +386,16 @@ def main() -> int:
     for field in ("segmentation_sha256", "embedder_sha256"):
         if (value := getattr(args, field)) is not None:
             models[field] = value
-    result = run_job(
-        store, mid, models, asr_model=args.asr_model_dir, fake_asr=args.fake_asr, resume=args.resume
-    )
+    with installed_pair(store.root.parent / "diar-trust", models) as pair:
+        result = run_job(
+            store,
+            mid,
+            models,
+            asr_model=args.asr_model_dir,
+            fake_asr=args.fake_asr,
+            resume=args.resume,
+            trusted_pair=pair,
+        )
     print(
         json.dumps(result, sort_keys=True)
         if args.json

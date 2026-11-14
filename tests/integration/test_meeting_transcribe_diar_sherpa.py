@@ -10,10 +10,13 @@ import os
 from pathlib import Path
 
 import pytest
-from tools.meeting_diar_check import model_paths
-from tools.meeting_transcribe_diar_check import prepare_meeting, run_job
 
-from astra_voice.meetings.model import Transcript
+pytest.importorskip("yaml", reason="Для каталога моделей нужен PyYAML")
+from tools.meeting_diar_check import model_paths  # noqa: E402
+from tools.meeting_transcribe_diar_check import installed_pair, prepare_meeting, run_job  # noqa: E402
+
+from astra_voice.meetings.model import Transcript  # noqa: E402
+from helpers.meeting_trust import SigningUnavailable  # noqa: E402
 
 pytestmark = [pytest.mark.engine, pytest.mark.usefixtures("filesystem_euid")]
 
@@ -45,7 +48,11 @@ def test_complete_job_labels_and_real_role_exit(
     store, mid = prepare_meeting(
         tmp_path, {"far": corpus / corpus_name / "far.wav"}, duration_s=seconds
     )
-    result = run_job(store, mid, models, fake_asr=True)
+    try:
+        with installed_pair(tmp_path / "diar-trust", models) as pair:
+            result = run_job(store, mid, models, fake_asr=True, trusted_pair=pair)
+    except SigningUnavailable as error:
+        pytest.skip(f"sandbox cannot start temporary gpg-agent: {error}")
     assert result["diar_status"] == "done", result
     assert result["labels_final"] and result["speakers"] > 0, result
     assert result["blocks"] == (2 if corpus_name == "synth" else 1), result
