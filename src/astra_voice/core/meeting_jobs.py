@@ -498,7 +498,7 @@ class MeetingJobs:
                 for meeting in resume:
                     # A preceding retention scan may have published tombstones
                     # after this worker snapshot, before either GUI completion.
-                    if meeting.id in self.tombstones:
+                    if meeting.id in self.tombstones or meeting.id in self.cancelled:
                         continue
                     if meeting.rediar is not None:
                         if meeting.id in self._redo_resumable:
@@ -877,6 +877,12 @@ class MeetingJobs:
         if meeting_id in self._redo_generations and not self.names_busy(meeting_id):
             return
         self.cancelled.add(meeting_id)
+        if meeting_id in self._redo_preparing or meeting_id in self._redo_recovery:
+            # Classification owns the disk until it knows which side of K3
+            # survived. WORK_PENDING consumes this intent before queue admission;
+            # PUBLISHED must only roll forward, never discard the public result.
+            self._changed()
+            return
         entry = self._take(meeting_id)
         active = self._active
         if active is not None and active.meeting_id == meeting_id:
@@ -1934,8 +1940,10 @@ class MeetingJobs:
             transcription = meeting.transcription
             transcription.model_id = str(load.get("id", transcription.model_id))
             transcription.revision = str(load.get("revision", transcription.revision))
-            transcription.diarization = active.diar_models is not None
             transcription.diar_status = str(event.get("diar_status", "skipped"))
+            transcription.diarization = (
+                active.diar_models is not None and transcription.diar_status != "skipped"
+            )
             transcription.finished_at = self.wall_clock().isoformat()
             transcription.wall_ms = int(event.get("wall_ms", 0))
             transcription.peak_rss_kb = int(event.get("peak_rss_kb", 0))
@@ -2350,10 +2358,14 @@ class MeetingJobs:
         self.meetings[mid] = meeting
         if result == RediarPublishResult.WORK_PENDING:
             self._redo_resumable.add(mid)
-            if self._recover_requested:
+            if mid in self.cancelled or self._recover_requested:
                 self._redo_generations[mid] = meeting.meeting_generation
-                self._add(mid, resume=True, redo=True)
+                if mid in self.cancelled:
+                    self._persist_cancel(mid)
+                else:
+                    self._add(mid, resume=True, redo=True)
         elif result == RediarPublishResult.PUBLISHED:
+            self.cancelled.discard(mid)  # publication precedes cancellation
             self._redo_resumable.discard(mid)
             current = deepcopy(meeting)
             if current.rediar is not None:
@@ -2394,6 +2406,9 @@ class MeetingJobs:
         ):
             return
         self._redo_preparing.add(meeting_id)
+        # Before classification the disk may already be past K3. Present the
+        # same non-cancellable recovery state as an ambiguous publication retry.
+        self._redo_recovery[meeting_id] = self.clock()
         self._changed()
 
         def work() -> Callable[[], None]:

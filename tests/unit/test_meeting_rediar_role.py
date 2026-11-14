@@ -26,7 +26,7 @@ from astra_voice.worker import meeting_diar as diar
 from astra_voice.worker import meeting_transcribe as mt
 from helpers.meeting_audio import MID, Rig, make_disk, tone, write_track
 
-pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid", "synthetic_diar_models")]
 WORK = "rediar-transcript.json"
 CHECK = "rediar-checkpoint.json"
 MODELS = {"segmentation_dir": "/absent/segmentation", "embedder_dir": "/absent/embedder"}
@@ -534,6 +534,7 @@ def test_pair_trust_failures_preserve_published(
             # The established signed-catalog gate supplies no pair on missing/revoked models.
             monkeypatch.setattr(diarization, "trusted_diarization_models", lambda *a, **k: None)
             pair = diar_models.installed_diar_models()
+        h.state.diar_models_provider = lambda: pair
         assert pair is None
         h.request.pop("diar_models")
     else:
@@ -547,6 +548,9 @@ def test_pair_trust_failures_preserve_published(
                 segmentation_sha256="a" * 64,
                 embedder_sha256=hashlib.sha256(b"\x08\x01").hexdigest(),
             )
+        # Admission in this snapshot-validation test deliberately supplies the
+        # malformed pair; checked_models must still reject it inside the role.
+        h.state.diar_models_provider = lambda: dict(h.request["diar_models"])
         original = h.factory
 
         def factory(*args: Any, **kwargs: Any) -> FakeDiar:
@@ -640,7 +644,9 @@ class CrashReference:
 
 
 @pytest.fixture(scope="module")
-def crash_reference(tmp_path_factory: pytest.TempPathFactory) -> Iterator[CrashReference]:
+def crash_reference(
+    tmp_path_factory: pytest.TempPathFactory, synthetic_diar_models: None
+) -> Iterator[CrashReference]:
     directory = tmp_path_factory.mktemp("rediar-crash-reference")
     template = prepare(directory / "template")
     template_before = tree(template)

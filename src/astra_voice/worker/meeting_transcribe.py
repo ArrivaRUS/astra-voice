@@ -36,7 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from astra_voice.meetings import MeetingValidationError, diar_link, echo_gate, reconcile
+from astra_voice.meetings import (
+    MeetingValidationError,
+    diar_link,
+    echo_gate,
+    reconcile,
+)
 from astra_voice.meetings.events import MeetingState, PhaseStatus
 from astra_voice.meetings.model import (
     ID_PATTERN,
@@ -466,6 +471,14 @@ class _Job:
             current.cancel()
 
 
+def _installed_diar_models() -> dict[str, str] | None:
+    # Catalog/service imports include download dependencies. Keep them out of
+    # the transcriber's import/startup path (T452); resolve only at the D4 gate.
+    from astra_voice.meetings.diar_models import installed_diar_models
+
+    return installed_diar_models()
+
+
 class MeetingTranscribeState:
     """Handler for run_role: handle() for commands, poll() for events/outcomes."""
 
@@ -480,12 +493,14 @@ class MeetingTranscribeState:
         asr_timeout_s: float = ASR_WINDOW_TIMEOUT_S,
         status_path: str = "/proc/self/status",
         diar_factory: Callable[..., Any] = DiarProcess,
+        diar_models_provider: Callable[[], dict[str, str] | None] | None = None,
     ) -> None:
         self.store = store if store is not None else MeetingStore()
         self.engine_factory, self.vad_factory = engine_factory, vad_factory
         self.mem_available_mb, self.clock = mem_available_mb, clock
         self.asr_timeout_s, self.status_path = asr_timeout_s, status_path
         self.diar_factory = diar_factory
+        self.diar_models_provider = diar_models_provider or _installed_diar_models
         self.diar_peak_rss_kb = 0  # scalar diagnostics for the CLI, never voice features
         self.ledger = RequestLedger()
         self.pending: dict[str, list[Message]] = {}
@@ -1314,12 +1329,12 @@ class MeetingTranscribeState:
                 "grid": "fixed",
                 "max_block_ms": 1_380_000,
             }
-            if job.rediarize:
-                # Bind recovery to the catalog's expected sealed-image hashes too.
-                document["diar"]["expected_sha256"] = {
-                    key: request.get("diar_models", {}).get(key)
-                    for key in ("segmentation_sha256", "embedder_sha256")
-                }
+            # Expected signed hashes are part of both ordinary and redo recovery,
+            # even when the installed paths and their file fingerprints coincide.
+            document["diar"]["expected_sha256"] = {
+                key: request.get("diar_models", {}).get(key)
+                for key in ("segmentation_sha256", "embedder_sha256")
+            }
         return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
     def _identity(self, vad_name: str) -> ModelIdentity:
@@ -1377,6 +1392,16 @@ class MeetingTranscribeState:
         # D5 retains its existing bounded ASR refinement after diar has exited.
         vad_name, probabilities = ("rediarize-v1", None) if job.rediarize else self.vad_factory()
         identity = self._identity(vad_name)
+        if request["diarization"] and request["resume"]:
+            # Do not let an old completed diar checkpoint bypass trust renewal.
+            pair = self.diar_models_provider()
+            if pair is None:
+                if job.rediarize:
+                    raise _Failed("model")
+                request["diarization"] = False
+                request.pop("diar_models", None)
+            else:
+                request["diar_models"] = dict(pair)
         config = self._config(job, identity)
         resume = self._resume(job, owner, manifest, config, identity)
         kept, cursors = resume.kept, resume.cursors
@@ -1856,14 +1881,28 @@ class MeetingTranscribeState:
             ack = self._unload_ack()
             if ack["type"] != "model.unloaded" or self.engine is not None:
                 raise ValueError("diar-unload-unconfirmed")
-            durable.diar.status = PhaseStatus.RUNNING
-            self._progress(job, "diar", 0, duration, force=True, block=0, blocks=len(blocks))
-            self._persist(job, owner, durable, utterances, cursors)
             if len(blocks) > job.request["limits"]["max_blocks"]:
                 raise ValueError("diar-block-limit")
             self._diar_memory(job, deadline)
-            if not job.request.get("diar_models"):
-                raise ValueError("diar-models-missing")
+            # The same installed/signed-catalog provider used by admission, after
+            # ASR unload and memory wait. Never execute the stale request pair.
+            pair = self.diar_models_provider()
+            if pair is None:
+                job.diar_status = "failed" if job.rediarize else "skipped"
+                if not job.rediarize:
+                    job.request["diarization"] = False
+                    job.request.pop("diar_models", None)
+                    durable.config = self._config(job, durable.identity)
+                    durable.diar = DiarProgress()
+                    durable.reconcile = ReconcileProgress()
+                return
+            job.request["diar_models"] = dict(pair)
+            durable.config = self._config(job, durable.identity)
+            durable.diar.status = PhaseStatus.RUNNING
+            durable.diar.turns.clear()
+            durable.diar.label_map.clear()
+            self._progress(job, "diar", 0, duration, force=True, block=0, blocks=len(blocks))
+            self._persist(job, owner, durable, utterances, cursors)
             with self.fence:
                 if job.cancelled:
                     raise _Cancelled

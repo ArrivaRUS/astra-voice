@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from test_meeting_jobs import MID, MID2
 from test_meeting_rediar_jobs import WORK, RedoRig, fail_metadata_directory_fsync
+from test_tray import qapp as qapp
 
 from astra_voice.core import meeting_jobs
 from astra_voice.core.meeting_jobs import MeetingJobs, ModelAdmission
@@ -941,3 +942,87 @@ def test_retention_publishes_disk_marker_when_unlink_fails_and_retries_in_five_s
     rig.now += 5
     rig.jobs.tick()
     assert rig.meeting().audio.deleted_at == deleted
+
+
+@pytest.mark.parametrize("published", [False, True])
+@pytest.mark.parametrize("expired", [False, True])
+def test_cancel_during_delayed_startup_classification(
+    rig: RedoRig,
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: object,
+    published: bool,
+    expired: bool,
+) -> None:
+    from astra_voice.core.settings import Settings
+    from astra_voice.ui.meeting_bridge import MeetingBridge
+
+    rig.retention = 7
+    if expired:
+        expire(rig)
+    queued(rig, final=published)
+    directory = rig.store.root / MID
+    (directory / "rediar-checkpoint.json").write_bytes(b"old work checkpoint")
+    if published:
+        # Exact K3: public text renamed; names and metadata still need K4–K7.
+        names = rig.store.read(MID, "speakers.json")
+        names.transcript_generation = 1
+        (directory / "speakers.json").write_text(json.dumps(names.to_dict()))
+        os.replace(directory / WORK, directory / "transcript.json")
+    generation = rig.meeting().meeting_generation
+    rig.jobs.shutdown()
+    jobs = rig.jobs = rig.make()
+    jobs.wall_clock = lambda: rig.wall
+    jobs.admit_allowed = lambda: False
+    jobs.model_probe = lambda: pytest.fail("cancel/recovery must not admit a role")
+    jobs.diar_models = lambda: pytest.fail("cancel/recovery must not resolve models")
+    tasks: list[Any] = []
+    jobs._submit = tasks.append
+    jobs.recover()
+    tasks.pop(0)()  # scan done; classification is still delayed
+    jobs._drain()
+    assert MID in jobs._redo_preparing and not jobs.queued_ids
+    bridge = MeetingBridge(Settings(), store=rig.store)
+    monkeypatch.setattr(bridge, "_jobs", lambda: jobs)
+    try:
+        if published:
+            snapshot = bridge._redo_snapshot(rig.meeting())
+            assert snapshot["canCancel"] is False
+            assert snapshot["actionName"] == ""
+            assert not bridge.cancelDiarizationRedo(MID, 1)
+        jobs.cancel(MID)  # late/direct intent must never discard a K3 result
+        while tasks:
+            tasks.pop(0)()
+            jobs._drain()
+        assert not jobs.queued_ids and not jobs.active_id and not rig.roles
+        assert not jobs.busy and rig.meeting().rediar is None
+        assert not (directory / WORK).exists()
+        assert not (directory / "rediar-checkpoint.json").exists()
+        assert rig.meeting().meeting_generation == generation
+        if published:
+            assert rig.store.read(MID, "transcript.json").meeting_generation == 2
+            assert rig.store.read(MID, "speakers.json") == model.SpeakerMap(transcript_generation=2)
+            assert jobs.redo_results[MID] == "done"
+        else:
+            assert rig.published() == rig.before
+            assert jobs.redo_results[MID] == "cancelled"
+        jobs._retention_pass()
+        while tasks:
+            tasks.pop(0)()
+            jobs._drain()
+        assert rig.audio_present() == (published or not expired)
+    finally:
+        bridge.shutdown()
+
+
+def test_cancel_after_recovery_queue_keeps_published_pair(rig: RedoRig) -> None:
+    queued(rig, final=False)
+    directory = rig.store.root / MID
+    (directory / "rediar-checkpoint.json").write_bytes(b"work checkpoint")
+    jobs = restart(rig)
+    assert jobs.queued_ids == [MID]
+    jobs.cancel(MID)
+    assert not jobs.queued_ids and not rig.roles and not jobs.busy
+    assert jobs.redo_results[MID] == "cancelled"
+    assert rig.meeting().rediar is None and rig.published() == rig.before
+    assert not (directory / WORK).exists()
+    assert not (directory / "rediar-checkpoint.json").exists()

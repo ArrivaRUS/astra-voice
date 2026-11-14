@@ -25,7 +25,7 @@ from astra_voice.worker import ipc
 from astra_voice.worker import meeting_transcribe as mt
 from helpers.meeting_audio import MID, Rig, make_disk, tone, write_track
 
-pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid", "synthetic_diar_models")]
 
 
 class Harness:

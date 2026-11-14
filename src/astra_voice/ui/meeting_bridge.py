@@ -2204,6 +2204,14 @@ class MeetingBridge(QObject):
         snapshot = jobs.redo_snapshot(meeting.id) if jobs is not None else {}
         busy = bool(snapshot.get("busy") or meeting.rediar is not None)
         status = snapshot.get("status", "")
+        if not status and meeting.rediar is not None:
+            status = "recovering"
+        can_cancel = busy and status not in {
+            "recovery_error",
+            "recovering",
+            "committing",
+            "cancelling",
+        }
         separated = (
             meeting.transcription.diarization and meeting.transcription.diar_status == "done"
         )
@@ -2311,7 +2319,7 @@ class MeetingBridge(QObject):
         )
         action = (
             "cancel"
-            if busy and code != "recovery_error"
+            if can_cancel
             else "again"
             if can_start and code in {"failed", "failed-again", "cancelled"}
             else "divide"
@@ -2331,7 +2339,7 @@ class MeetingBridge(QObject):
                 "busy": busy,
                 "stage": str(snapshot.get("stage", "")),
                 "canStart": can_start,
-                "canCancel": busy and status not in {"recovery_error", "committing", "cancelling"},
+                "canCancel": can_cancel,
                 "canKeep": can_keep,
                 "menuVisible": available and separated,
                 "menuEnabled": can_start and separated,

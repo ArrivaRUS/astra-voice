@@ -224,6 +224,7 @@ def test_r2_a1_transport_inherits_exact_lease_open_file(
 
 def test_subprocess_r2_a1_stopped_real_diar_holds_lease_after_parent_sigkill(
     tmp_path: Path,
+    signed_diar_pair: Any,
 ) -> None:
     import ctypes
     import select
@@ -248,7 +249,7 @@ def test_subprocess_r2_a1_stopped_real_diar_holds_lease_after_parent_sigkill(
     child_pid = None
     try:
         parent = subprocess.Popen(
-            [sys.executable, "-B", str(helper), str(disk.root)],
+            [sys.executable, "-B", str(helper), str(disk.root), str(signed_diar_pair.root)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

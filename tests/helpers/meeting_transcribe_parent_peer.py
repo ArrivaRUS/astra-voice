@@ -15,6 +15,7 @@ if __name__ == "__main__":
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.worker.meeting_diar_client import DiarProcess
 from helpers.meeting_audio import MID, Rig
+from helpers.meeting_trust import SignedDiarPair
 
 
 class PublishedDiar(DiarProcess):
@@ -27,7 +28,11 @@ class PublishedDiar(DiarProcess):
 
 def main() -> None:
     disk = MeetingStore(Path(sys.argv[1]))
+    pair = SignedDiarPair(Path(sys.argv[2]))
+    models = pair.models()
+    assert models is not None
     rig = Rig(disk)
+    rig.state.diar_models_provider = pair.models
     rig.state.diar_factory = PublishedDiar
     rig.load()
     rig.send(
@@ -37,10 +42,7 @@ def main() -> None:
         tracks=["mic"],
         variant="mic_only",
         diarization=True,
-        diar_models={
-            "segmentation_dir": "/unused/segmentation",
-            "embedder_dir": "/unused/embedder",
-        },
+        diar_models=models,
         self_track="none",
         resume=False,
         echo_gate=False,

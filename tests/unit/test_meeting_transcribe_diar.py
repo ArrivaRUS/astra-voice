@@ -31,7 +31,7 @@ from astra_voice.worker.meeting_diar_client import DiarCancelled, DiarProcess, s
 from astra_voice.worker.meeting_transcribe import assign_speakers, diar_blocks
 from helpers.meeting_audio import MID, Rig, bursts, make_disk, write_track
 
-pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid", "synthetic_diar_models")]
 MODELS = {"segmentation_dir": "/absent/segmentation", "embedder_dir": "/absent/embedder"}
 
 
@@ -502,6 +502,7 @@ def peer_command(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     )
 
 
+@pytest.mark.usefixtures("installed_diar_models")
 def test_subprocess_kill9_second_of_four_blocks_and_resume(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -528,6 +529,7 @@ def test_subprocess_kill9_second_of_four_blocks_and_resume(
     assert progress[-1]["blocks"] == 4
 
 
+@pytest.mark.usefixtures("installed_diar_models")
 def test_subprocess_block_deadline_and_confirmed_exit(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -542,6 +544,7 @@ def test_subprocess_block_deadline_and_confirmed_exit(
         pass
 
 
+@pytest.mark.usefixtures("installed_diar_models")
 def test_subprocess_cooperative_cancel_during_block_and_delete_barrier(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

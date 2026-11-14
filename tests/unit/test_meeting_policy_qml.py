@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from policy_matrix import CASES
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,7 +51,7 @@ engine.rootContext().setContextProperty('themeSource', theme)
 apps = (AppDefinition('dion', 'DION', ('dion',), (), AppClass.DION),)
 bridges = []
 window = None
-cases = matrix_cases()
+cases = matrix_cases()[int(sys.argv[2]):int(sys.argv[3])]
 
 def named(name):
     obj = window.findChild(QObject, name)
@@ -221,7 +222,10 @@ print(f'ok: {len(cases)} real-bridge policy rows')
 """
 
 
-def test_real_bridge_policy_matrix_in_main_qml() -> None:
+# Overlap one row so every adjacent policy transition remains covered while
+# each fresh pytest/child process fits the caller's 30-second budget.
+@pytest.mark.parametrize("first", range(0, len(CASES), 5))
+def test_real_bridge_policy_matrix_in_main_qml(first: int) -> None:
     env = {
         key: value
         for key, value in os.environ.items()
@@ -240,7 +244,7 @@ def test_real_bridge_policy_matrix_in_main_qml() -> None:
         DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent",
     )
     result = subprocess.run(
-        [sys.executable, "-c", PROBE, str(ROOT)],
+        [sys.executable, "-c", PROBE, str(ROOT), str(first), str(first + 6)],
         cwd=ROOT,
         env=env,
         capture_output=True,

@@ -46,6 +46,7 @@ def test_complete_cli_job_summary_with_scripted_role(
     from tools import meeting_transcribe_diar_check as check
 
     from astra_voice.worker.meeting_transcribe import MeetingTranscribeState
+    from helpers.meeting_trust import RequestPairState
 
     class Peer:
         peak_rss_kb = 1234
@@ -65,7 +66,7 @@ def test_complete_cli_job_summary_with_scripted_role(
             return completed
 
     def factory(**options: Any) -> MeetingTranscribeState:
-        return MeetingTranscribeState(
+        return RequestPairState(
             **options, diar_factory=lambda *args, **kwargs: Peer(), mem_available_mb=lambda: 100_000
         )
 

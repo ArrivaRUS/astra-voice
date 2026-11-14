@@ -143,7 +143,6 @@ def test_pair_mutation_does_not_block_metadata_controls(
         bridge.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="R2.1: D4 trust boundary requires forbidden worker changes")
 @pytest.mark.parametrize("replacement", [None, {**PAIR, "embedder_sha256": "c" * 64}])
 def test_reconfirm_trust_after_asr_unload_before_diar_load(
     tmp_path: Path,

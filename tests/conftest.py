@@ -789,3 +789,43 @@ def pytest_terminal_summary(terminalreporter: TerminalReporter, config: pytest.C
         )
         for path, reason in sorted(ignored.items()):
             terminalreporter.write_line(f"{os.path.relpath(path, config.rootpath)}: {reason}")
+
+
+@pytest.fixture(scope="module")
+def synthetic_diar_models() -> Iterator[None]:
+    """Explicit opt-in for separation tests; never applied to trust tests."""
+    from helpers import meeting_audio
+    from helpers.meeting_trust import RequestPairState
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(meeting_audio, "MeetingTranscribeState", RequestPairState)
+        yield
+
+
+@pytest.fixture
+def signed_diar_pair(tmp_path: Path) -> object:
+    from helpers.meeting_trust import SignedDiarPair, SigningUnavailable
+
+    try:
+        return SignedDiarPair.prepare(tmp_path / "signed-pair")
+    except SigningUnavailable as exc:
+        pytest.skip(f"sandbox cannot start temporary gpg-agent: {exc}")
+
+
+@pytest.fixture
+def installed_diar_models(
+    synthetic_diar_models: None, signed_diar_pair: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Use the genuine signed provider for every transcriber in an IPC test."""
+    from functools import partial
+
+    from astra_voice.worker.meeting_transcribe import MeetingTranscribeState
+    from helpers import meeting_audio
+    from helpers.meeting_trust import SignedDiarPair
+
+    assert isinstance(signed_diar_pair, SignedDiarPair)
+    monkeypatch.setattr(
+        meeting_audio,
+        "MeetingTranscribeState",
+        partial(MeetingTranscribeState, diar_models_provider=signed_diar_pair.models),
+    )
