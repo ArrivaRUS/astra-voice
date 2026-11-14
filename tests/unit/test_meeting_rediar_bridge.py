@@ -981,3 +981,110 @@ def test_enqueue_failure_outcome_is_checked_against_confirmed_audio(
     sync(rig)
     assert rig.bridge.diarizationRedo["code"] == ("no-audio" if failed else "")
     assert "Звук сохранён" not in rig.bridge.diarizationRedo["text"]
+
+
+def _prepare_failed_meeting_for_keep(rig: SaveRig, days: int) -> None:
+    from datetime import UTC, datetime
+
+    meeting = rig.meeting()
+    meeting.transcription.diarization = True
+    meeting.transcription.diar_status = "failed"
+    meeting.processing_status = ProcessingStatus.PARTIAL
+    text = rig.store.read(MID, "transcript.json")
+    for row in text.utterances:
+        if row.speaker != "me":
+            row.speaker = "others"
+    text.transcript_revision += 1
+    rig.store.write(MID, "transcript.json", text, writer=Writer.TRANSCRIBE)
+    rig.store.write(MID, "speakers.json", SpeakerMap(transcript_generation=0), writer=Writer.GUI)
+    rig.store.write(MID, "meeting.json", meeting, writer=Writer.GUI)
+    rig.settings.meeting_audio_retention_days = days
+    rig.jobs.audio_retention_days = lambda: days
+    rig.jobs.wall_clock = lambda: datetime(2026, 11, 13, 12, tzinfo=UTC)
+    rig.open_card()
+    assert rig.bridge.diarizationRedo["code"] == "failed"
+
+
+def _assert_kept_pending_receipt(rig: SaveRig) -> None:
+    state = rig.bridge.diarizationRedo
+    assert state["code"] == "kept-pending" and state["visible"]
+    assert state["text"] == (
+        "Разделение по голосам: оставлено как есть. Звук удаляется по настройке хранения"
+    )
+    assert not state["canStart"] and not state["canCancel"] and not state["canKeep"]
+    assert all(value is False for key, value in state.items() if key.startswith("can"))
+    assert not state["menuVisible"] and not state["menuEnabled"]
+    assert state["action"] == "" and state["keepAction"] == ""
+    assert not state["showProgress"]
+    assert state["audioPresent"] and state["cleanupPending"] and state["audioUntil"] == ""
+    assert rig.bridge.card["diarizationRedo"]["text"] == state["text"]
+    assert "звук удаляется" in rig.bridge.card["subtitle"]["suffix"]
+    assert "звук хранится" not in rig.bridge.card["subtitle"]["suffix"]
+    assert rig.meeting().cleanup_pending and rig.meeting().audio.present
+    assert rig.jobs.meetings[MID].cleanup_pending
+
+
+def test_keep_zero_pending_receipt_until_confirmed_deletion(rig: SaveRig) -> None:
+    _prepare_failed_meeting_for_keep(rig, 0)
+    now = [1000.0]
+    rig.jobs.clock = lambda: now[0]
+    obstacle = rig.store.root / MID / "audio" / "pending-unlink-directory"
+    obstacle.mkdir(mode=0o700)  # Real EISDIR defers confirmation of zero-day cleanup.
+    assert rig.bridge.keepDiarizationAsIs(MID, 0)
+    rig.recording.tick()
+    assert rig.meeting().audio.retain_days == 0
+    assert rig.meeting().processing_status == ProcessingStatus.SUCCEEDED
+    _assert_kept_pending_receipt(rig)
+    obstacle.rmdir()
+    now[0] += 4.9
+    rig.recording.tick()
+    _assert_kept_pending_receipt(rig)
+    now[0] += 0.1
+    rig.recording.tick()
+    state = rig.bridge.diarizationRedo
+    assert state["code"] == "kept-deleted" and state["visible"]
+    assert state["text"] == (
+        "Разделение по голосам: оставлено как есть. Звук удалён по настройке хранения"
+    )
+    assert not state["audioPresent"] and not state["cleanupPending"]
+    assert all(value is False for key, value in state.items() if key.startswith("can"))
+    assert state["action"] == "" and state["keepAction"] == ""
+    assert not state["menuEnabled"]
+    assert "звук удалён" in rig.bridge.card["subtitle"]["suffix"]
+    assert not rig.meeting().audio.present and not rig.jobs.meetings[MID].audio.present
+
+
+def test_keep_pending_receipt_persists_when_real_unlink_is_refused(rig: SaveRig) -> None:
+    _prepare_failed_meeting_for_keep(rig, 0)
+    now = [1000.0]
+    rig.jobs.clock = lambda: now[0]
+    obstacle = rig.store.root / MID / "audio" / "directory-refuses-unlink"
+    obstacle.mkdir(mode=0o700)
+    assert rig.bridge.keepDiarizationAsIs(MID, 0)
+    rig.recording.tick()
+    _assert_kept_pending_receipt(rig)
+    for _ in range(2):
+        now[0] += 5
+        rig.recording.tick()  # Retry hits the actual directory and fails again.
+        assert obstacle.is_dir()
+        _assert_kept_pending_receipt(rig)
+    assert not rig.bridge.rediarizeMeeting(MID, 0, True)
+    assert not rig.bridge.divideMeeting(MID, 0)
+    assert not rig.bridge.keepDiarizationAsIs(MID, 0)
+    _assert_kept_pending_receipt(rig)
+
+
+def test_keep_seven_days_receipt_still_offers_division(rig: SaveRig) -> None:
+    _prepare_failed_meeting_for_keep(rig, 7)
+    assert rig.bridge.keepDiarizationAsIs(MID, 0)
+    rig.recording.tick()
+    state = rig.bridge.diarizationRedo
+    assert state["code"] == "kept-7" and state["visible"]
+    assert state["text"] == (
+        "Разделение по голосам: оставлено как есть. Звук хранится до 20.11 — "
+        "до этого встречу можно разделить"
+    )
+    assert state["audioPresent"] and not state["cleanupPending"]
+    assert state["canStart"] and not state["canKeep"] and not state["canCancel"]
+    assert state["action"] == "Разделить по голосам" and state["keepAction"] == ""
+    assert rig.meeting().audio.retain_days == 7 and not rig.meeting().cleanup_pending

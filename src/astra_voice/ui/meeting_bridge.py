@@ -2263,7 +2263,11 @@ class MeetingBridge(QObject):
         else:
             code = ""
         if not busy and meeting.cleanup_pending:
-            code = "no-audio" if failed else ""
+            if outcome == "kept" and not failed and meeting.audio.present:
+                # Keep the current acceptance receipt while deletion is unconfirmed.
+                code = "kept-pending"
+            else:
+                code = "no-audio" if failed else ""
         elif not busy and not meeting.audio.present:
             if failed:
                 code = "no-audio"
