@@ -646,6 +646,13 @@ class MeetingJobs:
                 try:
                     if self._deletion_owned(meeting.id) or meeting.id in pending:
                         continue
+                    # Capture checkpoints and controller metadata fail fast on
+                    # our store gate/GUI lease. Never contend with live capture,
+                    # including an inconsistent leftover redo descriptor.
+                    if meeting.state in {MeetingState.RECORDING, MeetingState.PAUSED}:
+                        continue
+                    if self.store.capture_active(meeting.id):
+                        continue  # capture still owns its final durable edges
                     if meeting.id not in owned:
                         # Classification precedes both retention and role admission.
                         if meeting.rediar is not None:

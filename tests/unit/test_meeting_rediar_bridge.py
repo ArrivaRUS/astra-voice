@@ -18,7 +18,7 @@ from test_meeting_speakers import data
 from test_tray import qapp as qapp
 
 from astra_voice.meetings import speakers, templates
-from astra_voice.meetings.events import MeetingState, ProcessingStatus
+from astra_voice.meetings.events import MeetingState, PhaseStatus, ProcessingStatus
 from astra_voice.meetings.model import Meeting, SpeakerMap
 from astra_voice.meetings.store import Writer
 from astra_voice.ui import meeting_card
@@ -64,6 +64,54 @@ def enqueue(rig: SaveRig) -> Meeting:
     assert result is not None
     sync(rig)
     return result
+
+
+def test_divide_without_speaker_map_finishes_successfully(rig: SaveRig) -> None:
+    (rig.store.root / MID / "speakers.json").unlink()
+    meeting = rig.meeting()
+    meeting.transcription.diarization = False
+    meeting.transcription.diar_status = "skipped"
+    rig.store.write(MID, "meeting.json", meeting, writer=Writer.GUI)
+    rig.bridge._diar_models_provider = lambda: None
+    rig.jobs.diar_models = lambda: None
+    rig.open_card()
+    assert not rig.bridge.divideMeeting(MID, 0)
+    rig.bridge._diar_models_provider = lambda: PAIR
+    rig.jobs.diar_models = lambda: PAIR
+    sync(rig)
+    assert rig.bridge.divideMeeting(MID, 0)
+    final = rig.store.read(MID, "transcript.json")
+    final.meeting_generation = rig.meeting().meeting_generation
+    final.transcript_revision += 1
+    seed = deepcopy(final)
+    seed.labels_final = False
+    seed.reconcile.status = PhaseStatus.PENDING
+    for row in seed.utterances:
+        row.final = False
+    # Like the actual role, persist the work seed before accepted/readiness.
+    rig.store.write(MID, "rediar-transcript.json", seed, writer=Writer.TRANSCRIBE)
+    rig.start_running()
+    active = rig.jobs._active
+    assert active is not None
+    assert active.generation == final.meeting_generation
+    final.transcript_revision += 1
+    rig.store.write(MID, "rediar-transcript.json", final, writer=Writer.TRANSCRIBE)
+    rig.role.emit(
+        "meeting.job.done",
+        meeting_id=MID,
+        meeting_generation=active.generation,
+        diar_status="done",
+        wall_ms=100,
+        peak_rss_kb=55,
+    )
+    rig.recording.tick()
+    sync(rig)
+    assert rig.bridge.diarizationRedo["code"] == "done"
+    assert not rig.jobs.recovery_errors
+    assert rig.meeting().rediar is None
+    assert rig.store.read(MID, "speakers.json") == SpeakerMap(transcript_generation=1)
+    read_pair(rig)
+    assert rig.bridge.card["diarizationRedo"]["code"] == "done"
 
 
 def publish(rig: SaveRig, *, finish: bool, bind_old: bool = True) -> None:

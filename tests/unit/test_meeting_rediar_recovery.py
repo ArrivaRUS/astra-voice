@@ -846,7 +846,7 @@ def test_crash_after_invalid_descriptor_clear_sweeps_non_done_orphans_on_restart
 
 
 @pytest.mark.parametrize("state", [s for s in MeetingState if s != MeetingState.DELETING])
-def test_retention_sweeps_rediar_orphans_without_descriptor_in_every_state(
+def test_retention_sweeps_rediar_orphans_except_capture_states(
     rig: RedoRig, state: MeetingState
 ) -> None:
     directory = rig.store.root / MID
@@ -859,7 +859,8 @@ def test_retention_sweeps_rediar_orphans_without_descriptor_in_every_state(
         path.write_bytes(b"orphan")
     before = rig.published()
     rig.jobs._retention_pass()
-    assert all(not path.exists() for path in owned)
+    capturing = state in {MeetingState.RECORDING, MeetingState.PAUSED}
+    assert all(path.exists() == capturing for path in owned)
     assert rig.meeting().state == state and rig.meeting().rediar is None
     assert rig.published() == before and not rig.roles
 

@@ -312,6 +312,48 @@ def test_success_publishes_and_finalizes_once(rig: RedoRig, partial: bool) -> No
     assert not rig.notices
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_divide_without_models_then_installed_without_speaker_map(
+    rig: RedoRig, restart: bool
+) -> None:
+    rig.retention = 7
+    (rig.store.root / MID / "speakers.json").unlink()
+    meeting = rig.meeting()
+    meeting.transcription.diarization = False
+    meeting.transcription.diar_status = "skipped"
+    rig.store.write(MID, "meeting.json", meeting, writer=store.Writer.GUI)
+    rig.pair = None
+    rig.jobs.rediarize(MID)
+    assert rig.meeting().rediar is None
+    rig.pair = dict(PAIR)
+    rig.start()
+    rig.finish_text()
+    if restart:
+        # A restart classifies the durable final work via _probe_redo.
+        rig.jobs.shutdown()
+        rig.jobs = meeting_jobs.MeetingJobs(
+            rig.store,
+            rig.factory,
+            audio_retention_days=lambda: 7,
+            wall_clock=lambda: rig.wall,
+            submit=lambda task: task(),
+        )
+        rig.jobs.start_retention()
+        rig.jobs.tick()
+    else:
+        rig.redo_done()
+    assert rig.jobs.redo_results[MID] == "done"
+    assert not rig.jobs.recovery_errors and not rig.jobs.names_busy(MID)
+    assert rig.meeting().rediar is None
+    assert rig.store.read(MID, "transcript.json").meeting_generation == 2
+    assert rig.store.read(MID, "speakers.json") == model.SpeakerMap(transcript_generation=2)
+    assert rig.meeting().transcription.finished_at == rig.wall.isoformat()
+    assert rig.meeting().audio.retain_days == 7 and rig.meeting().audio.present
+    rig.wall += timedelta(days=7)
+    rig.jobs._retention_pass()
+    assert not rig.meeting().audio.present
+
+
 @pytest.mark.parametrize("lease", [store.Writer.DIAR, store.Writer.TRANSCRIBE, store.Writer.GUI])
 def test_publish_busy_retries_with_backoff_and_other_jobs_run(
     rig: RedoRig, lease: store.Writer, monkeypatch: Any

@@ -290,10 +290,14 @@ def _rediar_unlink(directory: int, names: tuple[str, ...]) -> None:
     """
     temporary = re.compile(r"\.rediar-(?:transcript|checkpoint)-[0-9a-f]{32}\.tmp\Z")
     entries = (*names, *(n for n in os.listdir(directory) if temporary.fullmatch(n)))
+    removed = False
     for name in entries:
-        with contextlib.suppress(FileNotFoundError):
+        try:
             os.unlink(name, dir_fd=directory)
-    if entries:
+        except FileNotFoundError:
+            continue
+        removed = True
+    if removed:
         os.fsync(directory)
 
 
@@ -488,7 +492,10 @@ class MeetingWriter:
                             return RediarPublishResult.WORK_PENDING
                         return RediarPublishResult.INVALID
                     # K2 is the sole internal exception to I3, like reset_speakers.
-                    names = _read(self._directory, "speakers.json")
+                    try:
+                        names = _read(self._directory, "speakers.json")
+                    except FileNotFoundError:
+                        names = SpeakerMap()
                     assert isinstance(names, SpeakerMap)
                     if names.transcript_generation is None:
                         names.transcript_generation = published.meeting_generation
@@ -531,7 +538,11 @@ class MeetingWriter:
                     self._rediar_sync()
                 # K4: avoid a second name replacement on an idempotent call.
                 empty = SpeakerMap(transcript_generation=generation)
-                if _read(self._directory, "speakers.json") != empty:
+                try:
+                    names = _read(self._directory, "speakers.json")
+                except FileNotFoundError:
+                    names = SpeakerMap()
+                if names != empty:
                     self._rediar_names(empty)
                 # K5 also confirms a prior uncertain K4 and interrupted unlink.
                 _rediar_unlink(self._directory, ("rediar-checkpoint.json", "checkpoint.json"))
@@ -1250,6 +1261,35 @@ class MeetingStore:
                 return meeting
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось удалить звук встречи") from None
+
+    def capture_active(self, meeting_id: str) -> bool:
+        """Probe the capture lifetime lease without creating files or store gates.
+
+        RECORDING/PAUSED must be filtered by the caller before this probe. The
+        lease also covers capture finalization after metadata changes state.
+        A busy probe acquires no lock; a free probe closes its descriptor at once.
+        """
+        try:
+            with self._directory(meeting_id) as directory:
+                try:
+                    descriptor = os.open(
+                        ".writer-capture.lock",
+                        os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                        dir_fd=directory,
+                    )
+                except FileNotFoundError:
+                    return False
+                try:
+                    check_private_file(os.fstat(descriptor))
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return True
+                    return False
+                finally:
+                    os.close(descriptor)
+        except (OSError, ValueError, TypeError):
+            raise MeetingStoreError("Не удалось проверить запись встречи") from None
 
     def rediar_cleanup(self, meeting_id: str) -> Meeting:
         """Startup sweep of exact temp names, only after both writers release.

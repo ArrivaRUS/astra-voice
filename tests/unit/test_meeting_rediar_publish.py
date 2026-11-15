@@ -92,6 +92,56 @@ def assert_published(disk: store.MeetingStore) -> None:
         assert not (disk.root / ID / name).exists()
 
 
+@pytest.mark.parametrize("committed", [False, True], ids=["k2", "k4"])
+def test_publish_without_speaker_map(disk: store.MeetingStore, committed: bool) -> None:
+    (disk.root / ID / "speakers.json").unlink()
+    if committed:
+        os.replace(disk.root / ID / WORK, disk.root / ID / "transcript.json")
+    assert publish(disk) == RESULT.PUBLISHED
+    assert_published(disk)
+    assert publish(disk) == RESULT.PUBLISHED
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["k2", "k4"])
+@pytest.mark.parametrize("damage", ["invalid", "permissions", "directory", "symlink"])
+def test_speaker_read_errors_are_not_empty_maps(
+    disk: store.MeetingStore, committed: bool, damage: str
+) -> None:
+    if committed:
+        os.replace(disk.root / ID / WORK, disk.root / ID / "transcript.json")
+    target = disk.root / ID / "speakers.json"
+    if damage == "invalid":
+        target.write_bytes(b"not json")
+    elif damage == "permissions":
+        target.chmod(0o644)
+    else:
+        target.unlink()
+        if damage == "directory":
+            target.mkdir(mode=0o700)
+        else:
+            target.symlink_to("missing-map")
+    assert publish(disk) == RESULT.IO_ERROR
+    assert disk.transcript_state(ID).generation == (2 if committed else 1)
+
+
+@pytest.mark.parametrize("entry", [None, WORK, ".rediar-checkpoint-" + "a" * 32 + ".tmp"])
+def test_rediar_cleanup_syncs_only_actual_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str | None
+) -> None:
+    if entry is not None:
+        (tmp_path / entry).write_bytes(b"work")
+    syncs: list[int] = []
+    monkeypatch.setattr(os, "fsync", syncs.append)
+    directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        store._rediar_unlink(directory, (WORK, CHECK))
+        assert syncs == ([] if entry is None else [directory])
+        store._rediar_unlink(directory, (WORK, CHECK))
+        assert syncs == ([] if entry is None else [directory])
+    finally:
+        os.close(directory)
+
+
 @pytest.mark.parametrize("stage", ["ready", "k2", "k3", "k4", "k5"])
 def test_recovery_table_and_idempotence(
     disk: store.MeetingStore, stage: str, monkeypatch: Any
