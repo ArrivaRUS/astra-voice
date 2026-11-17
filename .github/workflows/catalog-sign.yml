@@ -1,0 +1,159 @@
+# Оракул подписи каталога: кандидат — данные; S1 доступен после Approve release.
+name: Подпись каталога
+# Полная сумма включает первые 16 знаков; у выражений Actions нет substring.
+run-name: Подпись каталога · ${{ inputs.sha256 }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Коммит-кандидат этого репозитория (40 hex)
+        required: true
+        type: string
+      sha256:
+        description: SHA256 точных байтов data/catalog.json (64 hex)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-sign
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Проверка данных и сводка владельцу
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.check.outputs.sha256 }}
+    steps:
+      - name: Только main
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            echo '::error::Подпись каталога разрешена только с ветки main'
+            exit 1
+          fi
+          for program in git python3 gpg gpgv gpgconf sha256sum cut mktemp chmod rm base64; do
+            command -v "$program" >/dev/null || { echo "::error::Нет штатной программы $program; подпись отменена"; exit 1; }
+          done
+      - name: Версии штатных инструментов
+        run: |
+          git --version
+          python3 --version
+          gpg --version
+          gpgv --version
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Проверка кандидата как данных
+        id: check
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          # Сначала формат, затем fetch только объекта из того же origin.
+          python3 -c 'from scripts.catalog_sign_check import validate_inputs; import os; validate_inputs(os.environ["INPUT_COMMIT"], os.environ["INPUT_SHA256"])'
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -c credential.helper= -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)" fetch --no-tags origin "$INPUT_COMMIT"
+          python3 scripts/catalog_sign_check.py --commit "$INPUT_COMMIT" --sha256 "$INPUT_SHA256" --main-commit "$GITHUB_SHA" --output "$RUNNER_TEMP/catalog-candidate"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: catalog-candidate
+          path: ${{ runner.temp }}/catalog-candidate/catalog.json
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Подпись S1 после Approve владельца
+    needs: check
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Только main
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            echo '::error::Подпись каталога разрешена только с ветки main'
+            exit 1
+          fi
+          for program in git python3 gpg gpgv gpgconf sha256sum cut mktemp chmod rm base64; do
+            command -v "$program" >/dev/null || { echo "::error::Нет штатной программы $program; подпись отменена"; exit 1; }
+          done
+      - name: Версии штатных инструментов
+        run: |
+          git --version
+          python3 --version
+          gpg --version
+          gpgv --version
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          # verify.py содержит пины и проверяющий код, импортируемый скриптом.
+          sparse-checkout: |
+            /data/keys/release.gpg
+            /scripts/check_signing_secret.py
+            /src/astra_voice/__init__.py
+            /src/astra_voice/security/__init__.py
+            /src/astra_voice/security/verify.py
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: catalog-candidate
+          path: ${{ runner.temp }}/catalog-to-sign
+      - name: Сверка точных байтов
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CHECK_SHA256: ${{ needs.check.outputs.sha256 }}
+          INPUT_SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/catalog-to-sign"
+          current_main="$(git -C "$GITHUB_WORKSPACE" -c credential.helper= -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)" ls-remote --refs --exit-code origin refs/heads/main)" || { echo '::error::Не удалось проверить вершину main; подпись отменена'; exit 1; }
+          if [ "$current_main" != "$(printf '%s\trefs/heads/main' "$GITHUB_SHA")" ]; then
+            echo '::error::main изменился, запустите подпись заново'
+            exit 1
+          fi
+          actual="$(sha256sum catalog.json | cut -d ' ' -f 1)"
+          test "$actual" = "$CHECK_SHA256"
+          test "$actual" = "${INPUT_SHA256,,}"
+      - name: Импорт S1 и подпись
+        id: signing
+        shell: bash
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/catalog-to-sign"
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          trap 'gpgconf --kill gpg-agent || :; rm -rf -- "$GNUPGHOME"' EXIT
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$GPG_SIGNING_KEY" | gpg --batch --quiet --import
+          unset GPG_SIGNING_KEY
+          SIGNING_FPR="$(python3 "$GITHUB_WORKSPACE/scripts/check_signing_secret.py" secret --homedir "$GNUPGHOME" --keyring "$GITHUB_WORKSPACE/data/keys/release.gpg")" || { echo '::error::Секрет подписи не прошёл проверку состава'; exit 1; }
+          gpg --batch --yes --local-user "${SIGNING_FPR}!" --detach-sign --output catalog.json.sig catalog.json
+          gpgv --keyring "$GITHUB_WORKSPACE/data/keys/release.gpg" catalog.json.sig catalog.json
+          python3 "$GITHUB_WORKSPACE/scripts/check_signing_secret.py" signature --keyring "$GITHUB_WORKSPACE/data/keys/release.gpg" --subkey "$SIGNING_FPR" catalog.json.sig catalog.json
+          printf '\nПодписан catalog.json, SHA256: `%s`\n' "$(sha256sum catalog.json | cut -d ' ' -f 1)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: catalog.json.sig
+          path: ${{ runner.temp }}/catalog-to-sign/catalog.json.sig
+          if-no-files-found: error
+          retention-days: 7

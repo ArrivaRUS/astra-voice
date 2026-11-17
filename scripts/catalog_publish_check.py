@@ -76,6 +76,34 @@ def _revocations(raw: bytes) -> set[str]:
     return pairs
 
 
+def check_history(
+    raw: bytes,
+    previous: bytes,
+    *,
+    label: str,
+    strict: bool = False,
+    allow_unrevoke: tuple[str, ...] = (),
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Общие правила выпуска и оракула подписи; strict запрещает повторную подпись."""
+    pair, old_pair = _pair(raw), _pair(previous)
+    if pair[0] < old_pair[0]:
+        raise PublishError(f"trust_epoch убыла: {pair[0]} < {old_pair[0]} ({label}).")
+    if (strict or raw != previous) and pair <= old_pair:
+        if pair == old_pair:
+            raise PublishError(
+                f"Равная пара {pair}; требуется строго большая пара ({label}); sha256: "
+                f"{hashlib.sha256(raw).hexdigest()} / {hashlib.sha256(previous).hexdigest()}."
+            )
+        raise PublishError(f"Откат каталога: пара {pair} не больше {old_pair} ({label}).")
+    removed = _revocations(previous) - _revocations(raw)
+    forbidden = removed - set(allow_unrevoke)
+    if forbidden:
+        raise PublishError("; ".join(f"потеря отзыва: {entry}" for entry in sorted(forbidden)))
+    for entry in sorted(removed):
+        print(f"Явно разрешено снятие отзыва: {entry} (--allow-unrevoke).")
+    return old_pair, pair
+
+
 def check(
     root: Path,
     *,
@@ -89,7 +117,7 @@ def check(
             f"GITHUB_REPOSITORY={repository!r} не совпадает с RELEASES_REPO={RELEASES_REPO!r}."
         )
     data = root / "data"
-    catalog = load_builtin(
+    load_builtin(
         Verifier("catalog", keyring=data / "keys" / "release.gpg"),
         root=data,
         require_schema=True,
@@ -104,25 +132,7 @@ def check(
     tag = _previous_tag(root) if previous_tag is None else previous_tag
     # Полное имя refs/tags исключает интерпретацию тега как опции или ревизии ветки.
     previous = _git(root, "show", f"refs/tags/{tag}:data/catalog.json")
-    old_pair = _pair(previous)
-    pair = catalog.trust_epoch, catalog.serial
-    if pair[0] < old_pair[0]:
-        raise PublishError(f"trust_epoch убыла: {pair[0]} < {old_pair[0]} (тег {tag}).")
-    if raw != previous and pair <= old_pair:
-        if pair == old_pair:
-            raise PublishError(
-                f"Равная пара {pair} при разных байтах / sha256: "
-                f"{hashlib.sha256(raw).hexdigest()} != {hashlib.sha256(previous).hexdigest()}."
-            )
-        raise PublishError(f"Откат каталога: пара {pair} не больше {old_pair} (тег {tag}).")
-    removed = _revocations(previous) - {
-        f"{entry.model_id}@{entry.revision}" for entry in catalog.revoked
-    }
-    forbidden = removed - set(allow_unrevoke)
-    if forbidden:
-        raise PublishError("; ".join(f"потеря отзыва: {entry}" for entry in sorted(forbidden)))
-    for entry in sorted(removed):
-        print(f"Явно разрешено снятие отзыва: {entry} (--allow-unrevoke).")
+    old_pair, pair = check_history(raw, previous, label=f"тег {tag}", allow_unrevoke=allow_unrevoke)
     print(f"Гейт каталога пройден: {name}; прошлый тег {tag}, {old_pair} → {pair}.")
 
 

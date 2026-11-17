@@ -15,6 +15,8 @@ from typing import cast
 
 import pytest
 
+yaml = pytest.importorskip("yaml")
+
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
 CheckSecret = Callable[
@@ -375,8 +377,10 @@ def test_empty_home_rejected(keys: Keys, api: dict[str, object], tmp_path: Path)
         assert "ровно один sec" in " ".join(errors)
 
 
-@pytest.fixture
-def signed(keys: Keys, tmp_path: Path) -> Iterator[tuple[Path, Path]]:
+@pytest.fixture(params=[True, False], ids=["armored-release", "binary-catalog"])
+def signed(
+    keys: Keys, tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[tuple[Path, Path]]:
     with imported(tmp_path, secret_for(keys, keys.s1)) as home:
         data = tmp_path / "SHA256SUMS"
         sig = tmp_path / "SHA256SUMS.asc"
@@ -386,11 +390,12 @@ def signed(keys: Keys, tmp_path: Path) -> Iterator[tuple[Path, Path]]:
             "--local-user",
             f"{keys.s1}!",
             "--detach-sign",
-            "--armor",
+            *(["--armor"] if request.param else []),
             "--output",
             str(sig),
             str(data),
         )
+        assert sig.read_bytes().startswith(b"-----BEGIN PGP") is request.param
         yield sig, data
 
 
@@ -503,3 +508,44 @@ def test_secret_cli_relative_paths(keys: Keys, tmp_path: Path) -> None:
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout == keys.s1 + "\n"
+
+
+def test_catalog_workflow_binary_signing_step(keys: Keys, tmp_path: Path) -> None:
+    """Сам shell-шаг workflow, настоящий временный S1; пины только тестового мастера."""
+    workflow = yaml.safe_load((ROOT / ".github/workflows/catalog-sign.yml").read_text())
+    step = next(step for step in workflow["jobs"]["sign"]["steps"] if step.get("id") == "signing")
+    workspace = tmp_path / "trusted-main"
+    (workspace / "scripts").mkdir(parents=True)
+    (workspace / "data/keys").mkdir(parents=True)
+    shutil.copyfile(keys.keyring, workspace / "data/keys/release.gpg")
+    # Производственный проверяющий скрипт с единственным тестовым пином.
+    (workspace / "scripts/check_signing_secret.py").write_text(
+        "import runpy\n"
+        f"main = runpy.run_path({str(ROOT / 'scripts/check_signing_secret.py')!r})['main']\n"
+        f"raise SystemExit(main(pinned=frozenset([{keys.master!r}]), revoked=frozenset()))\n",
+        encoding="utf-8",
+    )
+    runner_temp = tmp_path / "runner-temp"
+    data_dir = runner_temp / "catalog-to-sign"
+    data_dir.mkdir(parents=True)
+    data = data_dir / "catalog.json"
+    data.write_bytes(b'{"test":"temporary key only"}\n')
+    summary = tmp_path / "summary"
+    secret = gpg(keys.home, "--armor", "--export-secret-subkeys", f"{keys.s1}!").decode("ascii")
+    assert secret.startswith("-----BEGIN PGP PRIVATE KEY BLOCK-----")
+    result = subprocess.run(
+        ["bash", "-eu", "-c", step["run"]],
+        capture_output=True,
+        env={
+            **os.environ,
+            "GITHUB_WORKSPACE": str(workspace),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_STEP_SUMMARY": str(summary),
+            "GPG_SIGNING_KEY": secret,
+        },
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    sig = data_dir / "catalog.json.sig"
+    assert not sig.read_bytes().startswith(b"-----BEGIN PGP")
+    assert "Подписан catalog.json, SHA256:" in summary.read_text()
