@@ -33,6 +33,7 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -65,10 +66,17 @@ from astra_voice.meetings.segments import SegmentSidecar
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, MeetingWriter, Writer
 from astra_voice.meetings.timeline import EpochTimeline, SegmentTimeline
 from astra_voice.security.files import check_private_file, private_directory
+from astra_voice.worker import engine as engine_module
 from astra_voice.worker import ipc
 from astra_voice.worker.engine import CancelToken, Engine, EngineError, make_engine
 from astra_voice.worker.meeting_contract import ASR_WINDOW_TIMEOUT_S, COMMAND_FIELDS, RequestLedger
-from astra_voice.worker.meeting_diar_client import DiarCancelled, DiarProcess, model_fingerprint
+from astra_voice.worker.meeting_diar_client import (
+    DiarCancelled,
+    DiarProcess,
+    PcmSource,
+    _write_pcm,
+    model_fingerprint,
+)
 from astra_voice.worker.meeting_roles import failure
 
 if TYPE_CHECKING:
@@ -105,6 +113,7 @@ DIAR_BLOCK_MS = 1_200_000
 DIAR_PAUSE_SEARCH_MS = 90_000
 DIAR_MEMORY_WAIT_S = 120.0
 DIAR_MEMORY_RETRY_S = 1.0
+DIAR_PCM_CHUNK_FRAMES = RATE  # One second, independent of the diarization block size.
 MAX_THREADS = 2
 MAX_SEGMENT_FRAMES = 4_800_000
 TRANSCRIPT_CAPACITY = 9000  # Transcript schema maximum
@@ -724,6 +733,9 @@ class MeetingTranscribeState:
         from astra_voice.worker import vad
 
         vad.unload()
+        # Both runtimes are gone before ACK/child startup; glibc otherwise keeps
+        # freed ORT arenas resident even after the engine's gc.collect().
+        engine_module._trim_heap()
 
     def _unload_ack(self) -> Message:
         """The model.unload executor path; ACK exists only after unload returns."""
@@ -1844,6 +1856,38 @@ class MeetingTranscribeState:
         return audio
 
     @staticmethod
+    def _write_block_pcm(
+        fd: int,
+        reader: _Reader,
+        spans: list[_Span],
+        first: int,
+        end: int,
+        check: Callable[[], None],
+    ) -> None:
+        """Write the same PCM as _block_audio, without a block-sized array."""
+        check()
+        frames = (end - first) * RATE // 1000
+        # A new memfd reads as zeros in all unwritten gaps and the short tail.
+        os.ftruncate(fd, frames * 4)
+        for span in spans:
+            check()
+            a = max(first, span.recorded(span.first))
+            b = min(end, span.recorded(span.end))
+            if a >= b:
+                continue
+            start, stop = span.sample_at(a), span.sample_at(b)
+            offset = (a - first) * RATE // 1000
+            count = min(stop - start, frames - offset)
+            os.lseek(fd, offset * 4, os.SEEK_SET)
+            for position in range(0, count, DIAR_PCM_CHUNK_FRAMES):
+                check()
+                samples = reader.read(
+                    span, start + position, start + min(count, position + DIAR_PCM_CHUNK_FRAMES)
+                )
+                view = samples.astype("<f4", copy=False).data.cast("B")
+                _write_pcm(fd, view, check)
+
+    @staticmethod
     def _canonical_map(turns: list[DiarTurn], final: Message) -> dict[str, str]:
         labels = {t.label for t in turns}
         mapping: dict[str, str] = final["label_map"]
@@ -1917,9 +1961,23 @@ class MeetingTranscribeState:
                     for index, (first, end) in enumerate(blocks):
                         self._diar_memory(job, deadline)
                         self._check_wall(job, deadline)
-                        audio = self._block_audio(reader, target_spans, first, end)
-                        rows = role.block(audio, index, first)
-                        del audio
+                        audio = PcmSource(
+                            (end - first) * RATE // 1000,
+                            partial(
+                                self._write_block_pcm,
+                                reader=reader,
+                                spans=target_spans,
+                                first=first,
+                                end=end,
+                                check=partial(self._check_wall, job, deadline),
+                            ),
+                        )
+                        engine_module._trim_malloc()
+                        try:
+                            rows = role.block(audio, index, first)
+                        finally:
+                            del audio
+                            engine_module._trim_malloc()
                         self._check_wall(job, deadline)
                         if len(durable.diar.turns) + len(rows) > diar_link.MAX_SEGMENTS:
                             raise ValueError("diar-turns-limit")

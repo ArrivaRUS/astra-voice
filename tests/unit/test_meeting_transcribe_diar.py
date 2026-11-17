@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ from astra_voice.meetings import diar_link
 from astra_voice.meetings.events import MeetingState, PhaseStatus
 from astra_voice.meetings.model import Checkpoint, DiarTurn, Meeting, Transcript, Utterance
 from astra_voice.meetings.store import MeetingStoreError, MeetingWriter, Writer
-from astra_voice.worker import meeting_diar_client, meeting_transcribe
+from astra_voice.worker import engine, meeting_diar_client, meeting_transcribe
 from astra_voice.worker.meeting_diar_client import DiarCancelled, DiarProcess, sealed_pcm
 from astra_voice.worker.meeting_transcribe import assign_speakers, diar_blocks
 from helpers.meeting_audio import MID, Rig, bursts, make_disk, write_track
@@ -113,6 +114,33 @@ def install(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> list[ScriptedDiar]:
     monkeypatch.setattr(meeting_transcribe, "DIAR_BLOCK_MS", 3000)
     monkeypatch.setattr(meeting_transcribe, "DIAR_PAUSE_SEARCH_MS", 0)
     return roles
+
+
+def test_diar_releases_pcm_and_trims_malloc_between_blocks(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roles = install(rig, monkeypatch)
+    original = meeting_diar_client.PcmSource
+    references: list[Any] = []
+    trimmed: list[bool] = []
+
+    def build(*args: Any) -> Any:
+        audio = original(*args)
+        references.append(weakref.ref(audio))
+        return audio
+
+    def trim() -> None:
+        if references:
+            trimmed.append(references[-1]() is not None)
+
+    monkeypatch.setattr(meeting_transcribe, "PcmSource", build)
+    monkeypatch.setattr(engine, "_trim_malloc", trim)
+    start(rig)
+    done = rig.finish()
+    assert done["diar_status"] == "done"
+    assert roles and len(references) == len(roles[0].blocks)
+    assert trimmed == [True, False] * len(references)
+    assert all(reference() is None for reference in references)
 
 
 def test_d4_d10_phase_boundaries_and_canonical_publication(

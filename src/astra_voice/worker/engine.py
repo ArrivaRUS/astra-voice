@@ -449,6 +449,29 @@ def active_sessions() -> int:
     return sum(isinstance(obj, session_type) for obj in gc.get_objects())
 
 
+def _trim_heap() -> None:
+    """Return freed native arenas to the OS at a phase boundary, on glibc only."""
+    gc.collect()
+    _trim_malloc()
+
+
+def _trim_malloc() -> None:
+    """Return glibc's free pages without traversing Python's live object graph."""
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None)
+        # Other C libraries need not provide glibc's allocator extension.
+        if not hasattr(libc, "gnu_get_libc_version"):
+            return
+        trim = libc.malloc_trim
+    except (AttributeError, OSError):
+        return
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    trim(0)
+
+
 def _find_sessions(model: Any, session_type: type[T]) -> list[T]:
     """Находит сессии по типу в адаптере и препроцессорах, без повторов."""
     sessions: dict[int, T] = {}

@@ -376,6 +376,36 @@ def _meeting_thread_module(name: str) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def recorded_heap_trim(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> list[None]:
+    """Record both trims in one module; copied conftest needs no product package."""
+    calls: list[None] = []
+    if "real_heap_trim" in request.fixturenames:
+        return calls
+    try:
+        engine = sys.modules.get("astra_voice.worker.engine")
+        if engine is None:
+            engine = importlib.import_module("astra_voice.worker.engine")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"astra_voice", "astra_voice.worker", "astra_voice.worker.engine"}:
+            raise
+        return calls
+
+    def record() -> None:
+        calls.append(None)
+
+    monkeypatch.setattr(engine, "_trim_heap", record)
+    monkeypatch.setattr(engine, "_trim_malloc", record)
+    return calls
+
+
+@pytest.fixture
+def real_heap_trim() -> None:
+    """Explicit opt-in for allocator/GC tests; subprocess engine probes stay real."""
+
+
+@pytest.fixture(autouse=True)
 def no_leaked_meeting_threads(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Attribute meeting workers by origin, including anonymous/daemon threads."""
     before = set(threading.enumerate())

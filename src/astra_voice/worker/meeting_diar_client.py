@@ -18,10 +18,12 @@ import stat
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from astra_voice.meetings.diar_link import DIAR_PROFILES
+from astra_voice.worker import engine as engine_module
 from astra_voice.worker import ipc
 from astra_voice.worker.meeting_contract import operation_timeout
 from astra_voice.worker.meeting_diar import (
@@ -39,6 +41,27 @@ Message = dict[str, Any]
 
 class DiarCancelled(Exception):
     """Parent job cancellation, distinct from a diarization failure."""
+
+
+@dataclass(frozen=True)
+class PcmSource:
+    """A bounded-memory PCM writer; legacy block doubles can still use len()."""
+
+    frames: int
+    write: Callable[[int], None]
+
+    def __len__(self) -> int:
+        return self.frames
+
+
+def _write_pcm(fd: int, view: memoryview, check: Callable[[], None] | None = None) -> None:
+    while view:
+        if check is not None:
+            check()
+        count = os.write(fd, view)
+        if count <= 0:
+            raise OSError("diar-pcm-write")
+        view = view[count:]
 
 
 def model_fingerprint(models: Message) -> list[dict[str, Any]]:
@@ -86,12 +109,10 @@ def model_fingerprint(models: Message) -> list[dict[str, Any]]:
 def sealed_pcm(audio: Any) -> int:
     fd = os.memfd_create("astra-voice-diar-pcm", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
     try:
-        view = memoryview(audio).cast("B")
-        while view:
-            count = os.write(fd, view)
-            if count <= 0:
-                raise OSError("diar-pcm-write")
-            view = view[count:]
+        if isinstance(audio, PcmSource):
+            audio.write(fd)
+        else:
+            _write_pcm(fd, memoryview(audio).cast("B"))
         fcntl.fcntl(fd, F_ADD_SEALS, REQUIRED_SEALS)
         return fd
     except BaseException:
@@ -246,6 +267,8 @@ class DiarProcess:
     def block(self, audio: Any, index: int, offset_ms: int) -> list[list[Any]]:
         fd = sealed_pcm(audio)
         try:
+            if isinstance(audio, PcmSource):
+                engine_module._trim_malloc()
             request = self.send(
                 "diar.block",
                 descriptor=fd,
