@@ -169,7 +169,7 @@ def test_summary_complete_and_escaped(old: dict[str, Any]) -> None:
     assert gate.code("/" + hostile.replace("~", "~0").replace("/", "~1")) in result
     assert gate.code("changed") in result
     assert "trust_epoch: 1 → 1" in result
-    assert "serial: 4 → 5" in result
+    assert f"serial: {old['serial']} → {new['serial']}" in result
     assert gate.code(new["revoked"]) in result
     assert "Изменения содержимого отзывов" in result
     assert hostile not in result and "<img" not in result

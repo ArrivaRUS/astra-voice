@@ -319,11 +319,17 @@ class QueueRun:
                     continue
                 # The executor thread owns Popen; Linux children are per TID.
                 tasks = Path(f"/proc/{parent.pid}/task")
-                pids = {
-                    pid for path in tasks.glob("*/children") for pid in path.read_text().split()
-                }
+                pids: set[str] = set()
+                for path in tasks.glob("*/children"):
+                    try:
+                        pids.update(path.read_text().split())
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
                 for pid in pids:
-                    command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                    try:
+                        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
                     if b"meeting-diar" not in command:
                         continue
                     checkpoint = self.store.read(self.mid, filename)
