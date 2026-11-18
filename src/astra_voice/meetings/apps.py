@@ -22,7 +22,9 @@ APP_SCHEMA = obj(
         "binary": array(text_schema(255, 1), 32, unique=True),
         "exe": array(text_schema(255, 1), 32, unique=True),
         "class": choices("dion", "browser", "other"),
-    }
+        "verification": choices("executable", "declared-only"),
+    },
+    required=["id", "title", "binary", "exe", "class"],
 )
 APPS_SCHEMA = obj({"schema": {"type": "integer", "const": 1}, "apps": array(APP_SCHEMA, MAX_APPS)})
 
@@ -31,6 +33,11 @@ class AppClass(StrEnum):
     DION = "dion"
     BROWSER = "browser"
     OTHER = "other"
+
+
+class AppVerification(StrEnum):
+    EXECUTABLE = "executable"
+    DECLARED_ONLY = "declared-only"
 
 
 class AppDataError(ValueError):
@@ -56,6 +63,9 @@ def _validated(data: object) -> dict[str, Any]:
             if isinstance(raw.get(key), list):
                 raw[key] = [_name(item) if isinstance(item, str) else item for item in raw[key]]
         validate(raw, APP_SCHEMA)
+        raw.setdefault("verification", "executable" if raw["exe"] else "declared-only")
+        if bool(raw["exe"]) != (raw["verification"] == "executable"):
+            raise AppDataError("Несогласованная проверка программы")
         if not raw["binary"] and not raw["exe"]:
             raise AppDataError("Не задана идентичность программы")
         if any("/" in name or name in {".", ".."} for name in raw["binary"]):
@@ -77,12 +87,26 @@ class AppDefinition:
     binary: tuple[str, ...]
     exe: tuple[str, ...]
     app_class: AppClass
+    verification: AppVerification | None = None
+
+    def __post_init__(self) -> None:
+        if self.verification is None:
+            object.__setattr__(
+                self,
+                "verification",
+                AppVerification.EXECUTABLE if self.exe else AppVerification.DECLARED_ONLY,
+            )
 
     @classmethod
     def from_dict(cls, data: object) -> Self:
         raw = _validated(data)
         return cls(
-            raw["id"], raw["title"], tuple(raw["binary"]), tuple(raw["exe"]), AppClass(raw["class"])
+            raw["id"],
+            raw["title"],
+            tuple(raw["binary"]),
+            tuple(raw["exe"]),
+            AppClass(raw["class"]),
+            AppVerification(raw["verification"]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +117,13 @@ class AppDefinition:
                 "binary": list(self.binary),
                 "exe": list(self.exe),
                 "class": self.app_class.value,
+                "verification": (
+                    self.verification.value
+                    if self.verification is not None
+                    else "executable"
+                    if self.exe
+                    else "declared-only"
+                ),
             }
         )
 
