@@ -55,7 +55,14 @@ def catalog(tmp_path: Path) -> Catalog:
 
 
 @pytest.fixture
-def pair(tmp_path: Path, catalog: Catalog, monkeypatch: pytest.MonkeyPatch) -> Any:
+def pair(
+    tmp_path: Path,
+    catalog: Catalog,
+    monkeypatch: pytest.MonkeyPatch,
+    filesystem_euid: None,
+) -> Any:
+    # The real mutation lock checks ownership; keep euid aligned with tmp files,
+    # including root CI, rather than the default nonroot_euid guard simulation.
     settings = Settings()
     http = HttpClient(NetworkGate(settings, Policy()), user_agent="test")
     calls: list[str] = []

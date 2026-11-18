@@ -104,6 +104,8 @@ ComboBox {
         implicitWidth: selectedText.implicitWidth
         implicitHeight: selectedText.implicitHeight
         property bool truncated: selectedText.truncated
+        // Preserve the text interface for callers when the speaker number wraps it.
+        property alias color: selectedText.color
         MeetingSpeakerNumber {
             id: speakerNumber
             visible: control.speakerNumbers
