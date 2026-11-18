@@ -119,6 +119,60 @@ def test_unsafe_elf_flags(
     assert error in capsys.readouterr().err
 
 
+@pytest.mark.skipif(shutil.which("cc") is None, reason="requires compiler")
+@pytest.mark.parametrize(
+    "case", ["exact", "unknown-path", "unknown-value", "changed-bytes", "vendor"]
+)
+def test_inert_qt_rpath_exception_is_exact(
+    elf_tree: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    site = elf_tree / audit.APPIMAGE_SITE
+    site.parent.mkdir(parents=True)
+    shutil.move(elf_tree / audit.DEB_VENDOR, site)
+    (key,) = audit._INERT_RPATHS
+    rel, rpath = key
+    path = elf_tree / rel.lstrip("/")
+    if case == "unknown-path":
+        path = path.with_name("unknown.so")
+    elif case == "unknown-value":
+        rpath += "/unknown"
+    elif case == "vendor":
+        path = site / "sherpa_onnx/lib/libonnxruntime.so"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source = tmp_path / "data.c"
+    source.write_text("const unsigned char data[] = {0};\n")
+    subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-nostdlib",
+            "-Wl,--disable-new-dtags",
+            f"-Wl,-rpath,{rpath}",
+            str(source),
+            "-o",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    # Use a tiny data-only ELF in place of the 24 MiB pinned upstream object.
+    monkeypatch.setattr(
+        audit, "_INERT_RPATHS", {key: hashlib.sha256(path.read_bytes()).hexdigest()}
+    )
+    if case == "changed-bytes":
+        with path.open("ab") as stream:
+            stream.write(b"changed")
+    expect = "8" if case == "vendor" else "9"
+    assert audit.main(["--strict", "--expect", expect, str(elf_tree)]) == (
+        0 if case == "exact" else 1
+    )
+    assert ("RPATH/RUNPATH" in capsys.readouterr().err) == (case != "exact")
+
+
 def metadata(vendor: Path, name: str, version: str, requires: str = "") -> None:
     path = vendor / f"{name.replace('-', '_')}-{version}.dist-info/METADATA"
     path.parent.mkdir(parents=True)

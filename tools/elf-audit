@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
 import subprocess
@@ -47,6 +48,17 @@ VENDOR_ELFS = frozenset(
 DEFAULT_EXPECT = len(VENDOR_ELFS)
 DEB_VENDOR = Path("usr/lib/astra-voice/vendor")
 APPIMAGE_SITE = Path("opt/python3.11/lib/python3.11/site-packages")
+# PyQt5-Qt5 5.15.19: data-only leaf (no DT_NEEDED or executable PT_LOAD).
+# glibc consults RPATH on the requesting loader/its ancestors, not sibling DSOs.
+# This object cannot request loads. Pin its bytes as well as path/value: a new
+# dependency or executable code invalidates the exception. Keep upstream RECORD
+# hashes intact; the exact vendor manifest, GLIBC and stack gates still apply.
+_INERT_RPATHS = {
+    (
+        "/" + (APPIMAGE_SITE / "PyQt5/Qt5/lib/libicudata.so.56").as_posix(),
+        "/home/qt/icu_install/lib",
+    ): "8c5174124fb1e97dc7c170822c9115a33bed9769ed10f7a67c4afa55ba0d7e6d",
+}
 _PROVIDER_RE = re.compile(
     r"libonnxruntime_providers_(?:cuda|tensorrt|azure)\.so(?:\..*)?", re.IGNORECASE
 )
@@ -143,6 +155,10 @@ def _vendor_directory(root: Path) -> Path:
 
 
 def _safe_rpath(root: Path, elf: Elf, entry: str) -> bool:
+    expected = _INERT_RPATHS.get((elf.path, entry))
+    if expected is not None:
+        with (root / elf.path.lstrip("/")).open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest() == expected
     match = re.fullmatch(r"\$(?:ORIGIN|\{ORIGIN\})(?P<suffix>/[^:$]*)?", entry)
     if match is None:
         return False
