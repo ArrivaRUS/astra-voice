@@ -23,7 +23,20 @@ from astra_voice.meetings.segments import CaptureJournal, ClockAnchor, SegmentSi
 from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.security.files import private_directory
 from astra_voice.worker import ipc
+from astra_voice.worker.meeting_audio_local import (
+    LocalAudioServer,
+    SocketFds,
+    own_socket_fds,
+    resolve_local_server,
+    socket_family,
+)
 from astra_voice.worker.meeting_contract import COMMAND_FIELDS, RequestLedger
+from astra_voice.worker.meeting_observer import (
+    MeetingObserver,
+    ObserverFactory,
+    ObserverWait,
+    observer_metadata,
+)
 from astra_voice.worker.meeting_roles import failure
 from astra_voice.worker.meeting_session import MeetingSession, SessionAdmission
 
@@ -62,6 +75,14 @@ def _microphone() -> Source:
     from astra_voice.worker.monitor_stream import microphone_source
 
     return microphone_source()  # type: ignore[no-any-return]
+
+
+def _observer_address() -> LocalAudioServer | None:
+    return resolve_local_server(os.environ, os.getuid())
+
+
+def _observer_wait(wake: threading.Event, seconds: float) -> bool:
+    return wake.wait(seconds)
 
 
 class _Archive:
@@ -405,6 +426,11 @@ class MeetingCaptureState:
         free_mb: Callable[[], int] | None = None,
         fsync: Callable[[int], None] = os.fsync,
         session: SessionAdmission | None = None,
+        observer_address: Callable[[], LocalAudioServer | None] = _observer_address,
+        observer_factory: ObserverFactory = observer_metadata,
+        observer_fds: Callable[[], SocketFds] = own_socket_fds,
+        observer_family: Callable[[int, int], int | None] = socket_family,
+        observer_wait: ObserverWait = _observer_wait,
     ) -> None:
         self.session_monitor = MeetingSession.production() if session is None else None
         self.session = session if session is not None else self.session_monitor.state  # type: ignore[union-attr]
@@ -433,6 +459,15 @@ class MeetingCaptureState:
         self.sources: dict[str, Source] = {}
         self.track_states = {"mic": "ended", "far": "ended"}
         self.messages: queue.SimpleQueue[Message] = queue.SimpleQueue()
+        self.observer = MeetingObserver(
+            address=observer_address(),
+            factory=observer_factory,
+            read_fds=observer_fds,
+            family=observer_family,
+            wait=observer_wait,
+            clock=clock,
+            emit=lambda message: self.messages.put(message),
+        )
         self.audio_stop = threading.Event()
         self.stopped = False
         self.exit_code = 0
@@ -892,14 +927,18 @@ class MeetingCaptureState:
             return self._remember(message, [failure(message, code)])
 
     def _detector(self, request: Message) -> None:
-        # Until the observer is wired up, complete the command without creating a backend.
-        if request["type"] == "meeting.detector.start":
+        starting = request["type"] == "meeting.detector.start"
+        if starting:
             reply = self._reply(
                 "meeting.detector.started", request, apps_version=request["apps_version"]
             )
         else:
             reply = self._reply("meeting.detector.stopped", request)
         self.messages.put({"type": "detector-result", "request": request, "reply": reply})
+        if starting:
+            self.observer.start()
+        else:
+            self.observer.stop()
 
     def _prepare(self, request: Message) -> None:
         self.preparing = True
@@ -928,7 +967,10 @@ class MeetingCaptureState:
                 free = self.free_mb()
                 if free < 600:
                     raise ValueError("limit")
-                info = self._get_backend().prepare(far)
+                backend = self._get_backend()
+                info = backend.prepare(far)
+                own_context = getattr(backend, "own_context", None)
+                self.observer.registry.set("control", own_context() if own_context else None)
                 self.messages.put(
                     {"type": "prepared", "request": request, "info": info, "free": free}
                 )
@@ -1265,6 +1307,11 @@ class MeetingCaptureState:
                 result.append(event["event"])
             elif kind == "detector-result":
                 result.append(self._outcome(event["request"], event["reply"]))
+            elif kind == "detector-code":
+                result.append(event["event"])
+            elif kind in {"detector-candidate", "detector-call-ended", "detector-server-changed"}:
+                # Observation results remain internal until step 4v consumes them.
+                continue
             elif kind in {"prepared", "prepare-failed"}:
                 if not self.preparing or event["request"] != self.prepare_request:
                     continue
@@ -1697,6 +1744,7 @@ class MeetingCaptureState:
         if self.terminating:
             return
         self.terminating = True
+        self.observer.stop(exiting=True)
         self.preparing = False
         self.prepare_deadline = None
         self.termination_deadline = time.monotonic() + 1.0
@@ -1716,6 +1764,7 @@ class MeetingCaptureState:
         while not self.stopped and time.monotonic() < deadline:
             self.poll()
             time.sleep(0.005)
+        self.observer.join(max(0.0, deadline - time.monotonic()))
         # An escalated close can already have set stopped while storage is
         # finishing. It still owns a worker that must receive its exit request.
         if self.archive is not None:

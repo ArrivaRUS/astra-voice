@@ -156,6 +156,7 @@ class MeetingRecording(QObject):
         super().__init__(parent)
         self.store, self.enabled, self.policy_allowed = store, enabled, policy_allowed
         self._detector_allowed = detector_allowed
+        self._automation_off = False
         self._exit_stop_timeout = exit_stop_timeout
         self.session_kind, self.clock = session_kind, clock
         self.session_factory, self.owns_session = session_factory, owns_session
@@ -478,6 +479,7 @@ class MeetingRecording(QObject):
     def _call_available(self) -> bool:
         return (
             APP_STREAM_ENABLED
+            and not self._automation_off
             and bool(self.call_id)
             and self.variant1
             and self.app_class in {"dion", "browser"}
@@ -752,6 +754,8 @@ class MeetingRecording(QObject):
         if self._detector_generation != role.generation:
             self._reset_detector(role.generation)
         allowed = self._detector_allowed()
+        if allowed and self._automation_off:
+            return
         kind = "meeting.detector.start" if allowed else "meeting.detector.stop"
         if self.clock() < self._detector_retry_at:
             return
@@ -830,6 +834,12 @@ class MeetingRecording(QObject):
         if raw["type"] in {"meeting.call.started", "meeting.call.ended"}:
             return
         if raw["type"] == "meeting.detector.code":
+            if raw["code"] == DetectorCode.REMOTE and not self._automation_off:
+                self._automation_off = True
+                self._query_req = ""
+                if self.selected_source == "call":
+                    self.selected_source = "room"
+                self._publish()
             log.info(
                 DETECTOR_CODE,
                 DetectorPurpose(raw["purpose"]),
@@ -900,6 +910,7 @@ class MeetingRecording(QObject):
         self._tick_jobs()
         if (
             self.dialog_open
+            and not self._automation_off
             and self._retire_deadline is None
             and self.controller.supervisor.ready
             and not self._query_req

@@ -29,6 +29,7 @@ from astra_voice.meetings.identity import (
 )
 from astra_voice.meetings.identity_sockets import SsRunner
 from astra_voice.meetings.identity_ss import IdentitySocketProbe, SocketMeasurement, SsStatus
+from astra_voice.worker.meeting_audio_local import local_server_address as local_server_address
 from astra_voice.worker.meeting_detector import (
     INVALID_INDEX,
     Direction,
@@ -573,16 +574,6 @@ def _decide(request: CheckRequest, decision: _Decision) -> CheckResult:
         target,
         target_error,
     )
-
-
-def local_server_address(server: bytes | None) -> bytes | None:
-    """Only a single explicit Unix pathname, suitable for libpulse's address list."""
-    if not isinstance(server, bytes):
-        return None
-    path = server.removeprefix(b"unix:")
-    if not path.startswith(b"/") or len(path) >= 108 or any(c <= 32 or c == 127 for c in path):
-        return None
-    return b"unix:" + path
 
 
 def _dup_control_socket(fd: int, inode: int) -> socket.socket:

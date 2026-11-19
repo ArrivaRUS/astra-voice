@@ -208,6 +208,8 @@ def test_prepare_is_nonblocking_and_timeout_is_terminal(tmp_path: Path) -> None:
     import time
 
     rig = Rig(tmp_path)
+    backend_factory = Mock(return_value=rig.backend)
+    rig.state.backend_factory = backend_factory
     entered, release = threading.Event(), threading.Event()
 
     def blocked_prepare(far: dict[str, Any]) -> dict[str, Any]:
@@ -247,7 +249,8 @@ def test_prepare_is_nonblocking_and_timeout_is_terminal(tmp_path: Path) -> None:
         assert rig.until("meeting.detector.started")["apps_version"] == 1
         assert rig.until("meeting.detector.stopped")["req"] == stop_detector["req"]
         assert rig.state.preparing
-        assert rig.backend.detector_start_calls == rig.backend.detector_stop_calls == 0
+        assert rig.state.observer.registry.for_observer(0) == frozenset()
+        backend_factory.assert_called_once_with()
         (second,) = rig.request_prepare({"kind": "none"})
         assert second["type"] == "error" and second["code"] == "not-prepared"
         prepare.assert_called_once_with({"kind": "none"})

@@ -481,8 +481,15 @@ def test_no_call_reply_preserves_explicit_whole_output_choice(rig: Rig) -> None:
     assert rig.bridge.selectedSource == "all"
 
 
-def test_new_remote_warning_requires_new_click_after_confirmed_exit(rig: Rig) -> None:
+@pytest.mark.parametrize("source", ["all", "room"])
+def test_new_remote_warning_requires_new_click_after_confirmed_exit(
+    rig: Rig, caplog: pytest.LogCaptureFixture, source: str
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=meeting_recording.__name__)
+    rig.bridge.setSetting("meeting_offer_on_call", True)
     rig.bridge.requestRecording()
+    deliver_remote(rig.supervisor)
+    rig.bridge.selectRecordingSource(source)
     rig.bridge.on_start_clicked()
     rig.reply("prepared", server_local=False)
     assert not any(m["type"] == "meeting.capture.open" for m in rig.supervisor.messages)
@@ -495,6 +502,14 @@ def test_new_remote_warning_requires_new_click_after_confirmed_exit(rig: Rig) ->
     rig.bridge.on_start_clicked()
     assert len(rig.supervisors) == 2
     assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
+    assert rig.supervisor.messages[-1]["far"] == {
+        "kind": "sink_monitor" if source == "all" else "none"
+    }
+    rig.reply("prepared", server_local=False)
+    assert rig.supervisor.messages[-1]["type"] == "meeting.capture.open"
+    assert not background_commands(rig.supervisor)
+    for marker in ("private-pulse-host.example", "private-pulse-path-marker", "PULSE_SERVER"):
+        assert marker not in caplog.text
 
 
 def test_cancel_during_prepare_blocks_late_open(rig: Rig) -> None:
@@ -852,6 +867,104 @@ DETECTOR_STOP = "meeting.detector.stop"
 
 def detector_commands(role: Supervisor) -> list[dict[str, Any]]:
     return [msg for msg in role.messages if msg["type"] in {DETECTOR_START, DETECTOR_STOP}]
+
+
+def background_commands(role: Supervisor) -> list[str]:
+    return [
+        message["type"]
+        for message in role.messages
+        if message["type"] in {DETECTOR_START, "meeting.call.query"}
+    ]
+
+
+def deliver_remote(role: Supervisor, *, purpose: str = "observe", stale: bool = False) -> None:
+    role.event(
+        {
+            "type": "meeting.detector.code",
+            "purpose": purpose,
+            "code": "remote",
+            "duration_ms": 0,
+            "generation": role.generation - int(stale),
+        }
+    )
+
+
+@pytest.mark.parametrize("purpose", ["observe", "offer", "card", "start"])
+def test_remote_stops_start_and_query_for_current_generation(rig: Rig, purpose: str) -> None:
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    pending = rig.call_state()
+    assert background_commands(role) == ["meeting.call.query"]
+    deliver_remote(role, purpose=purpose)
+    role.event(pending)
+    assert not rig.recording.call_id
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.recording.tick()
+    assert background_commands(role) == ["meeting.call.query"]
+
+
+def test_remote_keeps_detector_stop_available(rig: Rig) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    (start,) = detector_commands(role)
+    deliver_detector(role, start, "meeting.detector.started")
+    deliver_remote(role, purpose="card")
+    rig.bridge.setSetting("meeting_offer_on_call", False)
+    assert [message["type"] for message in detector_commands(role)] == [
+        DETECTOR_START,
+        DETECTOR_STOP,
+    ]
+
+
+@pytest.mark.parametrize("remote", ["current", "stale", "none", "ordinary"])
+@pytest.mark.parametrize("replace", ["reopen", "exit-with-open-dialog", "after-capture"])
+def test_remote_latch_survives_role_replacement(
+    rig: Rig, remote: str, replace: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    previous = rig.supervisor
+    assert background_commands(previous) == [DETECTOR_START, "meeting.call.query"]
+    if remote == "ordinary":
+        with caplog.at_level(logging.INFO, logger=meeting_recording.__name__):
+            previous.event(
+                {
+                    "type": "meeting.detector.code",
+                    "purpose": "observe",
+                    "code": "identity_mismatch_counter",
+                    "duration_ms": 7,
+                    "generation": previous.generation,
+                }
+            )
+        (record,) = [entry for entry in caplog.records if entry.msg == DETECTOR_CODE]
+        assert log_arguments(record.msg, record.args) == ("observe", "identity_mismatch_counter", 7)
+        assert not rig.recording._automation_off
+    elif remote != "none":
+        deliver_remote(previous, stale=remote == "stale")
+
+    if replace == "after-capture":
+        rig.bridge.on_start_clicked()
+        rig.reply("prepared")
+        rig.reply("started")
+        assert rig.recording.controller.state == "recording"
+        rig.recording.controller.stop()
+        finish_capture_close(rig)
+    else:
+        rig.bridge.closeStartDialog()
+        if replace == "exit-with-open-dialog":
+            rig.bridge.requestRecording()
+            assert rig.supervisor is previous and rig.bridge.startDialogOpen
+    previous.ready, previous.exited = False, True
+    previous.on_exit(0)
+    if replace != "exit-with-open-dialog":
+        rig.bridge.requestRecording()
+    rig.recording.tick()
+    assert rig.supervisor is not previous and rig.supervisor.ready
+    assert background_commands(previous) == [DETECTOR_START, "meeting.call.query"]
+    assert background_commands(rig.supervisor) == (
+        [] if remote == "current" else [DETECTOR_START, "meeting.call.query"]
+    )
 
 
 def detector_reply(request: dict[str, Any], kind: str, **fields: Any) -> dict[str, Any]:

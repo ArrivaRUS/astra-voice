@@ -62,26 +62,34 @@ class Backend:
     def __init__(self) -> None:
         self.sources: list[Source] = []
         self.prepare_calls: list[dict[str, Any]] = []
-        self.detector_start_calls = self.detector_stop_calls = 0
+        self.close_calls = 0
+        self.control = Mock()
+        self.context = (51, 1)
+        self.server_local = True
 
     def prepare(self, far: dict[str, Any]) -> dict[str, Any]:
         self.prepare_calls.append(far)
-        return {"server_local": True, "server_kind": "pulseaudio", "far_available": True}
+        return {
+            "server_local": self.server_local,
+            "server_kind": "pulseaudio",
+            "far_available": True,
+        }
 
     def source(self, far: dict[str, Any]) -> Source:
         source = Source()
         self.sources.append(source)
         return source
 
-    def detector_start(self) -> int:
-        self.detector_start_calls += 1
-        return 42
-
-    def detector_stop(self) -> None:
-        self.detector_stop_calls += 1
+    def own_context(self) -> tuple[int, int] | None:
+        return self.context
 
     def close(self) -> None:
-        pass
+        self.close_calls += 1
+        self.control.close()
+
+
+def _unexpected_observer(*args: object) -> Any:
+    pytest.fail("test has not supplied an observer backend")
 
 
 def wait_until(predicate: Any) -> None:
@@ -103,6 +111,8 @@ class Rig:
             session = SessionAdmission(kind="KDE", clock=self.clock, max_age=float("inf"))
             session.update(known=True, active=True, locked=False, sleeping=False)
             kwargs["session"] = session
+        kwargs.setdefault("observer_address", lambda: None)
+        kwargs.setdefault("observer_factory", _unexpected_observer)
         self.state = MeetingCaptureState(
             clock=self.clock,
             mic_factory=self.mic,
@@ -294,7 +304,6 @@ def test_detector_replies_without_backend_and_does_not_block_prepare(rig: Rig) -
     assert rig.state.handle(start) == [*receipt, started]
     assert rig.until("meeting.detector.stopped")["req"] == stop["req"]
     rig.until("meeting.capture.prepared")
-    assert rig.backend.detector_start_calls == rig.backend.detector_stop_calls == 0
     assert not rig.mics and not rig.backend.sources
     query = "meeting.call.query"
     assert rig.state.handle({"type": query, "request_type": query, "req": "query1"}) == [
