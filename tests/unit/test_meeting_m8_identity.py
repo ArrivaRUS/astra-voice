@@ -622,10 +622,11 @@ def test_repeat_eacces_overrides_proven_socket_zero(
         deny_second(name)
         return original_read(directory, name)
 
-    monkeypatch.setattr(os, "readlink", readlink)
-    monkeypatch.setattr(ProcReader, "_read", staticmethod(read))
     sockets = Connections(0)
-    result = checker(proc, sockets).check([client()])[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "readlink", readlink)
+        patch.setattr(ProcReader, "_read", staticmethod(read))
+        result = checker(proc, sockets).check([client()])[0]
     assert reads == 2 and sockets.seen == [KEY]
     assert result == Identity(Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE)
     assert not result.offer_allowed and not result.variant1_allowed

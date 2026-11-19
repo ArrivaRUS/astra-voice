@@ -133,7 +133,6 @@ class Rig:
         self.on_launch: Callable[[], object] = lambda: None
         self.control_fd = 12345
         monkeypatch.setattr(identity_ss, "_control", self.control)
-        monkeypatch.setattr(subprocess, "Popen", self.popen)
         self._original_read = os.read
         monkeypatch.setattr(os, "read", self.read)
         self._offset = 0
@@ -162,11 +161,13 @@ class Rig:
         return chunk
 
     def measure(self, *pids: int, deadline: float | None = None) -> SocketMeasurement:
-        return self.probe.measure(
-            frozenset(pids),
-            self.control_fd,
-            time.monotonic() + 3 if deadline is None else deadline,
-        )
+        with self.patch.context() as patch:
+            patch.setattr(subprocess, "Popen", self.popen)
+            return self.probe.measure(
+                frozenset(pids),
+                self.control_fd,
+                time.monotonic() + 3 if deadline is None else deadline,
+            )
 
     def identities(self, sample: SocketMeasurement, *claims: Client) -> tuple[Identity, ...]:
         return IdentityChecker(load_apps(), self.proc, uid=UID, connections=sample).check(claims)
@@ -341,31 +342,32 @@ def test_shared_inode_with_another_candidate_is_insufficient(rig: Rig, partial: 
 def test_fd_walk_is_bracketed_and_complete(rig: Rig, mode: str) -> None:
     folder = process(rig.proc, 41, (701,))
     rig.output += pair(701, 901)
-    if mode == "fd_change":
-        rig.on_launch = lambda: (folder / "0").rename(folder / "1")
-    elif mode == "pid_reuse":
-        rig.on_launch = lambda: (folder.parent / "stat").write_text(stat_row(41, 92))
-    elif mode == "fd_denied":
-        original_open = os.open
+    with rig.patch.context() as patch:
+        if mode == "fd_change":
+            rig.on_launch = lambda: (folder / "0").rename(folder / "1")
+        elif mode == "pid_reuse":
+            rig.on_launch = lambda: (folder.parent / "stat").write_text(stat_row(41, 92))
+        elif mode == "fd_denied":
+            original_open = os.open
 
-        def open_fd(path: str | Path, flags: int, *args: Any, **kwargs: Any) -> int:
-            if path == "fd":
-                raise PermissionError(errno.EACCES, SECRET)
-            return original_open(path, flags, *args, **kwargs)
+            def open_fd(path: str | Path, flags: int, *args: Any, **kwargs: Any) -> int:
+                if path == "fd":
+                    raise PermissionError(errno.EACCES, SECRET)
+                return original_open(path, flags, *args, **kwargs)
 
-        rig.patch.setattr(os, "open", open_fd)
-    elif mode == "readlink_denied":
-        original_readlink = os.readlink
+            patch.setattr(os, "open", open_fd)
+        elif mode == "readlink_denied":
+            original_readlink = os.readlink
 
-        def deny_fd(path: str, *, dir_fd: int | None = None) -> str:
-            if path == "0":
-                raise PermissionError(errno.EACCES, SECRET)
-            return original_readlink(path, dir_fd=dir_fd)
+            def deny_fd(path: str, *, dir_fd: int | None = None) -> str:
+                if path == "0":
+                    raise PermissionError(errno.EACCES, SECRET)
+                return original_readlink(path, dir_fd=dir_fd)
 
-        rig.patch.setattr(os, "readlink", deny_fd)
-    else:
-        rig.patch.setattr("astra_voice.meetings.identity.MAX_FDS", 1)
-    sample = rig.measure(41)
+            patch.setattr(os, "readlink", deny_fd)
+        else:
+            patch.setattr("astra_voice.meetings.identity.MAX_FDS", 1)
+        sample = rig.measure(41)
     assert sample.status is SsStatus.OK
     expected = (
         SocketInsufficiency.FD_CHANGED
@@ -389,8 +391,9 @@ def test_foreign_uid_never_opens_fd_directory(rig: Rig) -> None:
         assert path != "fd"
         return original_open(path, flags, *args, **kwargs)
 
-    rig.patch.setattr(os, "open", track)
-    sample = rig.measure(41)
+    with rig.patch.context() as patch:
+        patch.setattr(os, "open", track)
+        sample = rig.measure(41)
     assert sample.status is SsStatus.OK
     assert sample.evidence(ProcessKey(41, 91)).connections is None
 
@@ -409,9 +412,10 @@ def test_eacces_on_exe_has_no_offer_even_when_ss_is_absent(rig: Rig, failed_read
                 raise PermissionError(errno.EACCES, SECRET)
         return original(path, dir_fd=dir_fd)
 
-    rig.patch.setattr(os, "readlink", deny_exe)
     sample = SocketMeasurement(SsStatus.ABSENT, Reason.SS_UNAVAILABLE)
-    identity = rig.identities(sample, claim(41))[0]
+    with rig.patch.context() as patch:
+        patch.setattr(os, "readlink", deny_exe)
+        identity = rig.identities(sample, claim(41))[0]
     assert identity == Identity(Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE)
     assert not identity.offer_allowed and not identity.variant1_allowed
 
@@ -737,12 +741,13 @@ def test_absent_requires_evidence_of_missing_system_entry(
     def spawn() -> Child:
         raise OSError(error, SECRET)
 
-    rig.patch.setattr(os, "open", open_dir)
-    rig.patch.setattr(os, "close", close_dir)
-    rig.patch.setattr(os, "fstat", fstat_dir)
-    rig.patch.setattr(os, "stat", stat_ss)
     rig.spawn = spawn
-    sample = rig.measure(41)
+    with rig.patch.context() as patch:
+        patch.setattr(os, "open", open_dir)
+        patch.setattr(os, "close", close_dir)
+        patch.setattr(os, "fstat", fstat_dir)
+        patch.setattr(os, "stat", stat_ss)
+        sample = rig.measure(41)
     assert sample.status is status
     expected_chain = []
     if error == errno.ENOENT:
@@ -805,14 +810,15 @@ def test_control_reads_peer_of_duplicate_fd(
         assert descriptor == duplicate
         return SimpleNamespace(st_mode=stat.S_IFSOCK, st_ino=CONTROL)
 
-    monkeypatch.setattr(os, "dup", lambda fd: duplicate if fd == original else -1)
-    monkeypatch.setattr(os, "fstat", fstat)
-    monkeypatch.setattr(socket, "socket", Socket)
-    if valid:
-        assert identity_ss._control(original) == (CONTROL, SERVER)
-    else:
-        with pytest.raises(ValueError):
-            identity_ss._control(original)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "dup", lambda fd: duplicate if fd == original else -1)
+        patch.setattr(os, "fstat", fstat)
+        patch.setattr(socket, "socket", Socket)
+        if valid:
+            assert identity_ss._control(original) == (CONTROL, SERVER)
+        else:
+            with pytest.raises(ValueError):
+                identity_ss._control(original)
     assert closed == [duplicate]
 
 

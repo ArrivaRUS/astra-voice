@@ -21,6 +21,7 @@ from unittest.mock import Mock
 import pytest
 
 from astra_voice.meetings import apps
+from astra_voice.meetings import events as meeting_events
 from astra_voice.meetings.apps import load_apps
 from astra_voice.meetings.detector_rule import CallEnded, Candidate, MeetingDetectorRule
 from astra_voice.security.files import read_private
@@ -2047,9 +2048,7 @@ def test_catalog_read_failure_recovers_with_full_snapshot(
         assert source.poll() == ()
         assert reads == [0, 1, 2] and backend.calls == [("snapshot",), ("snapshot",)]
         messages = [record.getMessage() for record in caplog.records if record.name == d.__name__]
-        assert messages == (
-            [] if problem == "missing" else ["Не удалось загрузить каталог программ встреч"]
-        )
+        assert messages == ([] if problem == "missing" else [meeting_events.CATALOG_LOAD_FAILED])
         assert MARKER not in caplog.text and "meeting-apps.json" not in caplog.text
     finally:
         source.stop()
@@ -2279,7 +2278,7 @@ def test_catalog_warns_once_until_it_recovers(
     def warnings() -> list[str]:
         return [record.getMessage() for record in caplog.records if record.name == d.__name__]
 
-    message = "Не удалось загрузить каталог программ встреч"
+    message = meeting_events.CATALOG_LOAD_FAILED
     monkeypatch.setattr(apps, "read_private", read)
     try:
         assert [event.program for event in upserts(source.start())] == [None]
@@ -2357,7 +2356,7 @@ def test_successful_empty_catalog_rearms_warning(
             assert not any(event.program for event in source.poll())
         assert reads == [0, 1, 2]
         assert [record.getMessage() for record in caplog.records if record.name == d.__name__] == [
-            "Не удалось загрузить каталог программ встреч",
+            meeting_events.CATALOG_LOAD_FAILED,
         ] * 2
     finally:
         source.stop()

@@ -19,6 +19,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from astra_voice.meetings.apps import AppDataError, load_apps
+from astra_voice.meetings.events import CATALOG_LOAD_FAILED
 
 log = logging.getLogger(__name__)
 
@@ -314,7 +315,7 @@ class MeetingDetectorSource:
             apps = load_apps()
         except AppDataError:
             if not self._catalog_warned:
-                log.warning("Не удалось загрузить каталог программ встреч")
+                log.warning(CATALOG_LOAD_FAILED)
                 self._catalog_warned = True
             apps = ()
         else:

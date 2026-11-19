@@ -167,6 +167,7 @@ POLICY_REJECTED = "%s"
 SETTING_INVALID = "meeting-setting-invalid setting=%s"
 EXCEPTION = "meeting-exception exception=%s"
 INVALID_LOG = "meeting-invalid-log"
+CATALOG_LOAD_FAILED = "meeting-catalog-load-failed"
 CAPTURE_STATS = "meeting-capture duration_ms=%d bytes=%d"
 NATIVE_STDERR = "meeting-native-stderr bytes=%d lines=%d"
 LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
@@ -174,6 +175,7 @@ LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     SETTING_INVALID: (SettingKey,),
     EXCEPTION: (ExceptionClass,),
     INVALID_LOG: (),
+    CATALOG_LOAD_FAILED: (),
     CAPTURE_STATS: (None, None),
     NATIVE_STDERR: (None, None),
 }
