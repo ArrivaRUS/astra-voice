@@ -55,6 +55,7 @@ from astra_voice.platform.paste import (
     normalize,
 )
 from astra_voice.ui.pill import (
+    CLIPBOARD_KEY_HELD,
     CLIPBOARD_NOT_FETCHED,
     CLIPBOARD_REASONS,
     CLIPBOARD_WINDOW_CHANGED,
@@ -684,12 +685,15 @@ def test_paste_outcomes(
 @pytest.mark.parametrize(
     ("paste_reason", "pill_text"),
     [
+        ("keys-held", CLIPBOARD_KEY_HELD),
         ("not-fetched", CLIPBOARD_NOT_FETCHED),
         ("focus-outside", CLIPBOARD_WINDOW_CHANGED),
+        ("active-changed", CLIPBOARD_WINDOW_CHANGED),
+        ("grab-refused", CLIPBOARD_WINDOW_CHANGED),
         ("", CLIPBOARD_WINDOW_CHANGED),
     ],
 )
-def test_window_changed_pill_distinguishes_unfetched(
+def test_window_changed_pill_uses_paste_reason(
     rig: Rig, paste_reason: str, pill_text: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     rig.paste_reason = paste_reason

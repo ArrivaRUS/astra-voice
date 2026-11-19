@@ -35,6 +35,7 @@ from astra_voice.platform.paste import (
     normalize,
 )
 from astra_voice.ui.pill import (
+    CLIPBOARD_KEY_HELD,
     CLIPBOARD_NOT_FETCHED,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
@@ -1859,6 +1860,13 @@ class DictationOrchestrator:
                     PillState.CLIPBOARD_ONLY,
                     lambda: self._pill.show_state(
                         PillState.CLIPBOARD_ONLY, text=CLIPBOARD_NOT_FETCHED
+                    ),
+                )
+            elif outcome is not None and outcome.reason == "keys-held":
+                self._show_outcome(
+                    PillState.CLIPBOARD_ONLY,
+                    lambda: self._pill.show_state(
+                        PillState.CLIPBOARD_ONLY, text=CLIPBOARD_KEY_HELD
                     ),
                 )
             else:
