@@ -8,6 +8,7 @@ The X11 cases require an explicitly declared, isolated test display.
 
 from __future__ import annotations
 
+import errno
 import os
 import select
 import signal
@@ -16,14 +17,18 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from contextlib import ExitStack, closing
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.core.dictation import DictationPhase
-from astra_voice.platform.command_hotkey import CommandHotkeyBackend
+from astra_voice.platform import command_hotkey as hotkey_port
+from astra_voice.platform.command_hotkey import CommandHotkeyBackend, receive_packet
 from astra_voice.platform.cowork import DeliveryResult
 from astra_voice.platform.hotkey import (
     GrabResult,
@@ -33,6 +38,7 @@ from astra_voice.platform.hotkey import (
     MappingEvent,
 )
 from astra_voice.platform.x11 import X11Display
+from astra_voice.worker import command_hotkey as hotkey_worker
 
 from .test_mapping_loss import Rig
 from .test_publication import PHRASE
@@ -205,43 +211,50 @@ def test_lock_unlock_epoch_discards_queued_confirmed_press_before_record_start(
 class IsolatedKeyboard:
     """Real XTest input and independent WM client, no desktop services or Qt."""
 
-    def __init__(self) -> None:
+    def __init__(self, backend: CommandHotkeyBackend | None = None) -> None:
         from Xlib import XK, X, display
 
-        self.wm = display.Display()
-        self.target = display.Display()
-        self.inject = display.Display()
-        self.window = self.target.screen().root.create_window(
-            0, 0, 100, 100, 0, X.CopyFromParent, event_mask=X.KeyPressMask | X.KeyReleaseMask
-        )
-        self.window.map()
-        self.window.set_input_focus(X.RevertToParent, X.CurrentTime)
-        self.target.sync()
-        self.codes = {
-            name: int(self.inject.keysym_to_keycode(XK.string_to_keysym(name)))
-            for name in (
-                "Super_L",
-                "Control_L",
-                "Shift_L",
-                "l",
-                "d",
-                "e",
-                "Tab",
-                "space",
-                "Caps_Lock",
+        with ExitStack() as setup:
+            self.backend = backend if backend is not None else CommandHotkeyBackend()
+            setup.callback(self.backend.close)
+            self.wm = setup.enter_context(closing(display.Display()))
+            self.target = setup.enter_context(closing(display.Display()))
+            self.inject = setup.enter_context(closing(display.Display()))
+            self.window = self.target.screen().root.create_window(
+                0, 0, 100, 100, 0, X.CopyFromParent, event_mask=X.KeyPressMask | X.KeyReleaseMask
             )
-        }
-        assert all(self.codes.values())
-        self.backend = CommandHotkeyBackend()
-        self.now = 1.0
-        self.manager = HotkeyManager(self.backend, clock=lambda: self.now)
-        self.manager.defer_single_super = True
-        self.started: list[float] = []
-        self.manager.on_press = lambda: self.started.append(self.now)
-        assert self.manager.grab("Super_L", HotkeyMode.PTT).ok
-        self.held: list[str] = []
+            self.window.map()
+            self.window.set_input_focus(X.RevertToParent, X.CurrentTime)
+            self.target.sync()
+            self.codes = {
+                name: int(self.inject.keysym_to_keycode(XK.string_to_keysym(name)))
+                for name in (
+                    "Super_L",
+                    "Control_L",
+                    "Shift_L",
+                    "l",
+                    "d",
+                    "e",
+                    "Tab",
+                    "space",
+                    "Caps_Lock",
+                )
+            }
+            assert all(self.codes.values())
+            self.now = 1.0
+            self.manager = HotkeyManager(self.backend, clock=lambda: self.now)
+            self.manager.defer_single_super = True
+            self.started: list[float] = []
+            self.manager.on_press = lambda: self.started.append(self.now)
+            assert self.manager.grab("Super_L", HotkeyMode.PTT).ok
+            self.held: list[str] = []
+            setup.pop_all()
 
     def key(self, name: str, pressed: bool) -> None:
+        self.inject_key(name, pressed)
+        self.pump()
+
+    def inject_key(self, name: str, pressed: bool) -> None:
         from Xlib import X
         from Xlib.ext import xtest
 
@@ -251,13 +264,15 @@ class IsolatedKeyboard:
             self.held.append(name)
         elif name in self.held:
             self.held.remove(name)
-        self.pump()
+
+    def process_input(self) -> None:
+        self.manager.process_pending()
+        self.manager.tick()
 
     def pump(self, seconds: float = 0.02) -> None:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            self.manager.process_pending()
-            self.manager.tick()
+            self.process_input()
             self.wm.sync()
             time.sleep(0.002)
 
@@ -299,17 +314,104 @@ class IsolatedKeyboard:
         self.inject.close()
 
 
+class SteppedCommandHotkeyBackend(CommandHotkeyBackend):
+    """Drive the real broker and wire protocol with a test-owned clock and X connection."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        super().__init__()
+        self.monkeypatch = monkeypatch
+        self.now = 1.0
+        self.broker: hotkey_worker.Broker | None = None
+
+    def _launch(self) -> bool:
+        self._connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self._connection.setblocking(False)
+        peer.setblocking(False)
+        with self.monkeypatch.context() as patch:
+            patch.setattr(hotkey_worker, "boot_time", lambda: self.now)
+            self.broker = hotkey_worker.Broker(peer)
+        self._last_reply = self._last_ping = self.now
+        return True
+
+    def _request(self, operation: str, **fields: object) -> dict[str, Any]:
+        pump = self._pump
+
+        def pump_request() -> None:
+            pump()
+            # The in-process broker has finished this turn. A retry with the
+            # clock stopped could otherwise wait forever for a missing reply.
+            assert self._sequence in self._replies, f"stepped broker sent no reply to {operation!r}"
+
+        with self.monkeypatch.context() as patch:
+            patch.setattr(hotkey_port, "boot_time", lambda: self.now)
+            patch.setattr(self, "_pump", pump_request)
+            reply = super()._request(operation, **fields)
+        assert reply, f"stepped broker RPC {operation!r} did not complete"
+        return reply
+
+    def _pump(self, *args: object) -> None:
+        with self.monkeypatch.context() as patch:
+            patch.setattr(hotkey_port, "boot_time", lambda: self.now)
+            patch.setattr(hotkey_worker, "boot_time", lambda: self.now)
+            super()._pump(*args)  # Send any heartbeat due on this turn.
+            broker = self.broker
+            if broker is None:
+                return
+            while select.select([broker.connection], [], [], 0)[0]:
+                broker.command(receive_packet(broker.connection))
+            display = broker.backend._x.d
+            if display is not None:
+                display.sync()  # The injector already synced its last key request.
+                broker.drain_x()
+                broker.tick()
+                display.sync()  # Finish a replay before reading from the WM client.
+            super()._pump(*args)
+
+    def _fail(self) -> None:
+        broker, self.broker = self.broker, None
+        try:
+            if broker is not None:
+                with closing(broker.connection):
+                    broker.backend.close()
+        finally:
+            super()._fail()
+
+
 @pytest.fixture
-def isolated_keyboard() -> Iterator[IsolatedKeyboard]:
+def isolated_x11() -> None:
     display_name = os.environ.get("DISPLAY", "")
     if os.environ.get("ASTRA_VOICE_TEST_X11_ISOLATED") != "1" or display_name in {"", ":0", ":0.0"}:
         pytest.skip("requires ASTRA_VOICE_TEST_X11_ISOLATED=1 on a private Xvfb display")
     pytest.importorskip("Xlib")
-    keyboard = IsolatedKeyboard()
-    try:
+
+
+@pytest.fixture
+def isolated_keyboard(isolated_x11: None) -> Iterator[IsolatedKeyboard]:
+    with closing(IsolatedKeyboard()) as keyboard:
         yield keyboard
-    finally:
-        keyboard.close()
+
+
+@pytest.mark.unit
+def test_isolated_keyboard_failed_grab_closes_connections_and_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Xlib import display
+
+    wm, target, inject = Mock(), Mock(), Mock()
+    inject.keysym_to_keycode.return_value = 133
+    with closing(CommandHotkeyBackend()) as backend:
+        descriptors = (backend._read, backend._write)
+        with monkeypatch.context() as patch:
+            patch.setattr(display, "Display", Mock(side_effect=[wm, target, inject]))
+            patch.setattr(HotkeyManager, "grab", Mock(return_value=GrabResult("not-grabbed")))
+            with pytest.raises(AssertionError):
+                IsolatedKeyboard(backend)
+        for connection in (wm, target, inject):
+            connection.close.assert_called_once_with()
+        for descriptor in descriptors:
+            with pytest.raises(OSError) as error:
+                os.fstat(descriptor)
+            assert error.value.errno == errno.EBADF
 
 
 @pytest.mark.xvfb
@@ -317,31 +419,43 @@ def isolated_keyboard() -> Iterator[IsolatedKeyboard]:
 @pytest.mark.parametrize("extra", [None, "Control_L", "Shift_L"])
 @pytest.mark.parametrize("shortcut", ["l", "d", "e", "Tab"])
 def test_early_win_chord_reaches_independent_root_wm_grab_exactly_once(
-    isolated_keyboard: IsolatedKeyboard, delay: float, extra: str | None, shortcut: str
+    isolated_x11: None,
+    monkeypatch: pytest.MonkeyPatch,
+    delay: float,
+    extra: str | None,
+    shortcut: str,
 ) -> None:
     from Xlib import X
 
-    keyboard = isolated_keyboard
-    mask = X.Mod4Mask | {None: 0, "Control_L": X.ControlMask, "Shift_L": X.ShiftMask}[extra]
-    keyboard.wm.screen().root.grab_key(
-        keyboard.codes[shortcut], mask, False, X.GrabModeAsync, X.GrabModeAsync
-    )
-    keyboard.wm.sync()
-    keyboard.key("Super_L", True)
-    keyboard.pump(delay)
-    if extra:
-        keyboard.key(extra, True)
-    keyboard.key(shortcut, True)
-    keyboard.key(shortcut, False)
-    if extra:
-        keyboard.key(extra, False)
-    keyboard.key("Super_L", False)
-    keyboard.now += 0.5
-    keyboard.pump()
-    assert keyboard.started == [], "an early system chord opened command capture"
-    assert keyboard.presses().count(keyboard.codes[shortcut]) == 1, (
-        "WM shortcut swallowed/duplicated"
-    )
+    with (
+        closing(SteppedCommandHotkeyBackend(monkeypatch)) as backend,
+        closing(IsolatedKeyboard(backend)) as keyboard,
+    ):
+        mask = X.Mod4Mask | {None: 0, "Control_L": X.ControlMask, "Shift_L": X.ShiftMask}[extra]
+        keyboard.wm.screen().root.grab_key(
+            keyboard.codes[shortcut], mask, False, X.GrabModeAsync, X.GrabModeAsync
+        )
+        keyboard.wm.sync()
+        keyboard.inject_key("Super_L", True)
+        keyboard.process_input()
+        assert backend.broker is not None and backend.broker.pending is not None
+        backend.now += delay
+        keyboard.process_input()
+
+        chord = [(shortcut, True), (shortcut, False)]
+        if extra:
+            chord = [(extra, True), *chord, (extra, False)]
+        for name, pressed in [*chord, ("Super_L", False)]:
+            keyboard.inject_key(name, pressed)
+            keyboard.process_input()
+
+        backend.now += 0.5
+        keyboard.now += 0.5
+        keyboard.process_input()
+        assert keyboard.started == [], "an early system chord opened command capture"
+        assert keyboard.presses().count(keyboard.codes[shortcut]) == 1, (
+            "WM shortcut swallowed/duplicated"
+        )
 
 
 @pytest.mark.xvfb
