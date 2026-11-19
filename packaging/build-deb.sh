@@ -5,7 +5,7 @@
 #   packaging/build-deb.sh --container     # поднять debian:12 и собрать в нём (dh + lintian)
 #   packaging/build-deb.sh --dh            # мы УЖЕ внутри debian:12 (так работает CI)
 #   packaging/build-deb.sh --host          # запасной путь: dpkg-deb по готовому дереву
-#   packaging/build-deb.sh --no-vendor     # без onnxruntime/onnx_asr (ELF в пакете = 0)
+#   packaging/build-deb.sh --no-vendor     # без вендорных колёс (ELF в пакете = 0)
 #   packaging/build-deb.sh --fetch-wheels  # СЕТЬ: наполнить кэш колёс по wheels.lock
 #
 # Раскладка задаётся ровно в одном месте — packaging/debian/rules, цель
@@ -109,7 +109,9 @@ fi
 # --- версия для кода ----------------------------------------------------------
 say "версия $VERSION (SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, режим $MODE)"
 BUILD_DATE="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d)"
-cat >"$ROOT/src/astra_voice/_version.py" <<EOF
+ASTRA_VOICE_VERSION_FILE="$BUILD/_version.py"
+export ASTRA_VOICE_VERSION_FILE
+cat >"$ASTRA_VOICE_VERSION_FILE" <<EOF
 # Сгенерировано packaging/build-deb.sh из packaging/debian/changelog. Не править.
 __version__ = "$VERSION"
 # Дата сборки (из SOURCE_DATE_EPOCH) — для раздела «О программе».
@@ -189,7 +191,7 @@ say "гейт sha256: модель VAD"
 (cd "$ROOT/data/vad" && sha256sum -c SHA256SUMS)
 
 say "гейт ELF: tools/elf-audit --strict"
-EXPECT=$([ "$VENDOR" = 1 ] && echo 3 || echo 0)
+EXPECT=$([ "$VENDOR" = 1 ] && echo 8 || echo 0)
 python3 "$ROOT/tools/elf-audit" --strict --expect "$EXPECT" "$DIST/$DEB"
 
 if [ "$VENDOR" = 1 ]; then

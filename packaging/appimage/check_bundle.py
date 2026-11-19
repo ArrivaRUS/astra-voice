@@ -94,7 +94,7 @@ HOST_PACKAGES: dict[str, str] = {
     "xdg-utils": "xdg-open хоста",
 }
 #: Модули бандла сверх `control`, без которых AppImage не работает.
-EXTRA_MODULES = ("onnxruntime", "onnx_asr", "ssl", "certifi")
+EXTRA_MODULES = ("onnxruntime", "onnx_asr", "sherpa_onnx", "ssl", "certifi")
 
 _DEP_NAME_RE = re.compile(r"\$\{([^}]+)\}|([a-z0-9][a-z0-9+.\-]*)")
 
@@ -292,6 +292,9 @@ FORBIDDEN_ALWAYS = (
     "_dbm.cpython-*.so",
     "libdb-*.so",
     "libdb.so*",
+    "libonnxruntime_providers_cuda.so*",
+    "libonnxruntime_providers_tensorrt.so*",
+    "libonnxruntime_providers_azure.so*",
 )
 #: При OpenSSL с хоста в AppDir нет своих libssl/libcrypto.
 FORBIDDEN_HOST_OPENSSL = ("libssl.so*", "libcrypto.so*")
@@ -301,14 +304,31 @@ def check_forbidden(appdir: Path, openssl_origin: str) -> list[str]:
     patterns = FORBIDDEN_ALWAYS + (FORBIDDEN_HOST_OPENSSL if openssl_origin == "host" else ())
     problems: list[str] = []
     for path in sorted(appdir.rglob("*")):
-        if any(fnmatch.fnmatchcase(path.name, pattern) for pattern in patterns):
+        if any(fnmatch.fnmatchcase(path.name.lower(), pattern.lower()) for pattern in patterns):
             problems.append(f"запрещённый файл в AppDir: {path.relative_to(appdir)}")
     return problems
+
+
+#: Named vendor ELF targets shared with tools/elf-audit (CPython 3.11).
+VENDOR_ELFS = frozenset(
+    {
+        "onnxruntime/capi/libonnxruntime.so.1.24.4",
+        "onnxruntime/capi/libonnxruntime_providers_shared.so",
+        "onnxruntime/capi/onnxruntime_pybind11_state.cpython-311-x86_64-linux-gnu.so",
+        "sherpa_onnx/lib/_sherpa_onnx.cpython-311-x86_64-linux-gnu.so",
+        "sherpa_onnx/lib/libonnxruntime.so",
+        "sherpa_onnx/lib/libsherpa-onnx-c-api.so",
+        "sherpa_onnx/lib/libsherpa-onnx-cxx-api.so",
+        "sherpa_onnx.libs/libasound-fb5348bf.so.2.0.0",
+    }
+)
+VENDOR_DIRECTORY = Path("opt/python3.11/lib/python3.11/site-packages")
 
 
 def check_symlinks(appdir: Path) -> list[str]:
     """Нет абсолютных ссылок и ссылок, выходящих из AppDir (хостовый sitecustomize, R3.2)."""
     appdir = appdir.resolve()
+    vendor = appdir / VENDOR_DIRECTORY
     problems: list[str] = []
     for path in sorted(appdir.rglob("*")):
         if not path.is_symlink():
@@ -319,6 +339,16 @@ def check_symlinks(appdir: Path) -> list[str]:
             problems.append(f"абсолютная ссылка {rel} -> {target}")
         elif not Path(os.path.normpath(path.parent / target)).is_relative_to(appdir):
             problems.append(f"ссылка {rel} -> {target} выходит из AppDir")
+        if path.is_relative_to(vendor):
+            try:
+                resolved = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                problems.append(f"ссылка {rel}: цель не разрешается: {exc}")
+                continue
+            if not resolved.is_relative_to(vendor):
+                problems.append(f"ссылка {rel} -> {target} выходит из vendor")
+            elif resolved.relative_to(vendor).as_posix() not in VENDOR_ELFS:
+                problems.append(f"ссылка {rel} -> {target}: цель не входит в список ELF")
     return problems
 
 

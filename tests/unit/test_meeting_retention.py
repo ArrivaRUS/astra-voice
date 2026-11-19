@@ -13,8 +13,10 @@ import pytest
 from test_meeting_jobs import MID, MID2, Rig
 
 from astra_voice.core import meeting_jobs
+from astra_voice.meetings import store as meeting_store
 from astra_voice.meetings.events import MeetingState, ProcessingStatus
 from astra_voice.meetings.model import Audio, Meeting, Transcript, Transcription, Utterance
+from astra_voice.meetings.segments import CaptureJournal
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, Writer
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
@@ -77,6 +79,112 @@ def rig(tmp_path: Path) -> Iterator[RetentionRig]:
     instance = RetentionRig(tmp_path)
     yield instance
     instance.jobs.shutdown()
+
+
+@pytest.mark.parametrize("state", [MeetingState.RECORDING, MeetingState.PAUSED])
+@pytest.mark.parametrize("rediar", [False, True])
+def test_retention_never_locks_recording_and_capture_can_write(
+    rig: RetentionRig, monkeypatch: pytest.MonkeyPatch, state: MeetingState, rediar: bool
+) -> None:
+    from astra_voice.meetings.model import Rediar
+
+    rig.create(
+        state=state,
+        meeting_generation=1,
+        transcript_generation=0 if rediar else None,
+        rediar=Rediar(1, "a" * 64) if rediar else None,
+    )
+    meeting = rig.meeting()
+    with rig.store.writer(MID, Writer.CAPTURE) as capture:
+        listing = rig.store.list
+        real_lock = meeting_store._lock
+        writing = False
+
+        def observed_lock(*args: Any, **kwargs: Any) -> Any:
+            if not writing:
+                pytest.fail("retention attempted a lease/store lock on capture")
+            return real_lock(*args, **kwargs)
+
+        def during_scan(*, include_deleting: bool = False) -> list[Meeting]:
+            nonlocal writing
+            snapshot = listing(include_deleting=include_deleting)
+            # These writes run inside the retention scan, with CAPTURE held
+            # throughout. The controller and capture use the real store gates.
+            writing = True
+            try:
+                capture.write(
+                    "capture.json", CaptureJournal(MID, meeting.meeting_generation, "capture-test")
+                )
+                meeting.title = "Запись продолжается"
+                rig.store.write(MID, "meeting.json", meeting, writer=Writer.GUI)
+            finally:
+                writing = False
+            return snapshot
+
+        with monkeypatch.context() as patch:
+            patch.setattr(meeting_store, "_lock", observed_lock)
+            patch.setattr(rig.store, "list", during_scan)
+            patch.setattr(rig.store, "rediar_cleanup", lambda mid: pytest.fail("capture cleanup"))
+            rig.jobs._retention_pass()
+    assert rig.store.read(MID, "capture.json").capture_id == "capture-test"
+    assert rig.meeting().title == "Запись продолжается"
+
+
+def test_retention_still_cleans_rediar_files_for_ready_meeting(rig: RetentionRig) -> None:
+    rig.saved(age=1)
+    directory = rig.store.root / MID
+    names = (
+        "rediar-transcript.json",
+        "rediar-checkpoint.json",
+        ".rediar-transcript-" + "a" * 32 + ".tmp",
+    )
+    for name in names:
+        (directory / name).write_bytes(b"orphan")
+    rig.jobs._retention_pass()
+    assert all(not (directory / name).exists() for name in names)
+    assert rig.meeting().audio.present
+    assert (directory / "transcript.json").exists()
+
+
+@pytest.mark.parametrize(
+    "state", [MeetingState.RECORDED, MeetingState.INTERRUPTED, MeetingState.DONE]
+)
+def test_retention_skips_capture_owner_after_state_changes(
+    rig: RetentionRig, monkeypatch: pytest.MonkeyPatch, state: MeetingState
+) -> None:
+    rig.create(state=state)
+    rig.age(100)
+    rig.days = 30
+    with rig.store.writer(MID, Writer.CAPTURE) as capture:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                meeting_store, "_lock", lambda *a, **kw: pytest.fail("capture owner locked")
+            )
+            patch.setattr(
+                rig.store, "rediar_cleanup", lambda mid: pytest.fail("capture owner cleaned")
+            )
+            rig.jobs._retention_pass()
+        capture.write("capture.json", CaptureJournal(MID, 0, "capture-test"))
+        rig.store.write(MID, "meeting.json", rig.meeting(), writer=Writer.GUI)
+    assert (rig.store.root / MID).exists()
+    assert not rig.jobs.tombstones and not rig.jobs.recovery_errors
+    rig.jobs._retention_pass()
+    assert not (rig.store.root / MID).exists()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_capture_probe_does_not_create_or_sync_files(
+    rig: RetentionRig, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    rig.create()
+    if existing:
+        with rig.store.writer(MID, Writer.CAPTURE):
+            assert rig.store.capture_active(MID)
+    directory = rig.store.root / MID
+    before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    monkeypatch.setattr(os, "fsync", lambda fd: pytest.fail("probe synced a directory"))
+    assert not rig.store.capture_active(MID)
+    assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == before
 
 
 @pytest.mark.parametrize("age,removed", [(8, True), (7, True), (6, False), (-1, False)])
@@ -283,11 +391,19 @@ def test_crash_after_unlink_before_metadata_is_idempotent_t433(
     rig: RetentionRig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     text = rig.saved(cleanup_pending=True)
-    real_update = rig.jobs._update
-    monkeypatch.setattr(rig.jobs, "_update", lambda *a, **kw: None)
+    real_persist = rig.store._persist_metadata
+
+    def fail_after_unlink(directory: int, meeting: Meeting) -> None:
+        if not meeting.audio.present:
+            raise OSError("fixed")
+        real_persist(directory, meeting)
+
+    # The metadata edge moved into the store transaction in 5в-5. Inject at
+    # that same durable boundary, preserving every original recovery assertion.
+    monkeypatch.setattr(rig.store, "_persist_metadata", fail_after_unlink)
     rig.jobs._retention_pass()
     assert rig.meeting().cleanup_pending and not rig.audio_present()
-    monkeypatch.setattr(rig.jobs, "_update", real_update)
+    monkeypatch.setattr(rig.store, "_persist_metadata", real_persist)
     rig.jobs._retention_pass()
     assert not rig.meeting().cleanup_pending and not rig.meeting().audio.present
     assert (rig.store.root / MID / "transcript.json").read_bytes() == text

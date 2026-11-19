@@ -162,7 +162,7 @@ def test_export_keeps_gui_and_lease_timer_alive_and_rejects_repeat(
     assert "Коллеги, добрый день." in (rig.documents / "slow.md").read_text()
 
 
-def test_done_card_rows_hide_echo_and_empty_and_turn_placeholders_into_marks(
+def test_done_card_rows_show_echo_hide_empty_and_turn_placeholders_into_marks_t531(
     rig: SaveRig,
 ) -> None:
     rig.create(
@@ -176,16 +176,20 @@ def test_done_card_rows_hide_echo_and_empty_and_turn_placeholders_into_marks(
         ("utterance", "[0:00:04]", "Я", "Коллеги, добрый день."),
         ("mark", "0:00:10", "", "Ваш микрофон не записывался: 0:00:10–0:00:11"),
         ("utterance", "[0:00:12]", "Собеседники", "<b>Добрый</b> & день"),
+        ("utterance", "[0:00:23]", "Я", "эхо"),
         ("mark", "0:40:00", "", "Кусок записи повреждён 0:40:00–0:40:10"),
     ]
     assert rows[2]["accessibleName"] == "0:00:12, Собеседники: <b>Добрый</b> & день"
     assert [mark["text"] for mark in card["marks"]] == [
         "Ваш микрофон не записывался 0:00:10–0:00:11",
         "Кусок записи повреждён 0:40:00–0:40:10",
+        "Возможное эхо: 1 реплика",
     ]
     assert card["badge"] == {"text": "Готово", "kind": "success", "icon": "check"}
     assert card["subtitle"]["mono"] == "0:30:00"
-    assert card["participants"] == [
+    assert [
+        {key: row[key] for key in ("kind", "label", "minutes")} for row in card["participants"]
+    ] == [
         {"kind": "me", "label": "Я", "minutes": "1 мин"},
         {"kind": "others", "label": "Собеседники", "minutes": "1 мин"},
     ]
@@ -966,7 +970,8 @@ def test_preview_5000_rows_is_bounded_and_fast(
         normalizations = Mock(wraps=templates._one_line)
         patch.setattr(templates, "_one_line", normalizations)
         meeting_card.save_preview(template, rig.meeting(), transcript)
-        assert normalizations.call_count <= (
+        # The preview now includes title + two participant names in its header.
+        assert normalizations.call_count <= 3 + (
             0 if template == "stats" else 4 if template == "text_only" else 7
         )
     preview, elapsed = _minimum_preview_time(template, rig.meeting(), transcript)
@@ -1048,7 +1053,7 @@ def test_preview_bounds_a_single_5000_reply_paragraph(
         normalizations = Mock(wraps=templates._one_line)
         patch.setattr(templates, "_one_line", normalizations)
         meeting_card.save_preview("text_only", rig.meeting(), transcript)
-        assert normalizations.call_count <= 5  # capped even while one speaker keeps talking
+        assert normalizations.call_count <= 6  # capped replies + title and participant name
     preview, elapsed = _minimum_preview_time("text_only", rig.meeting(), transcript)
     print(f"preview single paragraph: {elapsed * 1000:.2f} ms")
     # Structural counters above enforce bounded work; time is a coarse hang guard.
@@ -1120,3 +1125,196 @@ def test_preview_continuation_never_attaches_to_a_recording_mark(rig: SaveRig) -
     assert preview["rows"][-1]["kind"] == "mark"
     assert not preview["rows"][-1]["text"].endswith("…")
     assert preview["moreText"] == "…"
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+@pytest.mark.parametrize("fmt", ["md", "txt"])
+@pytest.mark.parametrize("checked", [False, True])
+def test_echo_checkbox_preview_export_no_mutation_t545_t547_t548_t551_t553(
+    rig: SaveRig, template: str, fmt: str, checked: bool
+) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(
+        [(0, 1000, "me", "ЭХО"), (1000, 2000, "me", "ЭХО"), (2000, 3000, "S1", "Настоящая речь")],
+        echo=0,
+    )
+    # two echo rows, joined before exclusion; persisted meeting stays unchanged
+    data = rig.store.read(MID, "transcript.json")
+    assert isinstance(data, Transcript)
+    data.transcript_revision += 1
+    data.utterances[1].echo = True
+    data.utterances[2].multiple_speakers = True
+    rig.store.write(MID, "transcript.json", data, writer=Writer.TRANSCRIBE)
+    rig.open_card()
+    before = (rig.store.root / MID / "transcript.json").read_bytes()
+    bridge = rig.bridge
+    bridge.setProperty("savePreviewOpen", True)
+    assert not bridge.saveExcludeEcho
+    bridge.setProperty("saveTemplate", template)
+    signals = QSignalSpy(bridge.savePreviewChanged)
+    bridge.setSaveExcludeEcho(checked)
+    assert bool(signals) == checked
+    assert bridge.saveEchoCount == 2 and bridge.saveEchoVisible == (template != "stats")
+    assert bridge.saveEchoAccessibleName == "Не включать реплики с пометкой «возможное эхо», 2"
+    assert bridge.saveEchoDescription == meeting_card.TEXTS["excludeEchoDescription"]
+    expected = render(template, rig.meeting(), data, fmt, exclude_echo=checked)
+    assert bridge.savePreviewText(fmt) == expected
+    preview = bridge.savePreview()
+    if template == "stats":
+        assert preview["excludedEcho"] in expected
+    else:
+        assert any(row["flag"] == "echo" for row in preview["rows"]) == (not checked)
+        assert all(row["textMuted"] == (row["flag"] == "echo") for row in preview["rows"])
+    target = rig.documents / f"marks.{fmt}"
+    rig.answer = str(target)
+    assert save_result(rig, lambda: bridge.saveAs(fmt)) == "saved"
+    assert target.read_text() == expected
+    assert (rig.store.root / MID / "transcript.json").read_bytes() == before
+    bridge.setProperty("savePreviewOpen", False)
+    bridge.setProperty("savePreviewOpen", True)
+    assert not bridge.saveExcludeEcho
+
+
+@pytest.mark.parametrize("closing", ["cancel", "close", "save"])
+def test_checkbox_resets_each_open_and_new_instance_t546(rig: SaveRig, closing: str) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS, echo=3)
+    rig.open_card()
+    bridge = rig.bridge
+    bridge.setProperty("savePreviewOpen", True)
+    bridge.setSaveExcludeEcho(True)
+    if closing == "save":
+        rig.answer = str(rig.documents / "once.txt")
+        assert save_result(rig, lambda: bridge.saveAs("txt")) == "saved"
+    bridge.setProperty("savePreviewOpen", False)
+    bridge.setProperty("savePreviewOpen", True)
+    assert not bridge.saveExcludeEcho
+    bridge.setSaveExcludeEcho(True)
+    bridge.closeMeeting()
+    rig.open_card()
+    assert not bridge.saveExcludeEcho
+    # No Settings field exists: a fresh bridge always starts unchecked.
+    fresh = rig.store.root.parent / "fresh"
+    fresh.mkdir()
+    other = SaveRig(fresh)
+    try:
+        assert not other.bridge.saveExcludeEcho
+    finally:
+        other.bridge.shutdown()
+
+
+def test_no_echo_checkbox_hidden_t552(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS)
+    rig.open_card()
+    for template in TEMPLATES:
+        rig.bridge.setProperty("saveTemplate", template)
+        assert rig.bridge.saveEchoCount == 0 and not rig.bridge.saveEchoVisible
+
+
+def test_echo_choice_stays_with_pending_replacement_t548(rig: SaveRig) -> None:
+    rig.create(state=MeetingState.DONE)
+    rig.transcript(ROWS, echo=3)
+    rig.open_card()
+    rig.bridge.setSaveExcludeEcho(True)
+    target = rig.documents / "existing.txt"
+    target.write_text("старый файл")
+    rig.answer = str(target)
+    expected = rig.bridge.savePreviewText("txt")
+    assert save_result(rig, lambda: rig.bridge.saveAs("txt")) == "exists"
+    rig.bridge.setSaveExcludeEcho(False)
+    rig.bridge.setProperty("saveTemplate", "stats")
+    assert save_result(rig, rig.bridge.replaceSaveTarget) == "saved"
+    assert target.read_text() == expected
+
+
+@pytest.mark.parametrize(
+    "kind,published",
+    [("echo", False), ("echo", True), ("multi", True), ("speaker", False), ("speaker", True)],
+)
+def test_late_metadata_and_new_tail_keep_rows_t528_round2(
+    rig: SaveRig, kind: str, published: bool
+) -> None:
+    from dataclasses import replace
+
+    from PyQt5.QtCore import QPersistentModelIndex
+
+    rig.create(
+        state=MeetingState.TRANSCRIBING,
+        marks=[Mark(500, "mic_gap_start"), Mark(1000, "mic_gap_end"), Mark(3000, "pause", "user")],
+    )
+    rig.open_card()
+    bridge = rig.bridge
+    builder = bridge._card_builder
+    assert builder is not None
+    meeting = builder.meeting
+    meeting.transcription.diarization = True
+    meeting.transcription.diar_status = "done"
+    first = Utterance(
+        "u00000",
+        track="mic" if kind == "echo" else "far",
+        start_ms=2000,
+        end_ms=2500,
+        text="А",
+        speaker="me" if kind == "echo" else "others",
+    )
+    builder.load([first], complete=False)
+    model = bridge.cardRows
+    original_mark = model.get(0)
+    index = QPersistentModelIndex(model.index(1))
+    resets, changes, inserts = (
+        QSignalSpy(model.modelReset),
+        QSignalSpy(model.dataChanged),
+        QSignalSpy(model.rowsInserted),
+    )
+    updated = replace(
+        first,
+        echo=kind == "echo",
+        multiple_speakers=kind == "multi",
+        speaker="me" if kind == "echo" else "S1",
+    )
+    tail = Utterance(
+        "u00001", seq=1, track="far", start_ms=4000, end_ms=4500, text="Б", speaker="S2"
+    )
+    snapshot = [updated, tail]
+    if published:
+        # The real final-publication bridge seam, including its prefix check.
+        meeting.state = MeetingState.DONE
+        bridge._card_tail = True
+        bridge._card_results.put(
+            (
+                bridge._card_serial,
+                Transcript(
+                    meeting.id,
+                    meeting_generation=meeting.meeting_generation,
+                    utterances=snapshot,
+                    labels_final=True,
+                ),
+                False,
+            )
+        )
+        bridge._card_poll()
+    else:
+        builder.sync(snapshot)
+    assert not resets, "late metadata plus an appended reply must not reset the model"
+    assert index.isValid() and index.row() == 1
+    assert len(inserts) == 1 and list(inserts[0][1:]) == [2, 3]
+    assert len(changes) == 1 and changes[0][0].row() == changes[0][1].row() == 1
+    names = {role: bytes(name).decode() for role, name in model.roleNames().items()}
+    changed_roles = {names[role] for role in changes[0][2]}
+    required = (
+        {"who", "num", "accessibleName"}
+        if kind == "speaker"
+        else {"flag", "flagText", "flagIcon", "accessibleName"}
+    )
+    if kind == "echo":
+        required.add("textMuted")
+    assert required <= changed_roles
+    assert model.get(0) == original_mark
+    assert [row["text"] for row in model.rows() if row["kind"] == "utterance"] == ["А", "Б"]
+    assert model.get(1)["flag"] == {"echo": "echo", "multi": "multi", "speaker": ""}[kind]
+    assert model.get(1)["who"] == ("Я" if kind == "echo" else "Спикер 1")
+    assert builder.utterances == snapshot
+    assert builder.minutes() == templates.speaker_minutes(snapshot)
+    builder.sync(snapshot)
+    assert not resets and len(changes) == len(inserts) == 1

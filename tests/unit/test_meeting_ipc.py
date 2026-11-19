@@ -546,3 +546,43 @@ def test_model_loaded_rejects_invalid_load_time(value: object) -> None:
             {**REPLIES["meeting-transcribe"][0], "load_ms": value}, role="meeting-transcribe"
         )
     assert caught.value.code == ipc.BAD_FIELD
+
+
+@pytest.mark.parametrize("seconds", [1200, 1290, 1380])
+def test_r2_b_diar_accepts_grid_shifted_block_and_actual_duration_timeout(seconds: int) -> None:
+    from astra_voice.worker.meeting_contract import operation_timeout
+
+    message = command("meeting-diar", "diar.block")
+    message.update(block_s=seconds, expected_rtf=0.1)
+    clean = ipc.decode(ipc.encode(message, role="meeting-diar")[4:], role="meeting-diar")
+    assert clean["block_s"] == seconds
+    assert operation_timeout(clean) == pytest.approx(seconds * 0.3)
+
+
+@pytest.mark.parametrize("seconds", [1380.001, 1381])
+def test_r2_b_diar_rejects_blocks_beyond_grid_ceiling(seconds: float) -> None:
+    message = command("meeting-diar", "diar.block")
+    message["block_s"] = seconds
+    with pytest.raises(ipc.FrameError):
+        ipc.encode(message, role="meeting-diar")
+
+
+def test_echo_mark_socket_subprocess_t516_t520() -> None:
+    """Real socket transport; run outside the sandbox together with role integration."""
+    import socket
+
+    event = {"type": "meeting.job.utterance", **IDENTITY, "seq": 1, **UTT, "echo": True}
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sender.settimeout(3)
+        receiver.settimeout(3)
+        sender.sendall(ipc.encode(event, role="meeting-transcribe"))
+        reader = ipc.FrameReader(role="meeting-transcribe")
+        restored: list[dict[str, Any]] = []
+        while not restored:
+            restored.extend(reader.feed(receiver.recv(65536)))
+        assert restored == [event]
+        assert restored[0]["echo"] and restored[0]["text"] == UTT["text"]
+    finally:
+        sender.close()
+        receiver.close()

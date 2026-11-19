@@ -26,6 +26,8 @@ ComboBox {
     property real itemsWidth: 0
     // Optional rich rows keep the native ComboBox keyboard/selection behavior.
     property var itemDetails: []
+    // M7 opt-in: neutral speaker number; accessible names remain bridge labels.
+    property bool speakerNumbers: false
 
     function detailsAt(index) {
         return index >= 0 && index < itemDetails.length ? itemDetails[index] : null
@@ -98,17 +100,34 @@ ComboBox {
         }
     }
 
-    contentItem: Text {
-        textFormat: Text.PlainText
-        text: control.displayText
-        font: control.font
-        renderType: Text.NativeRendering
-        color: !control.enabled ? Theme.fgDisabled
-            : control.detailsAt(control.currentIndex) && control.detailsAt(control.currentIndex).muted
-                ? Theme.fgMuted : Theme.fg
-        verticalAlignment: Text.AlignVCenter
-        elide: Text.ElideRight
-        rightPadding: Theme.selectChevron + Theme.selectGap
+    contentItem: Item {
+        implicitWidth: selectedText.implicitWidth
+        implicitHeight: selectedText.implicitHeight
+        property bool truncated: selectedText.truncated
+        // Preserve the text interface for callers when the speaker number wraps it.
+        property alias color: selectedText.color
+        MeetingSpeakerNumber {
+            id: speakerNumber
+            visible: control.speakerNumbers
+            num: control.speakerNumbers && control.detailsAt(control.currentIndex) ? control.detailsAt(control.currentIndex).num || "" : ""
+            anchors.verticalCenter: parent.verticalCenter
+        }
+        Text {
+            id: selectedText
+            textFormat: Text.PlainText
+            x: control.speakerNumbers ? speakerNumber.width + Theme.speakerNumGap : 0
+            width: parent.width - x
+            height: parent.height
+            text: control.displayText
+            font: control.font
+            renderType: Text.NativeRendering
+            color: !control.enabled ? Theme.fgDisabled
+                : control.detailsAt(control.currentIndex) && control.detailsAt(control.currentIndex).muted
+                    ? Theme.fgMuted : Theme.fg
+            verticalAlignment: Text.AlignVCenter
+            elide: Text.ElideRight
+            rightPadding: Theme.selectChevron + Theme.selectGap
+        }
     }
 
     indicator: Icon {

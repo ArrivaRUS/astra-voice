@@ -177,7 +177,7 @@ def test_transcribe_defaults_reach_the_runner(
         "minutes": None,
         "model_dir": None,
         "threads": 2,
-        "echo_gate": False,
+        "echo_gate": True,
         "out": None,
     }
     progress("asr", 1, 2)  # JSON mode: silent progress
@@ -652,3 +652,17 @@ def test_build_meeting_writes_m2_segments_from_the_corpus(tmp_path: Path) -> Non
     with wave.open(str(audio / "far-0002.wav"), "rb") as wav:
         assert wav.getnframes() == 8_000
         assert set(np.frombuffer(wav.readframes(8_000), dtype="<i2")) == {2}
+
+
+def test_validate_reports_marked_echo_not_dropped_t516() -> None:
+    rows = [utterance(0, "far", 0, "Речь"), utterance(1, "mic", 150, "Речь")]
+    rows[1]["echo"] = True
+    report = check.evaluate(
+        check.load_reference(corpus_document(), 12_000),
+        rows,
+        audio_ms=12000,
+        wall_ms=600,
+        done=DONE,
+    )
+    assert report["echo_utterances"] == 1 and report["echo_dropped"] == 0
+    assert "возможное эхо 1" in "\n".join(check.text_report(report))

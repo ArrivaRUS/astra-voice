@@ -70,7 +70,7 @@ def test_conditional_actions_are_present_only_when_available(harness: Harness) -
     h.tray.set_meeting_state(
         TrayState.MEETING_REC, limit_soon=True, can_extend=True, mic_name="Встроенный микрофон"
     )
-    assert labels(h)[1:3] == ["Продлить на час", "Продолжить с „Встроенный микрофон“"]
+    assert labels(h)[1:3] == ["Продлить на час", "Продолжить с «Встроенный микрофон»"]
     h.tray.set_meeting_state(TrayState.MEETING_REC, limit_soon=True, can_extend=False)
     assert "Продлить на час" not in labels(h)
     assert not any(label.startswith("Продолжить с") for label in labels(h))

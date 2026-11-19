@@ -15,7 +15,7 @@ from typing import Any, cast
 
 import pytest
 
-from astra_voice.models.catalog import CatalogEntry, Metric, Metrics
+from astra_voice.models.catalog import Catalog, CatalogEntry, Metric, Metrics
 from astra_voice.models.store import ModelStore
 from astra_voice.runtime import SELFCHECK_MAX_S
 
@@ -60,7 +60,7 @@ def prepare(
     tmp_path: Path,
     models: tuple[CatalogEntry, ...],
 ) -> ModelStore:
-    monkeypatch.setitem(validate, "load_catalog", lambda: SimpleNamespace(entries=models))
+    monkeypatch.setitem(validate, "load_catalog", lambda: Catalog(1, 1, (), models))
     wav = tmp_path / "smoke.wav"
     wav.write_bytes(b"stub")
     monkeypatch.setitem(validate, "smoke_wav_path", lambda: wav)
@@ -661,7 +661,7 @@ def test_explicit_live_store_uses_lock_and_other_store_does_not(
             return False
 
     monkeypatch.setattr(QtCore, "QLockFile", BusyLock)
-    monkeypatch.setitem(validate, "load_catalog", lambda: SimpleNamespace(entries=()))
+    monkeypatch.setitem(validate, "load_catalog", lambda: Catalog(1, 1, (), ()))
     assert validate["main"](["catalog", "--switch", "--store", str(live_store), "--json"]) == 2
     assert json.loads(capsys.readouterr().out)["explanation"] == (
         "Закройте Astra Voice и повторите проверку"
@@ -835,3 +835,19 @@ def test_load_a_fails_early_and_restores_current(
     assert code == facts["exit_code"] == 2
     assert facts["explanation"] == "Загрузка модели A не удалась"
     assert current_path.read_bytes() == before
+
+
+def test_catalog_command_excludes_diarization(
+    validate: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    models = (entry("asr"), replace(entry("diar"), kind="diarization"))
+    store = prepare(validate, monkeypatch, tmp_path, models)
+    seen: list[CatalogEntry] = []
+
+    def all_models(args: Any, entries: tuple[CatalogEntry, ...], model_store: Any) -> Any:
+        seen.extend(entries)
+        return 0, {"rows": [], "verdict": "ok"}
+
+    monkeypatch.setitem(validate, "catalog_all", all_models)
+    assert validate["main"](["catalog", "--all", "--json", "--store", str(store.root)]) == 0
+    assert seen == [models[0]]

@@ -150,7 +150,7 @@ if mode == "states":
                 "secondaryAction": "resume-microphone",
                 "microphoneName": "Встроенный микрофон",
             },
-            "Продолжить с „Встроенный микрофон“",
+            "Продолжить с «Встроенный микрофон»",
         ),
         (
             "mic-paused",

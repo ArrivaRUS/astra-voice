@@ -2,7 +2,8 @@
 
 Число ELF — не любопытство, а цифра, которую заказчик подписывает по ГОСТ в
 контуре с ЗПС (v1.1) и которая стоит в `docs/INSTALL-ADMIN.md` и в SBOM.
-Ожидание жёсткое: 3 `.so` onnxruntime при сборке с vendor, 0 при `--no-vendor`
+Ожидание жёсткое: 3 `.so` onnxruntime + 5 ELF sherpa-onnx/core с vendor,
+0 при `--no-vendor`
 (`arch/spikes/S3.md` §1.3, `docs/plans.md` M1 «Stop-and-Fix»).
 
 Тест ничего не собирает: он проверяет пакет, который уже лежит в `dist/`.
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -23,9 +25,19 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
 DIST = ROOT / "dist"
 ELF_AUDIT = ROOT / "tools" / "elf-audit"
-#: С vendor — ровно три `.so` onnxruntime; без vendor — ни одного.
-EXPECT_WITH_VENDOR = 3
+#: С vendor — точный набор из восьми ELF; без vendor — ни одного.
+EXPECT_WITH_VENDOR = 8
 EXPECT_WITHOUT_VENDOR = 0
+VENDOR_ELFS = {
+    "onnxruntime/capi/libonnxruntime.so.1.24.4",
+    "onnxruntime/capi/libonnxruntime_providers_shared.so",
+    "onnxruntime/capi/onnxruntime_pybind11_state.cpython-311-x86_64-linux-gnu.so",
+    "sherpa_onnx/lib/_sherpa_onnx.cpython-311-x86_64-linux-gnu.so",
+    "sherpa_onnx/lib/libonnxruntime.so",
+    "sherpa_onnx/lib/libsherpa-onnx-c-api.so",
+    "sherpa_onnx/lib/libsherpa-onnx-cxx-api.so",
+    "sherpa_onnx.libs/libasound-fb5348bf.so.2.0.0",
+}
 
 
 def _deb() -> Path:
@@ -62,6 +74,19 @@ def test_elf_count_matches_expectation(deb: Path) -> None:
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert f"ELF найдено: {expect}" in proc.stdout
+    with tempfile.TemporaryDirectory(prefix="test-deb-elves-") as tmp:
+        root = Path(tmp)
+        subprocess.run(["dpkg-deb", "-x", str(deb), str(root)], check=True)
+        actual = set()
+        for path in root.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                with path.open("rb") as fh:
+                    if fh.read(4) == b"\x7fELF":
+                        actual.add(path.relative_to(root).as_posix())
+        expected = (
+            {"usr/lib/astra-voice/vendor/" + name for name in VENDOR_ELFS} if has_vendor else set()
+        )
+        assert actual == expected
 
 
 def test_layout_is_as_packaged(deb: Path) -> None:

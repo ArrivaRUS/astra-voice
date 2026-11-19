@@ -147,3 +147,14 @@ def test_lexicon_scope_includes_public_docs_and_excludes_internal_docs(tmp_path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("перехват", encoding="utf-8")
     assert public_paths(tmp_path) == {tmp_path / name for name in public}
+
+
+def test_installation_vocabulary_is_public_and_uses_voice_separation_terms() -> None:
+    from astra_voice.ui.meeting_texts import DIAR_INSTALL_TEXTS
+
+    path = ROOT / "src/astra_voice/ui/meeting_texts.py"
+    assert path in public_paths(ROOT)
+    literals = {text for _, text in python_texts(path.read_text(encoding="utf-8"))}
+    assert set(DIAR_INSTALL_TEXTS.values()) <= literals
+    for text in DIAR_INSTALL_TEXTS.values():
+        assert not re.search("перехват|диаризац|NCC|гейт|корреляц|дубль", text, re.IGNORECASE)

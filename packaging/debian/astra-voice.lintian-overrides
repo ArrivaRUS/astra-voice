@@ -1,0 +1,7 @@
+# These four ELF files are vendored byte-for-byte from SHA256-pinned
+# sherpa-onnx/core wheels (packaging/wheels.lock). Stripping would change
+# their upstream bytes and the ELF hashes recorded in our SBOM.
+astra-voice: unstripped-binary-or-object [usr/lib/astra-voice/vendor/sherpa_onnx.libs/libasound-fb5348bf.so.2.0.0]
+astra-voice: unstripped-binary-or-object [usr/lib/astra-voice/vendor/sherpa_onnx/lib/libonnxruntime.so]
+astra-voice: unstripped-binary-or-object [usr/lib/astra-voice/vendor/sherpa_onnx/lib/libsherpa-onnx-c-api.so]
+astra-voice: unstripped-binary-or-object [usr/lib/astra-voice/vendor/sherpa_onnx/lib/libsherpa-onnx-cxx-api.so]

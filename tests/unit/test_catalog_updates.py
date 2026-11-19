@@ -122,7 +122,14 @@ def state_file(tmp_path: Path) -> Path:
     """Состояние после встроенного каталога пакета: (trust_epoch, serial) = (1, 4)."""
     path = catalog_state.state_path(tmp_path / "state")
     path.parent.mkdir(parents=True)
-    builtin = load_builtin(StubVerifier(), root=DATA_ROOT, state_path=path)
+    # Explicit synthetic baseline: published serial may advance independently.
+    root = tmp_path / "builtin"
+    root.mkdir()
+    baseline = with_serial(json.loads((DATA_ROOT / "catalog.json").read_bytes()), 4)
+    (root / "catalog.json").write_bytes(encode(baseline))
+    (root / "catalog.json.sig").write_bytes(b"stub signature")
+    (root / "catalog.schema.json").write_bytes((DATA_ROOT / "catalog.schema.json").read_bytes())
+    builtin = load_builtin(StubVerifier(), root=root, state_path=path)
     assert (builtin.trust_epoch, builtin.serial) == (1, 4)
     return path
 

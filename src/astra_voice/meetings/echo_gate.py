@@ -2,8 +2,8 @@
 
 A pure function over PCM already on disk: no devices, files or calibration
 capture (T1 §4.2 п. 2). Every tunable lives here so M0 (laptop block F) can
-switch the default or move a threshold with one number. Until block F is
-measured the gate is OFF by default (D7: no measurement -> disabled).
+move a threshold with one number. D7 (10.11.2026) enables marking by default;
+all candidates are still recognized and saved.
 
 Decision for one microphone utterance (16 kHz, aligned on the recorded axis):
 both tracks are low-passed and decimated to 4 kHz; normalized cross-correlation
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     Audio = npt.NDArray[np.float32]
     Signal = npt.NDArray[np.float64]
 
-ECHO_GATE_DEFAULT = False  # D7: switched by M0 block F (own-speech loss <= 2 %)
+ECHO_GATE_DEFAULT = True  # D7: mark possible echo, never discard speech
 THETA_ECHO = 0.35  # SP2 starting point; calibrated on the laptop in M0
 MAX_LAG_MS = 400
 FAR_OVERLAP_MIN = 0.5

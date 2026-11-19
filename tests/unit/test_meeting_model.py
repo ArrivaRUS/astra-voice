@@ -54,6 +54,7 @@ M1_DISK_ROWS = [
                 "speaker": "S1",
                 "final": True,
                 "echo": False,
+                "multiple_speakers": False,
             }
         ],
     ),

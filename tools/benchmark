@@ -132,7 +132,7 @@ def catalog_entries() -> tuple[dict[tuple[str, str], CatalogEntry], str]:
     except Exception as exc:
         # Подпись или схема не прошли: наружу — только тип отказа, без путей.
         return {}, type(exc).__name__
-    return {(entry.id, entry.revision): entry for entry in catalog.entries}, ""
+    return {(entry.id, entry.revision): entry for entry in catalog.dictation_entries}, ""
 
 
 def apply_probe_limits(min_ram_mb: int) -> None:

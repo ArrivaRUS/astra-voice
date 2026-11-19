@@ -36,6 +36,8 @@ _LICENSE_RE = re.compile(r"(LICEN[CS]E|COPYING|NOTICE|AUTHORS)[^/]*", re.IGNOREC
 #: Колёса без файла лицензии в dist-info: где лицензия на самом деле.
 WHEEL_EXCEPTIONS: dict[str, tuple[str, ...]] = {
     "PyQt5": ("repo:PyQt5/LICENSE",),
+    "sherpa_onnx_core": ("repo:sherpa-onnx/LICENSE", "repo:sherpa-onnx/README.txt"),
+    "sherpa-onnx-core": ("repo:sherpa-onnx/LICENSE", "repo:sherpa-onnx/README.txt"),
     "onnxruntime": ("package:onnxruntime/LICENSE", "package:onnxruntime/ThirdPartyNotices.txt"),
 }
 #: Имя в /usr/share/common-licenses → файл в licenses/common/.

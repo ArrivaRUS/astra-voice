@@ -59,10 +59,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 LOCK = ROOT / "packaging" / "wheels.lock"
 
-_LOCK_RE = re.compile(
-    r"^(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s\\]+)\s*\\?\s*(?:\n\s*--hash=sha256:(?P<sha>[0-9a-f]{64}))?",
-    re.MULTILINE,
-)
+_LOCK_RE = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s]+)(?P<hashes>.*)$")
+WHEEL_LICENSES = {"sherpa-onnx": "Apache-2.0", "sherpa-onnx-core": "Apache-2.0"}
 _DEP_RE = re.compile(r"^\s*([a-z0-9][a-z0-9+.\-]*)")
 
 
@@ -80,8 +78,12 @@ def _wheel_components(lock: Path = LOCK) -> list[dict[str, Any]]:
     text = lock.read_text(encoding="utf-8")
     text = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     out: list[dict[str, Any]] = []
-    for m in _LOCK_RE.finditer(text):
-        name, version, sha = m.group("name"), m.group("version"), m.group("sha")
+    for line in text.replace("\\\n", " ").splitlines():
+        m = _LOCK_RE.fullmatch(line)
+        if m is None:
+            continue
+        name, version = m.group("name"), m.group("version")
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", m.group("hashes"))
         comp: dict[str, Any] = {
             "type": "library",
             "bom-ref": f"pkg:pypi/{name}@{version}",
@@ -91,8 +93,10 @@ def _wheel_components(lock: Path = LOCK) -> list[dict[str, Any]]:
             "scope": "required",
             "properties": [{"name": "astra-voice:origin", "value": "vendored wheel"}],
         }
-        if sha:
-            comp["hashes"] = [{"alg": "SHA-256", "content": sha}]
+        if hashes:
+            comp["hashes"] = [{"alg": "SHA-256", "content": sha} for sha in hashes]
+        if license_id := WHEEL_LICENSES.get(name):
+            comp["licenses"] = [{"expression": license_id}]
         out.append(comp)
     return out
 
@@ -157,14 +161,31 @@ def _tree_elf_components(root: Path) -> list[dict[str, Any]]:
             if fh.read(4) != b"\x7fELF":
                 continue
         rel = "/" + str(path.relative_to(root))
+        license_id = (
+            "MIT"
+            if rel.endswith("sherpa_onnx/lib/libonnxruntime.so")
+            else "LGPL-2.1-or-later"
+            if "/sherpa_onnx.libs/libasound-" in rel
+            else None
+        )
+        extra: dict[str, Any] = {}
+        if license_id:
+            extra["licenses"] = [{"expression": license_id}]
+            extra["version"] = "1.28.2" if license_id == "MIT" else "1.2.12"
         out.append(
             {
+                **extra,
                 "type": "file",
                 "bom-ref": f"file:{rel}",
                 "name": rel,
                 "hashes": [{"alg": "SHA-256", "content": _sha256(path)}],
                 "properties": [
                     {"name": "astra-voice:gost-signing-object", "value": "true"},
+                    *(
+                        [_prop("sources", "not-attached")]
+                        if license_id == "LGPL-2.1-or-later"
+                        else []
+                    ),
                 ],
             }
         )
@@ -312,6 +333,7 @@ NESTED_LICENSES = (
     (re.compile(r"libopenblas"), "BSD-3-Clause"),
     (re.compile(r"libgfortran"), "GPL-3.0-or-later WITH GCC-exception-3.1"),
     (re.compile(r"libquadmath"), "LGPL-2.1-or-later"),
+    (re.compile(r"libasound"), "LGPL-2.1-or-later"),
 )
 #: Статически вшито в type2-runtime (scripts/common/install-dependencies.sh и Dockerfile
 #: коммита dd6cebed): версия None — пакет Alpine 3.21 без закреплённой версии (риск R3).
@@ -492,8 +514,12 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
                     continue
             if _is_elf(path):
                 origin[target] = ref
-                if ".libs/" in rel:
-                    license_id = _nested_license(path.name)
+                if ".libs/" in rel or rel == "sherpa_onnx/lib/libonnxruntime.so":
+                    license_id = (
+                        "MIT"
+                        if rel == "sherpa_onnx/lib/libonnxruntime.so"
+                        else _nested_license(path.name)
+                    )
                     comp: dict[str, Any] = {
                         "type": "library",
                         "bom-ref": f"file:/{target}",
@@ -504,6 +530,10 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
                             *_pending_props(lock, path.name, pending_used),
                         ],
                     }
+                    if rel == "sherpa_onnx/lib/libonnxruntime.so":
+                        comp["version"] = "1.28.2"
+                    elif path.name.startswith("libasound-"):
+                        comp["version"] = "1.2.12"
                     if license_id:
                         comp["licenses"] = [{"expression": license_id}]
                     source = _gcc_source(lock, path.name)
@@ -547,6 +577,8 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
             "hashes": [{"alg": "SHA-256", "content": sha} for sha in req.hashes],
             "properties": [_prop("origin", "vendored wheel")],
         }
+        if license_id := WHEEL_LICENSES.get(_norm(req.name)):
+            comp["licenses"] = [{"expression": license_id}]
         if req.name == "PyQt5":
             comp["externalReferences"] = _source_refs(lock, "pyqt5-sdist")
         if nested:
@@ -735,11 +767,11 @@ def main(argv: list[str] | None = None) -> int:
 
     version = _deb_field(args.deb, "Version")
     # Воспроизводимость: время сборки берём из SOURCE_DATE_EPOCH, если задан.
-    epoch = os.environ.get("SOURCE_DATE_EPOCH")
-    ts = datetime.fromtimestamp(int(epoch) if epoch else args.deb.stat().st_mtime, tz=UTC)
+    deb_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    ts = datetime.fromtimestamp(int(deb_epoch) if deb_epoch else args.deb.stat().st_mtime, tz=UTC)
 
     components = _wheel_components() + _dep_components(args.deb) + _elf_components(args.deb)
-    bom: dict[str, Any] = {
+    bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "serialNumber": "urn:uuid:"

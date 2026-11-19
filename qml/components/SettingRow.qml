@@ -25,10 +25,15 @@ Item {
     // Пояснение моноширинным (пути в «О программе», сквозное правило 5).
     property bool subMono: false
 
+    property string subIcon: ""
+    property bool subAlert: false
+    property alias labelFooterData: labelFooter.data
+
+    property real footerHeight: 0
     default property alias controlData: slot.data
 
     readonly property color labelColor: rowEnabled ? Theme.fg : Theme.fgDisabled
-    readonly property color subColor: rowEnabled ? Theme.fgMuted : Theme.fgDisabled
+    property color subColor: rowEnabled ? Theme.fgMuted : Theme.fgDisabled
 
     // Высота — по содержимому в паддингах 7/14 (§3.2): с пояснением `card.row-h-with-sub`,
     // без пояснения не меньше `card.row-min-h`, со списком — по высоте контрола.
@@ -98,7 +103,10 @@ Item {
             }
 
             Text {
+                id: subLine
+                objectName: "settingRowSub"
                 width: parent.width
+                leftPadding: root.subIcon !== "" ? Theme.diarInstallIconSize + Theme.diarInstallIconGap : 0
                 textFormat: Text.PlainText
                 text: root.sub
                 visible: root.sub !== ""
@@ -109,7 +117,19 @@ Item {
                 lineHeightMode: Text.FixedHeight
                 renderType: Text.NativeRendering
                 wrapMode: Text.WordWrap
+                Accessible.name: text
+                Accessible.role: root.subAlert ? Accessible.AlertMessage : Accessible.StaticText
+                Icon {
+                    objectName: "settingRowSubIcon"
+                    visible: root.subIcon !== ""
+                    name: root.subIcon
+                    size: Theme.diarInstallIconSize
+                    color: root.subColor
+                    y: 3 - 1 // CSS margin-top 3, excluding the alert glyph's 1 px inset.
+                    Accessible.ignored: true
+                }
             }
+            Column { id: labelFooter; width: parent.width }
         }
 
         // Бейдж «Задано администратором» (§3.2): замок + подпись, не только цвет.

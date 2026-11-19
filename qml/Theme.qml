@@ -763,4 +763,28 @@ QtObject {
     readonly property real updatePanelPaddingY: 14
     readonly property real updatePanelPaddingX: 16
     readonly property real updatePanelRadius: 10
+
+    // ── shadow.menu / shadow.meeting-drawer / shadow.toast
+    readonly property real shadowMenuX: 0
+    readonly property real shadowMenuY: 12
+    readonly property real shadowMenuRadius: 34
+    readonly property color shadowMenuColor: shadow
+    readonly property real shadowMeetingDrawerX: -12
+    readonly property real shadowMeetingDrawerY: 0
+    readonly property real shadowMeetingDrawerRadius: 34
+    readonly property color shadowMeetingDrawerColor: shadow
+    readonly property real shadowToastX: 0
+    readonly property real shadowToastY: 10
+    readonly property real shadowToastRadius: 28
+    readonly property color shadowToastColor: Qt.rgba(0, 0, 0, 0.35)
+    readonly property color transcriptEchoFg: fgMuted
+    readonly property real diarInstallIconSize: 12
+    readonly property real diarInstallIconGap: 5
+    readonly property real diarInstallProgressTop: 6
+    readonly property real diarInstallCardProgressW: 160
+    readonly property real diarInstallCardControlH: 28.75
+    readonly property real diarInstallHeaderPhaseY: 0.5
+    readonly property real diarInstallCardGap: 8
+    readonly property real diarInstallCardBottom: 10
+    readonly property real speakerNumTextOffsetY: -2
 }

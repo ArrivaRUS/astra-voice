@@ -220,6 +220,7 @@ def real_contracts(monkeypatch: pytest.MonkeyPatch) -> dict[str, MetaContract]:
     from astra_voice.platform.session import SessionKind
     from astra_voice.ui.about_bridge import AboutBridge
     from astra_voice.ui.bridges import OnboardingController, SettingsBridge
+    from astra_voice.ui.meeting_bridge import MeetingBridge
     from astra_voice.ui.updates_bridge import UpdatesBridge
 
     # QApplication и экземпляры мостов не нужны; AppInfo объявлен внутри фабрики.
@@ -230,6 +231,7 @@ def real_contracts(monkeypatch: pytest.MonkeyPatch) -> dict[str, MetaContract]:
         "appInfo": meta_contract(app_info.metaObject()),
         "updatesBridge": meta_contract(UpdatesBridge.staticMetaObject),
         "aboutBridge": meta_contract(AboutBridge.staticMetaObject),
+        "meetingBridge": meta_contract(MeetingBridge.staticMetaObject),
     }
 
 

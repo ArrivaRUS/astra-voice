@@ -2620,7 +2620,7 @@ def catalog(args: argparse.Namespace) -> int:
                 }
                 return catalog_report(args, 2, facts)
             locked = True
-        entries = load_catalog().entries
+        entries = load_catalog().dictation_entries
         store = ModelStore(args.store if args.store is not None else paths.model_store_dir())
         code, facts = (
             catalog_all(args, entries, store) if args.all else catalog_switch(args, entries, store)
@@ -3005,7 +3005,7 @@ def meetings_transcribe(args: argparse.Namespace) -> int:
         minutes=args.minutes,
         model_dir=args.model_dir,
         threads=args.threads,
-        echo_gate=args.echo_gate,
+        echo_gate=True,  # D7: marking is always enabled in the normal pipeline
         out=args.out,
         progress=(lambda stage, done, total: None) if args.json else progress_printer(),
     )
@@ -3079,7 +3079,9 @@ def main(argv: list[str] | None = None) -> int:
         "--threads", type=positive_int, default=None, help="--transcribe: потоки ORT (2)"
     )
     meetings_parser.add_argument(
-        "--echo-gate", action="store_true", help="--transcribe: включить эхо-гейт"
+        "--echo-gate",
+        action="store_true",
+        help="--transcribe: помечать возможное эхо (включено по умолчанию)",
     )
     meetings_parser.add_argument(
         "--out",

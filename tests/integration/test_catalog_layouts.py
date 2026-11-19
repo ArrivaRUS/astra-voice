@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
-from astra_voice.models.catalog import CatalogEntry, load_builtin
+from astra_voice.models.catalog import DIARIZATION_MODEL_IDS, CatalogEntry, _model, load_builtin
 from astra_voice.security.verify import Verifier
 from astra_voice.worker.engine import LAYOUTS, VariantSpec, make_engine
 
@@ -29,12 +31,26 @@ def entries() -> tuple[CatalogEntry, ...]:
     return catalog.entries
 
 
-def test_catalog_has_twelve_models(entries: tuple[CatalogEntry, ...]) -> None:
-    assert len(entries) == 12
+def test_catalog_has_twelve_asr_and_two_diarization_models(
+    entries: tuple[CatalogEntry, ...],
+) -> None:
+    assert Counter(entry.kind for entry in entries) == {"dictation": 12, "diarization": 2}
+    assert {entry.id for entry in entries if entry.kind == "diarization"} == set(
+        DIARIZATION_MODEL_IDS
+    )
 
 
 def test_every_entry_matches_its_layout(entries: tuple[CatalogEntry, ...]) -> None:
+    raw_entries = {
+        entry["id"]: entry
+        for entry in json.loads((DATA_ROOT / "catalog.json").read_bytes())["models"]
+    }
     for entry in entries:
+        if entry.kind == "diarization":
+            # The product's step 7a validator checks the exact layout/variant/files,
+            # license and recommendation flag; these are not ASR engines.
+            assert _model(raw_entries[entry.id]) == entry
+            continue
         layout = entry.layout
         variant = entry.variant
         assert layout in LAYOUTS, (entry, layout)

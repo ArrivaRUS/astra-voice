@@ -29,6 +29,10 @@ log = logging.getLogger(__name__)
 CATALOG_MAX_BYTES = 1 << 20
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 LANGUAGE_RE = re.compile(r"^[a-z]{2,8}(-[A-Za-z0-9]{2,8})?$")
+DIARIZATION_MODEL_IDS = (
+    "sherpa-onnx-pyannote-segmentation-3-0",
+    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced",
+)
 
 
 class CatalogError(Exception):
@@ -99,6 +103,7 @@ class CatalogEntry:
     metrics: Metrics = Metrics()
     # Локальная запись установленной ревизии, отсутствующей в каталоге.
     removed_from_catalog: bool = False
+    kind: str = "dictation"
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,14 @@ class Catalog:
     trust_epoch: int
     revoked: tuple[RevokedEntry, ...]
     entries: tuple[CatalogEntry, ...]
+
+    # Only the signed loader sets this; manually constructed catalogs are not trusted.
+    verified: bool = False
+
+    @property
+    def dictation_entries(self) -> tuple[CatalogEntry, ...]:
+        """Записи диктовки; служебные модели встреч сюда не попадают."""
+        return tuple(entry for entry in self.entries if entry.kind == "dictation")
 
     def entry(self, model_id: str) -> CatalogEntry | None:
         """Возвращает модель по идентификатору или None, если её нет."""
@@ -385,7 +398,31 @@ def _model(value: object) -> CatalogEntry:
     size_bytes = _positive_integer(data.get("size_bytes"))
     if sum(file.size for file in files) != size_bytes:
         raise CatalogError("bad-schema", "Размер модели не совпадает с суммой размеров файлов.")
+    kind = _string(data.get("kind", "dictation"))
+    layout = _string(data.get("layout"))
+    variant = _string(data.get("variant"))
+    diar_layouts = {
+        "sherpa-onnx-pyannote-segmentation": ("pyannote-segmentation-3.0", "model.onnx"),
+        "sherpa-onnx-campplus": (
+            "3dspeaker-campplus",
+            "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        ),
+    }
+    if kind not in {"dictation", "diarization"}:
+        raise CatalogError("bad-schema", "Неизвестный вид модели.")
+    if kind == "diarization":
+        if (
+            layout not in diar_layouts
+            or not _optional_string(data.get("license"))
+            or data.get("recommended") is not False
+            or (variant, tuple(file.path for file in files))
+            != (diar_layouts[layout][0], (diar_layouts[layout][1],))
+        ):
+            raise CatalogError("bad-schema", "Неверная запись модели разделения.")
+    elif layout in diar_layouts:
+        raise CatalogError("bad-schema", "Раскладка разделения требует kind=diarization.")
     return CatalogEntry(
+        kind=kind,
         id=model_id,
         revision=revision,
         name=_string(data.get("name")),
@@ -529,4 +566,5 @@ def load_builtin(
         trust_epoch=trust_epoch,
         revoked=revoked,
         entries=entries,
+        verified=True,
     )

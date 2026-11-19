@@ -299,6 +299,7 @@ def evaluate(
             "unrecognized": sum(1 for u in rows if u.get("text") == "[не распознано]"),
             "damaged": sum(1 for u in rows if u.get("text") == "[кусок записи повреждён]"),
             "echo_dropped": int(done["echo_dropped"]) if done else None,
+            "echo_utterances": sum(bool(u.get("echo")) for u in rows),
         }
     )
     stats = report["timecodes"]
@@ -583,7 +584,10 @@ def run_role(
                     )
                 elif kind == "meeting.job.utterance":
                     run.utterances.append(
-                        {k: event[k] for k in ("seq", "track", "start_ms", "end_ms", "text")}
+                        {
+                            k: event.get(k, False)
+                            for k in ("seq", "track", "start_ms", "end_ms", "text", "echo")
+                        }
                     )
                     if len(run.utterances) % CREDITS_STEP == 0:
                         send("meeting.job.credit", **identity, n=CREDITS_STEP)
@@ -633,7 +637,7 @@ def run_transcribe(
     minutes: float | None = None,
     model_dir: Path | None = None,
     threads: int = 2,
-    echo_gate: bool = False,
+    echo_gate: bool = True,
     out: Path | None = None,
     progress: Callable[[str, int, int], None] = lambda stage, done, total: None,
 ) -> tuple[int, dict[str, Any]]:
@@ -742,7 +746,7 @@ def text_report(report: dict[str, Any]) -> list[str]:
             f" · 1 ч ≈ {report['hour_wall_ms']} мс · пик RSS {report['peak_rss_kb']} КиБ"
         )
         lines.append(
-            f"реплик {report['utterances']} · эхо отброшено {report['echo_dropped']}"
+            f"реплик {report['utterances']} · возможное эхо {report['echo_utterances']}"
             f" · вердикты {json.dumps(report['verdicts'], ensure_ascii=False)}"
         )
     return lines

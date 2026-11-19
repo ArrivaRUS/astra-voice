@@ -40,6 +40,11 @@ HASH: Schema = {"type": "string", "pattern": r"^[a-f0-9]{64}$"}
 LABEL: Schema = {"type": "string", "pattern": LABEL_PATTERN}
 
 
+def utterance_order(start_ms: int, track: str, end_ms: int) -> tuple[int, int, int]:
+    """Shared ASR/D5 chronology: mic before far on equal starts, then end."""
+    return start_ms, 0 if track == "mic" else 1, end_ms
+
+
 def text_schema(limit: int, minimum: int = 0) -> Schema:
     return {"type": "string", "minLength": minimum, "maxLength": limit}
 
@@ -312,7 +317,7 @@ class Transcription(JsonModel):
     model_id: str = "unspecified"
     revision: str = "unspecified"
     diarization: bool = False
-    diar_status: PhaseStatus = PhaseStatus.PENDING
+    diar_status: str = PhaseStatus.PENDING
     finished_at: str | None = None
     wall_ms: int = 0
     peak_rss_kb: int = 0
@@ -324,7 +329,7 @@ class Transcription(JsonModel):
             "model_id": IDENTIFIER,
             "revision": text_schema(128, 1),
             "diarization": BOOL,
-            "diar_status": choices(*PhaseStatus),
+            "diar_status": choices(*PhaseStatus, "failed", "skipped"),
             "finished_at": nullable(TIMESTAMP),
             "wall_ms": UINT,
             "peak_rss_kb": UINT,
@@ -377,6 +382,13 @@ class AiHistory(JsonModel):
 
 
 @dataclass
+class Rediar(JsonModel):
+    generation: int
+    base_sha256: str
+    SCHEMA = obj({"generation": UINT, "base_sha256": HASH})
+
+
+@dataclass
 class Meeting(JsonModel):
     id: str
     started_at: str
@@ -401,6 +413,8 @@ class Meeting(JsonModel):
     processing_status: ProcessingStatus = ProcessingStatus.PENDING
     cancelled: bool = False
     cleanup_pending: bool = False
+    rediar: Rediar | None = None
+    transcript_generation: int | None = None
     SCHEMA = obj(
         {
             "schema": VERSION,
@@ -426,7 +440,58 @@ class Meeting(JsonModel):
             "processing_status": choices(*ProcessingStatus),
             "cancelled": BOOL,
             "cleanup_pending": BOOL,
-        }
+            "rediar": nullable(Rediar.SCHEMA),
+            "transcript_generation": nullable(UINT),
+        },
+        required=[
+            "schema",
+            "id",
+            "started_at",
+            "meeting_generation",
+            "state",
+            "variant",
+            "app_class",
+            "title",
+            "ended_at",
+            "recorded_ms",
+            "limit_ms",
+            "intervals",
+            "marks",
+            "tracks",
+            "audio",
+            "transcription",
+            "self_label",
+            "warnings",
+            "ai",
+            "size_bytes",
+            "processing_status",
+            "cancelled",
+            "cleanup_pending",
+        ],
+    )
+
+    @classmethod
+    def _check(cls, data: dict[str, Any]) -> None:
+        super()._check(data)
+        generation = data["meeting_generation"]
+        published = data.get("transcript_generation")
+        rediar = data.get("rediar")
+        if published is not None and published > generation:
+            raise MeetingValidationError("Недопустимое поколение опубликованного текста")
+        if rediar is not None and (
+            rediar["generation"] > generation
+            or published is None
+            or published >= rediar["generation"]
+        ):
+            raise MeetingValidationError("Недопустимое поколение повторного разделения")
+
+
+def published_generation(meeting: Meeting) -> int:
+    """Generation of the published text, independently of subsequent jobs."""
+    return (
+        meeting.meeting_generation
+        if meeting.transcript_generation is None
+        else meeting.transcript_generation
     )
 
 
@@ -441,6 +506,7 @@ class Utterance(JsonModel):
     speaker: str = "me"
     final: bool = False
     echo: bool = False
+    multiple_speakers: bool = False
     SCHEMA = obj(
         {
             "id": IDENTIFIER,
@@ -452,8 +518,59 @@ class Utterance(JsonModel):
             "speaker": LABEL,
             "final": BOOL,
             "echo": BOOL,
+            "multiple_speakers": BOOL,
+        },
+        required=["id", "seq", "track", "start_ms", "end_ms", "text", "speaker", "final"],
+    )
+
+
+@dataclass
+class ReconcileReplacement(JsonModel):
+    seq: int = 0
+    replaces_id: str = "unspecified"
+    expected_revision: int = 0
+    items: list[Utterance] = field(default_factory=list)
+    SCHEMA = obj(
+        {
+            "seq": UINT,
+            "replaces_id": IDENTIFIER,
+            "expected_revision": UINT,
+            "items": array(Utterance.SCHEMA, 24),
         }
     )
+
+
+@dataclass
+class ReconcileProgress(JsonModel):
+    status: PhaseStatus = PhaseStatus.PENDING
+    done_ids: list[str] = field(default_factory=list)
+    used_ms: int = 0
+    budget_ms: int = 0
+    speech_ms: int = 0
+    inflight_id: str | None = None
+    pending: ReconcileReplacement | None = None
+    failed: bool = False
+    replaced_ids: list[str] = field(default_factory=list)
+    SCHEMA = obj(
+        {
+            "status": choices(*PhaseStatus),
+            "done_ids": array(IDENTIFIER, 9000, unique=True),
+            "used_ms": MILLISECONDS,
+            "budget_ms": MILLISECONDS,
+            "speech_ms": MILLISECONDS,
+            "inflight_id": nullable(IDENTIFIER),
+            "pending": nullable(ReconcileReplacement.SCHEMA),
+            "failed": BOOL,
+            "replaced_ids": array(IDENTIFIER, 9000, unique=True),
+        },
+        required=["status", "done_ids", "used_ms", "budget_ms", "speech_ms"],
+    )
+
+    @classmethod
+    def _check(cls, data: dict[str, Any]) -> None:
+        super()._check(data)
+        if data["used_ms"] > data["budget_ms"] or 100 * data["budget_ms"] > 15 * data["speech_ms"]:
+            raise MeetingValidationError("Недопустимый бюджет сверки")
 
 
 @dataclass
@@ -464,6 +581,7 @@ class Transcript(JsonModel):
     transcript_revision: int = 0
     utterances: list[Utterance] = field(default_factory=list)
     labels_final: bool = False
+    reconcile: ReconcileProgress = field(default_factory=ReconcileProgress)
     SCHEMA = obj(
         {
             "schema": VERSION,
@@ -472,16 +590,42 @@ class Transcript(JsonModel):
             "transcript_revision": UINT,
             "utterances": array(Utterance.SCHEMA, 9000),
             "labels_final": BOOL,
-        }
+            "reconcile": ReconcileProgress.SCHEMA,
+        },
+        required=[
+            "schema",
+            "meeting_id",
+            "meeting_generation",
+            "transcript_revision",
+            "utterances",
+            "labels_final",
+        ],
     )
 
     @classmethod
     def _check(cls, data: dict[str, Any]) -> None:
         super()._check(data)
+        if data["labels_final"] and any(not u["final"] for u in data["utterances"]):
+            raise MeetingValidationError("Текст встречи ещё не окончательный")
         ids = [u["id"] for u in data["utterances"]]
         seqs = [u["seq"] for u in data["utterances"]]
         if len(set(ids)) != len(ids) or len(set(seqs)) != len(seqs):
             raise MeetingValidationError("Повтор реплики")
+        progress = data.get("reconcile", {})
+        pending = progress.get("pending")
+        if pending is not None:
+            items = pending["items"]
+            item_ids = {u["id"] for u in items}
+            # Another track can occur between parts in the merged chronology.
+            committed = [u for u in data["utterances"] if u["id"] in item_ids]
+            if (
+                pending["expected_revision"] + 1 != data["transcript_revision"]
+                or pending["seq"] != data["transcript_revision"]
+                or pending["replaces_id"] not in progress["done_ids"]
+                or not items
+                or committed != items
+            ):
+                raise MeetingValidationError("Недопустимая квитанция замены")
 
 
 @dataclass
@@ -512,7 +656,11 @@ class AsrCursor(JsonModel):
 class AsrProgress(JsonModel):
     mic: AsrCursor = field(default_factory=AsrCursor)
     far: AsrCursor = field(default_factory=AsrCursor)
-    SCHEMA = obj({"mic": AsrCursor.SCHEMA, "far": AsrCursor.SCHEMA})
+    status: PhaseStatus = PhaseStatus.PENDING
+    SCHEMA = obj(
+        {"mic": AsrCursor.SCHEMA, "far": AsrCursor.SCHEMA, "status": choices(*PhaseStatus)},
+        required=["mic", "far"],
+    )
 
 
 @dataclass
@@ -543,30 +691,6 @@ class DiarProgress(JsonModel):
             "label_map": mapping(IDENTIFIER),
         }
     )
-
-
-@dataclass
-class ReconcileProgress(JsonModel):
-    status: PhaseStatus = PhaseStatus.PENDING
-    done_ids: list[str] = field(default_factory=list)
-    used_ms: int = 0
-    budget_ms: int = 0
-    speech_ms: int = 0
-    SCHEMA = obj(
-        {
-            "status": choices(*PhaseStatus),
-            "done_ids": array(IDENTIFIER, 9000, unique=True),
-            "used_ms": MILLISECONDS,
-            "budget_ms": MILLISECONDS,
-            "speech_ms": MILLISECONDS,
-        }
-    )
-
-    @classmethod
-    def _check(cls, data: dict[str, Any]) -> None:
-        super()._check(data)
-        if data["used_ms"] > data["budget_ms"] or 100 * data["budget_ms"] > 15 * data["speech_ms"]:
-            raise MeetingValidationError("Недопустимый бюджет сверки")
 
 
 @dataclass
@@ -643,7 +767,16 @@ class SpeakerMap(JsonModel):
     schema: int = 1
     labels: dict[str, Speaker] = field(default_factory=dict)
     renumbered: bool = False
-    SCHEMA = obj({"schema": VERSION, "labels": mapping(Speaker.SCHEMA, LABEL), "renumbered": BOOL})
+    transcript_generation: int | None = None
+    SCHEMA = obj(
+        {
+            "schema": VERSION,
+            "labels": mapping(Speaker.SCHEMA, LABEL),
+            "renumbered": BOOL,
+            "transcript_generation": nullable(UINT),
+        },
+        required=["schema", "labels", "renumbered"],
+    )
 
     @classmethod
     def _check(cls, data: dict[str, Any]) -> None:

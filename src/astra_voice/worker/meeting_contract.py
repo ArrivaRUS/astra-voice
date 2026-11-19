@@ -73,7 +73,9 @@ UTTERANCE = obj(
         "text": text_schema(32768),
         "speaker": nullable(LABEL),
         "provisional": BOOL,
-    }
+        "multiple_speakers": BOOL,
+    },
+    required=["id", "track", "start_ms", "end_ms", "text", "speaker", "provisional"],
 )
 
 
@@ -190,7 +192,7 @@ COMMAND_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
             "block_index": {"type": "integer", "minimum": 0, "maximum": 11},
             "offset_ms": MILLISECONDS,
             "pcm_fd": {"type": "integer", "minimum": 3, "maximum": 2147483647},
-            "block_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 1200},
+            "block_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 1380},
             "expected_rtf": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
         },
         "diar.finish": IDENTITY,
@@ -207,7 +209,20 @@ OPTIONAL: dict[str, dict[str, Any]] = {
         "admission_mono_ms": UINT,
     },
     "meeting.capture.resume": {"mic_device": S, "tracks": TRACKS},
-    "meeting.job.start": {"diar_models": obj({"segmentation_dir": S, "embedder_dir": S})},
+    # Missing digests reach the role and fail as model-untrusted, never load.
+    "meeting.job.start": {
+        "operation": choices("rediarize"),
+        "diar_models": obj(
+            {
+                "segmentation_dir": S,
+                "embedder_dir": S,
+                "segmentation_sha256": S,
+                "embedder_sha256": S,
+            },
+            required=["segmentation_dir", "embedder_dir"],
+        ),
+    },
+    "diar.load": {"segmentation_sha256": S, "embedder_sha256": S},
 }
 # Reply -> allowed request_type. Not every correlated receipt is a final ACK.
 REPLIES: dict[str, dict[str, tuple[str, ...]]] = {
@@ -382,7 +397,7 @@ EVENT_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
         "meeting.job.utterance": {
             **IDENTITY,
             "seq": UINT,
-            **UTTERANCE["properties"],
+            **{k: v for k, v in UTTERANCE["properties"].items() if k != "multiple_speakers"},
             "provisional": {"type": "boolean", "const": True},
         },
         "meeting.job.labels": {
@@ -450,6 +465,10 @@ OPTIONAL.update(
             ),
         },
         "meeting.job.progress": {"block": UINT, "blocks": UINT},
+        "meeting.job.utterance": {"multiple_speakers": BOOL, "echo": BOOL},
+        "meeting.job.labels": {"transcript_revision": UINT},
+        "meeting.job.accepted": {"transcript_revision": UINT},
+        "meeting.job.done": {"reconcile_failed": BOOL, "echo_utterances": UINT},
     }
 )
 ERROR_CODES = choices(
@@ -468,6 +487,8 @@ ERROR_CODES = choices(
     "dir-unwritable",
     "limit",
     "model",
+    "model-untrusted",
+    "external-data",
     "memory",
     "io",
     "timeout",

@@ -11,7 +11,8 @@ to the transport, so a crash in between resumes straight to done. After a
 cancel is acknowledged no write to the meeting directory can start (write
 fence); serialization and validation run outside the fence.
 Speech text, user paths and file names never reach logs or error messages.
-Diarization (stage 4) is not part of this step: done carries diar_status=skipped.
+Diarization runs in a reaped child after acknowledged ASR unload. Only text,
+anonymous intervals and label maps are durable; interrupted diarization restarts.
 """
 
 from __future__ import annotations
@@ -32,29 +33,50 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from astra_voice.meetings import MeetingValidationError, echo_gate
+from astra_voice.meetings import (
+    MeetingValidationError,
+    diar_link,
+    echo_gate,
+    reconcile,
+)
+from astra_voice.meetings.events import MeetingState, PhaseStatus
 from astra_voice.meetings.model import (
     ID_PATTERN,
     MAX_MEETING_MS,
     AsrCursor,
     AsrProgress,
     Checkpoint,
+    DiarProgress,
+    DiarTurn,
     Meeting,
     ModelIdentity,
     ProcessingLimits,
+    ReconcileProgress,
+    ReconcileReplacement,
     Transcript,
     Utterance,
+    published_generation,
+    utterance_order,
 )
 from astra_voice.meetings.segments import SegmentSidecar
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, MeetingWriter, Writer
 from astra_voice.meetings.timeline import EpochTimeline, SegmentTimeline
 from astra_voice.security.files import check_private_file, private_directory
+from astra_voice.worker import engine as engine_module
 from astra_voice.worker import ipc
 from astra_voice.worker.engine import CancelToken, Engine, EngineError, make_engine
 from astra_voice.worker.meeting_contract import ASR_WINDOW_TIMEOUT_S, COMMAND_FIELDS, RequestLedger
+from astra_voice.worker.meeting_diar_client import (
+    DiarCancelled,
+    DiarProcess,
+    PcmSource,
+    _write_pcm,
+    model_fingerprint,
+)
 from astra_voice.worker.meeting_roles import failure
 
 if TYPE_CHECKING:
@@ -85,7 +107,13 @@ CHECKPOINT_UTTERANCES = 32
 CHECKPOINT_AUDIO_MS = 30_000
 WALL_SLACK_MS = 600_000  # ceiling: 2 x duration + 10 min
 PROGRESS_INTERVAL_S = 0.5  # <= 2 progress events per second
-MEMORY_MARGIN_MB = 200  # no diarization in this step
+MEMORY_MARGIN_MB = 200
+DIAR_MEMORY_MB = 900
+DIAR_BLOCK_MS = 1_200_000
+DIAR_PAUSE_SEARCH_MS = 90_000
+DIAR_MEMORY_WAIT_S = 120.0
+DIAR_MEMORY_RETRY_S = 1.0
+DIAR_PCM_CHUNK_FRAMES = RATE  # One second, independent of the diarization block size.
 MAX_THREADS = 2
 MAX_SEGMENT_FRAMES = 4_800_000
 TRANSCRIPT_CAPACITY = 9000  # Transcript schema maximum
@@ -95,7 +123,6 @@ DONE_DELIVERY_S = 5.0  # final checkpoint is dropped only after done left the ro
 UNRECOGNIZED_TEXT = "[не распознано]"
 DAMAGED_TEXT = "[кусок записи повреждён]"
 _SEGMENT_FILE = re.compile(r"(mic|far)-([0-9]{4})\.(wav|json)\Z")
-_TRACK_ORDER = {"mic": 0, "far": 1}
 
 
 class _Cancelled(Exception):
@@ -322,7 +349,7 @@ class _Candidate:
 
     @property
     def key(self) -> tuple[int, int, int]:
-        return self.start_ms, _TRACK_ORDER[self.track], self.end_ms
+        return utterance_order(self.start_ms, self.track, self.end_ms)
 
 
 @dataclass
@@ -341,6 +368,7 @@ class _Resume:
     fresh: bool  # the text starts from zero
     on_disk: bool  # transcript.json or checkpoint.json already exists
     complete: Transcript | None = None  # final text of this very configuration
+    checkpoint: Checkpoint | None = None
 
 
 @dataclass
@@ -352,6 +380,9 @@ class _Durable:
     identity: ModelIdentity
     capacity: int
     revision: int
+    asr_status: PhaseStatus = PhaseStatus.PENDING
+    diar: DiarProgress = field(default_factory=DiarProgress)
+    reconcile: ReconcileProgress = field(default_factory=ReconcileProgress)
 
 
 class _Reader:
@@ -408,6 +439,11 @@ class _Reader:
 class _Job:
     def __init__(self, request: Message) -> None:
         self.request = request
+        # Select once from the operation, never from mutable metadata or IPC paths.
+        self.rediarize = request.get("operation") == "rediarize"
+        self.transcript_name = "rediar-transcript.json" if self.rediarize else "transcript.json"
+        self.checkpoint_name = "rediar-checkpoint.json" if self.rediarize else "checkpoint.json"
+        self.published: Transcript | None = None
         self.identity: Message = {
             "meeting_id": request["meeting_id"],
             "meeting_generation": request["meeting_generation"],
@@ -420,6 +456,11 @@ class _Job:
         self.current: CancelToken | None = None  # one ASR window
         self.progress_at = -math.inf
         self.delivered = threading.Event()  # done handed to the transport
+        self.diar_exited = threading.Event()
+        self.diar_exited.set()  # cleared under the write fence before the diar lease
+        self.diar_status = "skipped"
+        self.labels_seq = 0
+        self.replacements: dict[int, tuple[int, bool]] = {}
 
     def matches(self, message: Message) -> bool:
         return all(message.get(key) == value for key, value in self.identity.items())
@@ -439,6 +480,14 @@ class _Job:
             current.cancel()
 
 
+def _installed_diar_models() -> dict[str, str] | None:
+    # Catalog/service imports include download dependencies. Keep them out of
+    # the transcriber's import/startup path (T452); resolve only at the D4 gate.
+    from astra_voice.meetings.diar_models import installed_diar_models
+
+    return installed_diar_models()
+
+
 class MeetingTranscribeState:
     """Handler for run_role: handle() for commands, poll() for events/outcomes."""
 
@@ -452,11 +501,16 @@ class MeetingTranscribeState:
         clock: Callable[[], float] = time.monotonic,
         asr_timeout_s: float = ASR_WINDOW_TIMEOUT_S,
         status_path: str = "/proc/self/status",
+        diar_factory: Callable[..., Any] = DiarProcess,
+        diar_models_provider: Callable[[], dict[str, str] | None] | None = None,
     ) -> None:
         self.store = store if store is not None else MeetingStore()
         self.engine_factory, self.vad_factory = engine_factory, vad_factory
         self.mem_available_mb, self.clock = mem_available_mb, clock
         self.asr_timeout_s, self.status_path = asr_timeout_s, status_path
+        self.diar_factory = diar_factory
+        self.diar_models_provider = diar_models_provider or _installed_diar_models
+        self.diar_peak_rss_kb = 0  # scalar diagnostics for the CLI, never voice features
         self.ledger = RequestLedger()
         self.pending: dict[str, list[Message]] = {}
         self.stopped = False
@@ -566,16 +620,28 @@ class MeetingTranscribeState:
             if active is None or active.finished or not active.matches(message):
                 return self._remember(message, [self._reply("meeting.job.cancelled", message)])
             active.cancel()
-            if self._fenced():
+            if self._fenced(active):
                 return self._remember(message, [self._reply("meeting.job.cancelled", message)])
             self.cancels.append((message, active))
             return self._receipt(message)
-        # meeting.job.applied: GUI application receipt only (never fsync evidence).
+        # A receipt proves application in memory, never fsync. Each replacement
+        # consumes one credit, and only its first correct receipt returns it.
+        active = self.job
+        if active is None or not active.matches(message):
+            return self._remember(message, [failure(message, "req-conflict")])
+        with active.condition:
+            expected = active.replacements.get(message["seq"])
+            if expected is None or expected[0] != message["revision"]:
+                return self._remember(message, [failure(message, "req-conflict")])
+            if not expected[1]:
+                active.replacements[message["seq"]] = (expected[0], True)
+                active.credits = min(MAX_CREDITS, active.credits + 1)
+                active.condition.notify_all()
         return self._remember(message, [self._reply("meeting.ack", message)])
 
-    def _fenced(self) -> bool:
+    def _fenced(self, job: _Job) -> bool:
         """True when no meeting write is in flight; later writes see cancelled."""
-        if not self.fence.acquire(blocking=False):
+        if not job.diar_exited.is_set() or not self.fence.acquire(blocking=False):
             return False
         self.fence.release()
         return True
@@ -587,7 +653,7 @@ class MeetingTranscribeState:
     def poll(self, limit: int = 2) -> list[Message]:
         result: list[Message] = []
         for request, _job in list(self.cancels):
-            if self._fenced():
+            if self._fenced(_job):
                 self.cancels.remove((request, _job))
                 result.append(self._outcome(request, self._reply("meeting.job.cancelled", request)))
         while len(result) < limit:
@@ -617,7 +683,7 @@ class MeetingTranscribeState:
         if self.job is not None:
             self.job.cancel()
         self.tasks.put(None)
-        self.thread.join(1.0)
+        self.thread.join(3.0)
         if not self.thread.is_alive() and self.engine is not None:
             try:
                 self.engine.unload()
@@ -637,9 +703,9 @@ class MeetingTranscribeState:
                 if kind == "load":
                     self.outbox.put(("loaded", payload, self._load(payload)))
                 elif kind == "unload":
-                    self._unload()
+                    response = self._unload_ack()
                     self.spec = None
-                    self.outbox.put(("loaded", payload, {"type": "model.unloaded"}))
+                    self.outbox.put(("loaded", payload, response))
                 else:
                     self._run_job(payload)
             except BaseException:  # the executor must outlive any single task
@@ -655,11 +721,26 @@ class MeetingTranscribeState:
     def _unload(self) -> None:
         if self.engine is not None:
             self.engine.unload()
+            # OnnxAsrEngine keeps these references when a native operation
+            # outlives its unload timeout. Returning None alone is not an ACK.
+            if (
+                getattr(self.engine, "_model", None) is not None
+                or getattr(self.engine, "_pending", None) is not None
+            ):
+                raise EngineError("asr-unload-unconfirmed")
         self.engine = None
         self.loaded = None
         from astra_voice.worker import vad
 
         vad.unload()
+        # Both runtimes are gone before ACK/child startup; glibc otherwise keeps
+        # freed ORT arenas resident even after the engine's gc.collect().
+        engine_module._trim_heap()
+
+    def _unload_ack(self) -> Message:
+        """The model.unload executor path; ACK exists only after unload returns."""
+        self._unload()
+        return {"type": "model.unloaded"}
 
     def _load(self, request: Message) -> Message:
         spec = {
@@ -725,7 +806,7 @@ class MeetingTranscribeState:
         with self.fence:
             if job.cancelled:
                 raise _Cancelled
-            owner.remove("checkpoint.json")
+            owner.remove(job.checkpoint_name)
 
     def _run_job(self, job: _Job) -> None:
         try:
@@ -752,14 +833,18 @@ class MeetingTranscribeState:
         ):
             raise _Failed("io")
 
-    def _ensure_model(self, job: _Job) -> bool:
+    def _ensure_model(self, job: _Job, *, after_diar: bool = False) -> bool:
         if job.cancelled:
             raise _Cancelled  # never load a model for a cancelled job
         if self.engine is not None:
-            return True
+            return True  # the resident ASR model is already charged to MemAvailable
         if self.spec is None:
             raise _Failed("model")
-        need = int(self.spec["min_ram_mb"]) + MEMORY_MARGIN_MB
+        need = (
+            int(self.spec["min_ram_mb"])
+            + MEMORY_MARGIN_MB
+            + (DIAR_MEMORY_MB if job.request["diarization"] and not after_diar else 0)
+        )
         available = self.mem_available_mb()
         if available < need:
             self._emit(
@@ -785,10 +870,6 @@ class MeetingTranscribeState:
     def _job(self, job: _Job) -> None:
         started = self.clock()
         self._check_dir(job)
-        if not self._ensure_model(job):
-            return
-        if job.cancelled:
-            raise _Cancelled
         meeting_id = job.identity["meeting_id"]
         meeting = self.store.read(meeting_id, "meeting.json")
         if (
@@ -797,6 +878,11 @@ class MeetingTranscribeState:
             or meeting.cancelled
         ):
             raise _Failed("io")
+        self._check_operation(job, meeting)
+        if not self._ensure_model(job):
+            return
+        if job.cancelled:
+            raise _Cancelled
         with contextlib.ExitStack() as lease:
             # Taking the lease creates its lock file and fsyncs the directory:
             # behind the fence, so nothing changes on disk after a cancel ack.
@@ -811,6 +897,49 @@ class MeetingTranscribeState:
                     self._pipeline(job, owner, reader, started)
                 finally:
                     reader.close()
+
+    def _check_operation(self, job: _Job, meeting: Meeting) -> None:
+        """R0/R1: fail closed before model load, leases, or any durable write."""
+        request = job.request
+        if not job.rediarize:
+            if "operation" in request or meeting.rediar is not None:
+                raise _Failed("io")
+            return
+        if (
+            request["resume"] is not True
+            or request["diarization"] is not True
+            or not request.get("diar_models")
+            or meeting.state != MeetingState.DONE
+            or meeting.rediar is None
+            or meeting.rediar.generation != meeting.meeting_generation
+            or not meeting.audio.present
+            or meeting.cleanup_pending
+        ):
+            raise _Failed("io")
+        meeting_id = meeting.id
+        state = self.store.transcript_state(meeting_id)
+        if (
+            state.digest != meeting.rediar.base_sha256
+            or state.generation != published_generation(meeting)
+            or not state.labels_final
+        ):
+            raise _Failed("io")
+        published = self.store.read(meeting_id, "transcript.json")
+        if not isinstance(published, Transcript):
+            raise _Failed("io")
+        job.published = published
+        # Pin/probe the actual target, including private-file and WAV checks.
+        with private_directory(
+            self.store.root / meeting_id / "audio", private_from=self.store.root
+        ) as audio:
+            reader = _Reader(audio)
+            try:
+                spans, _, _, _ = self._inventory(job, reader)
+                target = diar_target(published.utterances, spans)
+                if not any(s.track == target and s.end > s.first for s in spans):
+                    raise _Failed("io")
+            finally:
+                reader.close()
 
     # ---- stage 0: inventory ---------------------------------------------
 
@@ -987,6 +1116,55 @@ class MeetingTranscribeState:
         except MeetingStoreError:
             return None  # an unreadable checkpoint is never trusted
 
+    @staticmethod
+    def _check_rediar_resume(
+        transcript: Transcript | None, checkpoint: Any, on_disk: bool, *, final: bool = False
+    ) -> bool:
+        """I-2: neither document may hide a durable D5 reservation/receipt."""
+        text_progress = transcript.reconcile if transcript is not None else ReconcileProgress()
+        check_progress = (
+            checkpoint.reconcile if isinstance(checkpoint, Checkpoint) else ReconcileProgress()
+        )
+        started = any(p != ReconcileProgress() for p in (text_progress, check_progress))
+        if not started:
+            if transcript is None and on_disk and not isinstance(checkpoint, Checkpoint):
+                raise _Failed("io")  # cannot prove that the lost pair predates D5
+            return False
+        if (
+            transcript is None
+            or not isinstance(checkpoint, Checkpoint)
+            or checkpoint.transcript_revision > transcript.transcript_revision
+            or checkpoint.asr.status != PhaseStatus.DONE
+            or checkpoint.diar.status != PhaseStatus.DONE
+            or text_progress.status == PhaseStatus.PENDING
+            or (
+                check_progress.status == PhaseStatus.PENDING
+                and check_progress != ReconcileProgress()
+            )
+            or text_progress.used_ms < check_progress.used_ms
+            or (
+                (final or check_progress.budget_ms)
+                and text_progress.budget_ms != check_progress.budget_ms
+            )
+            or (
+                (final or check_progress.speech_ms)
+                and text_progress.speech_ms != check_progress.speech_ms
+            )
+            or not set(check_progress.done_ids) <= set(text_progress.done_ids)
+            or not set(check_progress.replaced_ids) <= set(text_progress.replaced_ids)
+            or (
+                check_progress.inflight_id is not None
+                and check_progress.inflight_id != text_progress.inflight_id
+                and check_progress.inflight_id not in text_progress.done_ids
+            )
+            or (
+                checkpoint.transcript_revision == transcript.transcript_revision
+                and check_progress != text_progress
+            )
+        ):
+            raise _Failed("io")
+        return True
+
     def _resume(
         self,
         job: _Job,
@@ -1000,13 +1178,12 @@ class MeetingTranscribeState:
         try:
             # Through the lease: one read + validation also serves the writer's
             # revision cache, so the next publication does not re-read the text.
-            transcript = owner.read_transcript()
+            transcript = owner.read_transcript(job.transcript_name)
         except MeetingStoreError:
             raise _Failed("io") from None  # cannot be superseded safely
-        checkpoint = self._read_optional(meeting_id, "checkpoint.json")
-        on_disk = transcript is not None or os.path.lexists(
-            self.store.root / meeting_id / "checkpoint.json"
-        )
+        checkpoint = self._read_optional(meeting_id, job.checkpoint_name)
+        checkpoint_exists = os.path.lexists(self.store.root / meeting_id / job.checkpoint_name)
+        on_disk = transcript is not None or checkpoint_exists
         same = (
             isinstance(transcript, Transcript)
             and transcript.meeting_id == meeting_id
@@ -1014,13 +1191,35 @@ class MeetingTranscribeState:
         )
         base = transcript.transcript_revision if same and transcript is not None else 0
         fresh = _Resume([], {"mic": 0, "far": 0}, base, True, on_disk)
+        rediar_complete = (
+            job.rediarize
+            and same
+            and transcript is not None
+            and transcript.labels_final
+            and transcript.reconcile.status == PhaseStatus.DONE
+            and transcript.reconcile.pending is None
+            and transcript.reconcile.inflight_id is None
+            and all(u.seq == i for i, u in enumerate(transcript.utterances))
+        )
+        d5_started = False
+        # A missing checkpoint is normal only for a final result whose done was
+        # delivered. An existing (including unreadable) one must pass I-2 first.
+        if job.rediarize and not (rediar_complete and checkpoint is None and not checkpoint_exists):
+            d5_started = self._check_rediar_resume(
+                transcript, checkpoint, on_disk, final=rediar_complete
+            )
+        if rediar_complete:
+            assert transcript is not None
+            return _Resume(
+                list(transcript.utterances), {"mic": 0, "far": 0}, base, False, on_disk, transcript
+            )
         if (
             job.request["resume"]
             and same
             and isinstance(transcript, Transcript)
             and transcript.labels_final
             and checkpoint is None
-            and not os.path.lexists(self.store.root / meeting_id / "checkpoint.json")
+            and not os.path.lexists(self.store.root / meeting_id / job.checkpoint_name)
             and all(u.seq == i for i, u in enumerate(transcript.utterances))
         ):
             # Checkpoint already dropped after done: within one generation the final
@@ -1038,13 +1237,20 @@ class MeetingTranscribeState:
                 transcript,
             )
         if not (job.request["resume"] and same and isinstance(checkpoint, Checkpoint)):
+            if d5_started:
+                raise _Failed("io")
             return fresh
         assert isinstance(transcript, Transcript)
         if checkpoint.transcript_revision > transcript.transcript_revision:
+            if d5_started:
+                raise _Failed("io")
             return fresh  # never trust a checkpoint ahead of durable text
         # Identity fields only: the text itself was validated when it was read.
         view = dataclasses.replace(
-            transcript, transcript_revision=checkpoint.transcript_revision, utterances=[]
+            transcript,
+            transcript_revision=checkpoint.transcript_revision,
+            utterances=[],
+            reconcile=ReconcileProgress(),
         )
         try:
             compatible = checkpoint.compatible_with(
@@ -1056,7 +1262,13 @@ class MeetingTranscribeState:
         except MeetingValidationError:
             compatible = False
         kept = list(transcript.utterances)
-        if not compatible or any(u.seq != i for i, u in enumerate(kept)):
+        if (
+            not compatible
+            or any(u.seq != i for i, u in enumerate(kept))
+            or (job.rediarize and checkpoint.asr.status != PhaseStatus.DONE)
+        ):
+            if d5_started:
+                raise _Failed("io")
             return fresh
         cursors = {"mic": 0, "far": 0}
         for utterance in kept:
@@ -1066,8 +1278,30 @@ class MeetingTranscribeState:
             cursors["far"] = max(cursors["far"], checkpoint.asr.far.done_until_ms)
         # Every run that writes text from zero first publishes its own checkpoint,
         # so the latest compatible checkpoint vouches for the final text as well.
-        complete = transcript if transcript.labels_final else None
-        return _Resume(kept, cursors, transcript.transcript_revision, False, on_disk, complete)
+        complete = (
+            transcript
+            if transcript.labels_final
+            and (
+                not job.request["diarization"]
+                or (
+                    checkpoint.diar.status == PhaseStatus.DONE
+                    and checkpoint.reconcile.status == PhaseStatus.DONE
+                    and checkpoint.transcript_revision == transcript.transcript_revision
+                )
+            )
+            else None
+        )
+        if checkpoint.diar.status == PhaseStatus.DONE:
+            # D10: the transcript may be one fsync ahead of the checkpoint.
+            # Its embedded transaction state vouches for exactly that revision.
+            checkpoint = dataclasses.replace(
+                checkpoint,
+                transcript_revision=transcript.transcript_revision,
+                reconcile=deepcopy(transcript.reconcile),
+            )
+        return _Resume(
+            kept, cursors, transcript.transcript_revision, False, on_disk, complete, checkpoint
+        )
 
     # ---- pipeline ---------------------------------------------------------
 
@@ -1087,14 +1321,32 @@ class MeetingTranscribeState:
             },
             "split": {"max_ms": MAX_UTTERANCE_MS, "from_ms": SPLIT_FROM_MS},
             "echo_gate": bool(request["echo_gate"]),
+            "echo_behavior": "recognize-and-mark-v1",
             "echo": echo_gate.config(),
             "tracks": sorted(request["tracks"]),
             "self_track": request["self_track"],
             "variant": request["variant"],
-            "diarization": False,
+            "diarization": bool(request["diarization"]),
             "limits": request["limits"],
             "window": {"utterances": CHECKPOINT_UTTERANCES, "audio_ms": CHECKPOINT_AUDIO_MS},
         }
+        if request["diarization"]:
+            document["diar"] = {
+                "models": model_fingerprint(request.get("diar_models", {})),
+                "algorithm": diar_link.DIAR_ALGORITHM,
+                "profile": "3dspeaker-campplus",
+                "parameters": diar_link.DIAR_PROFILES["3dspeaker-campplus"]._asdict(),
+                "block_ms": DIAR_BLOCK_MS,
+                "pause_search_ms": DIAR_PAUSE_SEARCH_MS,
+                "grid": "fixed",
+                "max_block_ms": 1_380_000,
+            }
+            # Expected signed hashes are part of both ordinary and redo recovery,
+            # even when the installed paths and their file fingerprints coincide.
+            document["diar"]["expected_sha256"] = {
+                key: request.get("diar_models", {}).get(key)
+                for key in ("segmentation_sha256", "embedder_sha256")
+            }
         return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
     def _identity(self, vad_name: str) -> ModelIdentity:
@@ -1111,7 +1363,15 @@ class MeetingTranscribeState:
         )
 
     def _progress(
-        self, job: _Job, stage: str, done: int, total: int, *, force: bool = False
+        self,
+        job: _Job,
+        stage: str,
+        done: int,
+        total: int,
+        *,
+        force: bool = False,
+        block: int | None = None,
+        blocks: int | None = None,
     ) -> None:
         now = self.clock()
         if not force and now - job.progress_at < PROGRESS_INTERVAL_S:
@@ -1126,6 +1386,7 @@ class MeetingTranscribeState:
                 "stage": stage,
                 "done_ms": min(total, max(0, done)),
                 "total_ms": total,
+                **({"block": block, "blocks": blocks} if block is not None else {}),
             },
         )
 
@@ -1139,34 +1400,90 @@ class MeetingTranscribeState:
         request = job.request
         limits = request["limits"]
         spans, damaged, manifest, duration = self._inventory(job, reader)
-        vad_name, probabilities = self.vad_factory()
+        # Re-diarization never initializes VAD or runs the primary ASR pipeline.
+        # D5 retains its existing bounded ASR refinement after diar has exited.
+        vad_name, probabilities = ("rediarize-v1", None) if job.rediarize else self.vad_factory()
         identity = self._identity(vad_name)
+        if request["diarization"] and request["resume"]:
+            # Do not let an old completed diar checkpoint bypass trust renewal.
+            pair = self.diar_models_provider()
+            if pair is None:
+                if job.rediarize:
+                    raise _Failed("model")
+                request["diarization"] = False
+                request.pop("diar_models", None)
+            else:
+                request["diar_models"] = dict(pair)
         config = self._config(job, identity)
         resume = self._resume(job, owner, manifest, config, identity)
         kept, cursors = resume.kept, resume.cursors
         capacity = min(int(limits["max_utterances"]), TRANSCRIPT_CAPACITY)
         durable = _Durable(manifest, config, identity, capacity, resume.revision)
-        if resume.fresh and resume.on_disk and duration <= int(limits["max_ms"]):
+        profile = diar_link.DIAR_PROFILES["3dspeaker-campplus"]
+        durable.diar = DiarProgress(
+            algo=diar_link.DIAR_ALGORITHM,
+            block_ms=DIAR_BLOCK_MS,
+            threshold=profile.seed_threshold,
+            tau=profile.merge_ceiling,
+        )
+        checkpoint = resume.checkpoint
+        if checkpoint is not None:
+            durable.asr_status = checkpoint.asr.status
+            if checkpoint.diar.status == PhaseStatus.DONE:
+                durable.diar = deepcopy(checkpoint.diar)
+                durable.reconcile = deepcopy(checkpoint.reconcile)
+        if job.rediarize and resume.fresh:
+            assert job.published is not None
+            target = diar_target(job.published.utterances, spans)
+            kept = [
+                dataclasses.replace(
+                    u,
+                    speaker="others" if u.track == target else "me",
+                    multiple_speakers=False,
+                    final=False,
+                )
+                for u in job.published.utterances
+            ]
+            if len(kept) > capacity or duration > int(limits["max_ms"]):
+                raise _Failed("limit")
+            cursors = {"mic": 0, "far": 0}
+            for u in kept:
+                cursors[u.track] = max(cursors[u.track], u.end_ms)
+            durable.revision = max(durable.revision, job.published.transcript_revision)
+            durable.asr_status = PhaseStatus.DONE
+            self._persist(job, owner, durable, kept, cursors)
+        elif resume.fresh and resume.on_disk and duration <= int(limits["max_ms"]):
             # From zero over existing files: our empty text and checkpoint go first,
             # so no older checkpoint can vouch for the text this run writes (D10).
             self._persist(job, owner, durable, [], cursors)
+        if job.rediarize and resume.complete is None and durable.asr_status != PhaseStatus.DONE:
+            raise _Failed("io")
         reply = self._reply(
             "meeting.job.accepted",
             {**job.identity, **{k: request[k] for k in ("req", "request_type")}},
             resume_from={"mic_ms": cursors["mic"], "far_ms": cursors["far"]},
+            transcript_revision=durable.revision,
         )
         if job.cancelled:
             raise _Cancelled
         self.outbox.put(("reply", (request, job), reply))
         if resume.complete is not None:
             # The final text of this configuration is durable: no VAD/ASR, no rewrite.
-            # echo_dropped of the original run is not durable; it is reported as 0.
+            if request["diarization"]:
+                job.diar_status = "done"
+                self._labels(job, resume.complete.utterances, final=True)
             self._finish(job, owner, resume.complete, 0, started)
             return
         if duration > int(limits["max_ms"]):
             raise _Failed("limit")
         deadline = started + (2 * duration + WALL_SLACK_MS) / 1000
+        if durable.asr_status == PhaseStatus.DONE:
+            # All ASR text is vouched for by this exact revision. No inference,
+            # even VAD, is needed to restart the entire diarization track.
+            self._post_asr(job, owner, reader, spans, kept, cursors, durable, duration, started, 0)
+            return
         # Stage 1: VAD per span (deterministic, so resume yields the same list).
+        assert probabilities is not None
         candidates = list(damaged)
         for index, span in enumerate(spans):
             probs = self._span_probabilities(job, span, reader, probabilities, duration, deadline)
@@ -1186,7 +1503,7 @@ class MeetingTranscribeState:
         candidates.sort(key=lambda c: c.key)
         # Stage 2: echo gate (mic only, only when far is part of the job).
         echoes = self._echo(job, candidates, spans, reader)
-        transcribable = [c for c, echo in zip(candidates, echoes, strict=True) if not echo]
+        transcribable = candidates
         if len(transcribable) > capacity:
             raise _Failed("limit")
         if any(
@@ -1196,6 +1513,7 @@ class MeetingTranscribeState:
             kept, cursors = [], {"mic": 0, "far": 0}  # durable text is not this input
             self._persist(job, owner, durable, [], cursors)
         # Stage 3: ASR in chronological order of both tracks.
+        self._progress(job, "asr", 0, duration, force=True)
         self._asr(
             job,
             owner,
@@ -1340,8 +1658,9 @@ class MeetingTranscribeState:
             if final
             else list(utterances),
             labels_final=final,
+            reconcile=deepcopy(durable.reconcile),
         )
-        self._write(job, owner, "transcript.json", transcript)
+        self._write(job, owner, job.transcript_name, transcript)
         checkpoint = Checkpoint(
             meeting_id=identity_fields["meeting_id"],
             meeting_generation=identity_fields["meeting_generation"],
@@ -1349,12 +1668,16 @@ class MeetingTranscribeState:
             input_manifest_sha256=durable.manifest,
             processing_config_sha256=durable.config,
             model=durable.identity,
-            asr=AsrProgress(AsrCursor(cursors["mic"]), AsrCursor(cursors["far"])),
+            asr=AsrProgress(
+                AsrCursor(cursors["mic"]), AsrCursor(cursors["far"]), durable.asr_status
+            ),
+            diar=deepcopy(durable.diar),
+            reconcile=deepcopy(durable.reconcile),
             limits=ProcessingLimits(
                 utterances=durable.capacity, blocks=job.request["limits"]["max_blocks"]
             ),
         )
-        self._write(job, owner, "checkpoint.json", checkpoint)
+        self._write(job, owner, job.checkpoint_name, checkpoint)
         return transcript
 
     def _finish(
@@ -1372,10 +1695,12 @@ class MeetingTranscribeState:
                 **job.identity,
                 "utterances": len(transcript.utterances),
                 "speakers": len({u.speaker for u in transcript.utterances}),
-                "diar_status": "skipped",
+                "diar_status": job.diar_status,
+                "reconcile_failed": transcript.reconcile.failed,
                 "wall_ms": max(0, round((self.clock() - started) * 1000)),
                 "peak_rss_kb": _status_kb("VmHWM", self.status_path),
-                "echo_dropped": echo_dropped,
+                "echo_dropped": 0,  # compatibility: D7 never drops replies
+                "echo_utterances": sum(u.echo for u in transcript.utterances),
                 "transcript_revision": transcript.transcript_revision,
             },
         )
@@ -1385,8 +1710,9 @@ class MeetingTranscribeState:
         while not job.delivered.wait(0.05):
             if job.cancelled or time.monotonic() > deadline:
                 return  # a leftover final checkpoint only short-cuts a later resume
-        with contextlib.suppress(MeetingStoreError):
-            self._remove_checkpoint(job, owner)
+        if job.diar_status != "failed":
+            with contextlib.suppress(MeetingStoreError):
+                self._remove_checkpoint(job, owner)
 
     def _asr(
         self,
@@ -1410,11 +1736,6 @@ class MeetingTranscribeState:
         seen = 0
         for candidate, echo in zip(candidates, echoes, strict=True):
             length = candidate.end_ms - candidate.start_ms
-            if echo:
-                if candidate.end_ms > cursors[candidate.track]:
-                    cursors[candidate.track] = candidate.end_ms
-                    window_ms += length
-                continue
             seen += 1
             if seen <= len(kept):
                 continue
@@ -1435,6 +1756,7 @@ class MeetingTranscribeState:
                 end_ms=candidate.end_ms,
                 text=text,
                 speaker="me" if candidate.track == "mic" and self_track == "mic" else "others",
+                echo=echo,
             )
             utterances.append(utterance)
             self._emit(
@@ -1449,6 +1771,7 @@ class MeetingTranscribeState:
                     "end_ms": utterance.end_ms,
                     "text": utterance.text,
                     "speaker": utterance.speaker,
+                    "echo": utterance.echo,
                     "provisional": True,
                 },
             )
@@ -1459,8 +1782,612 @@ class MeetingTranscribeState:
                 self._persist(job, owner, durable, utterances, cursors)
                 window_utterances = window_ms = 0
             self._progress(job, "asr", candidate.end_ms, duration)
-        # Stage 5: final text (labels_final without diarization) + its checkpoint,
-        # done, then the checkpoint is dropped (T-414).
+        durable.asr_status = PhaseStatus.DONE
+        self._post_asr(
+            job, owner, reader, spans, utterances, cursors, durable, duration, started, sum(echoes)
+        )
+
+    # ---- stage 4: isolated diarization -----------------------------------
+
+    def _labels(
+        self,
+        job: _Job,
+        utterances: list[Utterance],
+        *,
+        final: bool,
+        revision: int | None = None,
+    ) -> None:
+        # Both the item count and encoded byte count bound a frame (long ids
+        # need smaller batches than the schema's maximum 2000 items).
+        speakers = len({u.speaker for u in utterances if u.speaker.startswith("S")})
+        for first in range(0, max(1, len(utterances)), 256):
+            self._emit(
+                job,
+                {
+                    "type": "meeting.job.labels",
+                    **job.identity,
+                    "seq": job.labels_seq,
+                    "items": [[u.id, u.speaker] for u in utterances[first : first + 256]],
+                    "final": final,
+                    "speakers_total": speakers,
+                    **({"transcript_revision": revision} if revision is not None else {}),
+                },
+            )
+            job.labels_seq += 1
+
+    def _diar_memory(self, job: _Job, deadline: float) -> None:
+        assert self.spec is not None
+        # ASR has already been unloaded. Only the new phase's incremental
+        # memory belongs in this check, not another ASR model reservation.
+        need = MEMORY_MARGIN_MB + DIAR_MEMORY_MB
+        until = min(deadline, self.clock() + DIAR_MEMORY_WAIT_S)
+        while True:
+            self._check_wall(job, until)
+            available = self.mem_available_mb()
+            if available >= need:
+                return
+            self._emit(
+                job,
+                {
+                    "type": "meeting.job.waiting",
+                    **job.identity,
+                    "reason": "memory",
+                    "need_mb": need,
+                    "available_mb": max(0, available),
+                },
+            )
+            with job.condition:
+                job.condition.wait(min(DIAR_MEMORY_RETRY_S, max(0.001, until - self.clock())))
+
+    @staticmethod
+    def _block_audio(reader: _Reader, spans: list[_Span], first: int, end: int) -> Audio:
+        import numpy as np
+
+        audio = np.zeros((end - first) * RATE // 1000, dtype="<f4")
+        for span in spans:
+            a = max(first, span.recorded(span.first))
+            b = min(end, span.recorded(span.end))
+            if a >= b:
+                continue
+            samples = reader.read(span, span.sample_at(a), span.sample_at(b))
+            offset = (a - first) * RATE // 1000
+            count = min(len(samples), len(audio) - offset)
+            audio[offset : offset + count] = samples[:count]
+        return audio
+
+    @staticmethod
+    def _write_block_pcm(
+        fd: int,
+        reader: _Reader,
+        spans: list[_Span],
+        first: int,
+        end: int,
+        check: Callable[[], None],
+    ) -> None:
+        """Write the same PCM as _block_audio, without a block-sized array."""
+        check()
+        frames = (end - first) * RATE // 1000
+        # A new memfd reads as zeros in all unwritten gaps and the short tail.
+        os.ftruncate(fd, frames * 4)
+        for span in spans:
+            check()
+            a = max(first, span.recorded(span.first))
+            b = min(end, span.recorded(span.end))
+            if a >= b:
+                continue
+            start, stop = span.sample_at(a), span.sample_at(b)
+            offset = (a - first) * RATE // 1000
+            count = min(stop - start, frames - offset)
+            os.lseek(fd, offset * 4, os.SEEK_SET)
+            for position in range(0, count, DIAR_PCM_CHUNK_FRAMES):
+                check()
+                samples = reader.read(
+                    span, start + position, start + min(count, position + DIAR_PCM_CHUNK_FRAMES)
+                )
+                view = samples.astype("<f4", copy=False).data.cast("B")
+                _write_pcm(fd, view, check)
+
+    @staticmethod
+    def _canonical_map(turns: list[DiarTurn], final: Message) -> dict[str, str]:
+        labels = {t.label for t in turns}
+        mapping: dict[str, str] = final["label_map"]
+        if (
+            set(mapping) != labels
+            or not set(mapping.values()) <= labels
+            or len(set(mapping.values())) != final["speakers_total"]
+            or any(mapping.get(value) != value for value in mapping.values())
+            or any(int(value[1:]) > int(old[1:]) for old, value in mapping.items())
+        ):
+            raise ValueError("diar-final-map")
+        return mapping
+
+    def _diarize(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        reader: _Reader,
+        spans: list[_Span],
+        utterances: list[Utterance],
+        cursors: dict[str, int],
+        durable: _Durable,
+        duration: int,
+        deadline: float,
+    ) -> None:
+        target = diar_target(utterances, spans)
+        target_spans = [span for span in spans if span.track == target]
+        blocks = diar_blocks(utterances, target, duration, durable.diar.block_ms)
+        role: Any = None
+        completed = False
+        try:
+            # Same synchronous handler as model.unload; a failure never
+            # acknowledges and must never start a child. No child/DIAR lease
+            # exists yet, so cancellation need not wait for ASR cleanup.
+            ack = self._unload_ack()
+            if ack["type"] != "model.unloaded" or self.engine is not None:
+                raise ValueError("diar-unload-unconfirmed")
+            if len(blocks) > job.request["limits"]["max_blocks"]:
+                raise ValueError("diar-block-limit")
+            self._diar_memory(job, deadline)
+            # The same installed/signed-catalog provider used by admission, after
+            # ASR unload and memory wait. Never execute the stale request pair.
+            pair = self.diar_models_provider()
+            if pair is None:
+                job.diar_status = "failed" if job.rediarize else "skipped"
+                if not job.rediarize:
+                    job.request["diarization"] = False
+                    job.request.pop("diar_models", None)
+                    durable.config = self._config(job, durable.identity)
+                    durable.diar = DiarProgress()
+                    durable.reconcile = ReconcileProgress()
+                return
+            job.request["diar_models"] = dict(pair)
+            durable.config = self._config(job, durable.identity)
+            durable.diar.status = PhaseStatus.RUNNING
+            durable.diar.turns.clear()
+            durable.diar.label_map.clear()
+            self._progress(job, "diar", 0, duration, force=True, block=0, blocks=len(blocks))
+            self._persist(job, owner, durable, utterances, cursors)
+            with self.fence:
+                if job.cancelled:
+                    raise _Cancelled
+                job.diar_exited.clear()
+            with self.store.writer(job.identity["meeting_id"], Writer.DIAR) as diar_owner:
+                try:
+                    role = self.diar_factory(
+                        job.identity, lambda: job.cancelled, lease_fd=diar_owner.diar_lease_fd()
+                    )
+                    role.overall_deadline = time.monotonic() + max(0, deadline - self.clock())
+                    role.load(job.request["diar_models"])
+                    for index, (first, end) in enumerate(blocks):
+                        self._diar_memory(job, deadline)
+                        self._check_wall(job, deadline)
+                        audio = PcmSource(
+                            (end - first) * RATE // 1000,
+                            partial(
+                                self._write_block_pcm,
+                                reader=reader,
+                                spans=target_spans,
+                                first=first,
+                                end=end,
+                                check=partial(self._check_wall, job, deadline),
+                            ),
+                        )
+                        engine_module._trim_malloc()
+                        try:
+                            rows = role.block(audio, index, first)
+                        finally:
+                            del audio
+                            engine_module._trim_malloc()
+                        self._check_wall(job, deadline)
+                        if len(durable.diar.turns) + len(rows) > diar_link.MAX_SEGMENTS:
+                            raise ValueError("diar-turns-limit")
+                        for a, b, label in rows:
+                            if (
+                                not first <= a < b <= end
+                                or re.fullmatch(r"S[1-9][0-9]*", label) is None
+                            ):
+                                raise ValueError("diar-turn-invalid")
+                            durable.diar.turns.append(DiarTurn(label, a, b))
+                        assign_speakers(utterances, durable.diar.turns, target)
+                        self._persist(job, owner, durable, utterances, cursors)
+                        self._labels(job, utterances, final=False)
+                        self._progress(
+                            job, "diar", end, duration, block=index + 1, blocks=len(blocks)
+                        )
+                    self._check_wall(job, deadline)
+                    final = role.finish()
+                    if not durable.diar.turns and any(u.track == target for u in utterances):
+                        raise ValueError("diar-empty-turns")
+                    durable.diar.label_map = self._canonical_map(durable.diar.turns, final)
+                    # Durable final intervals/map while the lease and child are
+                    # still alive. A crash here restarts the whole diar track.
+                    self._persist(job, owner, durable, utterances, cursors)
+                    if not role.close(completed=True):
+                        raise ValueError("diar-exit-unconfirmed")
+                    self.diar_peak_rss_kb = max(self.diar_peak_rss_kb, role.peak_rss_kb)
+                    role = None
+                    self._check_wall(job, deadline)
+                    completed = True
+                finally:
+                    if role is not None:
+                        role.close()
+                        self.diar_peak_rss_kb = max(self.diar_peak_rss_kb, role.peak_rss_kb)
+        except (DiarCancelled, _Cancelled):
+            raise _Cancelled from None
+        except (OSError, ValueError, RuntimeError, MemoryError, TimeoutError, EngineError, _Failed):
+            if job.cancelled:
+                raise _Cancelled from None
+            # All child failure paths have reaped it before fallback publication.
+            job.diar_status = "failed"
+            if job.rediarize:
+                return  # R4: leave the unfinished work pair; never persist fallback
+            durable.diar.status = PhaseStatus.PENDING
+            durable.diar.turns.clear()
+            durable.diar.label_map.clear()
+            for utterance in utterances:
+                utterance.speaker = "others" if utterance.track == target else "me"
+        finally:
+            job.diar_exited.set()  # after confirmed exit AND releasing the lease
+        if completed:
+            job.diar_status = "done"
+            durable.diar.status = PhaseStatus.DONE
+            durable.reconcile.status = PhaseStatus.PENDING
+            self._persist(job, owner, durable, utterances, cursors)
+
+    @staticmethod
+    def _replacement_message(job: _Job, pending: ReconcileReplacement) -> Message:
+        return {
+            "type": "meeting.job.replace",
+            **job.identity,
+            "seq": pending.seq,
+            "replaces_id": pending.replaces_id,
+            "expected_revision": pending.expected_revision,
+            "items": [
+                {
+                    "id": u.id,
+                    "track": u.track,
+                    "start_ms": u.start_ms,
+                    "end_ms": u.end_ms,
+                    "text": u.text,
+                    "speaker": u.speaker,
+                    "provisional": True,
+                    "multiple_speakers": u.multiple_speakers,
+                }
+                for u in pending.items
+            ],
+        }
+
+    def _apply_replacement(self, job: _Job, pending: ReconcileReplacement, deadline: float) -> None:
+        # On resume the GUI grants its initial credits only after restoring the
+        # live snapshot. Waiting for readiness uses the job's absolute ceiling;
+        # the short applied deadline starts only after a frame can be delivered.
+        self._wait_credit(job, deadline)
+        message = self._replacement_message(job, pending)
+        revision = pending.expected_revision + 1
+        with job.condition:
+            job.replacements[pending.seq] = (revision, False)
+        until = time.monotonic() + DONE_DELIVERY_S
+        while True:
+            self._check_wall(job, math.inf)
+            if time.monotonic() > until:
+                raise _Failed("io")
+            self._emit(job, message)
+            with job.condition:
+                job.condition.wait_for(
+                    lambda: job.cancelled or job.replacements[pending.seq][1], timeout=0.25
+                )
+                if job.cancelled:
+                    raise _Cancelled
+                if job.replacements[pending.seq][1]:
+                    return
+
+    def _reconcile(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        utterances: list[Utterance],
+        cursors: dict[str, int],
+        durable: _Durable,
+        reader: _Reader,
+        spans: list[_Span],
+        target: str,
+        deadline: float,
+    ) -> None:
+        """D5: reserve durably, infer, commit text+receipt, then deliver idempotently.
+
+        Reservation before inference bounds even work lost to SIGKILL. An
+        interrupted reservation is flagged without re-inference. The embedded
+        progress makes a transcript/checkpoint crash recoverable without diar.
+        """
+        progress = durable.reconcile
+        if progress.status == PhaseStatus.DONE:
+            return
+        turns = [
+            dataclasses.replace(t, label=durable.diar.label_map[t.label])
+            for t in durable.diar.turns
+        ]
+        if progress.status == PhaseStatus.PENDING:
+            # Meeting speech is the union across tracks, not double-talk twice.
+            speech_end = 0
+            for u in sorted(utterances, key=lambda u: u.start_ms):
+                if u.text not in {DAMAGED_TEXT, UNRECOGNIZED_TEXT}:
+                    progress.speech_ms += max(0, u.end_ms - max(speech_end, u.start_ms))
+                    speech_end = max(speech_end, u.end_ms)
+            progress.budget_ms = progress.speech_ms * 15 // 100
+            progress.status = PhaseStatus.RUNNING
+            self._persist(job, owner, durable, utterances, cursors)
+        if progress.pending is not None:
+            self._apply_replacement(job, progress.pending, deadline)
+            progress.pending = None
+            self._persist(job, owner, durable, utterances, cursors)
+        selected = reconcile.candidates(utterances, turns, target)
+        loaded = False
+        unavailable = False
+        for original, split in selected:
+            if original.id in progress.done_ids:
+                continue
+            self._check_wall(job, math.inf)  # cancellation still fences fallback publication
+            span = next(
+                (
+                    s
+                    for s in spans
+                    if s.track == target
+                    and s.recorded(s.first) <= original.start_ms
+                    and s.recorded(s.end) >= original.end_ms
+                ),
+                None,
+            )
+            if split and span is None:
+                progress.failed = True
+            windows = []
+            if span is not None:
+                for part in split:
+                    a, b = span.sample_at(part.start_ms), span.sample_at(part.end_ms)
+                    lo = max(span.first, a - reconcile.CONTEXT_MS * RATE // 1000)
+                    hi = min(span.end, b + reconcile.CONTEXT_MS * RATE // 1000)
+                    windows.append((lo, hi, a, b))
+            # Two passes: contextual plus core. Both count, with ceiling to ms.
+            cost = sum(math.ceil(((hi - lo) + (b - a)) * 1000 / RATE) for lo, hi, a, b in windows)
+            interrupted = progress.inflight_id == original.id
+            can_run = (
+                bool(split)
+                and span is not None
+                and not unavailable
+                and not interrupted
+                and progress.used_ms + cost <= progress.budget_ms
+                and self.clock() <= deadline
+            )
+            if can_run and not loaded:
+                try:
+                    until = min(deadline, self.clock() + DIAR_MEMORY_WAIT_S)
+                    while not self._ensure_model(job, after_diar=True):
+                        self._check_wall(job, until)
+                        with job.condition:
+                            job.condition.wait(
+                                min(DIAR_MEMORY_RETRY_S, max(0.001, until - self.clock()))
+                            )
+                    loaded = True
+                except (_Failed, EngineError, MemoryError, RuntimeError, ValueError, OSError):
+                    unavailable = True
+                    progress.failed = True
+                    can_run = False
+            if self.clock() > deadline:
+                progress.failed = True
+            texts = []
+            if can_run:
+                # Worst-case reservation is durable BEFORE the first ASR call.
+                progress.inflight_id = original.id
+                progress.used_ms += cost
+                self._persist(job, owner, durable, utterances, cursors)
+                assert span is not None
+                try:
+                    for lo, hi, a, b in windows:
+                        self._check_wall(job, deadline)
+                        padded = self._recognize(job, reader.read(span, lo, hi))
+                        self._check_wall(job, deadline)
+                        core = self._recognize(job, reader.read(span, a, b))
+                        self._check_wall(job, deadline)
+                        if (
+                            padded == UNRECOGNIZED_TEXT
+                            or core == UNRECOGNIZED_TEXT
+                            or not reconcile.context_agrees(padded, core)
+                        ):
+                            raise ValueError("reconcile-context")
+                        texts.append(core)
+                except (_Failed, EngineError, MemoryError, RuntimeError, ValueError, OSError):
+                    progress.failed = True
+                    texts = []
+            if interrupted:
+                progress.failed = True
+            replacement = [dataclasses.replace(original, multiple_speakers=True)]
+            if texts and reconcile.trusted(original.text, texts):
+                replacement = [
+                    Utterance(
+                        id="r"
+                        + hashlib.sha256(
+                            f"{original.id}:{i}:{durable.revision}".encode()
+                        ).hexdigest()[:24],
+                        track=original.track,
+                        start_ms=part.start_ms,
+                        end_ms=part.end_ms,
+                        text=text,
+                        speaker=part.speaker,
+                    )
+                    for i, (part, text) in enumerate(zip(split, texts, strict=True))
+                ]
+            elif texts:
+                progress.failed = True
+            # A single, unsplit flagged item also travels via the atomic seam.
+            expected = durable.revision
+            pending = ReconcileReplacement(expected + 1, original.id, expected, replacement)
+            try:
+                ipc.encode(self._replacement_message(job, pending), role=ROLE)
+            except (ValueError, ipc.FrameError):
+                replacement = [dataclasses.replace(original, multiple_speakers=True)]
+                pending.items = replacement
+                progress.failed = True
+            if len(utterances) - 1 + len(replacement) > durable.capacity:
+                replacement = [dataclasses.replace(original, multiple_speakers=True)]
+                pending.items = replacement
+                progress.failed = True
+            index = next(i for i, u in enumerate(utterances) if u.id == original.id)
+            self._labels(job, utterances, final=False, revision=expected)
+            utterances[index : index + 1] = replacement
+            utterances.sort(key=lambda u: utterance_order(u.start_ms, u.track, u.end_ms))
+            for seq, u in enumerate(utterances):
+                u.seq = seq
+            progress.inflight_id = None
+            progress.done_ids.append(original.id)
+            if len(replacement) > 1:
+                progress.replaced_ids.append(original.id)
+            progress.pending = pending
+            # Only now can GUI see replace: text and checkpoint have fsynced.
+            self._persist(job, owner, durable, utterances, cursors)
+            self._apply_replacement(job, pending, deadline)
+            progress.pending = None
+            self._persist(job, owner, durable, utterances, cursors)
+        progress.status = PhaseStatus.DONE
+        self._persist(job, owner, durable, utterances, cursors)
+
+    def _post_asr(
+        self,
+        job: _Job,
+        owner: MeetingWriter,
+        reader: _Reader,
+        spans: list[_Span],
+        utterances: list[Utterance],
+        cursors: dict[str, int],
+        durable: _Durable,
+        duration: int,
+        started: float,
+        echo_dropped: int,
+    ) -> None:
+        if job.request["diarization"]:
+            deadline = started + (2 * duration + WALL_SLACK_MS) / 1000
+            if durable.diar.status != PhaseStatus.DONE:
+                target = diar_target(utterances, spans)
+                for u in utterances:
+                    u.speaker = "others" if u.track == target else "me"
+                # ASR done, text is durable before acknowledging unload.
+                self._persist(job, owner, durable, utterances, cursors)
+                self._diarize(
+                    job, owner, reader, spans, utterances, cursors, durable, duration, deadline
+                )
+                if job.rediarize and job.diar_status == "failed":
+                    work = owner.read_transcript(job.transcript_name)
+                    if work is None:
+                        raise _Failed("io")
+                    self._finish(job, owner, work, echo_dropped, started)
+                    return
+            else:
+                job.diar_status = "done"
+            if job.diar_status == "done":
+                self._progress(job, "reconcile", duration, duration, force=True)
+                target = diar_target(utterances, spans)
+                canonical_turns = [
+                    dataclasses.replace(t, label=durable.diar.label_map[t.label])
+                    for t in durable.diar.turns
+                ]
+                assign_speakers(utterances, canonical_turns, target)
+                self._reconcile(
+                    job, owner, utterances, cursors, durable, reader, spans, target, deadline
+                )
         self._progress(job, "finalize", duration, duration, force=True)
         final = self._persist(job, owner, durable, utterances, cursors, final=True)
-        self._finish(job, owner, final, sum(echoes), started)
+        if job.request["diarization"]:
+            self._labels(job, final.utterances, final=True, revision=final.transcript_revision)
+        self._finish(job, owner, final, echo_dropped, started)
+
+
+def diar_target(utterances: Sequence[Utterance], spans: Sequence[_Span]) -> str:
+    """An absent far track must not prevent the room/microphone variant."""
+    return (
+        "far"
+        if any(s.track == "far" for s in spans) or any(u.track == "far" for u in utterances)
+        else "mic"
+    )
+
+
+def diar_blocks(
+    utterances: Sequence[Utterance], target: str, duration: int, block_ms: int = DIAR_BLOCK_MS
+) -> list[tuple[int, int]]:
+    """Nearest pause in each fixed-grid ±90 s window, without boundary drift.
+
+    A pause is an interval: if the nominal point is inside it, keep that point;
+    otherwise use the nearest edge. Equal-distance ties choose the earlier cut.
+    The final short block ends at duration; the number is ceil(duration/block_ms).
+    """
+    regions = sorted((u.start_ms, u.end_ms) for u in utterances if u.track == target)
+    pauses = []
+    end = 0
+    for a, b in regions:
+        if a - end >= MIN_PAUSE_MS:
+            pauses.append((end, a))
+        end = max(end, b)
+    if duration - end >= MIN_PAUSE_MS:
+        pauses.append((end, duration))
+    count = min(math.ceil(duration / block_ms), diar_link.MAX_BLOCKS + 1)
+    boundaries = [0]
+    for index in range(1, count):
+        nominal = index * block_ms
+        low = max(boundaries[-1] + 1, nominal - DIAR_PAUSE_SEARCH_MS)
+        high = min(duration - (count - index), nominal + DIAR_PAUSE_SEARCH_MS)
+        choices = [
+            min(max(nominal, max(a, low)), min(b, high))
+            for a, b in pauses
+            if a <= high and b >= low
+        ]
+        cut = min(choices, key=lambda value: (abs(value - nominal), value), default=nominal)
+        boundaries.append(cut)
+    if count:
+        boundaries.append(duration)
+    return list(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
+def assign_speakers(
+    utterances: Sequence[Utterance], turns: Sequence[DiarTurn], target: str
+) -> None:
+    """Union overlap per speaker (>=30%), otherwise nearest interval; stable ties."""
+    ordered = sorted(turns, key=lambda t: (t.start_ms, t.end_ms, int(t.label[1:])))
+    ends = sorted(ordered, key=lambda t: (t.end_ms, t.start_ms, int(t.label[1:])))
+    starts_ms = [t.start_ms for t in ordered]
+    ends_ms = [t.end_ms for t in ends]
+    active: list[DiarTurn] = []
+    index = 0
+    for u in sorted(utterances, key=lambda u: (u.start_ms, u.end_ms, u.seq)):
+        if u.track != target:
+            u.speaker = "me"
+            continue
+        active = [t for t in active if t.end_ms > u.start_ms]
+        while index < len(ordered) and ordered[index].start_ms < u.end_ms:
+            if ordered[index].end_ms > u.start_ms:
+                active.append(ordered[index])
+            index += 1
+        coverage: dict[str, int] = {}
+        last: dict[str, int] = {}
+        for t in active:
+            a, b = max(u.start_ms, t.start_ms), min(u.end_ms, t.end_ms)
+            coverage[t.label] = coverage.get(t.label, 0) + max(0, b - max(a, last.get(t.label, a)))
+            last[t.label] = max(last.get(t.label, a), b)
+        best = min(coverage, key=lambda k: (-coverage[k], int(k[1:])), default=None)
+        if best is not None and coverage[best] * 10 >= 3 * max(1, u.end_ms - u.start_ms):
+            u.speaker = best
+            continue
+        nearby = list(active)
+        before = bisect.bisect_right(ends_ms, u.start_ms) - 1
+        after = bisect.bisect_left(starts_ms, u.end_ms)
+        if before >= 0:
+            nearby.append(ends[before])
+        if after < len(ordered):
+            nearby.append(ordered[after])
+        closest = min(
+            nearby,
+            key=lambda t: (
+                max(0, t.start_ms - u.end_ms, u.start_ms - t.end_ms),
+                abs((t.start_ms + t.end_ms) - (u.start_ms + u.end_ms)),
+                t.start_ms,
+                int(t.label[1:]),
+            ),
+            default=None,
+        )
+        u.speaker = closest.label if closest else "others"

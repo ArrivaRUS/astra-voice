@@ -43,7 +43,7 @@ def mix(
     return mic.astype(np.float32), far_full
 
 
-def test_echo_with_120ms_lag_is_dropped() -> None:
+def test_echo_with_120ms_lag_is_marked_t516() -> None:
     far = speech_like(4.4, 1)
     mic, far_window = mix(far, 120, 0.3, None, 2)
     decision = echo_gate.assess(mic, far_window, 0.9, enabled=True)
@@ -60,7 +60,7 @@ def test_independent_speech_is_kept() -> None:
     assert not decision.echo and decision.max_ncc < echo_gate.THETA_ECHO
 
 
-def test_double_talk_six_db_over_echo_is_kept_even_above_theta() -> None:
+def test_double_talk_six_db_over_echo_is_kept_even_above_theta_t518() -> None:
     far = speech_like(4.4, 5)
     length = len(far) - LEAD
     echo_rms = 0.3 * float(np.sqrt(np.mean(far.astype(np.float64) ** 2)))
@@ -82,11 +82,11 @@ def test_echo_needs_far_speech_overlap() -> None:
     assert not echo_gate.assess(mic, far_window, 0.4, enabled=True).echo
 
 
-def test_disabled_flag_keeps_everything_and_default_is_off() -> None:
+def test_disabled_override_keeps_everything_and_default_is_on_t516() -> None:
     far = speech_like(4.4, 10)
     mic, far_window = mix(far, 120, 0.3, None, 11)
     assert not echo_gate.assess(mic, far_window, 1.0, enabled=False).echo
-    assert echo_gate.ECHO_GATE_DEFAULT is False  # D7 until M0 block F
+    assert echo_gate.ECHO_GATE_DEFAULT is True  # D7: mark, never delete
     assert echo_gate.config()["theta"] == echo_gate.THETA_ECHO == 0.35
 
 
@@ -102,3 +102,30 @@ def test_short_and_silent_inputs_are_kept() -> None:
     assert not echo_gate.assess(
         speech_like(1.0, 12), np.zeros(10, dtype=np.float32), 1.0, enabled=True
     ).echo
+
+
+@pytest.mark.parametrize("lag", [0, 200, 400])
+def test_default_echo_window_boundaries_t516(lag: int) -> None:
+    far = speech_like(4.4, 101)
+    mic, window = mix(far, lag, 0.3, None, 102)
+    decision = echo_gate.assess(mic, window, 1.0, enabled=echo_gate.ECHO_GATE_DEFAULT)
+    assert decision.echo and decision.lag_ms == pytest.approx(lag, abs=1)
+
+
+def test_threshold_and_outside_window_are_pipeline_parameters_t521(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    far = speech_like(5.0, 103)
+    mic, window = mix(far, 200, 0.3, None, 104)
+    decision = echo_gate.assess(mic, window, 1.0, enabled=True)
+    assert decision.echo
+    monkeypatch.setattr(echo_gate, "THETA_ECHO", min(1.0, decision.max_ncc + 0.001))
+    assert not echo_gate.assess(mic, window, 1.0, enabled=True).echo
+    monkeypatch.setattr(echo_gate, "THETA_ECHO", decision.max_ncc - 0.001)
+    assert echo_gate.assess(mic, window, 1.0, enabled=True).echo
+    monkeypatch.setattr(echo_gate, "THETA_ECHO", 0.35)
+    # Independent nonperiodic signal shifted 500 ms lies outside the 400 ms search.
+    source = speech_like(5.0, 105)
+    outside = source[: 4 * RATE]
+    ahead = source[RATE // 10 : RATE // 10 + 4 * RATE + LEAD]
+    assert not echo_gate.assess(outside, ahead, 1.0, enabled=True).echo

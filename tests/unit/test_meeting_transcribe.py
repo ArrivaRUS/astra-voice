@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from astra_voice.meetings import echo_gate
 from astra_voice.meetings import store as store_module
 from astra_voice.meetings.model import Checkpoint, Transcript
 from astra_voice.worker import ipc
@@ -859,7 +860,10 @@ for name in forbidden:
     assert result.returncode == 0, result.stderr.decode()
 
 
-def test_run_role_wires_transcribe_handler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_role_wires_transcribe_handler_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Real socket/role loop: selected explicitly by the host validation command.
     from astra_voice.worker import meeting_roles
 
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
@@ -907,7 +911,7 @@ def test_run_role_wires_transcribe_handler(tmp_path: Path, monkeypatch: pytest.M
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_echo_gate_drops_mic_copy_of_far_only_when_enabled(
+def test_echo_gate_recognizes_and_marks_mic_copy_t516_t518(
     tmp_path: Path, rigs: list[Rig], enabled: bool
 ) -> None:
     rng = np.random.default_rng(42)
@@ -929,7 +933,12 @@ def test_echo_gate_drops_mic_copy_of_far_only_when_enabled(
     assert done["type"] == "meeting.job.done"
     tracks = [u["track"] for u in rig.utterances()]
     if enabled:
-        assert done["echo_dropped"] == 2 and tracks == ["far", "far", "mic"]
+        assert done["echo_dropped"] == 0 and done["echo_utterances"] == 2
+        assert tracks.count("mic") == 3
+        saved = transcript(disk)
+        assert sum(u.echo for u in saved.utterances) == 2
+        assert all(u.text and u.speaker == "me" for u in saved.utterances if u.echo)
+        assert all(u["text"] for u in rig.utterances())
     else:
         assert done["echo_dropped"] == 0 and tracks.count("mic") == 3
 
@@ -954,3 +963,67 @@ def test_store_remove_checkpoint_only_by_transcribe_after_final_text(tmp_path: P
     with disk.writer(MID, store_module.Writer.GUI) as gui:
         with pytest.raises(store_module.MeetingStoreError):
             gui.remove("checkpoint.json")
+
+
+def test_room_does_not_apply_echo_gate_t517(
+    tmp_path: Path, rigs: list[Rig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no far track: echo assessment must not run")
+
+    monkeypatch.setattr(echo_gate, "assess", unexpected)
+    disk = make_disk(tmp_path)
+    write_track(disk, "mic", bursts([0.3, 0.5]))
+    rig = new_rig(rigs, disk)
+    rig.load()
+    rig.start(tracks=["mic"], echo=True)
+    done = rig.finish()
+    assert done["type"] == "meeting.job.done" and done["echo_utterances"] == 0
+    assert len(transcript(disk).utterances) == 2
+    assert not any(u.echo for u in transcript(disk).utterances)
+
+
+@pytest.mark.parametrize("crash", ["checkpoint", "done"])
+def test_echo_resume_and_repeat_no_loss_or_duplicates_t520(
+    tmp_path: Path, rigs: list[Rig], monkeypatch: pytest.MonkeyPatch, crash: str
+) -> None:
+    from astra_voice.worker import meeting_transcribe
+
+    disk = many_bursts_disk(tmp_path)
+    levels = [0.2 + (i % 50) / 100 for i in range(70)]
+    write_track(disk, "far", bursts(levels, on=0.5, off=0.6), segment_s=30)
+    with monkeypatch.context() as patch:
+        if crash == "checkpoint":
+            crash_on(patch, 2)
+        else:
+
+            def killed(*args: Any, **kwargs: Any) -> None:
+                raise store_module.MeetingStoreError("crash before done")
+
+            patch.setattr(meeting_transcribe.MeetingTranscribeState, "_finish", killed)
+        first = new_rig(rigs, disk)
+        first.load()
+        first.start(echo=True)
+        assert first.finish()["type"] == "meeting.job.failed"
+        first.close()
+    resumed = new_rig(rigs, disk)
+    resumed.load()
+    resumed.start(echo=True, resume=True)
+    done = resumed.finish()
+    assert done["type"] == "meeting.job.done", done
+    saved = transcript(disk)
+    assert len(saved.utterances) == 140
+    assert sum(u.echo for u in saved.utterances) == done["echo_utterances"] == 70
+    assert all(u.text and u.speaker == "me" for u in saved.utterances if u.echo)
+    signature = [
+        (u.id, u.seq, u.track, u.start_ms, u.end_ms, u.text, u.echo) for u in saved.utterances
+    ]
+    assert len({(u.track, u.start_ms, u.end_ms) for u in saved.utterances}) == 140
+    repeated = new_rig(rigs, disk)
+    repeated.load()
+    repeated.start(echo=True, resume=False)
+    assert repeated.finish()["type"] == "meeting.job.done"
+    assert [
+        (u.id, u.seq, u.track, u.start_ms, u.end_ms, u.text, u.echo)
+        for u in transcript(disk).utterances
+    ] == signature

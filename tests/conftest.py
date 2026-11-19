@@ -376,6 +376,36 @@ def _meeting_thread_module(name: str) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def recorded_heap_trim(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> list[None]:
+    """Record both trims in one module; copied conftest needs no product package."""
+    calls: list[None] = []
+    if "real_heap_trim" in request.fixturenames:
+        return calls
+    try:
+        engine = sys.modules.get("astra_voice.worker.engine")
+        if engine is None:
+            engine = importlib.import_module("astra_voice.worker.engine")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"astra_voice", "astra_voice.worker", "astra_voice.worker.engine"}:
+            raise
+        return calls
+
+    def record() -> None:
+        calls.append(None)
+
+    monkeypatch.setattr(engine, "_trim_heap", record)
+    monkeypatch.setattr(engine, "_trim_malloc", record)
+    return calls
+
+
+@pytest.fixture
+def real_heap_trim() -> None:
+    """Explicit opt-in for allocator/GC tests; subprocess engine probes stay real."""
+
+
+@pytest.fixture(autouse=True)
 def no_leaked_meeting_threads(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Attribute meeting workers by origin, including anonymous/daemon threads."""
     before = set(threading.enumerate())
@@ -789,3 +819,43 @@ def pytest_terminal_summary(terminalreporter: TerminalReporter, config: pytest.C
         )
         for path, reason in sorted(ignored.items()):
             terminalreporter.write_line(f"{os.path.relpath(path, config.rootpath)}: {reason}")
+
+
+@pytest.fixture(scope="module")
+def synthetic_diar_models() -> Iterator[None]:
+    """Explicit opt-in for separation tests; never applied to trust tests."""
+    from helpers import meeting_audio
+    from helpers.meeting_trust import RequestPairState
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(meeting_audio, "MeetingTranscribeState", RequestPairState)
+        yield
+
+
+@pytest.fixture
+def signed_diar_pair(tmp_path: Path) -> object:
+    from helpers.meeting_trust import SignedDiarPair, SigningUnavailable
+
+    try:
+        return SignedDiarPair.prepare(tmp_path / "signed-pair")
+    except SigningUnavailable as exc:
+        pytest.skip(f"sandbox cannot start temporary gpg-agent: {exc}")
+
+
+@pytest.fixture
+def installed_diar_models(
+    synthetic_diar_models: None, signed_diar_pair: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Use the genuine signed provider for every transcriber in an IPC test."""
+    from functools import partial
+
+    from astra_voice.worker.meeting_transcribe import MeetingTranscribeState
+    from helpers import meeting_audio
+    from helpers.meeting_trust import SignedDiarPair
+
+    assert isinstance(signed_diar_pair, SignedDiarPair)
+    monkeypatch.setattr(
+        meeting_audio,
+        "MeetingTranscribeState",
+        partial(MeetingTranscribeState, diar_models_provider=signed_diar_pair.models),
+    )
