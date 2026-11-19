@@ -989,7 +989,7 @@ def test_autonomous_stop_event_order_retires_and_saves(rig: Rig, order: tuple[st
 def test_selected_far_unavailable_requires_fresh_mic_click(
     rig: Rig, reported_reason: str, safe_reason: str
 ) -> None:
-    far = {"kind": "app_stream", "sink_input": 1, "object_serial": 2, "call_id": "call1"}
+    far = {"kind": "app_stream", "call_id": "call1"}
     assert rig.bridge.on_start_clicked(far)
     rig.event("prepared", far_available=False, far_reason=reported_reason)
     assert rig.store.list() == []
@@ -1018,9 +1018,7 @@ def test_selected_far_unavailable_requires_fresh_mic_click(
 
 
 def test_selected_far_available_still_opens(rig: Rig) -> None:
-    assert rig.bridge.on_start_clicked(
-        {"kind": "app_stream", "sink_input": 1, "object_serial": 2, "call_id": "call1"}
-    )
+    assert rig.bridge.on_start_clicked({"kind": "app_stream", "call_id": "call1"})
     rig.event("prepared", far_available=True)
     assert rig.supervisor.messages[-1]["type"] == "meeting.capture.open"
     assert rig.store.list()[0].variant == "app_stream"

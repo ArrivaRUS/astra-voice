@@ -10,6 +10,7 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from test_meeting_capture import Rig, wait_until
@@ -211,10 +212,11 @@ def test_prepare_is_nonblocking_and_timeout_is_terminal(tmp_path: Path) -> None:
 
     def blocked_prepare(far: dict[str, Any]) -> dict[str, Any]:
         entered.set()
-        release.wait(3)
+        assert release.wait(10)
         return {"server_local": True, "server_kind": "pulseaudio", "far_available": True}
 
-    rig.backend.prepare = blocked_prepare  # type: ignore[method-assign]
+    prepare = Mock(side_effect=blocked_prepare)
+    rig.backend.prepare = prepare  # type: ignore[method-assign]
     try:
         start = time.monotonic()
         assert (
@@ -229,12 +231,26 @@ def test_prepare_is_nonblocking_and_timeout_is_terminal(tmp_path: Path) -> None:
             == "meeting.ack"
         )
         assert time.monotonic() - start < 1 and entered.wait(1)
-        stopped = {
+        start_detector = {
+            "type": "meeting.detector.start",
+            "request_type": "meeting.detector.start",
+            "req": "det-start",
+            "apps_version": 1,
+        }
+        stop_detector = {
             "type": "meeting.detector.stop",
             "request_type": "meeting.detector.stop",
-            "req": "det",
+            "req": "det-stop",
         }
-        assert rig.state.handle(stopped)[0]["type"] == "error"
+        assert rig.state.handle(start_detector)[0]["type"] == "meeting.ack"
+        assert rig.state.handle(stop_detector)[0]["type"] == "meeting.ack"
+        assert rig.until("meeting.detector.started")["apps_version"] == 1
+        assert rig.until("meeting.detector.stopped")["req"] == stop_detector["req"]
+        assert rig.state.preparing
+        assert rig.backend.detector_start_calls == rig.backend.detector_stop_calls == 0
+        (second,) = rig.request_prepare({"kind": "none"})
+        assert second["type"] == "error" and second["code"] == "not-prepared"
+        prepare.assert_called_once_with({"kind": "none"})
         rig.clock.now += 6
         rig.poll()
         assert rig.state.stopped and rig.state.exit_code != 0

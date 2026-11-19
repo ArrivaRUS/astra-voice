@@ -838,6 +838,7 @@ def _bind_meeting_recording(
         enabled=lambda: bridge.enabled,
         policy_allowed=lambda: bridge.canEnable,
         session_kind=session_kind,
+        detector_allowed=bridge.detector_allowed,
         microphone=lambda: settings_bridge.device or None,
         parent=bridge,
         **options,

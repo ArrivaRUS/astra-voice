@@ -161,6 +161,29 @@ class ExceptionClass(StrEnum):
     EXCEPTION = "Exception"
 
 
+class DetectorPurpose(StrEnum):
+    OBSERVE = "observe"
+    OFFER = "offer"
+    CARD = "card"
+    START = "start"
+
+
+class DetectorCode(StrEnum):
+    IDENTITY_MISMATCH = "identity_mismatch"
+    IDENTITY_MISMATCH_COUNTER = "identity_mismatch_counter"
+    VERIFICATION_UNAVAILABLE = "verification=unavailable"
+    VERIFICATION_FAILED = "verification=failed"
+    PULSE_FAILED = "pulse_failed"
+    PICTURE_CHANGED = "picture_changed"
+    BUDGET = "budget"
+    BUSY = "busy"
+    RATE = "rate"
+    REMOTE = "remote"
+    TARGET_GONE = "target-gone"
+    TARGET_MISMATCH = "target-mismatch"
+    NO_CALL = "no_call"
+
+
 # Constant templates are the only messages accepted in meeting-scoped logs.
 # POLICY_REJECTED preserves the existing finite policy code vocabulary exactly.
 POLICY_REJECTED = "%s"
@@ -170,6 +193,7 @@ INVALID_LOG = "meeting-invalid-log"
 CATALOG_LOAD_FAILED = "meeting-catalog-load-failed"
 CAPTURE_STATS = "meeting-capture duration_ms=%d bytes=%d"
 NATIVE_STDERR = "meeting-native-stderr bytes=%d lines=%d"
+DETECTOR_CODE = "meeting-detector purpose=%s code=%s duration_ms=%d"
 LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     POLICY_REJECTED: (PolicyCode,),
     SETTING_INVALID: (SettingKey,),
@@ -178,6 +202,7 @@ LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     CATALOG_LOAD_FAILED: (),
     CAPTURE_STATS: (None, None),
     NATIVE_STDERR: (None, None),
+    DETECTOR_CODE: (DetectorPurpose, DetectorCode, None),
 }
 
 
@@ -278,6 +303,7 @@ STATS_CHOICES = {
     "endpoint_class": frozenset({"off", "internal", "external", "unset"}),
     "exception": frozenset(ExceptionClass),
     "code": frozenset(PolicyCode)
+    | frozenset(DetectorCode)
     | {
         "timeout",
         "limit",
@@ -310,7 +336,7 @@ def stats_event(
             if type(value) is str and value in STATS_CHOICES[key]:
                 result[key] = value
             elif (
-                type(value) in {MeetingState, PauseReason, ExceptionClass, PolicyCode}
+                type(value) in {MeetingState, PauseReason, ExceptionClass, PolicyCode, DetectorCode}
                 and isinstance(value, StrEnum)
                 and value in STATS_CHOICES[key]
             ):

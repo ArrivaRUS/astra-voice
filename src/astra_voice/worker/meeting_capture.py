@@ -49,8 +49,6 @@ class Source(Protocol):
 class Backend(Protocol):
     def prepare(self, far: Message) -> Message: ...
     def source(self, far: Message) -> Source: ...
-    def detector_start(self) -> int: ...
-    def detector_stop(self) -> None: ...
     def close(self) -> None: ...
 
 
@@ -452,7 +450,6 @@ class MeetingCaptureState:
         self.finalizing = False
         self.final_status = "succeeded"
         self.lost_estimate_ms = 0
-        self.control_busy = False
         self.open_thread: threading.Thread | None = None
         self.readers: dict[str, threading.Thread] = {}
         self.shutdown_request: Message | None = None
@@ -687,8 +684,6 @@ class MeetingCaptureState:
             if action == "ping":
                 return self._remember(message, [self._reply("pong", message)])
             if action in {"meeting.detector.start", "meeting.detector.stop"}:
-                if self.preparing or self.control_busy:
-                    raise ValueError("not-prepared")
                 self._detector(message)
                 reply = self._reply("meeting.ack", message)
                 if message["req"] in self.ledger.requests:
@@ -714,7 +709,6 @@ class MeetingCaptureState:
             if action == "meeting.capture.prepare":
                 if (
                     self.preparing
-                    or self.control_busy
                     or self.opening
                     or self.finalizing
                     or self.sources
@@ -898,22 +892,14 @@ class MeetingCaptureState:
             return self._remember(message, [failure(message, code)])
 
     def _detector(self, request: Message) -> None:
-        self.control_busy = True
-
-        def work() -> None:
-            try:
-                if request["type"] == "meeting.detector.start":
-                    index = self._get_backend().detector_start()
-                    reply = self._reply("meeting.detector.started", request, own_client_index=index)
-                else:
-                    if self.backend:
-                        self.backend.detector_stop()
-                    reply = self._reply("meeting.detector.stopped", request)
-            except Exception:
-                reply = failure(request, "audio-failed")
-            self.messages.put({"type": "detector-result", "request": request, "reply": reply})
-
-        threading.Thread(target=work, name="meeting-detector-control", daemon=True).start()
+        # Until the observer is wired up, complete the command without creating a backend.
+        if request["type"] == "meeting.detector.start":
+            reply = self._reply(
+                "meeting.detector.started", request, apps_version=request["apps_version"]
+            )
+        else:
+            reply = self._reply("meeting.detector.stopped", request)
+        self.messages.put({"type": "detector-result", "request": request, "reply": reply})
 
     def _prepare(self, request: Message) -> None:
         self.preparing = True
@@ -925,6 +911,10 @@ class MeetingCaptureState:
 
         def work() -> None:
             try:
+                far = request["far"]
+                if far["kind"] == "app_stream":
+                    # Step 6a authorizes a fresh private target for this call_id.
+                    raise ValueError("target-mismatch")
                 assert self.directory is not None
                 if self.directory.name != request["meeting_id"]:
                     raise ValueError("dir-unwritable")
@@ -938,12 +928,6 @@ class MeetingCaptureState:
                 free = self.free_mb()
                 if free < 600:
                     raise ValueError("limit")
-                far = request["far"]
-                if (
-                    far["kind"] == "app_stream"
-                    and not {"sink_input", "object_serial"} <= far.keys()
-                ):
-                    raise ValueError("target-mismatch")
                 info = self._get_backend().prepare(far)
                 self.messages.put(
                     {"type": "prepared", "request": request, "info": info, "free": free}
@@ -952,7 +936,8 @@ class MeetingCaptureState:
                 code = (
                     str(exc)
                     if isinstance(exc, ValueError)
-                    and str(exc) in {"limit", "target-mismatch", "dir-unwritable", "not-prepared"}
+                    and str(exc)
+                    in {"limit", "target-gone", "target-mismatch", "dir-unwritable", "not-prepared"}
                     else "audio-failed"
                 )
                 self.messages.put({"type": "prepare-failed", "request": request, "code": code})
@@ -1083,8 +1068,8 @@ class MeetingCaptureState:
                     {
                         "type": "open-failed",
                         "request": request,
-                        "code": "admission-stale"
-                        if str(exc) == "admission-stale"
+                        "code": str(exc)
+                        if str(exc) in {"admission-stale", "target-gone", "target-mismatch"}
                         else "audio-failed",
                     }
                 )
@@ -1279,7 +1264,6 @@ class MeetingCaptureState:
             if kind == "session-event":
                 result.append(event["event"])
             elif kind == "detector-result":
-                self.control_busy = False
                 result.append(self._outcome(event["request"], event["reply"]))
             elif kind in {"prepared", "prepare-failed"}:
                 if not self.preparing or event["request"] != self.prepare_request:

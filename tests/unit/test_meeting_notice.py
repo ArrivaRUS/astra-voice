@@ -16,6 +16,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.meetings.events import MeetingState
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.settings_ext import NOTICE_TEXT
+from astra_voice.ui import meeting_recording
 from astra_voice.ui.meeting_bridge import MeetingBridge
 from astra_voice.ui.meeting_notice import copy_plain_text
 from astra_voice.ui.meeting_texts import notice_mute_text
@@ -84,28 +85,17 @@ def test_mute_line_names_dion_only_for_a_dion_call() -> None:
 
 
 @pytest.mark.parametrize("app_class", ["dion", "browser"])
-def test_recording_remembers_the_call_app_for_w3(rig: Rig, app_class: str) -> None:
+def test_recording_remembers_the_call_app_for_w3(
+    rig: Rig, app_class: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rig.bridge.requestRecording()
-    rig.recording.tick()
-    query = rig.supervisor.messages[-1]
-    rig.supervisor.event(
-        {
-            "type": "meeting.call.state",
-            "req": query["req"],
-            "request_type": "meeting.call.query",
-            "active": True,
-            "app_class": app_class,
-            "call_id": "call1",
-            "target": {
-                "sink_input": 7,
-                "object_serial": 9,
-                "verified": "declared-verified",
-            },
-            "generation": 1,
-        }
-    )
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.supervisor.event(rig.call_state(app_class))
     assert rig.bridge.selectedSource == "call"
-    rig.bridge.on_start_clicked()
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.bridge.on_start_clicked()
     assert rig.recording.notice_app_class == app_class
 
 

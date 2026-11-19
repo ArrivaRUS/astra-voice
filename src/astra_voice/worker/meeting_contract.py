@@ -15,6 +15,7 @@ import math
 from copy import deepcopy
 from typing import Any
 
+from astra_voice.meetings.events import DetectorCode, DetectorPurpose
 from astra_voice.meetings.model import (
     BOOL,
     IDENTIFIER,
@@ -99,22 +100,18 @@ MODEL = {
     "threads": {"type": "integer", "minimum": 1, "maximum": 256},
     "min_ram_mb": UINT,
 }
-FAR = obj(
-    {
-        "kind": choices("app_stream", "sink_monitor", "none"),
-        "sink_input": UINT,
-        "object_serial": UINT,
-        "call_id": IDENTIFIER,
-    },
-    required=["kind"],
-)
-TARGET = obj(
-    {
-        "sink_input": UINT,
-        "object_serial": UINT,
-        "verified": choices("declared-verified", "declared", "mismatch", "unverified"),
-    }
-)
+FAR = {
+    "anyOf": [
+        obj({"kind": choices("none", "sink_monitor")}),
+        obj({"kind": {"const": "app_stream"}, "call_id": IDENTIFIER}),
+    ]
+}
+ACTIVE_CALL = {
+    "call_id": IDENTIFIER,
+    "app_class": choices("dion", "browser", "other"),
+    "variant1": BOOL,
+    "measured_mono_ms": UINT,
+}
 ADMISSION = {**CAPTURE, "blocked_epoch": UINT, "admission_mono_ms": UINT}
 # Every listed field is required unless explicitly in optional.
 COMMAND_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
@@ -258,9 +255,8 @@ REPLIES: dict[str, dict[str, tuple[str, ...]]] = {
     },
 }
 REPLY_FIELDS: dict[str, dict[str, Any]] = {
-    "meeting.detector.started": {"own_client_index": UINT},
+    "meeting.detector.started": {"apps_version": UINT},
     "meeting.detector.stopped": {},
-    "meeting.call.state": {"active": BOOL},
     "meeting.capture.prepared": {
         **CAPTURE,
         **PAUSE,
@@ -311,11 +307,6 @@ REPLY_FIELDS: dict[str, dict[str, Any]] = {
 }
 OPTIONAL.update(
     {
-        "meeting.call.state": {
-            "call_id": IDENTIFIER,
-            "app_class": choices("dion", "browser", "other"),
-            "target": TARGET,
-        },
         "meeting.capture.prepared": {
             "far_reason": text_schema(120),
             "lock_signal_unavailable": BOOL,
@@ -337,17 +328,17 @@ TRACK_EVENT = {
 REPLY_FIELDS["meeting.capture.track"] = TRACK_EVENT
 EVENT_FIELDS: dict[str, dict[str, dict[str, Any]]] = {
     "meeting-capture": {
-        "meeting.call.started": {
-            **IDENTITY,
-            "call_id": IDENTIFIER,
-            "app_class": choices("dion", "browser", "other"),
-            "verified": choices("declared-verified", "declared", "mismatch", "unverified"),
-            "has_target": BOOL,
-        },
+        "meeting.call.started": ACTIVE_CALL,
         "meeting.call.ended": {
-            **IDENTITY,
             "call_id": IDENTIFIER,
-            "reason": choices("mic_released", "app_gone"),
+            "reason": choices(
+                "mic_released", "app_gone", "server_changed", "evicted", "detector_off"
+            ),
+        },
+        "meeting.detector.code": {
+            "purpose": choices(*(purpose.value for purpose in DetectorPurpose)),
+            "code": choices(*(code.value for code in DetectorCode)),
+            "duration_ms": UINT,
         },
         "meeting.capture.alive": {
             **CAPTURE,
@@ -518,11 +509,18 @@ def schemas(role: str) -> dict[str, dict[str, Any]]:
         for kind, fields in commands.items()
     }
     for kind, allowed in REPLIES[role].items():
-        result[kind] = _schema(
-            kind,
-            {"req": IDENTIFIER, "request_type": choices(*allowed), **REPLY_FIELDS[kind]},
-            OPTIONAL.get(kind),
-        )
+        correlation = {"req": IDENTIFIER, "request_type": choices(*allowed)}
+        if kind == "meeting.call.state":
+            result[kind] = {
+                "anyOf": [
+                    _schema(kind, {**correlation, "active": {**BOOL, "const": False}}),
+                    _schema(
+                        kind, {**correlation, "active": {**BOOL, "const": True}, **ACTIVE_CALL}
+                    ),
+                ]
+            }
+        else:
+            result[kind] = _schema(kind, {**correlation, **REPLY_FIELDS[kind]}, OPTIONAL.get(kind))
     for kind, fields in EVENT_FIELDS[role].items():
         schema = _schema(kind, fields, OPTIONAL.get(kind))
         result[kind] = {"anyOf": [result[kind], schema]} if kind in result else schema

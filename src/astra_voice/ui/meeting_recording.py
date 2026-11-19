@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -39,7 +40,7 @@ from astra_voice.core.meeting_session import (
 from astra_voice.core.meeting_session import (
     MeetingBridge as ClickBridge,
 )
-from astra_voice.meetings.events import MeetingState
+from astra_voice.meetings.events import DETECTOR_CODE, DetectorCode, DetectorPurpose, MeetingState
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, new_meeting_id
 from astra_voice.platform.session import SessionKind
@@ -51,6 +52,7 @@ from astra_voice.worker.supervisor import WorkerSupervisor
 
 Message = dict[str, Any]
 EXIT_QUEUE_WRITE_S = 1.0  # floor for the exit-time «transcribing» write (one meeting.json)
+APP_STREAM_ENABLED = False  # Step 6a wires the role's START admission.
 log = logging.getLogger(__name__)
 
 
@@ -136,6 +138,7 @@ class MeetingRecording(QObject):
         enabled: Callable[[], bool],
         policy_allowed: Callable[[], bool],
         session_kind: SessionKind,
+        detector_allowed: Callable[[], bool] = lambda: False,
         session_factory: Callable[[], Any] = SessionMonitor,
         owns_session: bool = True,
         supervisor_factory: Callable[
@@ -152,6 +155,7 @@ class MeetingRecording(QObject):
     ) -> None:
         super().__init__(parent)
         self.store, self.enabled, self.policy_allowed = store, enabled, policy_allowed
+        self._detector_allowed = detector_allowed
         self._exit_stop_timeout = exit_stop_timeout
         self.session_kind, self.clock = session_kind, clock
         self.session_factory, self.owns_session = session_factory, owns_session
@@ -164,9 +168,9 @@ class MeetingRecording(QObject):
         self.dialog_open = False
         self.selected_source = "room"
         self._selection_touched = False
-        self.target: Message | None = None
+        self.call_id = ""
         self.app_class = ""
-        self._call_id = ""
+        self.variant1 = False
         self.no_app_split = False
         self._preview_ready = False
         self._preview_serial = 0
@@ -267,6 +271,7 @@ class MeetingRecording(QObject):
         self._retire_sent = False
         self._retire_killed = False
         self._query_req = ""
+        self._reset_detector(None)
         return self._supervisor_factory(event, exited)
 
     def bind_jobs(self, jobs: MeetingJobs) -> None:
@@ -466,15 +471,22 @@ class MeetingRecording(QObject):
                 and not self.controller._filesystem_pending
             )
             and (self.session_kind == SessionKind.FLY or self._snapshot().allowed)
-            and (
-                self.selected_source != "call" or self.target is not None and not self.no_app_split
-            )
+            and (self.selected_source != "call" or self._call_available and not self.no_app_split)
+        )
+
+    @property
+    def _call_available(self) -> bool:
+        return (
+            APP_STREAM_ENABLED
+            and bool(self.call_id)
+            and self.variant1
+            and self.app_class in {"dion", "browser"}
         )
 
     @property
     def options(self) -> list[Message]:
         rows = []
-        if self.target is not None:
+        if self._call_available:
             browser = self.app_class == "browser"
             rows.append(
                 {
@@ -520,13 +532,8 @@ class MeetingRecording(QObject):
         far: Message = {"kind": "none"}
         if self.selected_source == "all":
             far = {"kind": "sink_monitor"}
-        elif self.selected_source == "call" and self.target is not None:
-            far = {
-                "kind": "app_stream",
-                "sink_input": self.target["sink_input"],
-                "object_serial": self.target["object_serial"],
-                "call_id": self._call_id,
-            }
+        elif self.selected_source == "call" and self._call_available:
+            far = {"kind": "app_stream", "call_id": self.call_id}
         self._notice_app = self.app_class if far["kind"] == "app_stream" else ""
         if self.clicks.on_start_clicked(far):
             # A consumed role must exit before replacement; an already launched
@@ -713,6 +720,7 @@ class MeetingRecording(QObject):
 
     def policy_changed(self) -> None:
         if not self.enabled() or not self.policy_allowed():
+            self.sync_detector()
             self.close_dialog()
             if self.busy:
                 self.clicks.on_stop_clicked()
@@ -726,13 +734,81 @@ class MeetingRecording(QObject):
             self._query_req = request
         self.controller.supervisor.send({"type": kind, "request_type": kind, "req": request})
 
+    def _reset_detector(self, generation: int | None) -> None:
+        self._detector_generation = generation
+        self._detector_running: bool | None = False
+        self._detector_pending: tuple[str, str] | None = None
+        self._detector_retry_at = 0.0
+        self._detector_retry_delay = 1.0
+
+    def sync_detector(self) -> None:
+        controller = self.controller
+        role = controller.supervisor
+        # Detector request deadlines must not add another failure path during capture.
+        if self._closed or self.busy or self._retire_deadline is not None or not role.ready:
+            return
+        if controller.state == "stopped" and not self._standby_role:
+            return  # A consumed role still owes finalization and exit.
+        if self._detector_generation != role.generation:
+            self._reset_detector(role.generation)
+        allowed = self._detector_allowed()
+        kind = "meeting.detector.start" if allowed else "meeting.detector.stop"
+        if self.clock() < self._detector_retry_at:
+            return
+        if self._detector_pending is not None:
+            if self._detector_pending[1] == kind:
+                return
+        elif self._detector_running == allowed:
+            return
+
+        request = uuid4().hex
+        pending = (request, kind)
+        message: Message = {"type": kind, "request_type": kind, "req": request}
+        if allowed:
+            message["apps_version"] = 1
+        # send() can deliver a rejection synchronously.
+        self._detector_pending = pending
+        try:
+            role.send(message)
+        except Exception:
+            if self._detector_pending == pending:
+                self._detector_failed(transient=True)
+
+    def _detector_failed(self, *, transient: bool) -> None:
+        self._detector_pending = None
+        self._detector_running = None
+        if transient:
+            self._detector_retry_at = self.clock() + self._detector_retry_delay
+            self._detector_retry_delay = min(30.0, self._detector_retry_delay * 2)
+        else:
+            self._detector_retry_at = math.inf
+
+    def _detector_reply(self, reply: Message, generation: int) -> None:
+        if self._detector_generation != generation or self._detector_pending != (
+            reply.get("req"),
+            reply["request_type"],
+        ):
+            return
+        kind = reply["type"]
+        if kind in {"meeting.detector.started", "meeting.detector.stopped"}:
+            self._detector_pending = None
+            self._detector_running = kind == "meeting.detector.started"
+            self._detector_retry_at = 0.0
+            self._detector_retry_delay = 1.0
+        elif kind == "error":
+            self._detector_failed(transient=reply["code"] in {"limit", "timeout"})
+
     def _event(self, event: Message) -> None:
-        if event.get("generation") != self.controller.supervisor.generation:
+        generation = self.controller.supervisor.generation
+        if event.get("generation") != generation:
             return
         raw = {key: value for key, value in event.items() if key != "generation"}
         try:
-            ipc.decode(ipc.encode(raw, role="meeting-capture")[4:], role="meeting-capture")
+            raw = ipc.decode(ipc.encode(raw, role="meeting-capture")[4:], role="meeting-capture")
         except (ipc.FrameError, ValueError, TypeError):
+            return
+        if raw.get("request_type") in {"meeting.detector.start", "meeting.detector.stop"}:
+            self._detector_reply(raw, generation)
             return
         if raw["type"] == "meeting.call.state":
             if (
@@ -741,22 +817,25 @@ class MeetingRecording(QObject):
                 or raw.get("request_type") != "meeting.call.query"
             ):
                 return
-            self.target = None
-            if (
-                raw["active"]
-                and raw.get("app_class") in {"dion", "browser"}
-                and "target" in raw
-                and "call_id" in raw
-                and raw["target"]["verified"] in {"declared-verified", "declared"}
-            ):
-                self.target = raw["target"]
-                self.app_class = raw["app_class"]
-                self._call_id = raw["call_id"]
+            self.call_id = raw.get("call_id", "")
+            self.app_class = raw.get("app_class", "")
+            self.variant1 = raw.get("variant1", False)
+            if self._call_available:
                 if not self._selection_touched:
                     self.selected_source = "call"
-            if self.target is None and self.selected_source == "call":
+            elif self.selected_source == "call":
                 self.selected_source = "room"
             self._publish()
+            return
+        if raw["type"] in {"meeting.call.started", "meeting.call.ended"}:
+            return
+        if raw["type"] == "meeting.detector.code":
+            log.info(
+                DETECTOR_CODE,
+                DetectorPurpose(raw["purpose"]),
+                DetectorCode(raw["code"]),
+                raw["duration_ms"],
+            )
             return
         if raw["type"] == "meeting.capture.prepared":
             # Newly discovered warnings must be visible before a further click;
@@ -817,6 +896,7 @@ class MeetingRecording(QObject):
             self._indicator_guard.check()
         self.controller.tick()
         self._poll_retirement()
+        self.sync_detector()
         self._tick_jobs()
         if (
             self.dialog_open
@@ -946,7 +1026,9 @@ class MeetingRecording(QObject):
                 self.error,
                 self.warnings,
                 self.selected_source,
-                self.target,
+                self.call_id,
+                self.app_class,
+                self.variant1,
                 self.can_start,
                 self.interrupted_text,
                 tuple(self.recovered),
@@ -969,7 +1051,7 @@ class MeetingRecording(QObject):
 
     @property
     def notice_app_class(self) -> str:
-        """App class of the verified call target this recording was started with."""
+        """App class of the call this recording was started with."""
         return self._notice_app
 
     def show_notify_fallback(self, text: str) -> None:
