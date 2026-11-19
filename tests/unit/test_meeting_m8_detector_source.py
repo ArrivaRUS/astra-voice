@@ -11,6 +11,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ import pytest
 
 from astra_voice.meetings import apps
 from astra_voice.meetings.apps import load_apps
+from astra_voice.meetings.detector_rule import CallEnded, Candidate, MeetingDetectorRule
 from astra_voice.security.files import read_private
 from astra_voice.worker import meeting_detector as d
 from astra_voice.worker import meeting_metadata as m
@@ -31,6 +33,8 @@ from helpers.pulse_fakes import FakeLibrary
 pytestmark = pytest.mark.unit
 MARKER = "PRIVATE_MEDIA_HOME_USER_MAC_aabbccddeeff_LABEL"
 PID = 123456789
+CALL_PROGRAM = d.ProgramKey("dion", "dion")
+CALL_MIC = (d.Direction.MICROPHONE, 8)
 
 
 class Clock:
@@ -88,6 +92,9 @@ class Backend:
         overflow, self.overflow = self.overflow, False
         return overflow
 
+    def has_pending_notices(self) -> bool:
+        return bool(self.notices)
+
     def close(self) -> None:
         self.closed = True
         self.notices.clear()
@@ -113,6 +120,383 @@ def assert_revoked(events: tuple[d.NormalizedEvent, ...], source: d.MeetingDetec
     assert [event.kind for event in events] == [d.EventKind.RESET, d.EventKind.UNAVAILABLE]
     assert all(event.key is None and event.program is None for event in events)
     assert source.diagnostic_snapshot() == ()
+
+
+@pytest.fixture
+def call_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule]]:
+    dion = apps.AppDefinition("dion", "DION", ("dion",), (), apps.AppClass.DION)
+    monkeypatch.setattr(d, "load_apps", lambda: (dion,))
+    backend, clock = Backend(), Clock()
+    backend.streams[CALL_MIC] = stream(CALL_MIC[1], direction=CALL_MIC[0])
+    source = make(backend, clock)
+    rule = MeetingDetectorRule(clock=clock)
+    assert rule.update(source.start(), timing=source.picture_timing) == ()
+    try:
+        yield backend, clock, source, rule
+    finally:
+        source.stop()
+
+
+def test_rule_applies_deferred_microphone_removal(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+) -> None:
+    backend, clock, source, rule = call_source
+    backend.notify()
+    clock.now = 3.5
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    del backend.streams[CALL_MIC]
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    for at in (3.8, 3.9):
+        clock.now = at
+        events = source.poll()
+        assert events == ()
+        assert rule.update(events, timing=source.picture_timing) == ()
+        assert source.picture_timing == d.PictureTiming(at, 3.8, False)
+    clock.now = 4.5
+    (removed,) = source.poll()
+    assert removed.kind is d.EventKind.REMOVE
+    assert rule.update((removed,), timing=source.picture_timing) == ()
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    assert rule.candidate(CALL_PROGRAM) is None
+
+
+def test_rule_preserves_offer_when_deferred_return_crosses_off_deadline(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    assert rule.mark_offered(CALL_PROGRAM)
+    clock.now = 6.0
+    mic = backend.streams.pop(CALL_MIC)
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+
+    backend.notify()
+    clock.now = 14.75
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    backend.streams[CALL_MIC] = mic
+    backend.notify(d.Facility.MICROPHONE, d.Change.NEW, CALL_MIC[1])
+    for at in (15.5, 15.749):
+        clock.now = at
+        events = source.poll()
+        assert events == ()
+        assert rule.update(events, timing=source.picture_timing) == ()
+    clock.now = 16.5
+    (returned,) = source.poll()
+    assert returned.kind is d.EventKind.UPSERT
+    assert source.picture_timing == d.PictureTiming(16.5, 15.5, True)
+    assert rule.update((returned,), timing=source.picture_timing) == ()
+    clock.now = 22.5
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, True),
+    )
+
+
+def test_rule_keeps_offer_when_failed_lookup_crosses_off_deadline(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    assert rule.mark_offered(CALL_PROGRAM)
+    clock.now = 6.0
+    mic = backend.streams.pop(CALL_MIC)
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+
+    def missing(
+        direction: d.Direction, index: int, *, remaining: d.TimeRemaining | None = None
+    ) -> None:
+        assert (direction, index) == CALL_MIC
+        assert CALL_MIC not in backend.streams
+        clock.now = 16.1
+
+    monkeypatch.setattr(backend, "stream", missing)
+    clock.now = 15.9
+    backend.notify(d.Facility.MICROPHONE, d.Change.NEW, CALL_MIC[1])
+    events = source.poll()
+    assert_revoked(events, source)
+    assert source.picture_timing == d.PictureTiming(16.1, 15.9, False)
+    assert rule.update(events, timing=source.picture_timing) == ()
+
+    clock.now = 17.2
+    backend.streams[CALL_MIC] = mic
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    clock.now = 23.2
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, True),
+    )
+
+
+def test_rule_times_empty_snapshot_from_completion(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    assert rule.mark_offered(CALL_PROGRAM)
+    original_snapshot = backend.snapshot
+
+    def slow_snapshot(
+        *,
+        remaining: d.TimeRemaining | None = None,
+    ) -> tuple[tuple[d.RawClient, ...], tuple[d.RawStream, ...]]:
+        clock.now = 6.8
+        backend.streams.clear()
+        return original_snapshot(remaining=remaining)
+
+    monkeypatch.setattr(backend, "snapshot", slow_snapshot)
+    clock.now = 6.0
+    backend.notify(d.Facility.SERVER)
+    events = source.poll()
+    assert events == (d.NormalizedEvent(d.EventKind.RESET, 6.0),)
+    assert source.picture_timing == d.PictureTiming(6.8, 6.0, True)
+    assert rule.update(events, timing=source.picture_timing) == ()
+
+    clock.now = 15.799
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    clock.now = 17.8
+    assert rule.update(source.poll(), timing=source.picture_timing) == (CallEnded(CALL_PROGRAM),)
+
+
+def test_rule_restarts_off_deadline_after_snapshot_confirms_absence(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    assert rule.mark_offered(CALL_PROGRAM)
+    mic = backend.streams.pop(CALL_MIC)
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+
+    clock.now = 14.0
+    backend.notify(d.Facility.SERVER)
+    events = source.poll()
+    assert [event.kind for event in events] == [d.EventKind.RESET, d.EventKind.UPSERT]
+    assert source.picture_timing.confirmed
+    assert rule.update(events, timing=source.picture_timing) == ()
+    assert all(
+        event.key is None or event.key.direction is not d.Direction.MICROPHONE for event in events
+    )
+
+    for at in (16.0, 17.0, 22.999):
+        clock.now = at
+        assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    clock.now = 25.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (CallEnded(CALL_PROGRAM),)
+
+    clock.now = 25.25
+    backend.streams[CALL_MIC] = mic
+    backend.notify(d.Facility.MICROPHONE, d.Change.NEW, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    clock.now = 31.25
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+
+
+def noisy_player(backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    player_index = 33
+    backend.clients[20] = d.RawClient(20, properties(**{"application.process.binary": "player"}))
+    backend.streams[(d.Direction.OUTPUT, player_index)] = stream(player_index, client=20)
+    backend.notify(index=player_index, change=d.Change.NEW)
+    original = backend.stream
+
+    def notify_during_read(
+        direction: d.Direction, index: int, *, remaining: d.TimeRemaining | None = None
+    ) -> d.RawStream | None:
+        row = original(direction, index, remaining=remaining)
+        if direction is d.Direction.OUTPUT and index == player_index:
+            backend.notify(index=index)
+        return row
+
+    monkeypatch.setattr(backend, "stream", notify_during_read)
+
+
+def test_rule_candidate_is_available_through_unrelated_notices(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, clock, source, rule = call_source
+    noisy_player(backend, monkeypatch)
+    decisions: list[Candidate | CallEnded] = []
+    for quarter in range(16, 78):
+        clock.now = quarter / 4
+        events = source.poll()
+        assert not source.picture_timing.confirmed
+        update = rule.update(events, timing=source.picture_timing)
+        if update:
+            assert 4.0 <= clock.now <= 5.25
+        decisions.extend(update)
+        if decisions:
+            assert rule.candidate(CALL_PROGRAM) == Candidate(CALL_PROGRAM, False)
+    assert backend.calls.count(("stream", d.Direction.OUTPUT, 33)) >= 15
+    assert decisions == [Candidate(CALL_PROGRAM, False)]
+    assert rule.mark_offered(CALL_PROGRAM)
+    assert rule.candidate(CALL_PROGRAM) == Candidate(CALL_PROGRAM, True)
+
+
+def test_ready_candidate_uses_last_applied_picture_while_removal_is_pending(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    clock.now = 6.5
+    backend.notify()
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    assert rule.candidate(CALL_PROGRAM) == Candidate(CALL_PROGRAM, False)
+
+    clock.now = 6.75
+    del backend.streams[CALL_MIC]
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    events = source.poll()
+    assert events == () and not source.picture_timing.confirmed
+    assert rule.update(events, timing=source.picture_timing) == ()
+    candidate = rule.candidate(CALL_PROGRAM)
+    marked = rule.mark_offered(CALL_PROGRAM)
+    assert (candidate, marked) == (Candidate(CALL_PROGRAM, False), True)
+
+    clock.now = 7.5
+    (removed,) = source.poll()
+    assert removed.kind is d.EventKind.REMOVE
+    assert rule.update((removed,), timing=source.picture_timing) == ()
+    assert rule.candidate(CALL_PROGRAM) is None
+
+
+@pytest.mark.parametrize("returns", [False, True], ids=["still-absent", "microphone-returns"])
+def test_rule_short_gap_and_second_removal_across_snapshot(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+    returns: bool,
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    assert rule.mark_offered(CALL_PROGRAM)
+    mic = backend.streams.pop(CALL_MIC)
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+
+    clock.now = 13.05
+    backend.streams[CALL_MIC] = mic
+    backend.notify(d.Facility.MICROPHONE, d.Change.NEW, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    clock.now = 14.5
+    del backend.streams[CALL_MIC]
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    clock.now = 14.6
+    backend.notify(d.Facility.SERVER)
+    events = source.poll()
+    assert events[0].kind is d.EventKind.RESET and source.picture_timing.confirmed
+    assert rule.update(events, timing=source.picture_timing) == ()
+    clock.now = 16.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+
+    if returns:
+        clock.now = 16.2
+        backend.streams[CALL_MIC] = mic
+        backend.notify(d.Facility.MICROPHONE, d.Change.NEW, CALL_MIC[1])
+        assert rule.update(source.poll(), timing=source.picture_timing) == ()
+        clock.now = 22.2
+        assert rule.update(source.poll(), timing=source.picture_timing) == (
+            Candidate(CALL_PROGRAM, True),
+        )
+        assert not rule.mark_offered(CALL_PROGRAM)
+    else:
+        clock.now = 23.599
+        assert rule.update(source.poll(), timing=source.picture_timing) == ()
+        clock.now = 25.6
+        assert rule.update(source.poll(), timing=source.picture_timing) == (
+            CallEnded(CALL_PROGRAM),
+        )
+
+
+def test_rule_restarts_after_eight_seconds_of_absence_and_unavailable(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    assert rule.mark_offered(CALL_PROGRAM)
+    del backend.streams[CALL_MIC]
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    clock.now = 14.0
+    backend.overflow = True
+    events = source.poll()
+    assert_revoked(events, source)
+    assert rule.update(events, timing=source.picture_timing) == ()
+    clock.now = 14.2
+    events = source.poll()
+    assert events[0].kind is d.EventKind.RESET and source.picture_timing.confirmed
+    assert rule.update(events, timing=source.picture_timing) == ()
+    for at in (16.0, 23.199):
+        clock.now = at
+        assert rule.update(source.poll(), timing=source.picture_timing) == ()
+    clock.now = 25.2
+    assert rule.update(source.poll(), timing=source.picture_timing) == (CallEnded(CALL_PROGRAM),)
+
+
+@pytest.mark.parametrize("returns", [False, True], ids=["still-absent", "microphone-returns"])
+def test_rule_off_waits_for_confirmed_absence_under_unrelated_notices(
+    call_source: tuple[Backend, Clock, d.MeetingDetectorSource, MeetingDetectorRule],
+    monkeypatch: pytest.MonkeyPatch,
+    returns: bool,
+) -> None:
+    backend, clock, source, rule = call_source
+    clock.now = 6.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, False),
+    )
+    assert rule.mark_offered(CALL_PROGRAM)
+    mic = backend.streams.pop(CALL_MIC)
+    backend.notify(d.Facility.MICROPHONE, d.Change.REMOVE, CALL_MIC[1])
+    assert rule.update(source.poll(), timing=source.picture_timing) == ()
+
+    with monkeypatch.context() as patch:
+        noisy_player(backend, patch)
+        for quarter in range(56, 80):
+            clock.now = quarter / 4
+            events = source.poll()
+            assert not source.picture_timing.confirmed
+            assert rule.update(events, timing=source.picture_timing) == ()
+
+    if returns:
+        backend.streams[CALL_MIC] = mic
+        backend.notify(d.Facility.MICROPHONE, d.Change.NEW, CALL_MIC[1])
+    clock.now = 20.0
+    events = source.poll()
+    assert source.picture_timing.confirmed
+    if not returns:
+        assert rule.update(events, timing=source.picture_timing) == (CallEnded(CALL_PROGRAM),)
+        return
+
+    assert rule.update(events, timing=source.picture_timing) == ()
+    clock.now = 26.0
+    assert rule.update(source.poll(), timing=source.picture_timing) == (
+        Candidate(CALL_PROGRAM, True),
+    )
 
 
 def test_snapshot_changes_and_one_second_coalescing() -> None:
@@ -1026,10 +1410,13 @@ def test_native_snapshot_notices_are_processed_at_next_tick(
         event for event in upserts(source.start()) if event.key and event.key.index == 7
     )
     assert original_event.muted is False
+    assert source.picture_timing == d.PictureTiming(0.0, None, False)
     clock.now = 0.2
     assert source.poll() == ()
+    assert source.picture_timing == d.PictureTiming(0.2, 0.0, False)
     clock.now = 1
     (changed,) = source.poll()
+    assert source.picture_timing == d.PictureTiming(1.0, 0.0, True)
     assert changed.kind is d.EventKind.UPSERT and changed.key == original_event.key
     assert changed.muted is True
     assert pulse.calls.count("pa_context_get_sink_input_info") == 1

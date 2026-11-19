@@ -3,7 +3,7 @@
 The role's metadata loop calls start/poll/stop, serially, outside the GUI.
 No Python thread is created here. Native callbacks only enqueue notices; list
 queries are reserved for snapshots/resync, changes use by-index introspection.
-Only NormalizedEvent / diagnostic_snapshot leave this boundary. Raw properties
+Only normalized events, picture timing and diagnostics leave this boundary. Raw properties
 are private, projected before caching, and never logged or included in repr.
 """
 
@@ -90,6 +90,15 @@ class NormalizedEvent:
 
 
 @dataclass(frozen=True)
+class PictureTiming:
+    """Observation time and the earliest pending change in this poll."""
+
+    at: float
+    changes_since: float | None
+    confirmed: bool
+
+
+@dataclass(frozen=True)
 class RawClient:
     index: int
     properties: Mapping[str, object] = field(default_factory=dict, repr=False)
@@ -168,6 +177,7 @@ class MetadataBackend(Protocol):
     ) -> RawStream | None: ...
     def poll(self) -> tuple[tuple[Notice, ...], bool]: ...
     def take_overflow(self) -> bool: ...
+    def has_pending_notices(self) -> bool: ...
     def close(self) -> None: ...
 
 
@@ -250,7 +260,18 @@ class MeetingDetectorSource:
         self._keys: dict[tuple[Direction, int], StreamKey] = {}
         self._published: dict[tuple[Direction, int], NormalizedEvent] = {}
         self._pending: dict[tuple[Facility, int], _Pending] = {}
+        self._pending_since: float | None = None
+        self._changes_since: float | None = None
         self._own: frozenset[int] = frozenset()
+
+    @property
+    def picture_timing(self) -> PictureTiming:
+        """Read immediately after start/poll, including when it returned no events."""
+        return PictureTiming(
+            self._last_time,
+            self._changes_since,
+            self._phase is _Phase.LIVE and self._pending_since is None,
+        )
 
     def _now(self) -> float:
         now = self.clock()
@@ -266,6 +287,7 @@ class MeetingDetectorSource:
         self._keys.clear()
         self._published.clear()
         self._pending.clear()
+        self._pending_since = None
         self._own = frozenset()
         return NormalizedEvent(EventKind.RESET, now)
 
@@ -499,7 +521,7 @@ class MeetingDetectorSource:
             self._check_cache_growth()
         self._clients[index] = self._client(raw)
 
-    def _publish(self, *, remaining: TimeRemaining) -> tuple[NormalizedEvent, ...]:
+    def _publish(self, *, started: float, remaining: TimeRemaining) -> tuple[NormalizedEvent, ...]:
         now = self._now()
         updated: dict[tuple[Direction, int], NormalizedEvent] = {}
         events: list[NormalizedEvent] = []
@@ -530,6 +552,9 @@ class MeetingDetectorSource:
         if self._backend.take_overflow():
             raise MetadataUnavailable()
         self._budget(remaining)
+        if not self._pending:
+            # Introspection can dispatch new notices. Leave them for the next poll.
+            self._pending_since = started if self._backend.has_pending_notices() else None
         self._published = updated
         self._phase = _Phase.LIVE
         return tuple(events)
@@ -552,7 +577,7 @@ class MeetingDetectorSource:
             else:
                 self._load_changes(remaining)
             self._own = self._own_indexes()
-            events = self._publish(remaining=remaining)
+            events = self._publish(started=now, remaining=remaining)
         except MetadataCapacity:
             return self._capacity()
         except MetadataDisconnected:
@@ -578,6 +603,7 @@ class MeetingDetectorSource:
     def start(self) -> tuple[NormalizedEvent, ...]:
         if self._phase is not _Phase.STOPPED:
             return ()
+        self._changes_since = None
         now = self._now()
         if now >= self._next_snapshot_at and (
             self._catalog_retry_at is None or now >= self._catalog_retry_at
@@ -594,6 +620,7 @@ class MeetingDetectorSource:
         return self._connect()
 
     def poll(self) -> tuple[NormalizedEvent, ...]:
+        self._changes_since = None
         if self._phase is _Phase.STOPPED:
             return ()
         started = now = self._now()
@@ -613,6 +640,9 @@ class MeetingDetectorSource:
         try:
             notices, overflow = self._backend.poll()
             self._observe(notices, overflow)
+            if notices and self._pending_since is None:
+                self._pending_since = started
+            self._changes_since = self._pending_since
             now = self._now()
             if self._phase is _Phase.REBUILD or catalog_loaded:
                 if now >= self._next_at:
@@ -624,7 +654,7 @@ class MeetingDetectorSource:
             own = self._own_indexes()
             if own != self._own:
                 self._own = own
-                return self._publish(remaining=self._remaining(started))
+                return self._publish(started=started, remaining=self._remaining(started))
         except MetadataCapacity:
             return self._capacity()
         except MetadataDisconnected:

@@ -431,6 +431,10 @@ class PulseMetadata:
             self._overflow = False
             return overflow
 
+    def has_pending_notices(self) -> bool:
+        with self._lock:
+            return bool(self._notices)
+
     def close(self) -> None:
         with self._lock:
             self._closing = True
