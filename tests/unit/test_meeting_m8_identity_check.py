@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from test_meeting_m8_detector_source import PulseFake
+from test_meeting_m8_repr import repr_without_object_addresses
 from test_meeting_m8_ss import CONTROL, CONTROL_ROWS, SERVER, Child, Rig, pair, process, row
 
 from astra_voice.meetings import identity, identity_sockets, identity_ss
@@ -1154,8 +1155,9 @@ def test_public_payload_and_repr_only_expose_fixed_codes(
     assert result.anchor is not None and result.target is not None
     request = check.CheckRequest(check.Purpose.START, PROGRAM, result.anchor, 11.0)
     for internal in (result.anchor, result.target, result.target.streams[0], request, result):
+        representation = repr_without_object_addresses(internal)
         for secret in (private, EXE, str(PID), str(CLIENT), str(MIC), str(OUT), str(COOKIE)):
-            assert secret not in repr(internal)
+            assert secret not in representation
     h.pulse_failure = "query"
     h.close_fails = True
     failure = h.run()

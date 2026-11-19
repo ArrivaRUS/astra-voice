@@ -19,6 +19,7 @@ from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
+from test_meeting_m8_repr import repr_without_object_addresses
 
 from astra_voice.meetings import apps
 from astra_voice.meetings import events as meeting_events
@@ -756,10 +757,10 @@ def test_private_properties_never_escape_event_diagnostic_or_logs(
     )
     payload = (
         public
-        + repr(events)
-        + repr(backend.clients[10])
-        + repr(private_stream)
-        + repr(source)
+        + repr_without_object_addresses(events)
+        + repr_without_object_addresses(backend.clients[10])
+        + repr_without_object_addresses(private_stream)
+        + repr_without_object_addresses(source)
         + caplog.text
     )
     for private in (MARKER, str(PID), str(PID + 1), "application.", "media.name", "verdict"):

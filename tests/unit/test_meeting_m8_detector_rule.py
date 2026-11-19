@@ -7,6 +7,7 @@ from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
+from test_meeting_m8_repr import repr_without_object_addresses
 
 from astra_voice.meetings.apps import AppClass, AppDefinition
 from astra_voice.meetings.detector_rule import CallEnded, Candidate, MeetingDetectorRule
@@ -408,10 +409,10 @@ def test_decisions_state_repr_and_logs_are_anonymized(
     assert decisions == (Candidate(DION, False),)
     assert rule.mark_offered(DION)
     surfaces = (
-        repr(rule),
-        repr(vars(rule)),
-        repr(decisions),
-        repr(rule.candidate(DION)),
+        repr_without_object_addresses(rule),
+        repr_without_object_addresses(vars(rule)),
+        repr_without_object_addresses(decisions),
+        repr_without_object_addresses(rule.candidate(DION)),
         caplog.text,
     )
     for surface in surfaces:

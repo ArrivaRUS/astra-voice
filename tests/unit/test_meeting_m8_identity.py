@@ -12,6 +12,7 @@ from dataclasses import is_dataclass, replace
 from pathlib import Path
 
 import pytest
+from test_meeting_m8_repr import repr_without_object_addresses
 
 from astra_voice.meetings import identity as identity_module
 from astra_voice.meetings.apps import AppClass, AppDefinition, AppVerification, load_apps
@@ -672,7 +673,7 @@ def test_review_all_identity_dataclass_reprs_hide_process_generation() -> None:
             instance = instances[name]
             assert type(instance) is cls
             seen.add(name)
-            representation = repr(instance)
+            representation = repr_without_object_addresses(instance)
             if any(marker in representation for marker in markers):
                 leaks.append(name)
     assert seen == set(instances)
