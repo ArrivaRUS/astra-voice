@@ -37,9 +37,10 @@ from astra_voice.worker.meeting_detector import (
     check_picture_size,
     project_properties,
 )
-from astra_voice.worker.monitor_stream import _ChannelMap, _InputInfo, _Volume
+from astra_voice.worker.monitor_stream import _ChannelMap, _InputInfo, _ServerInfo, _Volume
 from astra_voice.worker.pulse_stream import (
     PA_CONTEXT_FAILED,
+    PA_CONTEXT_NOAUTOSPAWN,
     PA_CONTEXT_READY,
     PA_CONTEXT_TERMINATED,
     SubscribeCallback,
@@ -122,15 +123,26 @@ def _declare(pulse: Any) -> None:
 class PulseMetadata:
     """Private notice queue and bounded by-index/list introspection."""
 
-    def __init__(self, *, pulse: Any = None, server: bytes | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        pulse: Any = None,
+        server: bytes | None = None,
+        subscribe: bool = True,
+        deadline: float | None = None,
+        context_name: bytes = b"astra-voice-meeting-metadata",
+        binary_limit: int = MAX_PROPERTY_BYTES,
+    ) -> None:
         self._lock = threading.RLock()
+        self._deadline = deadline
+        self._binary_limit = binary_limit
         self._pulse: Any = pulse if pulse is not None else _PulseAsync()
         self._context: int | None = None
-        self._callback: Any = SubscribeCallback(self._notice)
+        self._callback: Any = SubscribeCallback(self._notice) if subscribe else None
         self._notices: deque[Notice] = deque()
         self._overflow = False
         self._closing = False
-        self._callback_detached = False
+        self._callback_detached = not subscribe
         self._disconnected = False
         self._unreferenced = False
         self._mainloop_freed = False
@@ -144,21 +156,27 @@ class PulseMetadata:
             api = self._pulse.mainloop_get_api(self._pulse.mainloop)
             if not api:
                 raise MetadataUnavailable()
-            self._context = self._pulse.context_new(api, b"astra-voice-meeting-metadata")
-            deadline = time.monotonic() + OPERATION_SECONDS
-            if not self._context or self._pulse.context_connect(self._context, server, 1, None) < 0:
+            self._context = self._pulse.context_new(api, context_name)
+            connect_deadline = self._operation_deadline()
+            _time_left(connect_deadline, None)
+            if (
+                not self._context
+                or self._pulse.context_connect(self._context, server, PA_CONTEXT_NOAUTOSPAWN, None)
+                < 0
+            ):
                 raise MetadataDisconnected()
             self._wait(
                 lambda: self._pulse.context_get_state(self._context) == PA_CONTEXT_READY,
-                deadline,
+                connect_deadline,
                 connecting=True,
             )
             self._check()
             self.own_index = int(self._pulse.lib.pa_context_get_index(self._context))
             if not 0 <= self.own_index < INVALID_INDEX:
                 raise MetadataUnavailable()
-            self._pulse.context_set_subscribe_callback(self._context, self._callback, None)
-            self._subscribe(SUBSCRIPTION_MASK)
+            if subscribe:
+                self._pulse.context_set_subscribe_callback(self._context, self._callback, None)
+                self._subscribe(SUBSCRIPTION_MASK)
         except BaseException as error:
             try:
                 self.close()
@@ -167,6 +185,11 @@ class PulseMetadata:
                     raise MetadataOpenFailed(self) from None
                 raise error from None
             raise
+
+    def _operation_deadline(self) -> float:
+        return (
+            self._deadline if self._deadline is not None else time.monotonic() + OPERATION_SECONDS
+        )
 
     def _check(self, *, connecting: bool = False) -> None:
         if self._closing or not self._context:
@@ -194,7 +217,10 @@ class PulseMetadata:
         while not ready():
             self._check(connecting=connecting)
             left = _time_left(deadline, remaining)
-            self._iterate(min(5000, math.ceil(left * 1_000_000)))
+            micros = left * 1_000_000
+            self._iterate(
+                min(5000, int(micros) if self._deadline is not None else math.ceil(micros))
+            )
         _time_left(deadline, remaining)
 
     @contextmanager
@@ -232,7 +258,8 @@ class PulseMetadata:
         self._callbacks.append(callback)
         try:
             with self._request():
-                deadline = time.monotonic() + OPERATION_SECONDS
+                deadline = self._operation_deadline()
+                _time_left(deadline, None)
                 op = self._pulse.lib.pa_context_subscribe(self._context, mask, callback, None)
                 with self._operation(op):
                     self._wait(lambda: success is not None, deadline)
@@ -277,7 +304,12 @@ class PulseMetadata:
                 ):
                     continue
                 # Bound BEFORE copying bytes; never strlen()/decode a raw name.
-                if not pointer.value or not 0 < size.value <= MAX_PROPERTY_BYTES + 1:
+                limit = (
+                    self._binary_limit
+                    if name == "application.process.binary"
+                    else MAX_PROPERTY_BYTES
+                )
+                if not pointer.value or not 0 < size.value <= limit + 1:
                     valid = False
                     continue
                 raw = C.string_at(pointer, size.value)
@@ -314,6 +346,8 @@ class PulseMetadata:
             if done:
                 return
             try:
+                if self._deadline is not None:
+                    _time_left(self._deadline, remaining)
                 if eol:
                     done = True
                     # PA_ERR_NOENTITY (5) is a normal removal during by-index lookup.
@@ -359,7 +393,7 @@ class PulseMetadata:
                     self._pulse.lib,
                     f"pa_context_get_{kind}_info" + ("_list" if index is None else ""),
                 )
-                deadline = time.monotonic() + OPERATION_SECONDS
+                deadline = self._operation_deadline()
                 _time_left(deadline, remaining)
                 op = (
                     method(self._context, callback, None)
@@ -389,6 +423,30 @@ class PulseMetadata:
                 "source_output", None, remaining=remaining, prior_rows=len(clients) + len(outputs)
             )
             return clients, cast(tuple[RawStream, ...], outputs + inputs)
+
+    def server_cookie(self) -> int:
+        callback_type = C.CFUNCTYPE(None, C.c_void_p, C.POINTER(_ServerInfo), C.c_void_p)
+        cookie: int | None = None
+        done = False
+
+        @callback_type
+        def receive(context: int, info: Any, unused: int) -> None:
+            nonlocal cookie, done
+            if info:
+                cookie = int(info.contents.cookie)
+            done = True
+
+        with self._lock, self._request():
+            deadline = self._operation_deadline()
+            _time_left(deadline, None)
+            method = self._pulse.lib.pa_context_get_server_info
+            method.argtypes = [C.c_void_p, callback_type, C.c_void_p]
+            method.restype = C.c_void_p
+            with self._operation(method(self._context, receive, None)):
+                self._wait(lambda: done, deadline)
+            if cookie is None:
+                raise MetadataUnavailable()
+            return cookie
 
     def client(self, index: int, *, remaining: TimeRemaining | None = None) -> RawClient | None:
         with self._lock:

@@ -10,6 +10,7 @@ import stat
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 
 from astra_voice.core.childenv import clean_env
 from astra_voice.meetings.identity import DIRECTORY_FLAGS, Reason
@@ -59,9 +60,10 @@ def _ss_absent() -> bool:
 class SsRunner:
     """Keep only the child handle until reaped. Call shutdown at role shutdown."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_launch: Callable[[], None] | None = None) -> None:
         self._child: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
+        self._on_launch = on_launch
 
     def run(self, deadline: float) -> bytearray:
         if not self._lock.acquire(blocking=False):
@@ -80,6 +82,8 @@ class SsRunner:
         if not math.isfinite(deadline) or deadline < now + SS_MIN_START_BUDGET:
             raise SsFailure(Reason.SS_TIMEOUT)
         deadline = min(deadline, now + SS_TIMEOUT)
+        if self._on_launch is not None:
+            self._on_launch()
         try:
             child = subprocess.Popen(
                 SS_ARGV,

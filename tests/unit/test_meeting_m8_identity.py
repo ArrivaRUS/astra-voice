@@ -464,23 +464,21 @@ def test_legacy_positional_constructor_can_still_roundtrip() -> None:
     assert AppDefinition.from_dict(app.to_dict()) == app
 
 
-@pytest.mark.parametrize(
-    "connections,claimants,reason",
-    [(0, 1, Reason.NO_CONNECTION), (1, 2, Reason.COUNTER)],
-)
-def test_review_declared_only_preserves_negative_sockets(
+@pytest.mark.parametrize("connections,claimants", [(0, 1), (1, 2)])
+def test_declared_only_can_offer_without_socket_evidence(
     proc: ProcReader,
     connections: int,
     claimants: int,
-    reason: Reason,
 ) -> None:
     sockets = Connections(connections)
     identity = IdentityChecker(declared_only_catalog(), proc, uid=UID, connections=sockets)
     results = identity.check([client(index) for index in range(claimants)])
     assert sockets.seen == [KEY] * claimants
-    assert all(result == Identity(Verdict.MISMATCH, AppClass.DION, reason) for result in results)
-    assert all(not result.variant1_allowed for result in results)
-    assert all(result.offer_allowed == (reason is Reason.COUNTER) for result in results)
+    assert all(
+        result == Identity(Verdict.DECLARED, AppClass.DION, Reason.DECLARED_ONLY)
+        for result in results
+    )
+    assert all(result.offer_allowed and not result.variant1_allowed for result in results)
 
 
 def test_review_process_exits_inside_pinned_snapshot(
@@ -592,7 +590,8 @@ def test_review_repeat_snapshot_error_overrides_negative_sockets(
     sockets = Connections(connections)
     results = IdentityChecker(catalog, proc, uid=UID, connections=sockets).check(items)
     assert reads == 2 * claimants and len(sockets.seen) == claimants
-    assert all(result.reason is reason for result in control)
+    expected = reason if measured_exe else Reason.DECLARED_ONLY
+    assert all(result.reason is expected for result in control)
     assert all(
         result == Identity(Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE)
         for result in results

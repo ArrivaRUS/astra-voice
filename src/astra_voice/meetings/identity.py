@@ -17,7 +17,7 @@ import re
 import time
 import unicodedata
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -404,6 +404,7 @@ class IdentityChecker:
         *,
         own_client_indexes: frozenset[int] = frozenset(),
         own_native_processes: frozenset[ProcessKey] = frozenset(),
+        checkpoint: Callable[[], None] | None = None,
     ) -> tuple[Identity, ...]:
         if len(clients) > MAX_CLIENTS:
             return tuple(Identity(Verdict.DECLARED, reason=Reason.LIMIT) for _ in clients)
@@ -411,6 +412,8 @@ class IdentityChecker:
         # failed claimant must not make another stream with that PID verified.
         claims: dict[int, set[int]] = {}
         for client in clients:
+            if checkpoint is not None:
+                checkpoint()
             if type(client.index) is not int or not 0 <= client.index < 2**32 - 1:
                 return tuple(Identity(Verdict.DECLARED, reason=Reason.PROPERTIES) for _ in clients)
             if client.index in own_client_indexes or self._native(client):
@@ -420,9 +423,14 @@ class IdentityChecker:
                 if pid is not None:
                     claims.setdefault(pid, set()).add(client.index)
         counts = Counter({pid: len(indexes) for pid, indexes in claims.items()})
-        return tuple(
-            self._check_safe(c, counts, own_client_indexes, own_native_processes) for c in clients
-        )
+        results: list[Identity] = []
+        for client in clients:
+            if checkpoint is not None:
+                checkpoint()
+            results.append(
+                self._check_safe(client, counts, own_client_indexes, own_native_processes)
+            )
+        return tuple(results)
 
     def _check_safe(
         self,
@@ -528,24 +536,21 @@ class IdentityChecker:
             evidence = SocketEvidence(reason=Reason.SS_TIMEOUT)
         except (ProcUnavailable, OSError, ValueError):
             evidence = SocketEvidence()
-        # Missing catalog paths prevent promotion, never negative socket checks.
-        if evidence.connections is None:
+        if declared_only:
+            result = Identity(Verdict.DECLARED, kind, Reason.DECLARED_ONLY)
+        elif evidence.connections is None:
             reason = (
                 evidence.reason
                 if type(evidence.reason) is Reason and evidence.reason in SOCKET_UNCERTAINTY
                 else Reason.SS_INSUFFICIENT
             )
-            result = Identity(
-                Verdict.DECLARED, kind, Reason.DECLARED_ONLY if declared_only else reason
-            )
+            result = Identity(Verdict.DECLARED, kind, reason)
         elif type(evidence.connections) is not int or not 0 <= evidence.connections <= MAX_CLIENTS:
             result = Identity(Verdict.DECLARED, kind, Reason.LIMIT)
         elif evidence.connections == 0:
             result = Identity(Verdict.MISMATCH, kind, Reason.NO_CONNECTION)
         elif counts.get(pid, 0) > evidence.connections:
             result = Identity(Verdict.MISMATCH, kind, Reason.COUNTER)
-        elif declared_only:
-            result = Identity(Verdict.DECLARED, kind, Reason.DECLARED_ONLY)
         else:
             result = Identity(Verdict.VERIFIED, kind, Reason.CONNECTION)
         try:
