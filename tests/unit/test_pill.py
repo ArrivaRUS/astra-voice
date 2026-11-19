@@ -27,6 +27,7 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.ui import indicators, notify
 from astra_voice.ui import pill as module
 from astra_voice.ui.pill import (
+    CLIPBOARD_KEY_HELD,
     CLIPBOARD_NOT_FETCHED,
     CLIPBOARD_REASONS,
     CLIPBOARD_WINDOW_CHANGED,
@@ -858,16 +859,17 @@ def test_unregistered_text_never_reaches_qml_or_logs(
     assert marker not in vars(harness.pill).values()
 
 
+@pytest.mark.parametrize("reason", sorted(CLIPBOARD_REASONS))
 def test_registered_clipboard_reason_reaches_qml(
-    harness: Harness, caplog: pytest.LogCaptureFixture
+    harness: Harness, reason: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    harness.pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
-    assert harness.properties["label"] == CLIPBOARD_WINDOW_CHANGED
+    harness.pill.show_state(PillState.CLIPBOARD_ONLY, text=reason)
+    assert harness.properties["label"] == reason
     assert not caplog.records
     harness.pill.set_enabled(False)
     assert harness.properties["label"] == ""
     harness.pill.set_forced(True)
-    assert harness.properties["label"] == CLIPBOARD_WINDOW_CHANGED
+    assert harness.properties["label"] == reason
     harness.clock.advance(EXPECTED_DURATIONS[PillState.CLIPBOARD_ONLY])
     assert harness.properties["label"] == ""
 
@@ -897,9 +899,15 @@ def test_unregistered_clipboard_reason_uses_fallback_and_is_not_logged(
 
 def test_clipboard_registry_is_exact() -> None:
     assert CLIPBOARD_REASONS == frozenset(
-        ("Окно сменилось — текст в буфере", "Окно не приняло текст — он в буфере")
+        (
+            "Окно сменилось — текст в буфере",
+            "Окно не приняло текст — он в буфере",
+            "Зажата клавиша — текст в буфере",
+        )
     )
-    assert CLIPBOARD_REASONS == frozenset((CLIPBOARD_WINDOW_CHANGED, CLIPBOARD_NOT_FETCHED))
+    assert CLIPBOARD_REASONS == frozenset(
+        (CLIPBOARD_WINDOW_CHANGED, CLIPBOARD_NOT_FETCHED, CLIPBOARD_KEY_HELD)
+    )
 
 
 @pytest.mark.parametrize("state", [s for s in PillState if s is not PillState.CLIPBOARD_ONLY])
@@ -1667,15 +1675,15 @@ def test_show_latency_logged_through_return_from_show(
     assert "show_state → show() 25.00 мс" in caplog.text
 
 
-def test_real_qml_clears_root_and_presentation_labels() -> None:
+def test_real_qml_displays_clipboard_labels_and_clears_hidden_labels() -> None:
     # Отдельный процесс сохраняет unit-набор независимым от глобального QApplication.
     # Проверяем настоящий QML, включая прямое изменение avState без Python-моста.
     source = """
 from PyQt5 import sip
-from PyQt5.QtCore import QObject
+from PyQt5.QtCore import QObject, QPointF
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtQuick import QQuickView
-from astra_voice.ui.pill import Pill, PillState, ERROR_MICROPHONE_UNAVAILABLE
+from astra_voice.ui.pill import Pill, PillState, CLIPBOARD_REASONS, ERROR_MICROPHONE_UNAVAILABLE
 from astra_voice.ui.icons import install_icon_provider
 
 app = QApplication([])
@@ -1688,6 +1696,17 @@ presentation = next(
     if child.metaObject().indexOfProperty("label") >= 0
     and child.metaObject().indexOfProperty("name") >= 0
 )
+caption = root.findChild(QObject, "commandPillCaption")
+for reason in sorted(CLIPBOARD_REASONS):
+    pill.show_state(PillState.CLIPBOARD_ONLY, text=reason)
+    assert root.property("label") == presentation.property("label") == reason
+    assert caption.property("text") == reason
+    assert caption.property("elide") == 3  # Text.ElideNone
+    assert not caption.property("truncated")
+    left = caption.mapToItem(root, QPointF(0, 0)).x()
+    padding = root.property("paddingX")
+    assert left >= padding - 0.01
+    assert left + caption.property("contentWidth") <= root.property("pillWidth") - padding + 0.01
 for transition in ("hidden", "disabled", "setting", "expiry"):
     pill.set_enabled(True)
     pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE)

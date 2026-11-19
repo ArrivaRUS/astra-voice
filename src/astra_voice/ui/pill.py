@@ -56,7 +56,10 @@ ERROR_REASONS: Final = frozenset(
 # Допустимые уточняющие подписи CLIPBOARD_ONLY для оркестрации.
 CLIPBOARD_WINDOW_CHANGED: Final = "Окно сменилось — текст в буфере"
 CLIPBOARD_NOT_FETCHED: Final = "Окно не приняло текст — он в буфере"
-CLIPBOARD_REASONS: Final = frozenset((CLIPBOARD_WINDOW_CHANGED, CLIPBOARD_NOT_FETCHED))
+CLIPBOARD_KEY_HELD: Final = "Зажата клавиша — текст в буфере"
+CLIPBOARD_REASONS: Final = frozenset(
+    (CLIPBOARD_WINDOW_CHANGED, CLIPBOARD_NOT_FETCHED, CLIPBOARD_KEY_HELD)
+)
 
 
 class PillState(Enum):

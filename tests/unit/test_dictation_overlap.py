@@ -61,6 +61,7 @@ from astra_voice.platform.cowork import DeliveryResult
 from astra_voice.platform.hotkey import HotkeyMode, HotkeyState
 from astra_voice.platform.paste import PasteOutcomeKind
 from astra_voice.ui.pill import (
+    CLIPBOARD_KEY_HELD,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_MICROPHONE_CHANGED,
     ERROR_RECOGNITION_FAILED,
@@ -1389,6 +1390,9 @@ def test_unsent_first_paste_waits_for_second_release_and_retries(
 def test_unsent_first_paste_retries_after_second_is_cancelled(rig: OverlapRig, reason: str) -> None:
     """T-283: ждущая A не застревает, если B отменили Esc: A вставляется, B — нет."""
     press_during_failed_first_paste(rig, reason)
+    assert rig.texts() == [A_TEXT]
+    assert dictation_results(rig) == []
+    assert clipboard_notices(rig) == 0
     rig.fsm.escape(rig.now)
     assert rig.sent_ids("record.cancel") == [rig.uids[B]]
     rig.event_for(B, "cancelled")
@@ -1419,7 +1423,7 @@ def test_keys_held_without_second_recording_stays_final(rig: OverlapRig) -> None
     rig.result_for(A, A_TEXT)
     rig.paste_reason = ""
     assert rig.texts() == [A_TEXT]
-    assert rig.pill.calls[-1] == (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED, None)
+    assert rig.pill.calls[-1] == (PillState.CLIPBOARD_ONLY, CLIPBOARD_KEY_HELD, None)
     assert dictation_results(rig) == ["ok"]
     assert rig.active(BUSY_RETRY_MS) == []
 
