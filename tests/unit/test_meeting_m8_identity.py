@@ -8,11 +8,8 @@ import json
 import os
 import subprocess
 import sys
-import threading
-import time
 from dataclasses import is_dataclass, replace
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -33,15 +30,14 @@ from astra_voice.meetings.identity import (
     ProcUnavailable,
     Reason,
     SocketEvidence,
+    SocketFds,
     Verdict,
 )
-from astra_voice.meetings.identity_sockets import (
-    SS_LIMIT,
-    SS_TIMEOUT,
-    AsyncConnectionProbe,
-    SocketCount,
-    SocketSample,
-    SsRequest,
+from astra_voice.meetings.identity_ss import (
+    SocketInsufficiency,
+    SocketMeasurement,
+    SsStatus,
+    _Endpoint,
 )
 
 pytestmark = pytest.mark.unit
@@ -97,6 +93,12 @@ def verified_catalog() -> tuple[AppDefinition, ...]:
         if app.app_class is AppClass.DION
         else app
         for app in load_apps()
+    )
+
+
+def declared_only_catalog() -> tuple[AppDefinition, ...]:
+    return tuple(
+        replace(app, exe=(), verification=AppVerification.DECLARED_ONLY) for app in load_apps()
     )
 
 
@@ -181,14 +183,16 @@ def test_missing_proc_field_is_negative(proc: ProcReader, field: str) -> None:
     assert not result.variant1_allowed
 
 
-def test_permission_denied_adapter_is_declared(
+def test_permission_denied_adapter_is_mismatch(
     proc: ProcReader, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def denied(pid: int) -> ProcessFacts:
         raise PermissionError(MARKER)
 
     monkeypatch.setattr(proc, "snapshot", denied)
-    assert checker(proc).check([client()])[0].verdict is Verdict.DECLARED
+    result = checker(proc).check([client()])[0]
+    assert result == Identity(Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE)
+    assert not result.offer_allowed and not result.variant1_allowed
 
 
 def test_starttime_change_same_client_and_new_client_generation(proc: ProcReader) -> None:
@@ -207,7 +211,8 @@ def test_pid_reuse_during_proc_snapshot(proc: ProcReader, monkeypatch: pytest.Mo
 
     def reuse(path: str, *, dir_fd: int | None = None) -> str:
         result = original(path, dir_fd=dir_fd)
-        (proc.root / str(PID) / "stat").write_text(stat(starttime=777))
+        if path == "exe":
+            (proc.root / str(PID) / "stat").write_text(stat(starttime=777))
         return result
 
     monkeypatch.setattr(os, "readlink", reuse)
@@ -263,10 +268,10 @@ def test_no_connection_is_negative_not_counter(proc: ProcReader) -> None:
     assert not result.offer_allowed
 
 
-def test_unavailable_ss_is_declared_with_offer(proc: ProcReader) -> None:
+def test_missing_adapter_has_no_proof_of_ss_absence(proc: ProcReader) -> None:
     result = checker(proc).check([client()])[0]
-    assert result == Identity(Verdict.DECLARED, AppClass.DION, Reason.SS_UNAVAILABLE)
-    assert result.offer_allowed and result.variant1_allowed
+    assert result == Identity(Verdict.DECLARED, AppClass.DION, Reason.SS_INSUFFICIENT)
+    assert result.offer_allowed and not result.variant1_allowed
 
 
 @pytest.mark.parametrize("count", [-1, MAX_CLIENTS + 1, True])
@@ -306,9 +311,11 @@ def test_raw_properties_never_reach_result_or_logs(
 
 
 @pytest.mark.parametrize("field", ["status", "stat"])
-def test_proc_read_limit_declared(proc: ProcReader, field: str) -> None:
+def test_proc_read_limit_mismatch(proc: ProcReader, field: str) -> None:
     (proc.root / str(PID) / field).write_bytes(b"x" * (PROC_LIMIT + 1))
-    assert checker(proc).check([client()])[0].reason is Reason.LIMIT
+    assert checker(proc).check([client()])[0] == Identity(
+        Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE
+    )
 
 
 @pytest.mark.parametrize("field", ["status", "stat"])
@@ -317,7 +324,7 @@ def test_proc_does_not_follow_field_symlinks(proc: ProcReader, field: str) -> No
     target = proc.root / "outside"
     path.rename(target)
     path.symlink_to(target)
-    assert checker(proc).check([client()])[0].verdict is Verdict.DECLARED
+    assert checker(proc).check([client()])[0].verdict is Verdict.MISMATCH
 
 
 def test_proc_does_not_follow_pid_or_root_symlink(proc: ProcReader) -> None:
@@ -325,10 +332,10 @@ def test_proc_does_not_follow_pid_or_root_symlink(proc: ProcReader) -> None:
     target = proc.root / "outside"
     folder.rename(target)
     folder.symlink_to(target, target_is_directory=True)
-    assert checker(proc).check([client()])[0].verdict is Verdict.DECLARED
+    assert checker(proc).check([client()])[0].verdict is Verdict.MISMATCH
     rootlink = proc.root / "rootlink"
     rootlink.symlink_to(proc.root, target_is_directory=True)
-    assert checker(ProcReader(rootlink)).check([client()])[0].verdict is Verdict.DECLARED
+    assert checker(ProcReader(rootlink)).check([client()])[0].verdict is Verdict.MISMATCH
 
 
 def test_stat_comm_is_not_split_on_spaces(proc: ProcReader) -> None:
@@ -353,15 +360,13 @@ def test_browser_declared_only_has_no_service_name(proc: ProcReader) -> None:
     link = proc.root / str(PID) / "exe"
     link.unlink()
     link.symlink_to("/test-fixture/firefox")  # fixture, NOT a catalog path
-    result = checker(proc, Connections()).check(
-        [client(**{"application.process.binary": "firefox"})]
-    )[0]
+    result = IdentityChecker(
+        declared_only_catalog(), proc, uid=UID, connections=Connections()
+    ).check([client(**{"application.process.binary": "firefox"})])[0]
     assert result == Identity(Verdict.DECLARED, AppClass.BROWSER, Reason.DECLARED_ONLY)
-    browser = next(app for app in load_apps() if app.app_class is AppClass.BROWSER)
-    assert (
-        browser.display_class == "Браузер" and browser.verification is AppVerification.DECLARED_ONLY
-    )
-    assert not browser.exe
+    assert result.offer_allowed and not result.variant1_allowed
+    browser = next(app for app in declared_only_catalog() if app.app_class is AppClass.BROWSER)
+    assert browser.display_class == "Браузер" and not browser.exe
 
 
 def test_old_schema_derives_verification_and_roundtrips() -> None:
@@ -407,133 +412,6 @@ def test_catalog_rejects_unknown_or_inconsistent_extensions(changes: dict[str, o
         )
 
 
-def wait_result(probe: AsyncConnectionProbe) -> SocketEvidence:
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        result = probe.evidence(KEY)
-        if result.reason is not Reason.SS_PENDING:
-            return result
-        time.sleep(0.001)
-    pytest.fail("stub worker did not finish")
-
-
-def test_ss_default_stub_unavailable_no_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
-    def forbidden(*args: object, **kwargs: object) -> Any:
-        pytest.fail("ss must remain an injected stub in step 1")
-
-    monkeypatch.setattr(subprocess, "Popen", forbidden)
-    probe = AsyncConnectionProbe()
-    probe.request()
-    assert wait_result(probe).reason is Reason.SS_UNAVAILABLE
-
-
-def test_ss_fixed_contract_async_rate_limit_cache_and_generation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("LD_PRELOAD", MARKER)
-    monkeypatch.setenv("ASTRA_VOICE_ORIG_LD_PRELOAD", MARKER)
-    monkeypatch.setenv("APPDIR", MARKER)
-    now = [10.0]
-    seen: list[SsRequest] = []
-
-    def runner(request: SsRequest) -> SocketSample:
-        assert threading.current_thread() is not threading.main_thread()
-        seen.append(request)
-        return SocketSample((SocketCount(KEY, 1),), 100)
-
-    probe = AsyncConnectionProbe(runner, clock=lambda: now[0])
-    assert probe.evidence(KEY).connections is None
-    probe.request()
-    assert wait_result(probe).connections == 1
-    request = seen[0]
-    assert request.argv == ("/usr/bin/ss", "-xp") and request.shell is False
-    assert dict(request.env) == {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
-    assert request.timeout == 2 and request.max_output == 4 * 1024 * 1024
-    probe.request()
-    now[0] = 14.999
-    probe.request()
-    assert len(seen) == 1
-    assert probe.evidence(ProcessKey(PID, 999)).reason is Reason.SS_GENERATION
-    now[0] = 15
-    assert probe.evidence(KEY).reason is Reason.SS_STALE
-    probe.request()
-    assert wait_result(probe).connections == 1 and len(seen) == 2
-
-
-@pytest.mark.parametrize(
-    "mode,reason",
-    [
-        ("missing", Reason.SS_UNAVAILABLE),
-        ("denied", Reason.SS_UNAVAILABLE),
-        ("timeout", Reason.SS_TIMEOUT),
-        ("overflow", Reason.SS_LIMIT),
-        ("rows", Reason.SS_LIMIT),
-        ("duplicate", Reason.SS_UNAVAILABLE),
-    ],
-)
-def test_ss_failed_evidence_is_declared(
-    proc: ProcReader,
-    mode: str,
-    reason: Reason,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    def runner(request: SsRequest) -> SocketSample:
-        if mode == "missing":
-            raise FileNotFoundError(MARKER)
-        if mode == "denied":
-            raise PermissionError(MARKER)
-        if mode == "timeout":
-            raise TimeoutError(MARKER)
-        if mode == "rows":
-            return SocketSample((SocketCount(KEY, 1),) * (MAX_CLIENTS + 1), 1)
-        if mode == "duplicate":
-            return SocketSample((SocketCount(KEY, 1),) * 2, 1)
-        return SocketSample((SocketCount(KEY, 1),), SS_LIMIT + 1)
-
-    probe = AsyncConnectionProbe(runner)
-    probe.request()
-    assert wait_result(probe).reason is reason
-    result = IdentityChecker(verified_catalog(), proc, uid=UID, connections=probe).check(
-        [client()]
-    )[0]
-    assert result == Identity(Verdict.DECLARED, AppClass.DION, reason)
-    assert MARKER not in caplog.text
-
-
-def test_ss_slow_backend_deadline_late_result_discarded_no_thread_growth() -> None:
-    now = [10.0]
-    entered, release, done = threading.Event(), threading.Event(), threading.Event()
-    calls: list[int] = []
-
-    def runner(request: SsRequest) -> SocketSample:
-        calls.append(1)
-        entered.set()
-        try:
-            assert release.wait(10)
-            return SocketSample((SocketCount(KEY, 1),), 1)
-        finally:
-            done.set()
-
-    probe = AsyncConnectionProbe(runner, clock=lambda: now[0])
-    try:
-        probe.request()
-        assert entered.wait(10)
-        now[0] += SS_TIMEOUT
-        assert probe.evidence(KEY).reason is Reason.SS_TIMEOUT
-        now[0] += 10
-        probe.request()
-        assert len(calls) == 1
-        release.set()
-        assert done.wait(10)
-        # Wait until the worker publishes the discarded result.
-        deadline = time.monotonic() + 10
-        while probe._pending and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert probe.evidence(KEY).connections is None
-    finally:
-        release.set()
-
-
 def test_import_identity_cannot_import_sound_capture_or_qt() -> None:
     script = """
 import sys
@@ -545,6 +423,7 @@ class Guard:
 sys.meta_path.insert(0, Guard())
 import astra_voice.meetings.identity
 import astra_voice.meetings.identity_sockets
+import astra_voice.meetings.identity_ss
 assert not any("pulse_stream" in name for name in sys.modules)
 """
     result = subprocess.run(
@@ -561,41 +440,9 @@ def test_native_browser_without_measured_path_stays_declared(proc: ProcReader) -
     link.unlink()
     link.symlink_to("/fixture-only/chromium")
     item = client(**{"client.api": "libpipewire", "pipewire.sec.pid": PID})
-    result = checker(proc).check([item])[0]
+    result = IdentityChecker(declared_only_catalog(), proc, uid=UID).check([item])[0]
     assert result == Identity(Verdict.DECLARED, AppClass.BROWSER, Reason.DECLARED_ONLY)
-
-
-def test_failure_attempts_are_rate_limited_too() -> None:
-    now = [0.0]
-    calls: list[int] = []
-
-    def runner(request: SsRequest) -> SocketSample:
-        calls.append(1)
-        raise FileNotFoundError(MARKER)
-
-    probe = AsyncConnectionProbe(runner, clock=lambda: now[0])
-    probe.request()
-    assert wait_result(probe).reason is Reason.SS_UNAVAILABLE
-    now[0] = 4.999
-    probe.request()
-    assert len(calls) == 1
-    now[0] = 5
-    probe.request()
-    assert wait_result(probe).reason is Reason.SS_UNAVAILABLE
-    assert len(calls) == 2
-
-
-def test_ss_output_limit_inclusive_and_explicit_zero(proc: ProcReader) -> None:
-    def runner(request: SsRequest) -> SocketSample:
-        return SocketSample((SocketCount(KEY, 0),), SS_LIMIT)
-
-    probe = AsyncConnectionProbe(runner)
-    probe.request()
-    assert wait_result(probe).connections == 0
-    result = IdentityChecker(verified_catalog(), proc, uid=UID, connections=probe).check(
-        [client()]
-    )[0]
-    assert result == Identity(Verdict.MISMATCH, AppClass.DION, Reason.NO_CONNECTION)
+    assert result.offer_allowed and not result.variant1_allowed
 
 
 def test_injected_exception_and_reason_cannot_leak(
@@ -608,22 +455,13 @@ def test_injected_exception_and_reason_cannot_leak(
     result = IdentityChecker(verified_catalog(), proc, uid=UID, connections=Broken()).check(
         [client()]
     )[0]
-    assert result == Identity(Verdict.DECLARED, AppClass.DION, Reason.SS_UNAVAILABLE)
+    assert result == Identity(Verdict.DECLARED, AppClass.DION, Reason.SS_INSUFFICIENT)
     assert MARKER not in caplog.text + repr(result)
 
 
 def test_legacy_positional_constructor_can_still_roundtrip() -> None:
     app = AppDefinition("dion", "DION", ("dion",), (EXE,), AppClass.DION)
     assert AppDefinition.from_dict(app.to_dict()) == app
-
-
-def test_product_dion_waits_for_measured_executable(proc: ProcReader) -> None:
-    dion = next(app for app in load_apps() if app.app_class is AppClass.DION)
-    assert not dion.exe and dion.verification is AppVerification.DECLARED_ONLY
-    result = IdentityChecker(load_apps(), proc, uid=UID, connections=Connections()).check(
-        [client()]
-    )[0]
-    assert result == Identity(Verdict.DECLARED, AppClass.DION, Reason.DECLARED_ONLY)
 
 
 @pytest.mark.parametrize(
@@ -637,7 +475,7 @@ def test_review_declared_only_preserves_negative_sockets(
     reason: Reason,
 ) -> None:
     sockets = Connections(connections)
-    identity = IdentityChecker(load_apps(), proc, uid=UID, connections=sockets)
+    identity = IdentityChecker(declared_only_catalog(), proc, uid=UID, connections=sockets)
     results = identity.check([client(index) for index in range(claimants)])
     assert sockets.seen == [KEY] * claimants
     assert all(result == Identity(Verdict.MISMATCH, AppClass.DION, reason) for result in results)
@@ -714,7 +552,8 @@ def test_review_pinned_proc_permission_is_not_disappearance(
 
     monkeypatch.setattr(ProcReader, "_read", staticmethod(denied))
     result = checker(proc).check([client()])[0]
-    assert result == Identity(Verdict.DECLARED, AppClass.DION, Reason.UNAVAILABLE)
+    assert result == Identity(Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE)
+    assert not result.offer_allowed and not result.variant1_allowed
 
 
 @pytest.mark.parametrize("measured_exe", [False, True])
@@ -723,7 +562,7 @@ def test_review_pinned_proc_permission_is_not_disappearance(
     [(0, 1, Reason.NO_CONNECTION), (1, 2, Reason.COUNTER)],
 )
 @pytest.mark.parametrize("failure", [ProcUnavailable, PermissionError])
-def test_review_negative_sockets_survive_repeat_snapshot_error(
+def test_review_repeat_snapshot_error_overrides_negative_sockets(
     proc: ProcReader,
     monkeypatch: pytest.MonkeyPatch,
     measured_exe: bool,
@@ -734,7 +573,7 @@ def test_review_negative_sockets_survive_repeat_snapshot_error(
 ) -> None:
     # Each claimant gets valid initial facts, socket evidence, then a failed
     # repeat snapshot; compare with the SAME input without the read failure.
-    catalog = verified_catalog() if measured_exe else load_apps()
+    catalog = verified_catalog() if measured_exe else declared_only_catalog()
     items = [client(index) for index in range(claimants)]
     control = IdentityChecker(catalog, proc, uid=UID, connections=Connections(connections)).check(
         items
@@ -753,26 +592,69 @@ def test_review_negative_sockets_survive_repeat_snapshot_error(
     sockets = Connections(connections)
     results = IdentityChecker(catalog, proc, uid=UID, connections=sockets).check(items)
     assert reads == 2 * claimants and len(sockets.seen) == claimants
-    assert results == control
-    assert all(result == Identity(Verdict.MISMATCH, AppClass.DION, reason) for result in results)
-    assert all(not result.variant1_allowed for result in results)
+    assert all(result.reason is reason for result in control)
+    assert all(
+        result == Identity(Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE)
+        for result in results
+    )
+    assert all(not result.offer_allowed and not result.variant1_allowed for result in results)
+
+
+@pytest.mark.parametrize("field", ["exe", "status"])
+def test_repeat_eacces_overrides_proven_socket_zero(
+    proc: ProcReader, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    reads = 0
+    original_link, original_read = os.readlink, ProcReader._read
+
+    def deny_second(name: str) -> None:
+        nonlocal reads
+        if name == field:
+            reads += 1
+            if reads == 2:
+                raise PermissionError(errno.EACCES, MARKER)
+
+    def readlink(path: str, *, dir_fd: int | None = None) -> str:
+        deny_second(path)
+        return original_link(path, dir_fd=dir_fd)
+
+    def read(directory: int, name: str) -> bytes:
+        deny_second(name)
+        return original_read(directory, name)
+
+    monkeypatch.setattr(os, "readlink", readlink)
+    monkeypatch.setattr(ProcReader, "_read", staticmethod(read))
+    sockets = Connections(0)
+    result = checker(proc, sockets).check([client()])[0]
+    assert reads == 2 and sockets.seen == [KEY]
+    assert result == Identity(Verdict.MISMATCH, AppClass.DION, Reason.UNAVAILABLE)
+    assert not result.offer_allowed and not result.variant1_allowed
 
 
 def test_review_all_identity_dataclass_reprs_hide_process_generation() -> None:
     private_pid, private_starttime = 123456789, 987654321
     key = ProcessKey(private_pid, private_starttime)
-    count = SocketCount(key, 1)
+    private_uids = (314159265, 271828182, 161803398, 141421356)
+    private_exe = "/private/" + MARKER
+    markers = (str(private_pid), str(private_starttime), *map(str, private_uids), private_exe)
     instances = {
         "Identity": Identity(Verdict.DECLARED),
         "ProcessKey": key,
-        "ProcessFacts": ProcessFacts(key, (UID, UID, UID, UID), MARKER),
+        "ProcessFacts": ProcessFacts(key, private_uids, private_exe),
         "Client": Client(
             1, {"application.process.id": private_pid, "starttime": private_starttime}
         ),
         "SocketEvidence": SocketEvidence(),
-        "SsRequest": SsRequest(),
-        "SocketCount": count,
-        "SocketSample": SocketSample((count,), 1),
+        "SocketFds": SocketFds(key, {private_pid: private_starttime}, True),
+        "SocketMeasurement": SocketMeasurement(
+            SsStatus.OK,
+            Reason.CONNECTION,
+            {key: private_pid},
+            _insufficient_by_pid={private_pid: SocketInsufficiency.FD_CHANGED},
+        ),
+        "_Endpoint": _Endpoint(
+            b"u_str", True, str(private_pid).encode(), private_starttime, str(private_pid).encode()
+        ),
     }
     seen: set[str] = set()
     leaks: list[str] = []
@@ -791,10 +673,10 @@ def test_review_all_identity_dataclass_reprs_hide_process_generation() -> None:
             assert type(instance) is cls
             seen.add(name)
             representation = repr(instance)
-            if str(private_pid) in representation or str(private_starttime) in representation:
+            if any(marker in representation for marker in markers):
                 leaks.append(name)
     assert seen == set(instances)
-    assert not leaks, "process generation leaked by dataclasses: " + ", ".join(leaks)
+    assert not leaks, "private data leaked by dataclasses: " + ", ".join(leaks)
 
 
 @pytest.mark.parametrize("measured_exe", [False, True])
@@ -819,7 +701,7 @@ def test_round3_socket_adapter_process_failures(
             calls.append(process)
             raise failure(MARKER)
 
-    catalog = verified_catalog() if measured_exe else load_apps()
+    catalog = verified_catalog() if measured_exe else declared_only_catalog()
     result = IdentityChecker(catalog, proc, uid=UID, connections=FailingSockets()).check(
         [client()]
     )[0]
@@ -840,7 +722,9 @@ def test_round3_socket_adapter_unavailability_remains_declared(
     result = IdentityChecker(
         verified_catalog(), proc, uid=UID, connections=UnavailableSockets()
     ).check([client()])[0]
-    assert result == Identity(Verdict.DECLARED, AppClass.DION, Reason.SS_UNAVAILABLE)
+    reason = Reason.SS_TIMEOUT if failure is TimeoutError else Reason.SS_INSUFFICIENT
+    assert result == Identity(Verdict.DECLARED, AppClass.DION, reason)
+    assert result.offer_allowed and not result.variant1_allowed
 
 
 def test_round3_unexpected_socket_adapter_fault_is_not_claimed_as_ss_unavailable(

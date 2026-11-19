@@ -7,9 +7,11 @@
       "binary": [
         "dion"
       ],
-      "exe": [],
+      "exe": [
+        "/opt/Dion/dion"
+      ],
       "class": "dion",
-      "verification": "declared-only"
+      "verification": "executable"
     },
     {
       "id": "browser",
@@ -22,9 +24,13 @@
         "firefox-bin",
         "firefox-esr"
       ],
-      "exe": [],
+      "exe": [
+        "/usr/lib/chromium/chromium",
+        "/opt/yandex/browser/yandex_browser",
+        "/usr/lib/firefox/firefox"
+      ],
       "class": "browser",
-      "verification": "declared-only"
+      "verification": "executable"
     }
   ]
 }

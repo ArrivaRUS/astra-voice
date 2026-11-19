@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -15,6 +17,7 @@ from astra_voice.security.files import read_private
 
 MAX_APPS_BYTES = 64 * 1024
 MAX_APPS = 128
+OWN_BINARIES = frozenset({"astra-voice", "astra_voice"})
 APP_SCHEMA = obj(
     {
         "id": {"type": "string", "pattern": r"^[a-z0-9][a-z0-9_-]{0,63}$"},
@@ -168,10 +171,20 @@ def _load_apps(path: Path) -> tuple[AppDefinition, ...]:
         if type(document["schema"]) is not int:
             raise AppDataError("Недопустимая версия списка программ")
         apps = tuple(AppDefinition.from_dict(item) for item in document["apps"])
+        # In the .deb and AppImage the running executable can be the
+        # Python interpreter. Its canonical path is what /proc/PID/exe shows.
+        own_executables = {sys.executable, os.path.realpath(sys.executable)}
+        own_binaries = OWN_BINARIES | {Path(path).name for path in own_executables}
         ids: set[str] = set()
         binaries: set[str] = set()
         executables: set[str] = set()
         for app in apps:
+            if (
+                own_binaries.intersection(app.binary)
+                or own_executables.intersection(app.exe)
+                or any(name.rsplit("/", 1)[-1] in OWN_BINARIES for name in app.exe)
+            ):
+                raise AppDataError("Список программ включает Astra Voice")
             if (
                 app.id in ids
                 or binaries.intersection(app.binary)

@@ -4,18 +4,21 @@ Inputs are normalized client/stream properties from ONE server generation.
 Only fixed enums leave this module; application.name/media.name are never used.
 Call forget() on client removal and reset() on server reconnect. Own context
 indexes must cover all our pa_context instances in this server generation.
-Socket evidence is optional and injected (see identity_sockets); unavailable
+Socket evidence is optional and injected (see identity_ss); unavailable
 checks are not negative evidence. No process or sound service is started here.
 """
 
 from __future__ import annotations
 
 import errno
+import math
 import os
 import re
+import time
 import unicodedata
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -29,6 +32,14 @@ MAX_PROPERTIES = 128
 MAX_PROPERTY_BYTES = 4096
 MAX_PID = 2**31 - 1
 MAX_STARTTIME = 2**64 - 1
+MAX_FDS = 8192
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+UID_ROW = re.compile(
+    rb"^Uid:[ \t]+([0-9]{1,10})[ \t]+([0-9]{1,10})[ \t]+"
+    rb"([0-9]{1,10})[ \t]+([0-9]{1,10})[ \t]*$",
+    re.M,
+)
+SOCKET_LINK = re.compile(r"socket:\[([0-9]{1,20})\]")
 
 
 class Verdict(StrEnum):
@@ -56,13 +67,28 @@ class Reason(StrEnum):
     REUSED = "pid_reused"
     CONFLICT = "property_conflict"
     SS_UNAVAILABLE = "ss_unavailable"
-    SS_PENDING = "ss_pending"
     SS_TIMEOUT = "ss_timeout"
     SS_LIMIT = "ss_output_limit"
-    SS_STALE = "ss_stale"
-    SS_GENERATION = "ss_process_generation"
+    SS_INSUFFICIENT = "ss_insufficient"
     NO_CONNECTION = "pulse_connection_absent"
     COUNTER = "identity_mismatch_counter"
+
+
+SOCKET_UNCERTAINTY = frozenset(
+    {Reason.SS_UNAVAILABLE, Reason.SS_TIMEOUT, Reason.SS_LIMIT, Reason.SS_INSUFFICIENT}
+)
+VARIANT1_RIGHTS = frozenset(
+    {
+        (Verdict.VERIFIED, Reason.NATIVE),
+        (Verdict.VERIFIED, Reason.CONNECTION),
+        (Verdict.DECLARED, Reason.SS_UNAVAILABLE),
+    }
+)
+OFFER_RIGHTS = (
+    VARIANT1_RIGHTS
+    | {(Verdict.DECLARED, reason) for reason in SOCKET_UNCERTAINTY | {Reason.DECLARED_ONLY}}
+    | {(Verdict.MISMATCH, Reason.COUNTER)}
+)
 
 
 @dataclass(frozen=True)
@@ -74,13 +100,20 @@ class Identity:
     @property
     def offer_allowed(self) -> bool:
         """Counter ambiguity still permits an offer (owner decision 18.11)."""
-        return self.app_class is not AppClass.OTHER and (
-            self.verdict in {Verdict.VERIFIED, Verdict.DECLARED} or self.reason is Reason.COUNTER
-        )
+        return self._known_class and (self.verdict, self.reason) in OFFER_RIGHTS
 
     @property
     def variant1_allowed(self) -> bool:
-        return self.offer_allowed and self.verdict in {Verdict.VERIFIED, Verdict.DECLARED}
+        return self._known_class and (self.verdict, self.reason) in VARIANT1_RIGHTS
+
+    @property
+    def _known_class(self) -> bool:
+        return (
+            type(self.app_class) is AppClass
+            and self.app_class is not AppClass.OTHER
+            and type(self.verdict) is Verdict
+            and type(self.reason) is Reason
+        )
 
 
 @dataclass(frozen=True)
@@ -92,8 +125,17 @@ class ProcessKey:
 @dataclass(frozen=True)
 class ProcessFacts:
     key: ProcessKey
-    uids: tuple[int, int, int, int]
+    uids: tuple[int, int, int, int] = field(repr=False)
     exe: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SocketFds:
+    """Descriptor numbers and socket inodes (zero for non-sockets)."""
+
+    key: ProcessKey
+    descriptors: Mapping[int, int] = field(repr=False)
+    complete: bool
 
 
 class ProcUnavailable(Exception):
@@ -151,52 +193,107 @@ class ProcReader:
             raise ProcUnavailable()
         return int(number)
 
-    def snapshot(self, pid: int) -> ProcessFacts:
+    @contextmanager
+    def _pinned(self, pid: int) -> Iterator[int]:
         if type(pid) is not int or not 0 < pid <= MAX_PID:
             raise ProcUnavailable()
         try:
-            root = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            root = os.open(self.root, DIRECTORY_FLAGS)
             try:
                 try:
-                    directory = os.open(
-                        str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root
-                    )
+                    directory = os.open(str(pid), DIRECTORY_FLAGS, dir_fd=root)
                 except FileNotFoundError:
                     raise ProcessGone() from None
             finally:
                 os.close(root)
             try:
-                before = self._starttime(directory, pid)
-                data = self._read(directory, "status")
-                rows = re.findall(
-                    rb"^Uid:[ \t]+([0-9]{1,10})[ \t]+([0-9]{1,10})[ \t]+"
-                    rb"([0-9]{1,10})[ \t]+([0-9]{1,10})[ \t]*$",
-                    data,
-                    re.M,
-                )
-                if len(rows) != 1:
-                    raise ProcUnavailable()
-                uids = tuple(int(value) for value in rows[0])
-                # Foreign UID is already negative evidence; never inspect its exe.
-                exe = (
-                    os.readlink("exe", dir_fd=directory) if all(u == self.uid for u in uids) else ""
-                )
-                if len(exe.encode("utf-8")) > PROC_LIMIT:
-                    raise IdentityLimit()
-                after = self._starttime(directory, pid)
-                if before != after:
-                    raise ProcessReused()
-                return ProcessFacts(
-                    ProcessKey(pid, before), (uids[0], uids[1], uids[2], uids[3]), exe
-                )
+                yield directory
             except OSError as exc:
                 if exc.errno in {errno.ENOENT, errno.ESRCH}:
                     raise ProcessGone() from None
                 raise
             finally:
                 os.close(directory)
-        except OSError:
+        except TimeoutError:
+            raise
+        except (OSError, UnicodeError):
             raise ProcUnavailable() from None
+
+    @classmethod
+    def _uids(cls, directory: int) -> tuple[int, int, int, int]:
+        rows = UID_ROW.findall(cls._read(directory, "status"))
+        if len(rows) != 1:
+            raise ProcUnavailable()
+        real, effective, saved, filesystem = rows[0]
+        return int(real), int(effective), int(saved), int(filesystem)
+
+    def snapshot(self, pid: int) -> ProcessFacts:
+        with self._pinned(pid) as directory:
+            before = self._starttime(directory, pid)
+            uids = self._uids(directory)
+            # Foreign UID is already negative evidence; never inspect its exe.
+            exe = os.readlink("exe", dir_fd=directory) if uids == (self.uid,) * 4 else ""
+            if len(exe.encode("utf-8")) > PROC_LIMIT:
+                raise IdentityLimit()
+            if before != self._starttime(directory, pid):
+                raise ProcessReused()
+            return ProcessFacts(ProcessKey(pid, before), uids, exe)
+
+    def socket_fds(self, pid: int, deadline: float) -> SocketFds:
+        """Read bounded fd evidence for our UID, without following fd links."""
+
+        def check_time() -> None:
+            if not math.isfinite(deadline) or time.monotonic() >= deadline:
+                raise TimeoutError()
+
+        check_time()
+        with self._pinned(pid) as directory:
+            if self._uids(directory) != (self.uid,) * 4:
+                raise ProcUnavailable()
+            before = self._starttime(directory, pid)
+            key = ProcessKey(pid, before)
+            descriptor = os.open("fd", DIRECTORY_FLAGS, dir_fd=directory)
+            descriptors: dict[int, int] = {}
+            complete = True
+            try:
+                with os.scandir(descriptor) as entries:
+                    for index, entry in enumerate(entries):
+                        if index >= MAX_FDS:
+                            complete = False
+                            break
+                        check_time()
+                        if (
+                            len(entry.name) > 10
+                            or not entry.name.isascii()
+                            or not entry.name.isdecimal()
+                        ):
+                            complete = False
+                            continue
+                        try:
+                            link = os.readlink(entry.name, dir_fd=descriptor)
+                        except OSError:
+                            complete = False
+                            continue
+                        match = SOCKET_LINK.fullmatch(link)
+                        inode = int(match[1]) if match else 0
+                        if (match and not 0 < inode <= MAX_STARTTIME) or (
+                            not match and link.startswith("socket:")
+                        ):
+                            complete = False
+                            continue
+                        descriptors[int(entry.name)] = inode
+            except TimeoutError:
+                raise
+            except OSError:
+                complete = False
+            finally:
+                os.close(descriptor)
+            if self._uids(directory) != (self.uid,) * 4:
+                return SocketFds(key, {}, False)
+            if before != self._starttime(directory, pid):
+                raise ProcessReused()
+            check_time()
+            return SocketFds(key, descriptors, complete)
 
 
 @dataclass(frozen=True, repr=False)
@@ -222,7 +319,7 @@ class SocketEvidence:
     """
 
     connections: int | None = None
-    reason: Reason = Reason.SS_UNAVAILABLE
+    reason: Reason = Reason.SS_INSUFFICIENT
 
 
 class ConnectionProbe(Protocol):
@@ -387,10 +484,8 @@ class IdentityChecker:
             return Identity(Verdict.MISMATCH, kind, Reason.DEAD)
         except ProcessReused:
             return Identity(Verdict.MISMATCH, kind, Reason.REUSED)
-        except IdentityLimit:
-            raise
         except Exception:
-            return Identity(Verdict.DECLARED, kind, Reason.UNAVAILABLE)
+            return Identity(Verdict.MISMATCH, kind, Reason.UNAVAILABLE)
         if any(uid != self.uid for uid in facts.uids):
             return Identity(Verdict.MISMATCH, kind, Reason.UID)
         previous = self._bindings.get(client.index)
@@ -429,11 +524,17 @@ class IdentityChecker:
             return Identity(Verdict.MISMATCH, kind, Reason.REUSED)
         except IdentityLimit:
             raise
+        except TimeoutError:
+            evidence = SocketEvidence(reason=Reason.SS_TIMEOUT)
         except (ProcUnavailable, OSError, ValueError):
-            return Identity(Verdict.DECLARED, kind, Reason.SS_UNAVAILABLE)
+            evidence = SocketEvidence()
         # Missing catalog paths prevent promotion, never negative socket checks.
         if evidence.connections is None:
-            reason = evidence.reason if type(evidence.reason) is Reason else Reason.SS_UNAVAILABLE
+            reason = (
+                evidence.reason
+                if type(evidence.reason) is Reason and evidence.reason in SOCKET_UNCERTAINTY
+                else Reason.SS_INSUFFICIENT
+            )
             result = Identity(
                 Verdict.DECLARED, kind, Reason.DECLARED_ONLY if declared_only else reason
             )
@@ -458,17 +559,6 @@ class IdentityChecker:
             return Identity(Verdict.MISMATCH, kind, Reason.DEAD)
         except ProcessReused:
             return Identity(Verdict.MISMATCH, kind, Reason.REUSED)
-        except IdentityLimit:
-            return (
-                result
-                if result.verdict is Verdict.MISMATCH
-                else Identity(Verdict.DECLARED, kind, Reason.LIMIT)
-            )
         except Exception:
-            # A failed recheck cannot erase a contradiction already established.
-            return (
-                result
-                if result.verdict is Verdict.MISMATCH
-                else Identity(Verdict.DECLARED, kind, Reason.UNAVAILABLE)
-            )
+            return Identity(Verdict.MISMATCH, kind, Reason.UNAVAILABLE)
         return result
