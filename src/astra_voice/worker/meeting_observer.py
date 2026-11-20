@@ -6,6 +6,7 @@ import socket
 import threading
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from astra_voice.meetings.detector_rule import Candidate, MeetingDetectorRule
@@ -19,6 +20,7 @@ from astra_voice.worker.meeting_detector import (
     MetadataOpenFailed,
     NormalizedEvent,
     PictureTiming,
+    ProgramKey,
 )
 
 if TYPE_CHECKING:
@@ -36,6 +38,11 @@ class ObserverBackend(MetadataBackend, Protocol):
 
 
 ObserverFactory = Callable[[bytes, ObserverConnect], ObserverBackend]
+
+
+@dataclass(frozen=True)
+class ObserverServer:
+    cookie: int = field(repr=False)
 
 
 def observer_metadata(server: bytes, connect: ObserverConnect) -> ObserverBackend:
@@ -138,13 +145,13 @@ class MeetingObserver:
         self.registry = OwnContextRegistry()
         self.rule_lock = threading.Lock()
         self.rule = MeetingDetectorRule(clock=clock)
+        self._end_revisions: dict[ProgramKey, int] = {}
         self._factory, self._read_fds, self._family = factory, read_fds, family
         self._clock, self._wait, self._emit = clock, wait, emit
         self._condition = threading.Condition()
         self._wake = threading.Event()
         self._requested = self._exiting = False
         self._epoch = 0
-        self._cookie: int | None = None
         self._thread: threading.Thread | None = None
 
     @property
@@ -229,18 +236,43 @@ class MeetingObserver:
                 self._report_remote(epoch)
             raise
         try:
+            with self._condition:
+                if not self._active(epoch):
+                    raise MetadataDisconnected()
             index, cookie = backend.own_index, backend.server_cookie()
+            with self._condition:
+                if not self._active(epoch):
+                    raise MetadataDisconnected()
+                self.registry.set("observer", (index, cookie))
+                self._emit(
+                    {
+                        "type": "detector-server-changed",
+                        "epoch": epoch,
+                        "server": ObserverServer(cookie),
+                    }
+                )
         except Exception:
             try:
                 backend.close()
             except Exception:
                 raise MetadataOpenFailed(backend) from None
             raise
-        self.registry.set("observer", (index, cookie))
-        if self._cookie is not None and self._cookie != cookie:
-            self._emit({"type": "detector-server-changed", "epoch": epoch})
-        self._cookie = cookie
         return _RegisteredBackend(backend, index, self.registry)
+
+    def end_revisions(self) -> dict[ProgramKey, int]:
+        """Snapshot the call endings with rule_lock held."""
+        return dict(self._end_revisions)
+
+    def end_revision(self, program: ProgramKey) -> int:
+        """Read the revision of one program with rule_lock held."""
+        return self._end_revisions.get(program, 0)
+
+    def _call_ended(self, program: ProgramKey, epoch: int) -> None:
+        # The caller holds rule_lock. Keep the epoch check and emission atomic with stop().
+        with self._condition:
+            if epoch == self._epoch:
+                self._end_revisions[program] = self.end_revision(program) + 1
+                self._emit({"type": "detector-call-ended", "program": program, "epoch": epoch})
 
     def _update(
         self, events: tuple[NormalizedEvent, ...], timing: PictureTiming, epoch: int
@@ -253,7 +285,7 @@ class MeetingObserver:
                         {"type": "detector-candidate", "offered": decision.offered, **message}
                     )
                 else:
-                    self._emit({"type": "detector-call-ended", **message})
+                    self._call_ended(decision.program, epoch)
 
     def _run(self) -> None:
         epoch = 0

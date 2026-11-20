@@ -19,9 +19,9 @@ from test_meeting_m8_locality import (
     address,
     detector,
     make_socket,
-    query,
 )
 
+from astra_voice.meetings.apps import AppClass
 from astra_voice.worker import meeting_observer
 from astra_voice.worker.meeting_audio_local import CONNECT_LOCK, LocalAudioServer
 from astra_voice.worker.meeting_detector import (
@@ -31,10 +31,29 @@ from astra_voice.worker.meeting_detector import (
     NormalizedEvent,
     PictureTiming,
 )
-from astra_voice.worker.meeting_observer import ObserverBackend, ObserverConnect, observer_metadata
+from astra_voice.worker.meeting_identity_check import CheckRequest, CheckResult, Purpose
+from astra_voice.worker.meeting_metadata import PulseMetadata
+from astra_voice.worker.meeting_observer import (
+    ObserverBackend,
+    ObserverConnect,
+    ObserverServer,
+    observer_metadata,
+)
 from astra_voice.worker.pulse_stream import PA_CONTEXT_FAILED
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
+
+
+class NoCallCheck:
+    def __init__(self) -> None:
+        self.requests: list[CheckRequest] = []
+
+    def run(self, request: CheckRequest) -> CheckResult:
+        self.requests.append(request)
+        return CheckResult(True, None, AppClass.OTHER, False, False, (), 0, 1, None, None)
+
+    def shutdown(self, deadline: float) -> bool:
+        return True
 
 
 def local_rig(root: Path, patch: pytest.MonkeyPatch, **kwargs: Any) -> Rig:
@@ -143,10 +162,15 @@ def test_without_start_local_role_never_subscribes(
 ) -> None:
     with monkeypatch.context() as patch:
         pulses = ObserverPulses(patch)
-        rig = local_rig(tmp_path, patch)
+        checker = NoCallCheck()
+        rig = local_rig(tmp_path, patch, check_factory=lambda *_: checker)
         try:
             rig.prepare("none")
-            query(rig, "no-start")
+            kind = "meeting.call.query"
+            replies = rig.state.handle({"type": kind, "request_type": kind, "req": "no-start"})
+            assert [event["type"] for event in replies] == ["meeting.ack"]
+            assert rig.until("meeting.call.state")["active"] is False
+            assert [r.purpose for r in checker.requests] == [Purpose.CARD]
             assert rig.send("keepalive", seq=1)[0]["type"] == "meeting.ack"
             assert rig.state.observer._thread is None
             assert pulses.count("pa_context_connect") == pulses.count("pa_context_new") == 0
@@ -334,6 +358,112 @@ def test_prepare_can_run_while_observer_connect_waits_for_ready(
         assert_no_pcm(rig, pulses)
 
 
+@pytest.mark.parametrize("blocked_at", ["ready", "cookie"])
+def test_stop_during_observer_confirmation_leaves_no_server_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_at: str
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    steps = ObserverSteps()
+    cookie = 286331153
+
+    def pause() -> None:
+        entered.set()
+        if not release.wait(2):
+            raise TimeoutError()
+
+    def setup(pulse: ObserverPulse) -> None:
+        if pulse.own_index == 42 and blocked_at == "ready":
+            pulse.state = 1  # PA_CONTEXT_CONNECTING
+
+            def ready() -> None:
+                pause()
+                pulse.state = 4  # PA_CONTEXT_READY
+
+            pulse.before_dispatch = ready
+
+    original_cookie = PulseMetadata.server_cookie
+
+    def read_cookie(backend: PulseMetadata) -> int:
+        if backend.own_index == 42:
+            pause()
+        return original_cookie(backend)
+
+    with monkeypatch.context() as patch:
+        if blocked_at == "cookie":
+            patch.setattr(PulseMetadata, "server_cookie", read_cookie)
+        pulses = ObserverPulses(patch, cookies=(cookie,), setup=setup)
+        rig = local_rig(tmp_path, patch, observer_wait=steps.wait)
+        steps.clock = rig.clock
+        inbox = ObservedQueue()
+        rig.state.messages = inbox
+        idle = observer_idle(rig, patch)
+        registry = rig.state.observer.registry
+        try:
+            detector(rig, "start", "pending")
+            assert entered.wait(2)
+            detector(rig, "stop", "cancel")
+            assert [m["type"] for m in rig.poll()] == [
+                "meeting.detector.started",
+                "meeting.detector.stopped",
+            ]
+            release.set()
+            assert idle.wait(2)
+            assert inbox.observations == []
+            assert registry.snapshot().version == 0
+            assert not registry.for_observer(0)
+            assert pulses.count("pa_context_disconnect") == 1
+            assert pulses.count("pa_context_get_server_info") == int(blocked_at == "cookie")
+
+            detector(rig, "start", "confirmed")
+            steps.ready()
+            (event,) = inbox.observations
+            assert event == {
+                "type": "detector-server-changed",
+                "epoch": 1,
+                "server": ObserverServer(cookie),
+            }
+            assert registry.for_observer(1) == {43}
+        finally:
+            rig.state.terminate()
+            release.set()
+            steps.advance.set()
+            rig.cleanup()
+        assert pulses.count("pa_context_disconnect") == 2
+        assert_no_pcm(rig, pulses)
+
+
+def test_observer_server_event_repr_hides_cookie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    steps = ObserverSteps()
+    cookie = 286331153
+    other_cookie = 572662306
+    with monkeypatch.context() as patch:
+        pulses = ObserverPulses(patch, cookies=(cookie, other_cookie))
+        rig = local_rig(tmp_path, patch, observer_wait=steps.wait)
+        steps.clock = rig.clock
+        inbox = ObservedQueue()
+        rig.state.messages = inbox
+        try:
+            detector(rig, "start", "confirm-cookie")
+            steps.ready()
+            (event,) = inbox.observations
+            assert event["type"] == "detector-server-changed"
+            assert event["server"].cookie == cookie
+            assert str(cookie) not in repr(event)
+            pulses.pulses[0].state = PA_CONTEXT_FAILED
+            steps.step(12)
+            first, second = inbox.observations
+            assert first is event
+            assert second["type"] == event["type"] and second["epoch"] == event["epoch"]
+            assert second["server"].cookie == other_cookie
+            assert repr(first) == repr(second)
+        finally:
+            rig.state.terminate()
+            steps.advance.set()
+            rig.cleanup()
+
+
 def test_reconnect_reports_server_change_and_fences_old_cookie(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -359,7 +489,17 @@ def test_reconnect_reports_server_change_and_fences_old_cookie(
             view = registry.snapshot()
             assert (view.version, view.indexes, view.server_cookie) == (4, frozenset({43}), 2)
             assert registry.for_observer(12) == {43}
-            assert inbox.observations == [{"type": "detector-server-changed", "epoch": 0}]
+            first, second = inbox.observations
+            assert first == {
+                "type": "detector-server-changed",
+                "epoch": 0,
+                "server": ObserverServer(1),
+            }
+            assert second == {
+                "type": "detector-server-changed",
+                "epoch": 0,
+                "server": ObserverServer(2),
+            }
             assert [m["type"] for m in rig.poll()] == [
                 "meeting.detector.started",
                 "meeting.capture.alive",
@@ -385,13 +525,19 @@ def test_call_start_and_end_reach_only_the_role_queue_with_virtual_clock(
     steps = ObserverSteps()
     with monkeypatch.context() as patch:
         pulses = ObserverPulses(patch, setup=lambda pulse: pulse.streams.clear())
-        rig = local_rig(tmp_path, patch, observer_wait=steps.wait)
+        checker = NoCallCheck()
+        rig = local_rig(tmp_path, patch, observer_wait=steps.wait, check_factory=lambda *_: checker)
         steps.clock = rig.clock
         inbox = ObservedQueue()
         rig.state.messages = inbox
         try:
             detector(rig, "start", "start")
             steps.ready()  # Empty first snapshot. Streams arrive before the next poll.
+            assert inbox.observations.pop() == {
+                "type": "detector-server-changed",
+                "epoch": 0,
+                "server": ObserverServer(1),
+            }
             assert [m["type"] for m in rig.poll()] == ["meeting.detector.started"]
             pulse = pulses.pulses[0]
             pair_at = rig.clock.now
@@ -410,7 +556,14 @@ def test_call_start_and_end_reach_only_the_role_queue_with_virtual_clock(
                     "epoch": 0,
                 }
             ]
-            assert rig.state.poll() == []
+            assert all(m["type"] == "meeting.detector.code" for m in rig.poll())
+            assert rig.until("meeting.detector.code") == {
+                "type": "meeting.detector.code",
+                "purpose": "offer",
+                "code": "no_call",
+                "duration_ms": 0,
+            }
+            assert [r.purpose for r in checker.requests] == [Purpose.OFFER]
 
             mic_left_at = rig.clock.now
             pulse.streams.pop()
@@ -795,6 +948,11 @@ def test_pending_microphone_return_does_not_end_call(
         try:
             detector(rig, "start", "start")
             steps.ready()
+            assert inbox.observations.pop() == {
+                "type": "detector-server-changed",
+                "epoch": 0,
+                "server": ObserverServer(1),
+            }
             steps.step(51)
             assert [item["type"] for item in inbox.observations] == ["detector-candidate"]
             pulse = pulses.pulses[0]
@@ -839,6 +997,11 @@ def test_stop_resets_rule_before_restart_or_cleanup(
         try:
             detector(rig, "start", "start")
             steps.ready()
+            assert inbox.observations.pop() == {
+                "type": "detector-server-changed",
+                "epoch": 0,
+                "server": ObserverServer(1),
+            }
             steps.step(51)
             assert len(inbox.observations) == 1 and inbox.observations[0]["epoch"] == 0
             with observer.rule_lock:
@@ -858,6 +1021,11 @@ def test_stop_resets_rule_before_restart_or_cleanup(
 
             detector(rig, "start", "restart")
             steps.ready()
+            assert inbox.observations.pop() == {
+                "type": "detector-server-changed",
+                "epoch": 1,
+                "server": ObserverServer(1),
+            }
             steps.step(51)
             assert pulses.count("pa_context_connect") == 2
             assert len(inbox.observations) == 2

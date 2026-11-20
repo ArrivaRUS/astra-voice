@@ -288,6 +288,7 @@ def test_refusal_precedes_all_background_connections(
                 wrong = {**duplicate, "apps_version": 2}
                 assert rig.state.handle(wrong)[0]["code"] == "req-conflict"
                 query(rig, "query-before-click")
+                assert rig.poll() == [{**REMOTE, "purpose": "card"}]
                 assert_refusal(rig, "observer-2")
                 detector(rig, "stop", "stop")
                 rig.until("meeting.detector.stopped")

@@ -30,6 +30,7 @@ from astra_voice.worker.meeting_audio_local import (
     resolve_local_server,
     socket_family,
 )
+from astra_voice.worker.meeting_call_service import CheckFactory, MeetingCallService, role_checker
 from astra_voice.worker.meeting_contract import COMMAND_FIELDS, RequestLedger
 from astra_voice.worker.meeting_observer import (
     MeetingObserver,
@@ -431,6 +432,7 @@ class MeetingCaptureState:
         observer_fds: Callable[[], SocketFds] = own_socket_fds,
         observer_family: Callable[[int, int], int | None] = socket_family,
         observer_wait: ObserverWait = _observer_wait,
+        check_factory: CheckFactory = role_checker,
     ) -> None:
         self.session_monitor = MeetingSession.production() if session is None else None
         self.session = session if session is not None else self.session_monitor.state  # type: ignore[union-attr]
@@ -468,6 +470,7 @@ class MeetingCaptureState:
             clock=clock,
             emit=lambda message: self.messages.put(message),
         )
+        self.calls = MeetingCallService(self, check_factory)
         self.audio_stop = threading.Event()
         self.stopped = False
         self.exit_code = 0
@@ -493,6 +496,7 @@ class MeetingCaptureState:
         self.termination_deadline: float | None = None
         self.seq = 0
         self.preparing = False
+        self.prepare_starts = 0
         self.prepare_request: Message | None = None
         self.prepare_deadline: float | None = None
         self.disk_sampling = False
@@ -695,6 +699,7 @@ class MeetingCaptureState:
         return self.backend
 
     def handle(self, message: Message) -> list[Message]:
+        arrived_at = self.clock() if message.get("type") == "meeting.call.query" else 0.0
         message = ipc.decode(
             ipc.encode(message, role="meeting-capture")[4:], role="meeting-capture"
         )
@@ -725,9 +730,7 @@ class MeetingCaptureState:
                     self.pending[message["req"]] = [reply]
                 return self._remember(message, [reply])
             if action == "meeting.call.query":
-                return self._remember(
-                    message, [self._reply("meeting.call.state", message, active=False)]
-                )
+                return self.calls.query(message, arrived_at)
             if action == "meeting.capture.shutdown":
                 if not self.sources and not self.opening and not self.finalizing:
                     self.terminate()
@@ -939,8 +942,11 @@ class MeetingCaptureState:
             self.observer.start()
         else:
             self.observer.stop()
+            self.messages.put({"type": "detector-clear"})
 
     def _prepare(self, request: Message) -> None:
+        self.prepare_starts += 1
+        self.calls.cancel_offer_retries()
         self.preparing = True
         self.prepare_request = request
         self.prepare_deadline = self.clock() + 5.0
@@ -1295,6 +1301,9 @@ class MeetingCaptureState:
 
     def poll(self) -> list[Message]:
         result: list[Message] = []
+        checks: list[Message] = []
+        server_events: list[Message] = []
+        self.calls.sync_automation(result)
         self._session_events(result)
         self._expire_pause()
         while True:
@@ -1309,9 +1318,19 @@ class MeetingCaptureState:
                 result.append(self._outcome(event["request"], event["reply"]))
             elif kind == "detector-code":
                 result.append(event["event"])
-            elif kind in {"detector-candidate", "detector-call-ended", "detector-server-changed"}:
-                # Observation results remain internal until step 4v consumes them.
-                continue
+            elif kind == "detector-clear":
+                self.calls.detector_stopped(result)
+            elif kind == "card-remote":
+                self.calls.remote_card(result)
+            elif kind == "card-cancelled":
+                self.calls.finish_card(event["request"], {"active": False}, result)
+            elif kind == "check-result":
+                checks.append(event)
+                self.calls.note_result(event)
+            elif kind == "detector-server-changed":
+                server_events.append(event)
+            elif kind in {"detector-candidate", "detector-call-ended"}:
+                self.calls.observer_event(event, result)
             elif kind in {"prepared", "prepare-failed"}:
                 if not self.preparing or event["request"] != self.prepare_request:
                     continue
@@ -1717,6 +1736,18 @@ class MeetingCaptureState:
             self.stopped = True
             if self.archive:
                 self.archive.put("quit", None)
+        # Apply queued lifecycle changes and session updates before accepting checks.
+        self.calls.resolve_server(server_events, checks, result)
+        self.calls.sync_automation(result)
+        for event in checks:
+            self.calls.finish(
+                event["attempt"],
+                event["result"],
+                result,
+                report_remote_offer=event.get("report_remote_offer", False),
+                measured_server=event.get("measured_server"),
+            )
+        self.calls.retry_offers()
         return result
 
     def _autopause(self, reason: str, wire_reason: str, result: list[Message]) -> None:
@@ -1744,27 +1775,31 @@ class MeetingCaptureState:
         if self.terminating:
             return
         self.terminating = True
+        self.termination_deadline = time.monotonic() + 1.0
         self.observer.stop(exiting=True)
+        self.calls.terminate()
         self.preparing = False
         self.prepare_deadline = None
-        self.termination_deadline = time.monotonic() + 1.0
         if self.sources or self.opening:
             self._close(None, "stop")
         elif not self.finalizing:
             self.stopped = True
             if self.archive:
                 self.archive.put("quit", None)
+        self.calls.shutdown(self.termination_deadline)
 
     def cleanup(self) -> None:
         """Transport loss/signal: bounded physical cleanup, storage may be abandoned."""
         self.terminate()  # Start physical close before bounded helper reaping.
         if self.session_monitor is not None:
             self.session_monitor.close()
-        deadline = time.monotonic() + 1.0
+        assert self.termination_deadline is not None
+        deadline = self.termination_deadline
         while not self.stopped and time.monotonic() < deadline:
             self.poll()
             time.sleep(0.005)
         self.observer.join(max(0.0, deadline - time.monotonic()))
+        self.calls.cleanup(deadline)
         # An escalated close can already have set stopped while storage is
         # finishing. It still owns a worker that must receive its exit request.
         if self.archive is not None:

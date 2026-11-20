@@ -113,6 +113,13 @@ class Rig:
             kwargs["session"] = session
         kwargs.setdefault("observer_address", lambda: None)
         kwargs.setdefault("observer_factory", _unexpected_observer)
+        self.unexpected_checks = 0
+
+        def unexpected_check(*args: object) -> Any:
+            self.unexpected_checks += 1
+            pytest.fail("test has not supplied a call checker")
+
+        kwargs.setdefault("check_factory", unexpected_check)
         self.state = MeetingCaptureState(
             clock=self.clock,
             mic_factory=self.mic,
@@ -212,6 +219,7 @@ class Rig:
 
     def cleanup(self) -> None:
         self.state.cleanup()
+        assert self.unexpected_checks == 0
 
 
 @pytest.fixture
