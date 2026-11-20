@@ -157,6 +157,8 @@ class MeetingRecording(QObject):
         self.store, self.enabled, self.policy_allowed = store, enabled, policy_allowed
         self._detector_allowed = detector_allowed
         self._automation_off = False
+        self._observation_retry_at = 0.0
+        self._observation_retry_delay = 2.0
         self._exit_stop_timeout = exit_stop_timeout
         self.session_kind, self.clock = session_kind, clock
         self.session_factory, self.owns_session = session_factory, owns_session
@@ -332,38 +334,62 @@ class MeetingRecording(QObject):
         self._control_timer.start()
         self.tick()
 
-    def _activate(self) -> bool:
-        if self._closed or not self.enabled() or not self.policy_allowed():
-            return False
-        if self._retire_deadline is not None:
-            return False
+    def _observation_allowed(self) -> bool:
+        return (
+            self.enabled()
+            and self.policy_allowed()
+            and self._detector_allowed()
+            and not self._automation_off
+        )
+
+    def _ensure_session(self) -> None:
         if self._monitor is None:
             self._monitor = self.session_factory()
             self._monitor.changed.connect(self._session_changed)
             self._monitor.start()
+
+    def _defer_observation(self) -> None:
+        self._observation_retry_at = self.clock() + self._observation_retry_delay
+        self._observation_retry_delay = min(60.0, self._observation_retry_delay * 2)
+
+    def _activate(self, *, observation: bool = False) -> bool:
+        if self._closed or not self.enabled() or not self.policy_allowed():
+            return False
+        if self._retire_deadline is not None:
+            return False
+        self._ensure_session()
         if self.controller.state == "stopped" and not (self._standby_role and self._role_started):
-            if not self.controller.supervisor.exited or self.controller._filesystem_pending:
+            if (
+                not self.controller.supervisor.exited
+                or not self.controller._exit_confirmed
+                or self.controller._filesystem_pending
+            ):
                 return False
             role = self._new_supervisor()
             if not self.controller.attach_supervisor(role):
                 return False
         if not self._role_started:
+            role = cast(Role, self.controller.supervisor)
             try:
-                cast(Role, self.controller.supervisor).start()
-                if self.controller.supervisor.exited and not self.controller.supervisor.ready:
-                    self._preview_error = "audio-unavailable"
-                    self.controller.error_code = "audio-unavailable"
-                    self.controller.on_process_exit(3)
-                    return False
-                self._role_started = True
+                role.start()
             except (OSError, RuntimeError):
-                self._preview_error = "audio-unavailable"
-                self.controller.error_code = "audio-unavailable"
-                self.controller.on_process_exit(3)
+                self._launch_failed(observation=observation)
                 return False
+            if role.exited and not role.ready:
+                self._launch_failed(observation=observation)
+                return False
+            self._role_started = True
         self._lease_timer.start()
         self._control_timer.start()
         return True
+
+    def _launch_failed(self, *, observation: bool) -> None:
+        if self._observation_allowed():
+            self._defer_observation()
+        if not observation:
+            self._preview_error = self.controller.error_code = "audio-unavailable"
+        if not self.controller._exit_confirmed:
+            self.controller.on_process_exit(3)
 
     def open_dialog(self) -> None:
         if self._closed or not self.enabled() or not self.policy_allowed():
@@ -549,8 +575,7 @@ class MeetingRecording(QObject):
         self._preview_serial += 1
         if self.controller.state in {"preparing", "opening"}:
             self.clicks.on_stop_clicked()
-        elif not self.busy:
-            self._retire_unused_role()
+        self._sync_role_ownership()
         self._publish()
 
     def _release_session(self) -> None:
@@ -560,12 +585,28 @@ class MeetingRecording(QObject):
             if self.owns_session:
                 monitor.close()
 
-    def _retire_unused_role(self) -> None:
-        self._release_session()
-        if self._role_started and self._retire_deadline is None:
-            # One deadline covers both delayed hello and shutdown. Repeated
-            # close/policy notifications must never prolong resource ownership.
-            self._retire_deadline = self.clock() + 1
+    def _sync_role_ownership(self) -> None:
+        if self._closed:
+            return
+        observing = self._observation_allowed()
+        owned = observing or self.dialog_open or self.busy
+        if owned:
+            self._ensure_session()
+        if (
+            observing
+            and not self.busy
+            and not self._role_started
+            and self.clock() >= self._observation_retry_at
+        ):
+            self._activate(observation=True)
+        # Send detector.stop while the idle role can still accept commands.
+        self.sync_detector()
+        if not owned:
+            self._release_session()
+            if self._standby_role and self._role_started and self._retire_deadline is None:
+                # One deadline covers both delayed hello and shutdown. Repeated
+                # close/policy notifications must never prolong resource ownership.
+                self._retire_deadline = self.clock() + 1
         self._poll_retirement()
 
     def _poll_retirement(self) -> None:
@@ -574,12 +615,7 @@ class MeetingRecording(QObject):
         role = self.controller.supervisor
         if role.exited:
             # kill() deliberately has no exit callback: poll is authoritative.
-            if not self.controller._exit_confirmed or self.controller.state != "stopped":
-                self.controller.on_process_exit(0)
-            self._role_started = False
-            self._retire_deadline = None
-            if self.dialog_open:
-                self._activate()
+            self._exit(0)
             return
         if self._retire_killed:
             return
@@ -753,9 +789,7 @@ class MeetingRecording(QObject):
             return  # A consumed role still owes finalization and exit.
         if self._detector_generation != role.generation:
             self._reset_detector(role.generation)
-        allowed = self._detector_allowed()
-        if allowed and self._automation_off:
-            return
+        allowed = self._observation_allowed()
         kind = "meeting.detector.start" if allowed else "meeting.detector.stop"
         if self.clock() < self._detector_retry_at:
             return
@@ -799,6 +833,9 @@ class MeetingRecording(QObject):
             self._detector_running = kind == "meeting.detector.started"
             self._detector_retry_at = 0.0
             self._detector_retry_delay = 1.0
+            if self._detector_running:
+                self._observation_retry_at = 0.0
+                self._observation_retry_delay = 2.0
         elif kind == "error":
             self._detector_failed(transient=reply["code"] in {"limit", "timeout"})
 
@@ -847,6 +884,10 @@ class MeetingRecording(QObject):
                 raw["duration_ms"],
             )
             return
+        if self._standby_role:
+            # Launch/hello and idle IPC must not touch a previous capture's state.
+            self._publish()
+            return
         if raw["type"] == "meeting.capture.prepared":
             # Newly discovered warnings must be visible before a further click;
             # cancel this prepared role without ever granting open.
@@ -872,12 +913,13 @@ class MeetingRecording(QObject):
 
     def _exit(self, code: int) -> None:
         retiring = self._retire_deadline is not None
-        self.controller.on_process_exit(code)
+        if self._standby_role and not retiring and self._observation_allowed():
+            self._defer_observation()
+        if not self.controller._exit_confirmed:
+            self.controller.on_process_exit(code)
         self._role_started = False
         self._retire_deadline = None
-        if not self.dialog_open:
-            self._release_session()
-        elif retiring:
+        if retiring and self.dialog_open:
             # W4 may have been reopened while the old role was retiring.
             # Restore only its query/preview role, never implicit capture.
             self._activate()
@@ -905,8 +947,12 @@ class MeetingRecording(QObject):
         if self._indicator_guard is not None:
             self._indicator_guard.check()
         self.controller.tick()
-        self._poll_retirement()
-        self.sync_detector()
+        if self.controller.state == "idle":
+            # Failed preflight never prepared the process; it is still reusable.
+            self._standby_role = True
+        if self._role_started and self.controller.supervisor.exited:
+            self._exit(3)
+        self._sync_role_ownership()
         self._tick_jobs()
         if (
             self.dialog_open

@@ -925,7 +925,8 @@ def test_remote_latch_survives_role_replacement(
     rig.bridge.setSetting("meeting_offer_on_call", True)
     rig.bridge.requestRecording()
     previous = rig.supervisor
-    assert background_commands(previous) == [DETECTOR_START, "meeting.call.query"]
+    expected = [DETECTOR_START, "meeting.call.query"]
+    assert background_commands(previous) == expected
     if remote == "ordinary":
         with caplog.at_level(logging.INFO, logger=meeting_recording.__name__):
             previous.event(
@@ -959,9 +960,15 @@ def test_remote_latch_survives_role_replacement(
     previous.on_exit(0)
     if replace != "exit-with-open-dialog":
         rig.bridge.requestRecording()
+    elif remote != "current":
+        # Closing W4 left observation running. Its unexpected exit backs off.
+        rig.recording.tick()
+        assert rig.supervisor is previous
+        rig.now += 2
+        expected.append("meeting.call.query")
     rig.recording.tick()
     assert rig.supervisor is not previous and rig.supervisor.ready
-    assert background_commands(previous) == [DETECTOR_START, "meeting.call.query"]
+    assert background_commands(previous) == expected
     assert background_commands(rig.supervisor) == (
         [] if remote == "current" else [DETECTOR_START, "meeting.call.query"]
     )
@@ -1126,11 +1133,13 @@ def test_retiring_role_receives_only_shutdown(delayed_rig: Rig) -> None:
     rig.recording.tick()
     (start,) = detector_commands(role)
     deliver_detector(role, start, "meeting.detector.started")
+    rig.bridge.setSetting("meeting_offer_on_call", False)
+    assert detector_commands(role)[-1]["type"] == DETECTOR_STOP
     role.ready = False
     rig.bridge.closeStartDialog()
     role.ready = True
     role.messages.clear()
-    rig.bridge.setSetting("meeting_offer_on_call", False)
+    rig.bridge.setSetting("meeting_offer_on_call", True)
     rig.recording.tick()
     assert [msg["type"] for msg in role.messages] == ["meeting.capture.shutdown"]
 
@@ -1358,13 +1367,18 @@ def test_detector_retries_after_real_supervisor_queue_limit(
 
 
 @pytest.mark.parametrize("ready", [False, True], ids=["before-hello", "after-hello"])
-@pytest.mark.parametrize("reason", ["close", "disabled", "policy"])
+@pytest.mark.parametrize(
+    ("reason", "observing"),
+    [("close", False), ("close", True), ("disabled", False), ("policy", False)],
+    ids=["close", "close-with-observation", "disabled", "policy"],
+)
 def test_unused_role_retires_after_close_or_revocation(
-    delayed_rig: Rig, ready: bool, reason: str
+    delayed_rig: Rig, ready: bool, reason: str, observing: bool
 ) -> None:
     from astra_voice.core.policy import Policy
 
     rig = delayed_rig
+    rig.bridge.setSetting("meeting_offer_on_call", observing)
     rig.bridge.requestRecording()
     role = rig.supervisor
     role.ready = ready
@@ -1375,9 +1389,15 @@ def test_unused_role_retires_after_close_or_revocation(
         rig.recording.policy_changed()
     else:
         rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "off"}))
-    # Late hello must finish retirement, never revive discovery/capture.
     role.ready = True
     rig.recording.tick()
+    assert not rig.bridge.startDialogOpen
+    if observing:
+        assert [m["type"] for m in role.messages] == [DETECTOR_START]
+        assert rig.session.closes == 0
+        assert rig.session.receivers(rig.session.changed) == 1
+        return
+    # Late hello must finish retirement, never revive discovery/capture.
     assert [m["type"] for m in role.messages] == ["meeting.capture.shutdown"]
     assert rig.session.closes == 1
     assert rig.session.receivers(rig.session.changed) == 0
