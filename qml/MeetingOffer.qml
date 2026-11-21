@@ -29,7 +29,8 @@ Item {
     implicitHeight: surfaceHeight
     visible: presented
     Accessible.role: Accessible.AlertMessage
-    Accessible.name: root.startFailed ? root.errorText : (root.texts.title || "")
+    Accessible.name: root.startFailed ? root.errorText
+                                      : ((root.starting ? root.texts.starting : root.texts.title) || "")
 
     function forceLayout() {
         header.forceLayout();
