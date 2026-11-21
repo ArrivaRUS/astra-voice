@@ -20,11 +20,11 @@ from test_meeting_recording_bridge import (
 )
 from test_meeting_recording_bridge import rig as rig
 
-from astra_voice.core.settings import Settings
+from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.ui import meeting_offer, meeting_recording
+from astra_voice.ui.meeting_offer import OfferController, Origin
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
-from helpers.qt_app import get_qapplication
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 CALL = "w1-private-id"
@@ -78,11 +78,15 @@ def deliver(rig: Rig, event: dict[str, Any]) -> None:
 def offer_ready(rig: Rig, *, allowed: bool = True) -> View:
     view = View()
     rig.recording.bind_offer(view)
+    start_observing(rig, allowed=allowed)
+    return view
+
+
+def start_observing(rig: Rig, *, allowed: bool = True) -> None:
     start = observe(rig)
     deliver_detector(rig.supervisor, start, "meeting.detector.started")
     assert rig.recording._offer_eligible()
     assert not rig.bridge.startDialogOpen and rig.recording._snapshot().allowed is allowed
-    return view
 
 
 def show_offer(rig: Rig, *, call_id: str = CALL, app_class: str = "dion") -> None:
@@ -716,30 +720,106 @@ def test_show_and_close_resynchronize_role_ownership(
     assert view.calls == [SHOW, ("close",)]
 
 
-def test_a7_offer_is_independent_of_capture_indicators(tmp_path: Path) -> None:
-    get_qapplication()
-    instance = Rig(tmp_path, settings=Settings(meetings_enabled=True, pill_enabled=False))
-    try:
-        instance.recording.bind_indicators(
-            overlay_visible=lambda: False, tray_visible=lambda: False
+@pytest.mark.parametrize("pill_enabled", [False, True])
+def test_a7_offer_is_independent_of_capture_indicators(tmp_path: Path, pill_enabled: bool) -> None:
+    from test_meeting_m8_offer_view_qml import _run_probe
+
+    _run_probe("indicator-on" if pill_enabled else "indicator-off", tmp_path)
+
+
+@pytest.mark.parametrize("dismiss_in_show", [False, True])
+def test_u16_show_failure_cleans_up_and_remembers_the_call(
+    caplog: pytest.LogCaptureFixture, dismiss_in_show: bool
+) -> None:
+    change = Mock()
+    start = Mock()
+    offer = OfferController(clock=lambda: 100.0, on_visibility_changed=change, on_start=start)
+    session = SessionSnapshot(known=True, locked=False)
+    window = Mock()
+    mapped = False
+
+    def show(_kind: str, _seconds: int) -> None:
+        nonlocal mapped
+        mapped = True
+        if dismiss_in_show:
+            offer.dismiss()
+        raise RuntimeError("PRIVATE-W1-failure")
+
+    def close() -> None:
+        nonlocal mapped
+        mapped = False
+
+    def deliver(call_id: str, origin: Origin = "offer") -> None:
+        offer.receive(
+            call_id=call_id,
+            app_class="dion",
+            measured_ms=offer.now_ms(),
+            origin=origin,
+            eligible=True,
+            session=session,
         )
-        view = offer_ready(instance)
-        show_offer(instance)
-        assert view.calls == [SHOW]
-    finally:
-        instance.bridge.shutdown()
+
+    def tick() -> None:
+        offer.begin_tick()
+        offer.tick(eligible=True, session=session)
+
+    window.show.side_effect = show
+    window.close.side_effect = close
+    offer.bind(window)
+    offer.new_role(1)
+    offer.detector_started()
+    caplog.clear()
+    deliver("call-one")
+    tick()
+    assert not mapped and not offer.visible and offer.state == "idle" and offer.bound
+    assert offer.presentation == ("", 0)
+    window.close.assert_called_once_with()
+    if dismiss_in_show:
+        change.assert_called_once_with()
+    else:
+        change.assert_not_called()
+    tick()
+    deliver("call-one")
+    tick()
+    deliver("call-one", origin="card")
+    tick()
+    window.show.assert_called_once_with("call-app", 60)
+    window.update_remaining.assert_not_called()
+    start.assert_not_called()
+    (entry,) = caplog.records
+    assert entry.name == "astra_voice.ui.meeting_offer"
+    assert entry.levelno == logging.WARNING and entry.msg == "meeting-offer-show-failed"
+    assert not entry.args and entry.exc_info is None and "PRIVATE" not in caplog.text
+    offer.call_ended("call-one", "mic_released")
+    window.show.side_effect = None
+    deliver("call-two")
+    tick()
+    assert window.show.call_count == 2 and offer.visible and offer.state == "shown_guard"
 
 
 def test_a8_only_the_guarded_press_signals_intent_and_offer_is_passive() -> None:
     assert meeting_offer.__file__ is not None
     source = Path(meeting_offer.__file__).read_text(encoding="utf-8")
-    assert not violations(source)
     tree = ast.parse(source)
     controller = next(
         node
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "OfferController"
     )
+    show = next(
+        node
+        for node in controller.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_show"
+    )
+    # The UI module may emit this one fixed warning. The package's general
+    # constant-only logging guard still rejects every other unapproved call.
+    (fixed_warning,) = [
+        node.lineno
+        for node in ast.walk(show)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node) == "log.warning('meeting-offer-show-failed')"
+    ]
+    assert violations(source) == [fixed_warning]
     senders = [
         method.name
         for method in controller.body

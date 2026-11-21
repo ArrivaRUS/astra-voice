@@ -268,7 +268,7 @@ disabled + подпись **11.5** `fgMuted` под ней, зазор **3**, в
 
 | Параметр | Значение |
 |---|---|
-| Окно | **380** × ~148 (ЗАМЕР 146.9 DION / 170.6 браузер), r **10**, паддинг **12 14**, фон `notifyBg`, рамка 1 `notifyBorder`, `shadow.notify` |
+| Окно | **380** × по содержимому (ЗАМЕР 170.6 DION (счётчик отдельной строкой) / 188.8 браузер, 146.9 — `starting`), r **10**, паддинг **12 14**, фон `notifyBg`, рамка 1 `notifyBorder`, `shadow.notify` |
 | Шапка | глиф `meeting` **13** + «Astra Voice» `notificationHeaderSize` 11.5 `notifyFgMuted`, зазор **8** (= §11.2), отступ снизу **6**; «×» — круг **18**, фон `notifyBtnBg`, глиф `x` **10** `pillCloseFg` |
 | Заголовок | `notificationTitleSize` 13.5 / **500** `notifyFg`, отступ снизу **3** |
 | Текст | **12.5/1.45** `PillTheme.pillIconMuted` (9.85 : 1 на `notifyBg`) |

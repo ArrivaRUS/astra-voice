@@ -39,6 +39,8 @@ if bundle is None or not paths.resource_root().is_relative_to(bundle):
 for path in (
     paths.qml_dir() / "Pill.qml",
     paths.qml_dir() / "Main.qml",
+    paths.qml_dir() / "MeetingOffer.qml",
+    paths.qml_dir() / "components" / "MeetingOfferControl.qml",
     paths.data_dir_static() / "vad" / "silero_vad.onnx",
     paths.data_dir_static() / "catalog.json",
     paths.data_dir_static() / "catalog.json.sig",

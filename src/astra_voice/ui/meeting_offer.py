@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from astra_voice.core.command_mode import SessionSnapshot
 
+log = logging.getLogger(__name__)
+
 _FRESH_MS = 1_000
-_GUARD_MS = 500
+OFFER_GUARD_MS = 500
 _DISPLAY_MS = 60_000
 _UNLOCK_QUERY_MS = 5_000
 _INHERIT_MS = 15_000
@@ -363,7 +367,7 @@ class OfferController:
                 self._show(call)
         elif self._shown_at is not None:
             elapsed = now - self._shown_at
-            self._guarded = elapsed < _GUARD_MS
+            self._guarded = elapsed < OFFER_GUARD_MS
             remaining = _DISPLAY_MS - elapsed
             if self._apply_press(eligible and session.allowed):
                 self._ended.clear()
@@ -395,7 +399,17 @@ class OfferController:
         self._seconds = _DISPLAY_MS // 1000
         self._query_at = None
         self._remember(call, "shown")
-        self._view.show(_KINDS[call.app_class], self._seconds)
+        try:
+            self._view.show(_KINDS[call.app_class], self._seconds)
+        except Exception:
+            log.warning("meeting-offer-show-failed")
+            if self._visible is call:
+                self._visible = None
+                self._guarded = False
+                self._seconds = 0
+                with contextlib.suppress(Exception):
+                    self._view.close()
+            return
         if self._visible is call:
             self._shown_at = self.now_ms()
             self._visibility_changed()
@@ -413,7 +427,10 @@ class OfferController:
         shown_at = self._shown_at
         return (
             shown_at is not None
-            and shown_at + _GUARD_MS <= pressed_at_ms <= observed_at_ms < shown_at + _DISPLAY_MS
+            and shown_at + OFFER_GUARD_MS
+            <= pressed_at_ms
+            <= observed_at_ms
+            < shown_at + _DISPLAY_MS
         )
 
     def _apply_press(self, allowed: bool) -> bool:

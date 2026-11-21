@@ -94,6 +94,7 @@ class Rig:
         kind: SessionKind = SessionKind.KDE,
         role_type: type[Supervisor] = Supervisor,
         settings: Settings | None = None,
+        bind_recording: bool = True,
     ) -> None:
         self.now = 100.0
         self.session = Session()
@@ -136,7 +137,8 @@ class Rig:
             # metadata-drain tests below set the 1 s budget they measure.
             exit_stop_timeout=0.2,
         )
-        self.bridge.bindRecording(self.recording)
+        if bind_recording:
+            self.bridge.bindRecording(self.recording)
 
     @property
     def supervisor(self) -> Supervisor:
@@ -574,6 +576,7 @@ def test_app_binds_capture_and_borrows_runtime_monitor(
     from astra_voice.ui import (
         meeting_notice,
         meeting_notifications,
+        meeting_offer_window,
         meeting_overlay,
         meeting_recording,
     )
@@ -581,16 +584,19 @@ def test_app_binds_capture_and_borrows_runtime_monitor(
     bridge = Mock(_store=rig.store)
     runtime = Mock(_command_session=rig.session)
     factory = Mock()
-    monkeypatch.setattr(meeting_recording, "MeetingRecording", factory)
     jobs = Mock()
-    monkeypatch.setattr(meeting_jobs, "MeetingJobs", jobs)
-    for module, name in (
-        (meeting_overlay, "MeetingOverlay"),
-        (meeting_notice, "MeetingNotice"),
-        (meeting_notifications, "MeetingNotifications"),
-    ):
-        monkeypatch.setattr(module, name, Mock())
-    app._bind_meeting_recording(bridge, Mock(device="chosen-mic"), SessionKind.KDE, runtime)
+    offer = Mock()
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "MeetingRecording", factory)
+        patch.setattr(meeting_jobs, "MeetingJobs", jobs)
+        for module, name, constructor in (
+            (meeting_overlay, "MeetingOverlay", Mock()),
+            (meeting_notice, "MeetingNotice", Mock()),
+            (meeting_offer_window, "MeetingOffer", offer),
+            (meeting_notifications, "MeetingNotifications", Mock()),
+        ):
+            patch.setattr(module, name, constructor)
+        app._bind_meeting_recording(bridge, Mock(device="chosen-mic"), SessionKind.KDE, runtime)
     options = factory.call_args.kwargs
     assert options["owns_session"] is False
     assert options["session_factory"]() is rig.session
@@ -604,9 +610,14 @@ def test_app_binds_capture_and_borrows_runtime_monitor(
     factory.return_value.bind_jobs.assert_called_once_with(jobs.return_value)
     factory.return_value.bind_indicators.assert_called_once()
     factory.return_value.initialize.assert_called_once_with()
+    offer.assert_called_once_with(factory.return_value, parent=bridge)
+    factory.return_value.bind_offer.assert_called_once_with(offer.return_value)
+    assert bridge._meeting_offer is offer.return_value
 
 
-@pytest.mark.parametrize("broken", ["MeetingOverlay", "MeetingNotice", "MeetingJobs"])
+@pytest.mark.parametrize(
+    "broken", ["MeetingOverlay", "MeetingNotice", "MeetingOffer", "MeetingJobs"]
+)
 def test_app_keeps_running_when_meeting_parts_fail_to_build_i2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, broken: str
 ) -> None:
@@ -617,6 +628,7 @@ def test_app_keeps_running_when_meeting_parts_fail_to_build_i2(
     from astra_voice.ui import (
         meeting_notice,
         meeting_notifications,
+        meeting_offer_window,
         meeting_overlay,
         meeting_recording,
     )
@@ -625,19 +637,20 @@ def test_app_keeps_running_when_meeting_parts_fail_to_build_i2(
         Settings(meetings_enabled=True), store=MeetingStore(tmp_path / "m"), session=SessionKind.KDE
     )
     factory = Mock()
-    monkeypatch.setattr(meeting_recording, "MeetingRecording", factory)
     parts = {
         "MeetingOverlay": (meeting_overlay, Mock()),
         "MeetingNotice": (meeting_notice, Mock()),
+        "MeetingOffer": (meeting_offer_window, Mock()),
         "MeetingNotifications": (meeting_notifications, Mock()),
         "MeetingJobs": (meeting_jobs, Mock()),
     }
     # E.g. a build where the overlay QML did not load (ui/overlay.py RuntimeError).
     parts[broken][1].side_effect = RuntimeError("PRIVATE /path/Overlay.qml failed")
-    for name, (module, mock) in parts.items():
-        monkeypatch.setattr(module, name, mock)
     try:
-        with caplog.at_level(logging.WARNING):
+        with monkeypatch.context() as patch, caplog.at_level(logging.WARNING):
+            patch.setattr(meeting_recording, "MeetingRecording", factory)
+            for name, (module, mock) in parts.items():
+                patch.setattr(module, name, mock)
             app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE)
         assert "meeting-recording-unavailable" in caplog.text
         assert "PRIVATE" not in caplog.text
@@ -646,6 +659,7 @@ def test_app_keeps_running_when_meeting_parts_fail_to_build_i2(
         factory.return_value.shutdown.assert_called_once_with()
         factory.return_value.initialize.assert_not_called()
         assert getattr(bridge, "_meeting_overlay", None) is None
+        assert getattr(bridge, "_meeting_offer", None) is None
         for name, (_module, mock) in parts.items():
             if name != broken and mock.called:
                 mock.return_value.deleteLater.assert_called_once_with()

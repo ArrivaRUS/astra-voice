@@ -567,20 +567,14 @@ def test_app_gives_the_catalog_probe_before_initialize_recovers_9(
 ) -> None:
     """The first admission after recover() already uses the catalog's min_ram_mb."""
     from astra_voice.core import meeting_jobs
-    from astra_voice.ui import meeting_notice, meeting_notifications, meeting_overlay
+    from astra_voice.ui import (
+        meeting_notice,
+        meeting_notifications,
+        meeting_offer_window,
+        meeting_overlay,
+    )
     from astra_voice.ui import meeting_recording as recording_module
 
-    monkeypatch.setattr(
-        meeting_jobs,
-        "probe_gigaam_model",
-        lambda **kw: ModelAdmission("ok", {"min_ram_mb": kw["min_ram_mb"](LOAD["id"])}),
-    )
-    for module, name in (
-        (meeting_overlay, "MeetingOverlay"),
-        (meeting_notice, "MeetingNotice"),
-        (meeting_notifications, "MeetingNotifications"),
-    ):
-        monkeypatch.setattr(module, name, Mock())
     recording = Mock()
     seen: list[int] = []
 
@@ -589,14 +583,27 @@ def test_app_gives_the_catalog_probe_before_initialize_recovers_9(
         seen.append(jobs.model_probe().min_ram_mb)
 
     recording.initialize.side_effect = initialize
-    monkeypatch.setattr(recording_module, "MeetingRecording", Mock(return_value=recording))
     service = Mock()
     service.catalog.entry.return_value = SimpleNamespace(min_ram_mb=1234)
     bridge = Mock(
         _store=MeetingStore(tmp_path / "meetings"),
         settings={"meeting_retention_days": 90, "meeting_audio_retention_days": 7},
     )
-    app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None, service)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            meeting_jobs,
+            "probe_gigaam_model",
+            lambda **kw: ModelAdmission("ok", {"min_ram_mb": kw["min_ram_mb"](LOAD["id"])}),
+        )
+        for module, name in (
+            (meeting_overlay, "MeetingOverlay"),
+            (meeting_notice, "MeetingNotice"),
+            (meeting_offer_window, "MeetingOffer"),
+            (meeting_notifications, "MeetingNotifications"),
+        ):
+            patch.setattr(module, name, Mock())
+        patch.setattr(recording_module, "MeetingRecording", Mock(return_value=recording))
+        app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None, service)
     assert seen == [1234]
     jobs = recording.bind_jobs.call_args.args[0]
     assert jobs.meeting_retention_days() == 90

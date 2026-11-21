@@ -216,6 +216,26 @@ W2_TEXTS = {
     "trayMeetings": "Встречи…",
 }
 
+# W1, spec §4.3. Only these fixed strings go to the offer window.
+W1_TEXTS = {
+    "header": "Astra Voice",
+    "start": "Начать запись",
+    "refuse": "Не записывать",
+    "close": "Закрыть",
+}
+W1_REMAINING = "Закроется через {seconds} с"
+_W1_BODY = "Запись начнётся с момента нажатия — сказанное раньше в неё не попадёт."
+W1_CALL_TEXTS = {
+    "call-app": {
+        "title": "Идёт звонок в DION. Начать запись встречи?",
+        "body": _W1_BODY,
+    },
+    "call-browser": {
+        "title": "Идёт звонок в браузере. Начать запись встречи?",
+        "body": _W1_BODY + " Запишется звук браузера целиком — всех вкладок.",
+    },
+}
+
 # W3 «Предупредите участников о записи», spec §3.6/§4.6. The notice text itself
 # is the effective `meeting_notice_text` (user or administrator), never a constant here.
 W3_TEXTS = {

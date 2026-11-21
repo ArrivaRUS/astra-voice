@@ -781,9 +781,9 @@ class MeetingBridge(QObject):
             raise RuntimeError("meeting-speaker-save-timeout")
         self._speaker_writer.close(timeout=0.0)
         self._speaker_timer.stop()
-        # No notices about our own exit; W3 first, then the ordinary stop with
+        # Close W3 and W1 before our own exit, then the ordinary stop with
         # finalization (W2 still shows «Сохраняю запись…»), then W2.
-        for name in ("_meeting_notifications", "_meeting_notice"):
+        for name in ("_meeting_notifications", "_meeting_notice", "_meeting_offer"):
             owner = getattr(self, name, None)
             if owner is not None:
                 owner.shutdown()

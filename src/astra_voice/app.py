@@ -852,6 +852,7 @@ def _bind_meeting_recording(
         from astra_voice.meetings.diar_models import enabled_diar_models
         from astra_voice.ui.meeting_notice import MeetingNotice
         from astra_voice.ui.meeting_notifications import MeetingNotifications, job_notifier
+        from astra_voice.ui.meeting_offer_window import MeetingOffer
         from astra_voice.ui.meeting_overlay import MeetingOverlay
         from astra_voice.ui.meeting_recording import transcribe_supervisor
 
@@ -859,6 +860,9 @@ def _bind_meeting_recording(
         created.append(overlay)
         notice = MeetingNotice(recording, overlay, notice=bridge.notice, parent=bridge)
         created.append(notice)
+        offer = MeetingOffer(recording, parent=bridge)
+        created.append(offer)
+        recording.bind_offer(offer)
         notifications = MeetingNotifications(recording, parent=bridge)
         created.append(notifications)
         # E13.M4: the transcription queue is bound with capture; both start only when
@@ -896,6 +900,7 @@ def _bind_meeting_recording(
     bridge._meeting_overlay = overlay
     bridge.overlayKeyboardRequested.connect(overlay.activate_keyboard)
     bridge._meeting_notice = notice
+    bridge._meeting_offer = offer
     bridge.noticeKeyboardRequested.connect(notice.activate_keyboard)
     bridge._meeting_notifications = notifications
     bridge.bindRecording(recording)

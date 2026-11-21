@@ -82,7 +82,8 @@ def _check_deb(tmp_path: Path) -> None:
         check=True,
     )
     check_catalog(stage / "usr/share/astra-voice/data/meeting-apps.json")
-    # A real local .deb archive (no installation, signing or vendor wheels).
+    # A real local .deb archive. Fast compression keeps the staging check within
+    # its deadline even when other tests are building or compressing archives.
     control = stage / "DEBIAN"
     control.mkdir()
     control.chmod(0o755)
@@ -92,12 +93,16 @@ def _check_deb(tmp_path: Path) -> None:
     )
     archive = tmp_path / "test.deb"
     subprocess.run(
-        ["dpkg-deb", "--build", "--root-owner-group", str(stage), str(archive)],
+        ["dpkg-deb", "-Zgzip", "-z1", "--build", "--root-owner-group", str(stage), str(archive)],
         check=True,
     )
     extracted = tmp_path / "extracted"
     subprocess.run(["dpkg-deb", "--extract", str(archive), str(extracted)], check=True)
     check_catalog(extracted / "usr/share/astra-voice/data/meeting-apps.json")
+    for resource in ("MeetingOffer.qml", "components/MeetingOfferControl.qml"):
+        assert (extracted / "usr/share/astra-voice/qml" / resource).read_bytes() == (
+            ROOT / "qml" / resource
+        ).read_bytes()
 
 
 def _check_appimage(tmp_path: Path) -> None:
