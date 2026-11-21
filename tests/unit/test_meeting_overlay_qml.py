@@ -16,7 +16,7 @@ PROBE = r'''
 import re
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QObject, QPoint, QMetaObject, Qt, QUrl, pyqtProperty, pyqtSignal
+from PyQt5.QtCore import QObject, QPoint, QPointF, QMetaObject, Qt, QUrl, pyqtProperty, pyqtSignal
 from PyQt5.QtGui import QGuiApplication, QFontDatabase, QFontInfo, QFontMetricsF
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickWindow
@@ -60,6 +60,8 @@ import QtQuick 2.15
 import QtQuick.Window 2.15
 import "qml"
 Window {
+    property color mutedIcon: PillTheme.pillIconMuted
+    property string overlayAccessibleName: overlay.Accessible.name
     width: overlay.pillWidth + 36
     height: overlay.pillHeight + 42
     visible: true
@@ -185,6 +187,7 @@ if mode == "states":
             {"secondary": "DION закрылся — пишется только микрофон"},
             "DION закрылся",
         ),
+        ("far-partial", {"secondary": W2_TEXTS["farPartial"]}, W2_TEXTS["farPartial"]),
         (
             "recording",
             {
@@ -259,6 +262,8 @@ elif mode == "geometry":
                             microphoneName="Встроенный микрофон"), (482, 96)),
         ("app-closed", dict(elapsed="1:05:21",
                             secondary="DION закрылся — пишется только микрофон"), (482, 63)),
+        # Measured against the app-closed layout; far-partial has no reference image.
+        ("far-partial", dict(elapsed="1:05:21", secondary=W2_TEXTS["farPartial"]), (482, 63)),
         ("paused-lock", dict(secondary="Экран был заблокирован — продолжите вручную"),
                             (464, 63)),
         ("mic-paused", dict(elapsed="0:12:40",
@@ -297,6 +302,18 @@ elif mode == "geometry":
             if state == "notify-fallback":
                 assert not item("meetingExtend").property("visible")
                 assert not item("meetingResumeMicrophone").property("visible")
+            if state == "far-partial":
+                assert (
+                    item("meetingSecondaryText").property("color") == window.property("mutedIcon")
+                )
+                assert window.property("overlayAccessibleName").endswith(
+                    ". Часть звука не записывается"
+                )
+                row2_top = item("meetingSecondary").mapToItem(root, QPointF()).y()
+                for name in ("meetingPause", "meetingStop"):
+                    button = item(name)
+                    assert button.property("visible") and button.property("enabled")
+                    assert button.mapToItem(root, QPointF(0, button.height())).y() <= row2_top
             if state in ("stopping", "error"):
                 root.setProperty("compact", True)
                 QTest.qWait(20)
@@ -308,6 +325,9 @@ elif mode == "geometry":
             QTest.qWait(20)
             assert abs(root.property("pillWidth") - 141.6) < .01
             assert root.property("pillHeight") == 36
+            if state == "far-partial":
+                assert not item("meetingSecondary").property("visible")
+                assert W2_TEXTS["farPartial"] not in window.property("overlayAccessibleName")
         root.setProperty("compact", False)
         update()
         title = item("meetingTitle")

@@ -18,7 +18,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, QUrl
 from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtQml import QQmlApplicationEngine
 from test_meeting_capture import Rig as RoleRig
-from test_meeting_m8_call_service import ALLOWED, TARGET, CheckDouble, checked_card
+from test_meeting_m8_call_service import ALLOWED, CheckDouble, checked_card
 from test_meeting_m8_call_service import service as service
 from test_meeting_m8_offer import (
     CALL,
@@ -36,7 +36,7 @@ from test_meeting_m8_offer import (
     tick_at,
 )
 from test_meeting_m8_role_ownership import command_types
-from test_meeting_m8_start import CaptureEvents
+from test_meeting_m8_start import CaptureEvents, pinned_outputs
 from test_meeting_recording_bridge import (
     MID,
     Rig,
@@ -853,9 +853,15 @@ def test_start_latency_is_once_and_contains_only_fixed_fields(
     assert all(value not in line for value in (CALL, MID, "capture1", "target-", "call1"))
 
 
-@pytest.mark.parametrize("outcome", ["started", "target-mismatch"])
+@pytest.mark.parametrize(
+    "outcome,outputs", [("started", 1), ("started", 3), ("target-mismatch", 1)]
+)
 def test_w1_round_trip_through_worker_supervisor_and_capture_role(
-    rig: Rig, service: tuple[RoleRig, CheckDouble], outcome: str, monkeypatch: pytest.MonkeyPatch
+    rig: Rig,
+    service: tuple[RoleRig, CheckDouble],
+    outcome: str,
+    outputs: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worker, checks = service
     worker.clock.now = rig.now
@@ -873,7 +879,7 @@ def test_w1_round_trip_through_worker_supervisor_and_capture_role(
     commands: list[dict[str, object]] = []
     states: list[dict[str, object]] = []
     replies: list[dict[str, object]] = []
-    capture_events = CaptureEvents(worker, "prepared", "prepare-failed", "opened")
+    capture_events = CaptureEvents(worker, "prepared", "prepare-failed", "opened", "far-partial")
     archive_started = threading.Event()
     fsync = worker.state.fsync
 
@@ -912,7 +918,7 @@ def test_w1_round_trip_through_worker_supervisor_and_capture_role(
         assert view.calls == [SHOW] and commands == []
 
         worker.clock.now = START_AT / 1000
-        target = replace(TARGET, measured_at=worker.clock() + 0.55)
+        target = pinned_outputs(outputs, worker.clock() + 0.55)
         result = replace(ALLOWED, variant1=outcome == "started", target=target)
         run = checks.plan(result)
         press_start(rig)
@@ -944,6 +950,12 @@ def test_w1_round_trip_through_worker_supervisor_and_capture_role(
             )
             assert worker.backend.source_targets == [target]
             assert worker.backend.source_targets[0] is target
+            if outputs == 3:
+                worker.backend.sources[0].losses.put(target.streams[1:2])
+                capture_events.wait("far-partial")
+                feed(worker.poll())  # WorkerSupervisor reads and decodes the actual IPC frame.
+                assert rig.recording.overlay["state"] == "far-partial"
+                assert rig.recording.overlay["secondary"] == "Часть звука не записывается"
             assert not rig.bridge.startDialogOpen
             assert [command["type"] for command in commands] == [PREPARE, OPEN]
         else:

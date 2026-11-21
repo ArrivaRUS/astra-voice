@@ -16,9 +16,9 @@ import uuid
 import wave
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from astra_voice.meetings.events import DetectorCode
 from astra_voice.meetings.segments import CaptureJournal, ClockAnchor, SegmentSidecar
@@ -49,7 +49,7 @@ from astra_voice.worker.meeting_roles import failure
 from astra_voice.worker.meeting_session import MeetingSession, SessionAdmission
 
 if TYPE_CHECKING:
-    from astra_voice.worker.meeting_identity_check import CallAnchor, PinnedTarget
+    from astra_voice.worker.meeting_identity_check import CallAnchor, PinnedStream, PinnedTarget
 
 Message = dict[str, Any]
 MAX_PCM_BYTES = 128000  # total across the two tracks
@@ -498,12 +498,15 @@ class MeetingCaptureState:
         self.identity: Message = {}
         self.far: Message = {"kind": "none"}
         self.prepared_target: PinnedTarget | None = None
+        self.capture_target: PinnedTarget | None = None
         self._prepared_anchor: CallAnchor | None = None
         self._target_epoch: int | None = None
         self.mic_device: str | None = None
         self.archive: _Archive | None = None
         self.sources: dict[str, Source] = {}
         self.track_states = {"mic": "ended", "far": "ended"}
+        self._far_partial_pending = False
+        self._last_far_partial = float("-inf")
         self.messages: queue.SimpleQueue[Message] = queue.SimpleQueue()
         self.observer = MeetingObserver(
             address=observer_address(),
@@ -1035,12 +1038,13 @@ class MeetingCaptureState:
 
     def _drop_target(self) -> None:
         self.prepared_target = None
+        self.capture_target = None
         self._prepared_anchor = None
         self._target_epoch = None
 
     def _can_reopen(self) -> bool:
         return self.far["kind"] != "app_stream" or (
-            self.prepared_target is not None and self._prepared_anchor is None
+            self.capture_target is not None and self._prepared_anchor is None
         )
 
     def _require_prepared_target(self) -> None:
@@ -1098,7 +1102,7 @@ class MeetingCaptureState:
                         check.settled
                         and check.variant1
                         and target is not None
-                        and len(target.streams) == 1
+                        and 1 <= len(target.streams) <= 8
                     ):
                         error = check.target_error or TargetError.MISMATCH
                         diagnostic = result_code(check)
@@ -1258,8 +1262,12 @@ class MeetingCaptureState:
         stop = self.audio_stop
         self.used_meetings.add(self.identity["meeting_id"])
         backend = self._get_backend()
-        far, target = self.far, self.prepared_target
         first = request["type"] == "meeting.capture.open"
+        if first:
+            target = self.capture_target = self.prepared_target
+        else:
+            target = self.capture_target
+        far = self.far
 
         def start() -> None:
             try:
@@ -1269,6 +1277,7 @@ class MeetingCaptureState:
                     raise ValueError("limit")
                 self.sources = {}
                 far_ended = False
+                lost_streams: tuple[PinnedStream, ...] = ()
                 for track in self.selected_tracks:
                     if stop.is_set() or not self._admitted(request):
                         raise ValueError("admission-stale")
@@ -1277,6 +1286,8 @@ class MeetingCaptureState:
                             source = self.mic_factory()
                         elif far["kind"] == "app_stream":
                             source = backend.source(far, target=target)
+                            if target is not None and len(target.streams) > 1:
+                                cast(Any, source).strict = first
                         else:
                             source = backend.source(far)
                         self.sources[track] = source
@@ -1284,6 +1295,8 @@ class MeetingCaptureState:
                         if stop.is_set() or not self._admitted(request):
                             raise ValueError("admission-stale")
                         source.open(self.mic_device if track == "mic" else None)
+                        if track == "far":
+                            lost_streams = getattr(source, "lost_streams", ())
                     except ValueError as exc:
                         if (
                             first
@@ -1294,6 +1307,7 @@ class MeetingCaptureState:
                             raise
                         failed_source = self.sources.get(track)
                         if failed_source is not None:
+                            lost_streams = getattr(failed_source, "lost_streams", ())
                             failed_source.shutdown()
                             del self.sources[track]
                         far_ended = True
@@ -1306,6 +1320,7 @@ class MeetingCaptureState:
                         "type": "opened",
                         "request": request,
                         "far_ended": far_ended,
+                        "lost_streams": lost_streams,
                         "pause_before": pause_before,
                         "stop": stop,
                     }
@@ -1375,9 +1390,20 @@ class MeetingCaptureState:
         assert self.archive is not None
         archive = self.archive
         next_read = time.monotonic()
+        # The opener already reported the initial losses in "opened".
+        lost_count = len(getattr(source, "lost_streams", ())) if track == "far" else 0
         try:
             while not stop.is_set():
-                data = source.read_chunk()
+                try:
+                    data = source.read_chunk()
+                finally:
+                    if track == "far":
+                        lost = getattr(source, "lost_streams", ())
+                        if len(lost) > lost_count:
+                            self.messages.put(
+                                {"type": "far-partial", "lost_streams": lost[lost_count:]}
+                            )
+                            lost_count = len(lost)
                 if stop.is_set():
                     return
                 change = getattr(source, "change", None)
@@ -1424,6 +1450,7 @@ class MeetingCaptureState:
             self.messages.put({"type": "audio-failed"})
 
     def _close(self, request: Message | None, reason: str) -> None:
+        self._far_partial_pending = False
         if reason in {"lease", "indicators"} and self.pause_at is None:
             self.lease_tracks = {
                 track for track, state in self.track_states.items() if state == "live"
@@ -1503,6 +1530,19 @@ class MeetingCaptureState:
             "at_recorded_ms": self._recorded(),
         }
 
+    def _note_far_losses(self, lost: tuple[PinnedStream, ...]) -> None:
+        target = self.capture_target
+        if target is None or not lost:
+            return
+        streams = tuple(stream for stream in target.streams if stream not in lost)
+        if not streams:
+            # Keep the target for mic-only resume. The ended track excludes far.
+            self._far_partial_pending = False
+        elif streams != target.streams:
+            self.capture_target = replace(target, streams=streams)
+            if self.state == "recording" and self.track_states["far"] == "live":
+                self._far_partial_pending = True
+
     def _finish_prepare(self, event: Message, result: list[Message]) -> None:
         control: _PreparedControl = event["control"]
         if not self.preparing or event["request"] != self.prepare_request:
@@ -1544,6 +1584,8 @@ class MeetingCaptureState:
         self.final_status = "succeeded"
         self.lost_estimate_ms = 0
         self.track_states = {"mic": "ended", "far": "ended"}
+        self._far_partial_pending = False
+        self._last_far_partial = float("-inf")
         self.index = request["segment_index_from"]
         self.state, self.recorded_ms = "prepared", 0
         self.pause_reasons.clear()
@@ -1653,6 +1695,7 @@ class MeetingCaptureState:
             self.track_states[track] = "live"
             self.archive.put("track_start", (track, source.sample_clock(), self.recorded_ms))
             self._start_reader(track, source)
+        self._note_far_losses(event["lost_streams"])
         if event.get("far_ended"):
             self._queue_far_ended()
         if request.get("automatic"):
@@ -1893,12 +1936,16 @@ class MeetingCaptureState:
                         **{key: segment[key] for key in fields},
                     }
                 )
+            elif kind == "far-partial":
+                self._note_far_losses(event["lost_streams"])
             elif kind == "track-ended":
                 track, reason = event["track"], event["reason"]
                 self.lease_tracks.discard(track)
                 if reason == "audio_failed":
                     self._autopause("audio_failed", "audio-failed", result)
                 else:
+                    if track == "far":
+                        self._far_partial_pending = False
                     result.append(
                         self._track_event(
                             track,
@@ -1945,13 +1992,16 @@ class MeetingCaptureState:
                     result,
                 )
         # Apply revocations from the entire batch before publishing app-stream audio.
-        if self.calls.resolve_server(server_events, checks, result):
+        server_changed = self.calls.resolve_server(server_events, checks, result)
+        if server_changed:
             self._reset_control()
         self.calls.sync_automation(result)
         if prepare_result is not None:
             self._finish_prepare(prepare_result, result)
         if app_open is not None:
             self._finish_open(app_open, result)
+        if server_changed:
+            self._far_partial_pending = False
         self._session_events(result)
         self._expire_pause()
         self._maybe_auto_resume()
@@ -1979,6 +2029,15 @@ class MeetingCaptureState:
                 self._autopause("lease", "lease", result)
             if self.state == "recording" and self._recorded() >= self.limit_ms:
                 self._close(None, "limit")
+        if (
+            self._far_partial_pending
+            and self.state == "recording"
+            and self.track_states["far"] == "live"
+            and now - self._last_far_partial >= 1
+        ):
+            self._far_partial_pending = False
+            self._last_far_partial = now
+            result.append(self._track_event("far", "live", "partial"))
         if self.identity and now - self.last_alive >= 1 and self.state != "closing-unknown":
             self.last_alive, self.seq = now, self.seq + 1
             elapsed = now - self.cpu_at

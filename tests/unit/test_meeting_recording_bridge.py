@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -27,6 +29,7 @@ from astra_voice.ui import meeting_recording
 from astra_voice.ui.meeting_bridge import MeetingBridge
 from astra_voice.ui.meeting_offer import OfferView
 from astra_voice.ui.meeting_recording import AudioHints, MeetingRecording
+from astra_voice.ui.meeting_texts import W1_CALL_TEXTS, W2_TEXTS
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
@@ -260,6 +263,154 @@ def test_current_card_enables_call_and_starts_app_stream_on_click(rig: Rig) -> N
     assert rig.bridge.selectedSource == "call"
     rig.bridge.on_start_clicked()
     assert rig.supervisor.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
+
+
+def test_browser_offer_and_card_keep_the_all_tabs_copy(rig: Rig) -> None:
+    assert W1_CALL_TEXTS["call-browser"]["body"] == (
+        "Запись начнётся с момента нажатия — сказанное раньше в неё не попадёт. "
+        "Запишется звук браузера целиком — всех вкладок."
+    )
+    rig.bridge.requestRecording()
+    rig.supervisor.event(rig.call_state("browser"))
+    call, *_ = rig.bridge.startOptions
+    assert call["id"] == "call" and call["enabled"]
+    assert call["title"] == "Звонок в браузере"
+    assert (
+        call["caption"] == "Ваш микрофон и звук браузера — всех вкладок, не только вкладки звонка."
+    )
+
+
+def partial_frame() -> dict[str, Any]:
+    return {
+        "type": "meeting.capture.track",
+        "meeting_id": MID,
+        "meeting_generation": 0,
+        "capture_id": "capture1",
+        "state_rev": 1,
+        "track": "far",
+        "state": "live",
+        "kind": "partial",
+        "at_recorded_ms": 100,
+    }
+
+
+def test_partial_track_wire_accepts_only_public_fields_and_known_kind() -> None:
+    frame = partial_frame()
+    body = json.dumps(frame).encode()
+    assert ipc.decode(body, role="meeting-capture") == frame
+    assert (
+        ipc.decode(ipc.encode(frame, role="meeting-capture")[4:], role="meeting-capture") == frame
+    )
+    for extra in ({"kind": "bogus"}, {"streams": 3}, {"sink_input": 789}, {"stream_serial": 765}):
+        with pytest.raises(ipc.FrameError):
+            ipc.decode(json.dumps({**frame, **extra}).encode(), role="meeting-capture")
+
+
+def test_far_partial_is_sticky_prioritized_and_scoped_to_current_meeting(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = rig.recording.controller
+    rig.bridge.requestRecording()
+    rig.supervisor.event(rig.call_state("browser"))
+    rig.bridge.on_start_clicked()
+    rig.reply("prepared")
+    rig.reply("started", tracks=["mic", "far"])
+    frame = partial_frame()
+
+    def deliver(**fields: Any) -> None:
+        payload = ipc.decode(json.dumps({**frame, **fields}).encode(), role="meeting-capture")
+        rig.supervisor.event({**payload, "generation": rig.supervisor.generation})
+
+    for wrong in ({"capture_id": "old"}, {"meeting_generation": 1}, {"track": "mic"}):
+        deliver(**wrong)
+        assert not controller.far_partial
+    rig.supervisor.event({**frame, "generation": 0})
+    assert not controller.far_partial
+    deliver()
+    assert rig.recording.overlay["state"] == "far-partial"
+    assert (
+        rig.recording.overlay["secondary"]
+        == W2_TEXTS["farPartial"]
+        == "Часть звука не записывается"
+    )
+    rig.now += 9
+    rig.reply(
+        "alive",
+        state_rev=1,
+        seq=1,
+        state="recording",
+        recorded_ms=9000,
+        tracks={"mic": "live", "far": "live"},
+        free_mb=1000,
+        cpu_pct=0,
+        pause_reasons=[],
+        manual_resume_required=False,
+        blocked_epoch=2,
+    )
+    assert controller.far_partial and rig.recording.overlay["state"] == "far-partial"
+
+    # Earlier row-two branches win while a loss is latched.
+    deliver(track="mic", state="paused", kind="device-lost")
+    assert rig.recording.overlay["state"] == "mic-paused"
+    deliver(track="mic", kind="reopened")
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.recording, "_overlay_fallback_deadline", rig.now + 1)
+        assert rig.recording.overlay["state"] == "notify-fallback"
+        patch.setattr(rig.recording, "_overlay_far_deadline", rig.now + 1)
+        assert rig.recording.overlay["state"] == "app-closed"
+        patch.setattr(rig.recording, "_overlay_recovery_deadline", rig.now + 1)
+        patch.setattr(rig.recording, "_overlay_recovery_reason", "reason-indicator")
+        assert rig.recording.overlay["state"] == "reason-indicator"
+        patch.setattr(controller, "limit_warning", True)
+        assert rig.recording.overlay["state"] == "limit-soon"
+        deliver(track="mic", state="paused", kind="device-lost")
+        assert rig.recording.overlay["state"] == "mic-paused"
+    assert not controller.start() and controller.error_code == "busy" and controller.far_partial
+    with monkeypatch.context() as patch:
+        patch.setattr(controller, "enabled", lambda: False)
+        assert not controller.start() and controller.error_code == "disabled"
+        assert controller.far_partial
+
+    rig.recording.clicks.on_pause_clicked()
+    assert rig.recording.overlay["state"] == "paused"
+    assert rig.recording.overlay["secondary"] == "" and controller.far_partial
+    rig.reply("closed", tracks=["mic", "far"], state_rev=2)
+    rig.reply(
+        "finalized", segments={"mic": 0, "far": 0}, intervals=[], status="succeeded", state_rev=2
+    )
+    assert rig.recording.clicks.on_resume_clicked()
+    rig.reply("started", tracks=["mic", "far"], state_rev=3, blocked_epoch=2)
+    assert rig.recording.overlay["state"] == "far-partial"
+    deliver(state="ended", kind="target-removed", state_rev=3)
+    assert rig.recording.overlay["state"] == "app-closed"
+    rig.now += 9
+    rig.recording.tick()
+    assert rig.recording.overlay["state"] == "recording" and controller.far_partial
+
+    rig.recording.clicks.on_stop_clicked()
+    rig.reply("closed", tracks=["mic"], state_rev=4)
+    rig.reply(
+        "finalized", segments={"mic": 0, "far": 0}, intervals=[], status="succeeded", state_rev=4
+    )
+    previous = rig.supervisor
+    previous.ready, previous.exited = False, True
+    previous.on_exit(0)
+    with monkeypatch.context() as patch:
+        patch.setattr(controller, "session", lambda: replace(rig.session.value, locked=True))
+        assert not controller.start() and controller.error_code == "session-blocked"
+        assert controller.far_partial
+
+    next_id = "2026-11-01_130000-abce"
+    with monkeypatch.context() as patch:
+        patch.setattr(controller, "id_factory", lambda: next_id)
+        rig.bridge.requestRecording()
+        rig.supervisor.event(rig.call_state("browser"))
+        rig.bridge.on_start_clicked()
+    assert not controller.far_partial
+    rig.reply("prepared", meeting_id=next_id, capture_id="capture2")
+    rig.reply("started", meeting_id=next_id, capture_id="capture2", tracks=["mic", "far"])
+    deliver(state_rev=4)  # Valid wire frame from the previous capture.
+    assert rig.recording.overlay["state"] == "recording" and not controller.far_partial
 
 
 @pytest.mark.parametrize("app_class", ["dion", "browser"])

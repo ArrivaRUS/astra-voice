@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 import wave
@@ -16,6 +17,7 @@ from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.worker import ipc
 from astra_voice.worker.meeting_capture import MeetingCaptureState
+from astra_voice.worker.meeting_identity_check import PinnedStream
 from astra_voice.worker.meeting_session import SessionAdmission
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
@@ -36,12 +38,18 @@ class Source:
         self.samples = 0
         self.device_change: object | None = None
         self.ended = False
+        self.losses: queue.SimpleQueue[tuple[PinnedStream, ...]] = queue.SimpleQueue()
+        self.lost_streams: tuple[PinnedStream, ...] = ()
         self.clock_kind = "pulse"
 
     def open(self, device: str | None = None) -> None:
         self.opened = True
 
     def read_chunk(self) -> bytes | None:
+        try:
+            self.lost_streams += self.losses.get_nowait()
+        except queue.Empty:
+            pass
         if self.chunks:
             chunk = self.chunks.pop(0)
             if chunk:

@@ -954,12 +954,14 @@ class MixedFarSource:
         self._close_gate = threading.Lock()
         self._close_requests = 0
         self._members: list[_FarMember] = []
+        self.strict = True
         self.admission_check: Callable[[], bool] = lambda: True
         self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
         self._reset_mix()
 
     def _reset_mix(self) -> None:
         self.ended = self.partial = False
+        self.lost_streams: tuple[PinnedStream, ...] = ()
         self.change: str | None = None
         self.reanchors = self.late_bytes = 0
         self._out_pos = 0
@@ -991,7 +993,18 @@ class MixedFarSource:
                     source.admission_check = self._can_operate
                     source.admission_guard = lambda: self.admission_guard()
                     self._members.append(_FarMember(source))
-                    source.open(device)
+                    try:
+                        source.open(device)
+                    except ValueError as exc:
+                        if self.strict or str(exc) not in {"target-gone", "target-mismatch"}:
+                            raise
+                        source.shutdown()
+                        self._members.pop()
+                        self.lost_streams += (stream,)
+                if not self._members:
+                    self.ended = True
+                    raise ValueError("target-gone")
+                self.partial = bool(self.lost_streams)
             except BaseException as open_error:
                 try:
                     self._shutdown_members()
@@ -1026,6 +1039,8 @@ class MixedFarSource:
                     if data is None:
                         if not source.ended:
                             raise ValueError("audio-failed")
+                        assert source.target is not None
+                        self.lost_streams += source.target.streams
                         live.remove(member)
                         if self._leader is member:
                             self._leader = None
@@ -1040,7 +1055,7 @@ class MixedFarSource:
 
             if not self._can_operate():
                 return b""
-            self.partial = 0 < len(live) < len(self._members)
+            self.partial = bool(live and self.lost_streams)
             if not live:
                 self.ended = True
                 return None

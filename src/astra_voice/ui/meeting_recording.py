@@ -828,6 +828,8 @@ class MeetingRecording(QObject):
             elif self.clock() < self._overlay_fallback_deadline:
                 # S17-A4: the notification service did not take the notice.
                 state, secondary = "notify-fallback", self._overlay_fallback_text
+            elif controller.far_partial and controller.tracks.get("far") == "live":
+                state, secondary = "far-partial", W2_TEXTS["farPartial"]
         if self.clock() < self._overlay_error_deadline:
             visible, state, secondary = True, "error", W2_TEXTS["audioError"]
         pause_minutes = (

@@ -302,18 +302,23 @@ def test_member_loss_keeps_survivors_until_all_are_removed(
     case = mixer(3)
     source = case.open()
     first, second, third = case.pulses
-    assert not source.partial
+    assert not source.partial and source.lost_streams == ()
     second.events.append(("removed", 8))
     first.give(tone(1, 100), 1100)
     third.give(tone(3, 100), 1100)
     assert source.read_chunk() == tone(4, 100)
     assert source.partial and not source.ended
+    assert source.lost_streams == case.target.streams[1:2]
     assert second.destroyed_event.wait(2) and not second.recording
     assert source.read_chunk() == b""
     first.events.append(("removed", 7))
     third.events.append(("removed", 9))
     assert source.read_chunk() is None
     assert source.ended and not source.partial and source.read_chunk() is None
+    lost = case.target.streams
+    assert source.lost_streams == (lost[1], lost[0], lost[2])
+    source.shutdown()
+    assert source.lost_streams == (lost[1], lost[0], lost[2])
 
 
 @pytest.mark.parametrize("step", [0, 400])
@@ -427,6 +432,37 @@ def test_open_is_strict_and_shuts_down_every_created_member(
     calls = [p.calls.copy() for p in case.pulses]
     source.shutdown()
     assert [p.calls for p in case.pulses] == calls
+
+
+@pytest.mark.parametrize("all_gone", [False, True])
+def test_soft_open_closes_missing_members_and_never_reads_them(
+    mixer: Callable[[int], MixCase], all_gone: bool
+) -> None:
+    case = mixer(3)
+    source = case.source
+    source.strict = False
+
+    def configure(pulse: ScriptedPulse, i: int) -> None:
+        if i == 0 or (all_gone and i == 2):
+            pulse.target = None
+        elif i == 1:
+            assert pulse.target is not None
+            pulse.after_open.append(replace(pulse.target, serial=999))
+
+    case.before_open = configure
+    if all_gone:
+        with pytest.raises(ValueError, match="^target-gone$"):
+            case.open()
+        assert source.ended and not source.partial
+        assert source.lost_streams == case.target.streams
+        assert source.read_chunk() is None
+    else:
+        case.open()
+        assert source.partial and not source.ended
+        assert source.lost_streams == case.target.streams[:2]
+        case.pulses[2].give(tone(3, 100), 1100)
+        assert source.read_chunk() == tone(3, 100)
+    assert all(p.destroyed and ("read",) not in p.calls for p in case.pulses[:2])
 
 
 def test_events_recheck_only_own_index_and_server_rechecks_everyone(

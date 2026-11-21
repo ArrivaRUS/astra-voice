@@ -322,7 +322,9 @@ TRACK_EVENT = {
     **CAPTURE,
     "track": TRACK,
     "state": STATE,
-    "kind": choices("switched", "device-lost", "target-removed", "sink-moved", "reopened"),
+    "kind": choices(
+        "switched", "device-lost", "target-removed", "sink-moved", "reopened", "partial"
+    ),
     "at_recorded_ms": MILLISECONDS,
 }
 REPLY_FIELDS["meeting.capture.track"] = TRACK_EVENT
