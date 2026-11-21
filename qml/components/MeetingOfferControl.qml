@@ -7,8 +7,12 @@ Rectangle {
     property string glyph
     property bool primary: false
     property bool closeControl: false
-    readonly property bool hasActionGlyph: !closeControl && glyph.length > 0
-    readonly property real glyphSpace: hasActionGlyph ? actionGlyph.width + gap : 0
+    property bool inert: false
+    property bool spinning: false
+    property bool freezeAnimations: false
+    readonly property bool hasActionGlyph: !closeControl && !spinning && glyph.length > 0
+    readonly property real glyphSpace: (hasActionGlyph || spinning)
+                                       ? PillTheme.pillMeetingOfferBtnIcon + gap : 0
     readonly property real gap: PillTheme.pillMeetingOfferHeadMarginBottom
     readonly property color labelColor: primary ? PillTheme.notifyBtnPrimaryFg : PillTheme.notifyFg
     readonly property bool hovered: pointer.containsMouse
@@ -43,6 +47,34 @@ Rectangle {
         fill: true
         color: control.labelColor
     }
+    Canvas {
+        objectName: "offerSpinner"
+        x: Theme.notificationButtonPaddingX
+        y: Math.round((parent.height - height) / 2)
+        width: PillTheme.pillMeetingOfferBtnIcon
+        height: width
+        visible: control.spinning
+        property color ink: control.labelColor
+        onInkChanged: requestPaint()
+        onPaint: {
+            var context = getContext("2d")
+            context.clearRect(0, 0, width, height)
+            context.strokeStyle = ink
+            context.lineWidth = 1.5
+            context.lineCap = "round"
+            context.beginPath()
+            context.arc(width / 2, height / 2, (width - 1.5) / 2, -Math.PI / 2, Math.PI)
+            context.stroke()
+        }
+        RotationAnimator on rotation {
+            objectName: "offerSpinnerRotation"
+            from: 0
+            to: 360
+            duration: 1000
+            loops: Animation.Infinite
+            running: control.spinning && control.visible && !control.freezeAnimations
+        }
+    }
     Item {
         id: labelBox
         x: Theme.notificationButtonPaddingX + control.glyphSpace
@@ -68,8 +100,8 @@ Rectangle {
     MouseArea {
         id: pointer
         anchors.fill: parent
-        hoverEnabled: true
-        cursorShape: Qt.PointingHandCursor
+        hoverEnabled: !control.inert
+        cursorShape: control.inert ? Qt.ArrowCursor : Qt.PointingHandCursor
         onPressed: control.pressed(true)
     }
 }

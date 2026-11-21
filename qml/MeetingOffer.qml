@@ -9,8 +9,11 @@ Item {
     property string kind
     property var texts: ({})
     property string remainingText
+    property string errorText
     property int seconds
     property bool presented: false
+    property bool starting: false
+    property bool startFailed: false
     property bool freezeAnimations: false
     signal pressed(string action, bool mouse)
 
@@ -20,12 +23,13 @@ Item {
     readonly property real contentWidth: surfaceWidth - 2 * contentX
     readonly property real screenOffset: PillTheme.pillMeetingOfferScreenOffset
     readonly property real surfaceWidth: PillTheme.pillMeetingOfferW
-    readonly property real surfaceHeight: counter.y + counter.height + contentY
+    readonly property real surfaceHeight: startFailed ? actions.y + actions.height + contentY
+                                                     : counter.y + counter.height + contentY
     implicitWidth: surfaceWidth
     implicitHeight: surfaceHeight
     visible: presented
     Accessible.role: Accessible.AlertMessage
-    Accessible.name: root.texts.title || ""
+    Accessible.name: root.startFailed ? root.errorText : (root.texts.title || "")
 
     function forceLayout() {
         header.forceLayout();
@@ -88,6 +92,7 @@ Item {
             objectName: "offerClose"
             anchors.right: parent.right
             closeControl: true
+            inert: root.starting
             glyph: "x"
             label: root.texts.close || ""
             onPressed: root.pressed("close", mouse)
@@ -100,6 +105,7 @@ Item {
         y: head.y + head.height + PillTheme.pillMeetingOfferHeadMarginBottom
         width: root.contentWidth
         height: title.contentHeight * title.scale
+        visible: !root.startFailed
         OfferText {
             id: title
             objectName: "offerTitle"
@@ -114,16 +120,17 @@ Item {
     Item {
         id: bodyBox
         x: root.contentX
-        y: Math.round(titleBox.y + titleBox.height + PillTheme.pillMeetingOfferTitleMarginBottom)
+        y: root.startFailed ? titleBox.y
+                            : Math.round(titleBox.y + titleBox.height + PillTheme.pillMeetingOfferTitleMarginBottom)
         width: root.contentWidth
         height: body.contentHeight * body.scale
         OfferText {
             id: body
             objectName: "offerBody"
             width: parent.width / scale
-            wrapMode: Text.Wrap
-            text: root.texts.body || ""
-            color: PillTheme.pillIconMuted
+            wrapMode: root.startFailed ? Text.WordWrap : Text.Wrap
+            text: root.startFailed ? root.errorText : (root.texts.body || "")
+            color: root.startFailed ? PillTheme.notifyFg : PillTheme.pillIconMuted
         }
     }
     Item {
@@ -132,20 +139,33 @@ Item {
         x: root.contentX
         y: Math.round(bodyBox.y + bodyBox.height + PillTheme.pillMeetingOfferButtonsMarginTop)
         width: root.contentWidth
-        height: start.height
+        height: root.startFailed ? openMeetings.height : start.height
         MeetingOfferControl {
             id: start
             objectName: "offerStart"
             primary: true
+            visible: !root.startFailed
+            inert: root.starting
             glyph: "rec"
-            label: root.texts.start || ""
+            spinning: root.starting
+            freezeAnimations: root.freezeAnimations
+            label: (root.starting ? root.texts.starting : root.texts.start) || ""
             onPressed: root.pressed("start", mouse)
         }
         MeetingOfferControl {
             objectName: "offerRefuse"
             x: start.width + Theme.notificationButtonsGap
+            visible: !root.startFailed
+            inert: root.starting
             label: root.texts.refuse || ""
             onPressed: root.pressed("refuse", mouse)
+        }
+        MeetingOfferControl {
+            id: openMeetings
+            objectName: "offerOpenMeetings"
+            visible: root.startFailed
+            label: root.texts.openMeetings || ""
+            onPressed: root.pressed("open_meetings", mouse)
         }
     }
     Item {
@@ -155,6 +175,7 @@ Item {
         y: Math.round(actions.y + actions.height + Theme.notificationButtonsGap)
         width: root.contentWidth
         height: remaining.lineHeight * remaining.scale
+        visible: !root.startFailed
         OfferText {
             id: remaining
             objectName: "offerRemaining"
@@ -174,6 +195,7 @@ Item {
         y: root.surfaceHeight - root.borderWidth - height
         width: root.surfaceWidth - 2 * root.borderWidth
         height: PillTheme.pillMeetingOfferTimerH
+        visible: !root.startFailed
         clip: true
         Item {
             objectName: "offerProgressFill"
@@ -192,7 +214,8 @@ Item {
         }
         NumberAnimation on fraction {
             objectName: "offerCountdown"
-            running: root.presented && !root.freezeAnimations
+            running: root.presented && !root.startFailed && !root.freezeAnimations
+            paused: running && root.starting
             from: 1
             to: 0
             duration: 60000

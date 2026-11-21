@@ -18,7 +18,7 @@ from PyQt5.QtGui import QCursor, QExposeEvent, QGuiApplication, QMouseEvent, QRe
 from PyQt5.QtQuick import QQuickItem
 
 from astra_voice.core.command_mode import SessionSnapshot
-from astra_voice.core.meeting_session import StorageStatus
+from astra_voice.core.meeting_session import ERROR_TEXT, StorageStatus
 from astra_voice.meetings.store import MeetingStore
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import TIMESTAMP_ATOM, X11Display
@@ -125,12 +125,12 @@ def _show(window: MeetingOffer, recording: MeetingRecording, call_id: str = "cal
     wait_until(window._view.isExposed, timeout=2)
 
 
-def _click_start(x: X11Display, window: MeetingOffer) -> None:
+def _click_control(x: X11Display, window: MeetingOffer, name: str) -> None:
     from Xlib import X
     from Xlib.ext import xtest
 
     view = window._view
-    button = window._root.findChild(QQuickItem, "offerStart")
+    button = window._root.findChild(QQuickItem, name)
     assert button is not None and button.isVisible()
     assert view.devicePixelRatio() == 1, "XTest coordinates use the isolated Xvfb pixels"
     position = view.mapToGlobal(
@@ -350,7 +350,7 @@ def test_x1_x2_x3_click_focus_and_guard(
         frame_x_time = window._frame_x_time
         assert frame_x_time is not None, "PropertyNotify must provide the real XCB epoch"
         now[0] = 100.1
-        _click_start(xdisplay, window)
+        _click_control(xdisplay, window, "offerStart")
         wait_until(observed.is_set)
         assert not presses
         still_focused()
@@ -376,7 +376,7 @@ def test_x1_x2_x3_click_focus_and_guard(
         # mouse event and its server timestamp, with no wall-time sleep.
         with monkeypatch.context() as clock_patch:
             clock_patch.setattr(window, "_frame_x_time", (frame_x_time - 500) & 0xFFFFFFFF)
-            _click_start(xdisplay, window)
+            _click_control(xdisplay, window, "offerStart")
             wait_until(observed.is_set)
         assert presses == [("start", 100_600)]
         still_focused()
@@ -388,6 +388,58 @@ def test_x1_x2_x3_click_focus_and_guard(
             call.args[0]["type"] in {"meeting.capture.prepare", "meeting.capture.open"}
             for call in role.send.call_args_list
         )
+
+
+def test_start_failed_click_focus_and_show_again(
+    offer: tuple[MeetingOffer, MeetingRecording, list[float], Mock],
+    xdisplay: X11Display,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window, recording, now, _ = offer
+    observed = threading.Event()
+    view = window._view
+    view.pointerDispatched.connect(observed.set)
+    press = Mock(return_value=False)
+    with paste_target(tmp_path / "target") as target, monkeypatch.context() as patch:
+        patch.setattr(recording, "press_offer", press)
+        target.activate(xdisplay)
+        previous_active = xdisplay.active_window()
+        assert _focus(xdisplay) == target.window == previous_active
+        _show(window, recording)
+        wait_until(lambda: window._frame_x_time is not None, timeout=2)
+
+        original_height = view.height()
+        now[0] = 100.6
+        window.starting()
+        now[0] = 101.0
+        window.start_failed(ERROR_TEXT["disk-low"])
+        wait_until(lambda: view.height() < original_height, timeout=2)
+
+        def click(name: str) -> None:
+            epoch = window._frame_x_time
+            assert epoch is not None
+            observed.clear()
+            with monkeypatch.context() as clock_patch:
+                clock_patch.setattr(window, "_frame_x_time", (epoch - 500) & 0xFFFFFFFF)
+                _click_control(xdisplay, window, name)
+                wait_until(observed.is_set)
+
+        now[0] = 101.5
+        click("offerOpenMeetings")
+        press.assert_called_once_with("open_meetings", 101_500)
+        assert _focus(xdisplay) == target.window and xdisplay.active_window() == previous_active
+        _assert_wm_properties(xdisplay, window)
+
+        now[0] = 102.0
+        window.show("call-app", 60)
+        wait_until(lambda: window._frame_x_time is not None, timeout=2)
+        assert window._first_frame_at_ms == 102_000
+        now[0] = 102.5
+        click("offerStart")
+        assert press.call_args_list == [(("open_meetings", 101_500), {}), (("start", 102_500), {})]
+        assert _focus(xdisplay) == target.window and xdisplay.active_window() == previous_active
+        _assert_wm_properties(xdisplay, window)
 
 
 def test_x4_real_cursor_moves_w1_only_for_the_card(

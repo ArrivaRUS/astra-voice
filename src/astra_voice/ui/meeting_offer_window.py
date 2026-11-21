@@ -14,7 +14,7 @@ from astra_voice.platform.x11 import TIMESTAMP_ATOM, X11Display
 from astra_voice.ui.meeting_notice import NOTICE_SHADOW_MARGIN, NOTICE_SHADOW_OFFSET_Y
 from astra_voice.ui.meeting_offer import OFFER_GUARD_MS
 from astra_voice.ui.meeting_overlay import SurfaceWindow
-from astra_voice.ui.meeting_texts import W1_CALL_TEXTS, W1_REMAINING, W1_TEXTS
+from astra_voice.ui.meeting_texts import W1_CALL_TEXTS, W1_REMAINING, W1_TEXTS, W4_TEXTS
 
 if TYPE_CHECKING:
     from astra_voice.ui.meeting_recording import MeetingRecording
@@ -64,6 +64,8 @@ class MeetingOffer(SurfaceWindow):
         self._cursor_pos = cursor_pos
         self._closed = False
         self._open = False
+        self._starting = False
+        self._start_failed_at_ms: int | None = None
         self._xcb = QGuiApplication.platformName() == "xcb"
         self._waiting_for_expose = False
         self._frame_handler: Callable[[], None] | None = None
@@ -96,13 +98,22 @@ class MeetingOffer(SurfaceWindow):
             return
         if kind not in W1_CALL_TEXTS:
             raise ValueError("Unknown meeting offer kind")
+        if self._open:
+            # Remap for a new Expose and first frame, including on X11.
+            self.close()
         self._open = True
-        self._waiting_for_expose = False
-        self._stop_tracking_frames()
-        self._first_frame_at_ms = self._frame_x_time = None
-        self._workarea = None
+        self._starting = False
+        self._start_failed_at_ms = None
+        self._root.setProperty("starting", False)
+        self._root.setProperty("startFailed", False)
+        self._root.setProperty("errorText", "")
         self._root.setProperty("kind", kind)
-        self._root.setProperty("texts", W1_TEXTS | W1_CALL_TEXTS[kind])
+        self._root.setProperty(
+            "texts",
+            W1_TEXTS
+            | W1_CALL_TEXTS[kind]
+            | {"starting": W4_TEXTS["starting"], "openMeetings": W4_TEXTS["openMeetings"]},
+        )
         self.update_remaining(seconds)
         self._resize()
         if not self._open:
@@ -121,6 +132,19 @@ class MeetingOffer(SurfaceWindow):
         self._view.setProperty("_q_showWithoutActivating", True)
         self._view.show()
 
+    def starting(self) -> None:
+        if self._open and self._start_failed_at_ms is None:
+            self._starting = True
+            self._root.setProperty("starting", True)
+
+    def start_failed(self, text: str) -> None:
+        if self._open:
+            self._start_failed_at_ms = self.recording.offer.now_ms()
+            self._starting = False
+            self._root.setProperty("errorText", text)
+            self._root.setProperty("startFailed", True)
+            self._root.setProperty("starting", False)
+
     def _window_position(self, area: QRect, *, at_right: bool) -> QPoint:
         width, _ = self._surface_size()
         offset = int(self._root.property("screenOffset"))
@@ -133,11 +157,12 @@ class MeetingOffer(SurfaceWindow):
         return self._clamped(QPoint(x, area.y() + offset) - inset, area)
 
     def _place(self) -> None:
-        if self._workarea is not None:
+        # Failure changes the height while keeping the original top-left corner.
+        if self._workarea is not None and self._start_failed_at_ms is None:
             self._view.setPosition(self._window_position(self._workarea, at_right=self._at_right))
 
     def update_remaining(self, seconds: int) -> None:
-        if not self._closed:
+        if not self._closed and not self._starting and self._start_failed_at_ms is None:
             self._root.setProperty("seconds", seconds)
             self._root.setProperty("remainingText", W1_REMAINING.format(seconds=seconds))
 
@@ -244,9 +269,18 @@ class MeetingOffer(SurfaceWindow):
             self._restoring_user_time = False
 
     def _press(self, action: str, mouse: bool) -> None:
+        if self._starting:
+            return
         if not self._open or not self._view.isVisible() or not self._view.isExposed():
             return
         now = self.recording.offer.now_ms()
+        if self._start_failed_at_ms is not None:
+            if action not in {"open_meetings", "close"}:
+                return
+            if now - self._start_failed_at_ms < OFFER_GUARD_MS:
+                return
+        elif action not in {"start", "refuse", "close"}:
+            return
         if self._first_frame_at_ms is None or now - self._first_frame_at_ms < OFFER_GUARD_MS:
             return
         if mouse and self._xcb:
