@@ -15,10 +15,18 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from astra_voice.meetings.identity import ProcReader, ProcUnavailable
 from astra_voice.worker.meeting_audio_local import CONNECT_LOCK
+from astra_voice.worker.meeting_detector import INVALID_INDEX, project_properties
+
+if TYPE_CHECKING:
+    from astra_voice.worker.meeting_identity_check import PinnedTarget
+
+_PID = "application.process.id"
+_SERIAL = "object.serial"
 
 
 class _Timeval(ctypes.Structure):
@@ -57,19 +65,23 @@ class _ClockObservation:
     wall_offset_us: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Target:
     index: int
     serial: int
-    pid: int
-    cookie: int
+    pid: int = field(repr=False)
+    cookie: int = field(repr=False)
     monitor: str
+    client: int
+    starttime: int = field(repr=False)
 
 
 class MonitorPulse(Protocol):
     monitor_supported: bool
 
-    def resolve(self, index: int) -> Target | None: ...
+    def resolve(
+        self, index: int, *, expected_pid: int | None = None, confirm_loss: bool = False
+    ) -> Target | None: ...
     def default_monitor(self) -> str: ...
     def open_record(self, monitor: str, index: int | None, token: str) -> None: ...
     def close_record(self) -> None: ...
@@ -78,11 +90,33 @@ class MonitorPulse(Protocol):
     def sample_clock(self) -> tuple[str, int, int]: ...
 
 
+def _resolve_target(
+    pulse: MonitorPulse, target: PinnedTarget, *, confirm_loss: bool = False
+) -> Target:
+    (stream,) = target.streams
+    fresh = pulse.resolve(
+        stream.sink_input, expected_pid=stream.process.pid, confirm_loss=confirm_loss
+    )
+    if fresh is None:
+        raise ValueError("target-gone")
+    if (
+        fresh.cookie != target.server_cookie
+        or fresh.index != stream.sink_input
+        or fresh.serial != stream.stream_serial
+        or fresh.client != stream.client
+        or fresh.pid != stream.process.pid
+        or fresh.starttime != stream.process.starttime
+    ):
+        raise ValueError("target-mismatch")
+    return fresh
+
+
 class MonitorStreamSource:
-    def __init__(self, pulse: MonitorPulse, far: dict[str, Any], token: str) -> None:
-        self.pulse, self.far, self.token = pulse, far, token
+    def __init__(
+        self, pulse: MonitorPulse, token: str, *, target: PinnedTarget | None = None
+    ) -> None:
+        self.pulse, self.target, self.token = pulse, target, token
         self.lock = threading.RLock()
-        self.target: Target | None = None
         self.monitor = ""
         self.ended = False
         self.change: str | None = None
@@ -98,32 +132,47 @@ class MonitorStreamSource:
             self._open(device)
 
     def _open(self, device: str | None = None) -> None:
-        if self.far["kind"] == "app_stream":
+        if self.target is not None:
             if not self.pulse.monitor_supported:
                 raise ValueError("monitor-stream-unsupported")
-            target = self.pulse.resolve(int(self.far["sink_input"]))
-            if target is None or target.serial != self.far["object_serial"] or target.pid <= 0:
-                raise ValueError("target-mismatch")
-            if self.target is not None and (
-                target.index,
-                target.serial,
-                target.pid,
-                target.cookie,
-            ) != (self.target.index, self.target.serial, self.target.pid, self.target.cookie):
-                raise ValueError("target-mismatch")
-            self.target = target
-            self.monitor = target.monitor
+            fresh = _resolve_target(self.pulse, self.target)
+            self._open_record(fresh.monitor, fresh.index)
         else:
-            self.target = None
-            self.monitor = self.pulse.default_monitor()
-        if not self.admission_check():
-            raise ValueError("admission-stale")
-        self.pulse.open_record(self.monitor, self.target.index if self.target else None, self.token)
-        if not self.admission_check():
-            self.pulse.close_record()
-            raise ValueError("admission-stale")
-        self.opened = True
+            self._open_record(self.pulse.default_monitor(), None)
         self.ended = False
+
+    def _open_record(self, monitor: str, index: int | None) -> None:
+        if not self.admission_check():
+            raise ValueError("admission-stale")
+        try:
+            self.pulse.open_record(monitor, index, self.token)
+        except Exception as connect_error:
+            try:
+                self.close()
+            finally:
+                if isinstance(self.pulse, NativePulse) and not self.pulse.context_ready():
+                    raise ValueError("audio-failed") from connect_error
+            if self.target is not None and str(connect_error) != "admission-stale":
+                try:
+                    _resolve_target(self.pulse, self.target, confirm_loss=True)
+                except Exception as target_error:
+                    if isinstance(target_error, ValueError) and str(target_error) in {
+                        "target-gone",
+                        "target-mismatch",
+                    }:
+                        raise target_error from connect_error
+                    # A broken context cannot provide evidence of a vanished target.
+            raise
+        try:
+            if self.target is not None:
+                _resolve_target(self.pulse, self.target)
+            if not self.admission_check():
+                raise ValueError("admission-stale")
+        except Exception:
+            self.close()
+            raise
+        self.monitor = monitor
+        self.opened = True
 
     def read_chunk(self) -> bytes | None:
         with self.lock:
@@ -137,30 +186,14 @@ class MonitorStreamSource:
             if self.ended:
                 break
             if self.target is not None:
-                if kind == "removed" and index == self.target.index:
+                target_index = self.target.streams[0].sink_input
+                if kind == "removed" and index == target_index:
                     self.ended = True
-                elif kind == "server" or index == self.target.index:
-                    fresh = self.pulse.resolve(self.target.index)
-                    old = self.target
-                    if fresh is None or (fresh.index, fresh.serial, fresh.pid, fresh.cookie) != (
-                        old.index,
-                        old.serial,
-                        old.pid,
-                        old.cookie,
-                    ):
-                        self.ended = True
-                    elif fresh.monitor != self.monitor:
-                        self.pulse.close_record()
-                        self.target = fresh
-                        self.monitor = fresh.monitor
-                        if not self.admission_check():
-                            self.opened = False
-                            return None
-                        self.pulse.open_record(self.monitor, fresh.index, self.token)
-                        if not self.admission_check():
-                            self.close()
-                            return None
-                        self.change = "sink-moved"
+                elif kind == "server" or index == target_index:
+                    self._check_recording_target()
+                    if self.ended or not self.opened:
+                        return None
+                    if self.change:
                         return b""
             elif kind == "server":
                 fresh_monitor = self.pulse.default_monitor()
@@ -180,6 +213,23 @@ class MonitorStreamSource:
             self.close()
             return None
         return self.pulse.read_chunk()
+
+    def _check_recording_target(self) -> None:
+        assert self.target is not None
+        try:
+            fresh = _resolve_target(self.pulse, self.target)
+            if fresh.monitor != self.monitor:
+                self.close()
+                self._open_record(fresh.monitor, fresh.index)
+                self.change = "sink-moved"
+        except ValueError as exc:
+            if str(exc) == "admission-stale":
+                return
+            if str(exc) not in {"target-gone", "target-mismatch"}:
+                raise
+            if self.opened:
+                self.close()
+            self.ended = True
 
     def sample_clock(self) -> tuple[str, int, int]:
         with self.lock:
@@ -243,6 +293,16 @@ class _InputInfo(ctypes.Structure):
     ]
 
 
+class _ClientInfo(ctypes.Structure):
+    _fields_ = [
+        ("index", ctypes.c_uint32),
+        ("name", ctypes.c_char_p),
+        ("owner", ctypes.c_uint32),
+        ("driver", ctypes.c_char_p),
+        ("proplist", ctypes.c_void_p),
+    ]
+
+
 class _SinkInfo(ctypes.Structure):
     _fields_ = [
         ("name", ctypes.c_char_p),
@@ -285,7 +345,10 @@ def _meeting_pulse_type() -> Any:
                     ctypes.c_int,
                     [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p],
                 ),
-                "pa_proplist_gets": (ctypes.c_char_p, [ctypes.c_void_p, ctypes.c_char_p]),
+                "pa_proplist_get": (
+                    ctypes.c_int,
+                    [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p],
+                ),
                 "pa_proplist_free": (None, [ctypes.c_void_p]),
                 "pa_stream_get_time": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_void_p]),
                 "pa_stream_get_timing_info": (ctypes.POINTER(_TimingInfo), [ctypes.c_void_p]),
@@ -300,6 +363,10 @@ def _meeting_pulse_type() -> Any:
                 "pa_context_get_index": (ctypes.c_uint32, [ctypes.c_void_p]),
                 "pa_context_get_server": (ctypes.c_char_p, [ctypes.c_void_p]),
                 "pa_context_get_sink_input_info": (
+                    ctypes.c_void_p,
+                    [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p],
+                ),
+                "pa_context_get_client_info": (
                     ctypes.c_void_p,
                     [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p],
                 ),
@@ -529,6 +596,9 @@ class NativePulse:
                 raise ValueError("audio-failed")
             self.pulse.iterate(5000)
 
+    def context_ready(self) -> bool:
+        return self.context is not None and self.pulse.context_get_state(self.context) == 4
+
     def _event(self, context: int, event: int, index: int, userdata: int) -> None:
         facility = event & 15
         if facility not in (2, 7):
@@ -567,27 +637,62 @@ class NativePulse:
         server = self.pulse.lib.pa_context_get_server(self.context) or b""
         self.server_local = server.startswith((b"unix:", b"/"))
 
-    def _info(self, function: str, argument: Any, structure: Any) -> Any:
+    def _identity_properties(
+        self, proplist: int | None, names: tuple[str, ...]
+    ) -> dict[str, object] | None:
+        props: dict[str, object] = {}
+        if proplist:
+            for name in names:
+                pointer, size = ctypes.c_void_p(), ctypes.c_size_t()
+                if (
+                    self.pulse.lib.pa_proplist_get(
+                        proplist, name.encode("ascii"), ctypes.byref(pointer), ctypes.byref(size)
+                    )
+                    < 0
+                ):
+                    continue
+                # A decimal PID or serial has at most 20 digits followed by NUL.
+                if not pointer.value or not 1 <= size.value <= 21:
+                    return None
+                raw = ctypes.string_at(pointer, size.value)
+                if not raw.endswith(b"\0"):
+                    return None
+                props[name] = raw[:-1].decode("ascii", "replace")
+        projected, valid = project_properties(props)
+        return projected if valid else None
+
+    def _info(
+        self, function: str, argument: Any, structure: Any, *, confirm_loss: bool = False
+    ) -> Any:
         callback_type = ctypes.CFUNCTYPE(
             None, ctypes.c_void_p, ctypes.POINTER(structure), ctypes.c_int, ctypes.c_void_p
         )
         result: Any = None
         done = False
+        unavailable = False
 
         def receive(ctx: int, info: Any, eol: int, unused: int) -> None:
-            nonlocal result, done
+            nonlocal result, done, unavailable
             if eol:
+                if confirm_loss and eol < 0:
+                    result = None
+                    # PA_ERR_NOENTITY is the by-index reply for a removed input.
+                    unavailable = structure is not _InputInfo or self.pulse.context_errno(ctx) != 5
+                elif confirm_loss and result is None:
+                    unavailable = True
                 done = True
             elif info:
                 row = info.contents
                 if structure is _InputInfo:
-                    props: dict[str, str] = {}
-                    for key in ("object.serial", "application.process.id"):
-                        raw = self.pulse.lib.pa_proplist_gets(row.proplist, key.encode())
-                        props[key] = raw.decode("ascii", "replace") if raw else ""
-                    result = (int(row.index), int(row.sink), props)
+                    props = self._identity_properties(row.proplist, (_SERIAL, _PID))
+                    result = (int(row.index), int(row.sink), int(row.client), props)
+                elif structure is _ClientInfo:
+                    result = (int(row.index), self._identity_properties(row.proplist, (_PID,)))
                 else:
-                    result = (row.monitor_name or b"").decode("utf-8", "strict")
+                    try:
+                        result = (row.monitor_name or b"").decode("utf-8", "strict")
+                    except UnicodeDecodeError:
+                        result = None
 
         callback = callback_type(receive)
         op = getattr(self.pulse.lib, function)(self.context, argument, callback, None)
@@ -598,26 +703,55 @@ class NativePulse:
         finally:
             self.pulse.operation_cancel(op)
             self.pulse.operation_unref(op)
+        if unavailable:
+            raise ValueError("audio-failed")
         return result
 
-    def resolve(self, index: int) -> Target | None:
+    def resolve(
+        self, index: int, *, expected_pid: int | None = None, confirm_loss: bool = False
+    ) -> Target | None:
+        def unavailable() -> Target | None:
+            if confirm_loss:
+                raise ValueError("audio-failed")
+            return None
+
         self._server()
-        row = self._info("pa_context_get_sink_input_info", index, _InputInfo)
+        row = self._info(
+            "pa_context_get_sink_input_info", index, _InputInfo, confirm_loss=confirm_loss
+        )
         if row is None:
             return None
-        idx, sink, props = row
-        try:
-            serial, pid = int(props["object.serial"]), int(props["application.process.id"])
-        except ValueError:
+        idx, sink, client, props = row
+        if props is None or client == INVALID_INDEX:
+            return unavailable()
+        serial, stream_pid = props.get(_SERIAL), props.get(_PID)
+        if not isinstance(serial, int):
+            return unavailable()
+        client_row = self._info(
+            "pa_context_get_client_info", client, _ClientInfo, confirm_loss=confirm_loss
+        )
+        if client_row is None or client_row[0] != client or client_row[1] is None:
+            return unavailable()
+        client_pid = client_row[1].get(_PID)
+        if client_pid is not None and stream_pid is not None and client_pid != stream_pid:
+            return unavailable()
+        pid = client_pid if stream_pid is None else stream_pid
+        if not isinstance(pid, int):
+            return unavailable()
+        if stream_pid is None and expected_pid is not None and pid != expected_pid:
+            if confirm_loss:
+                raise ValueError("target-mismatch")
             return None
-        # Local process identity is checked here, never taken from an IPC PID.
         try:
-            if os.stat(f"/proc/{pid}").st_uid != os.geteuid():
-                return None
-        except OSError:
-            return None
-        monitor = self._info("pa_context_get_sink_info_by_index", sink, _SinkInfo)
-        return Target(idx, serial, pid, self.cookie, monitor) if monitor else None
+            starttime = ProcReader(uid=os.geteuid()).starttime(pid)
+        except (OSError, ProcUnavailable):
+            return unavailable()
+        monitor = self._info(
+            "pa_context_get_sink_info_by_index", sink, _SinkInfo, confirm_loss=confirm_loss
+        )
+        if not monitor:
+            return unavailable()
+        return Target(idx, serial, pid, self.cookie, monitor, client, starttime)
 
     def default_monitor(self) -> str:
         self._server()
@@ -783,7 +917,6 @@ def microphone_source() -> Any:
 class CapturePulseBackend:
     def __init__(self) -> None:
         self.control: NativePulse | None = None
-        self.prepared_target: Target | None = None
         self.lock = threading.RLock()
         self.token = uuid.uuid4().hex
 
@@ -792,23 +925,21 @@ class CapturePulseBackend:
             self.control = NativePulse()
         return self.control
 
-    def prepare(self, far: dict[str, Any]) -> dict[str, Any]:
+    def prepare(self, far: dict[str, Any], *, target: PinnedTarget | None = None) -> dict[str, Any]:
         with self.lock:
-            return self._prepare(far)
+            return self._prepare(far, target=target)
 
-    def _prepare(self, far: dict[str, Any]) -> dict[str, Any]:
-        self.prepared_target = None
+    def _prepare(self, far: dict[str, Any], *, target: PinnedTarget | None) -> dict[str, Any]:
         p = self._control()
         available = True
         reason = None
         if far["kind"] == "app_stream":
+            if target is None:
+                raise ValueError("target-gone")
             if not p.monitor_supported:
                 available, reason = False, "monitor-stream-unsupported"
             else:
-                target = p.resolve(int(far["sink_input"]))
-                if target is None or target.serial != far["object_serial"]:
-                    raise ValueError("target-mismatch")
-                self.prepared_target = target
+                _resolve_target(p, target)
         return {
             "server_local": p.server_local,
             "server_kind": p.server_kind,
@@ -816,11 +947,14 @@ class CapturePulseBackend:
             **({"far_reason": reason} if reason else {}),
         }
 
-    def source(self, far: dict[str, Any]) -> MonitorStreamSource:
-        pulse = NativePulse()
-        source = MonitorStreamSource(pulse, far, self.token)
-        source.target = self.prepared_target
-        return source
+    def source(
+        self, far: dict[str, Any], *, target: PinnedTarget | None = None
+    ) -> MonitorStreamSource:
+        if far["kind"] != "app_stream":
+            return MonitorStreamSource(NativePulse(), self.token)
+        if target is None:
+            raise ValueError("target-gone")
+        return MonitorStreamSource(NativePulse(), self.token, target=target)
 
     def own_context(self) -> tuple[int, int] | None:
         with self.lock:
