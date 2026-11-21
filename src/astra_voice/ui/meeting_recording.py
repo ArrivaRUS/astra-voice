@@ -1014,6 +1014,9 @@ class MeetingRecording(QObject):
             # Launch/hello and idle IPC must not touch a previous capture's state.
             self._publish()
             return
+        if self.controller._exit_confirmed and raw["type"] == "error":
+            # The supervisor fails pending requests after reporting process exit.
+            return
         if raw["type"] == "meeting.capture.prepared":
             # Newly discovered warnings must be visible before a further click;
             # cancel this prepared role without ever granting open.
@@ -1039,9 +1042,18 @@ class MeetingRecording(QObject):
 
     def _exit(self, code: int) -> None:
         retiring = self._retire_deadline is not None
-        if self._standby_role and not retiring and self._observation_allowed():
+        state = self.controller.state
+        starting = state in {"preparing", "opening"}
+        capture_crashed = code != 0 and state in {"recording", "paused"}
+        if (
+            (self._standby_role or starting or capture_crashed)
+            and not retiring
+            and self._observation_allowed()
+        ):
             self._defer_observation()
         if not self.controller._exit_confirmed:
+            if starting:
+                self.controller.error_code = "audio-unavailable"
             self.controller.on_process_exit(code)
         self._role_started = False
         self._retire_deadline = None
