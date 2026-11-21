@@ -58,6 +58,7 @@ def isolated_x11() -> None:
 @pytest.fixture
 def offer(
     isolated_x11: None,
+    filesystem_euid: None,
     xapp: Any,
     tmp_path: Path,
 ) -> Iterator[tuple[MeetingOffer, MeetingRecording, list[float], Mock]]:
