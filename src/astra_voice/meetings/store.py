@@ -72,6 +72,10 @@ class MeetingStoreBusy(MeetingStoreError):
     """Nonblocking lease/gate contention; retry without reporting corruption."""
 
 
+class _FlockBusy(BlockingIOError):
+    """Contention from flock itself, distinct from EAGAIN during file I/O."""
+
+
 class Writer(StrEnum):
     GUI = "gui"
     CAPTURE = "capture"
@@ -166,7 +170,10 @@ def _lock(directory: int, name: str) -> Iterator[int]:
             os.fchmod(descriptor, 0o600)
             os.fsync(directory)
         check_private_file(os.fstat(descriptor))
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise _FlockBusy(*exc.args) from None
         yield descriptor
     finally:
         os.close(descriptor)
@@ -386,10 +393,13 @@ class MeetingWriter:
             # Publication leases precede the transaction gate in every role.
             # All acquisitions are nonblocking: contention is an expected error.
             with contextlib.ExitStack() as resources:
-                if filename == "speakers.json" and isinstance(prepared.document, SpeakerMap):
-                    resources.enter_context(_lease(self._directory, Writer.DIAR))
-                    resources.enter_context(_lease(self._directory, Writer.TRANSCRIBE))
-                resources.enter_context(_lock(self._directory, ".store.lock"))
+                try:
+                    if filename == "speakers.json" and isinstance(prepared.document, SpeakerMap):
+                        resources.enter_context(_lease(self._directory, Writer.DIAR))
+                        resources.enter_context(_lease(self._directory, Writer.TRANSCRIBE))
+                    resources.enter_context(_lock(self._directory, ".store.lock"))
+                except _FlockBusy:
+                    raise MeetingStoreBusy("Писатель встречи занят") from None
                 try:
                     self._publish(prepared, expected_generation=expected_generation)
                 except BaseException:
@@ -1396,14 +1406,14 @@ class MeetingStore:
             if not isinstance(role, Writer):
                 raise MeetingStoreError("Неизвестный писатель встречи")
             directory = resources.enter_context(self._directory(meeting_id))
-            lease_fd = resources.enter_context(_lease(directory, role))
+            try:
+                lease_fd = resources.enter_context(_lease(directory, role))
+            except _FlockBusy:
+                raise MeetingStoreBusy("Писатель встречи занят") from None
             meeting = _metadata(directory, meeting_id)
             if meeting.state == MeetingState.DELETING:
                 raise MeetingStoreError("Встреча удаляется")
             writer = MeetingWriter(directory, meeting_id, role, lease_fd=lease_fd)
-        except BlockingIOError:
-            resources.close()
-            raise MeetingStoreBusy("Писатель встречи занят") from None
         except (OSError, ValueError, TypeError, RecursionError):
             resources.close()
             raise MeetingStoreError("Писатель встречи недоступен") from None

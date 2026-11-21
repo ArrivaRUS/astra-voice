@@ -24,12 +24,19 @@ from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.meetings.events import MeetingState
 from astra_voice.meetings.model import Interval, Mark, Meeting
 from astra_voice.meetings.segments import CaptureJournal, SegmentSidecar
-from astra_voice.meetings.store import MeetingStore, MeetingStoreError, Writer, new_meeting_id
+from astra_voice.meetings.store import (
+    MeetingStore,
+    MeetingStoreBusy,
+    MeetingStoreError,
+    Writer,
+    new_meeting_id,
+)
 from astra_voice.platform.session import SessionKind
 from astra_voice.security.files import private_directory
 from astra_voice.worker import ipc
 
 MEETING_HARD_LIMIT_MS = 14_400_000
+METADATA_RETRY_SECONDS = 2.0
 LOCK_SIGNAL_BY_SESSION = {SessionKind.KDE: "login1", SessionKind.FLY: "none"}
 ERROR_TEXT = {
     "disk-low": (
@@ -182,7 +189,10 @@ def probe_storage(path: Path) -> StorageStatus:
 
 class MeetingController:
     def close(self, *, timeout: float = 0.0) -> bool:
-        return self._writer.close(timeout=timeout)
+        drained = self._writer.close(timeout=timeout)
+        if not drained:
+            self._metadata_retry_stop.set()
+        return drained
 
     def __init__(
         self,
@@ -197,6 +207,8 @@ class MeetingController:
         policy_allowed: Callable[[], bool] = lambda: False,
         id_factory: Callable[[], str] = lambda: new_meeting_id(datetime.now(UTC)),
         metadata_submit: Callable[[Callable[[], None]], None] | None = None,
+        metadata_retry_clock: Callable[[], float] = time.monotonic,
+        metadata_retry_wait: Callable[[threading.Event, float], bool] = threading.Event.wait,
         filesystem_submit: Callable[[Callable[[], None]], None] | None = None,
         mic_device: Callable[[], str | None] = lambda: None,
     ) -> None:
@@ -212,6 +224,9 @@ class MeetingController:
         self._selected_mic: str | None = None
         self._writer = MetadataWriter()
         self._metadata_submit = metadata_submit or self._writer.submit
+        self._metadata_retry_clock = metadata_retry_clock
+        self._metadata_retry_wait = metadata_retry_wait
+        self._metadata_retry_stop = threading.Event()
         self._filesystem_submit = filesystem_submit or self._writer.submit
         self._filesystem_results: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._filesystem_pending = 0
@@ -942,12 +957,26 @@ class MeetingController:
         snapshot = deepcopy(meeting)
 
         def write() -> None:
+            deadline = self._metadata_retry_clock() + METADATA_RETRY_SECONDS
+            delay = 0.01
+            succeeded = False
             try:
-                self.store.write(snapshot.id, "meeting.json", snapshot, writer=Writer.GUI)
+                # Preserve the last disk state once exit has stopped the drain.
+                while not self._metadata_retry_stop.is_set():
+                    try:
+                        self.store.write(snapshot.id, "meeting.json", snapshot, writer=Writer.GUI)
+                        succeeded = True
+                        break
+                    except MeetingStoreBusy:
+                        remaining = deadline - self._metadata_retry_clock()
+                        if remaining <= 0 or self._metadata_retry_stop.is_set():
+                            raise
+                        # The lock may have cleared while this wait was ending.
+                        self._metadata_retry_wait(self._metadata_retry_stop, min(delay, remaining))
+                        delay = min(delay * 2, 0.2)
             except (MeetingStoreError, OSError):
-                self._write_results.put((snapshot.id, False, final))
-            else:
-                self._write_results.put((snapshot.id, True, final))
+                pass
+            self._write_results.put((snapshot.id, succeeded, final))
 
         try:
             self._metadata_submit(write)
