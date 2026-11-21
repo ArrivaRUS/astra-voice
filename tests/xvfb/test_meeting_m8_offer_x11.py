@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, QRect, Qt, pyqtSignal
-from PyQt5.QtGui import QCursor, QExposeEvent, QGuiApplication, QMouseEvent, QRegion
+from PyQt5.QtGui import QCursor, QExposeEvent, QGuiApplication, QMouseEvent, QRegion, QWindow
 from PyQt5.QtQuick import QQuickItem
 
 from astra_voice.core.command_mode import SessionSnapshot
@@ -25,6 +25,7 @@ from astra_voice.platform.x11 import TIMESTAMP_ATOM, X11Display
 from astra_voice.ui.meeting_offer_window import MeetingOffer
 from astra_voice.ui.meeting_recording import AudioHints, MeetingRecording
 from astra_voice.ui.meeting_texts import W1_CALL_TEXTS
+from helpers import meeting_offer as offer_points
 from helpers import paste_target, wait_until
 from helpers import xapp as xapp
 from helpers import xdisplay as xdisplay
@@ -126,9 +127,6 @@ def _show(window: MeetingOffer, recording: MeetingRecording, call_id: str = "cal
 
 
 def _click_control(x: X11Display, window: MeetingOffer, name: str) -> None:
-    from Xlib import X
-    from Xlib.ext import xtest
-
     view = window._view
     button = window._root.findChild(QQuickItem, name)
     assert button is not None and button.isVisible()
@@ -136,6 +134,13 @@ def _click_control(x: X11Display, window: MeetingOffer, name: str) -> None:
     position = view.mapToGlobal(
         button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint()
     )
+    _click_point(x, position)
+
+
+def _click_point(x: X11Display, position: QPoint) -> None:
+    from Xlib import X
+    from Xlib.ext import xtest
+
     xtest.fake_input(x.d, X.MotionNotify, x=position.x(), y=position.y())
     xtest.fake_input(x.d, X.ButtonPress, 1)
     xtest.fake_input(x.d, X.ButtonRelease, 1)
@@ -349,8 +354,15 @@ def test_x1_x2_x3_click_focus_and_guard(
         wait_until(lambda: window._frame_x_time is not None, timeout=2)
         frame_x_time = window._frame_x_time
         assert frame_x_time is not None, "PropertyNotify must provide the real XCB epoch"
+        view = window._view
+        assert view.devicePixelRatio() == 1, "XTest coordinates use the isolated Xvfb pixels"
+        button = window._root.findChild(QQuickItem, "offerStart")
+        assert button is not None and button.isVisible()
+        first_click, second_click = offer_points.start_click_points(
+            button, QGuiApplication.styleHints()
+        )
         now[0] = 100.1
-        _click_control(xdisplay, window, "offerStart")
+        _click_point(xdisplay, view.mapToGlobal(first_click))
         wait_until(observed.is_set)
         assert not presses
         still_focused()
@@ -376,7 +388,7 @@ def test_x1_x2_x3_click_focus_and_guard(
         # mouse event and its server timestamp, with no wall-time sleep.
         with monkeypatch.context() as clock_patch:
             clock_patch.setattr(window, "_frame_x_time", (frame_x_time - 500) & 0xFFFFFFFF)
-            _click_control(xdisplay, window, "offerStart")
+            _click_point(xdisplay, view.mapToGlobal(second_click))
             wait_until(observed.is_set)
         assert presses == [("start", 100_600)]
         still_focused()
@@ -414,6 +426,8 @@ def test_start_failed_click_focus_and_show_again(
         window.starting()
         now[0] = 101.0
         window.start_failed(ERROR_TEXT["disk-low"])
+        now[0] = 101.5
+        window._failure_input_timer.timeout.emit()
         wait_until(lambda: view.height() < original_height, timeout=2)
 
         def click(name: str) -> None:
@@ -425,7 +439,6 @@ def test_start_failed_click_focus_and_show_again(
                 _click_control(xdisplay, window, name)
                 wait_until(observed.is_set)
 
-        now[0] = 101.5
         click("offerOpenMeetings")
         press.assert_called_once_with("open_meetings", 101_500)
         assert _focus(xdisplay) == target.window and xdisplay.active_window() == previous_active
@@ -440,6 +453,61 @@ def test_start_failed_click_focus_and_show_again(
         assert press.call_args_list == [(("open_meetings", 101_500), {}), (("start", 102_500), {})]
         assert _focus(xdisplay) == target.window and xdisplay.active_window() == previous_active
         _assert_wm_properties(xdisplay, window)
+
+
+def test_failure_guard_intercepts_click_above_another_window(
+    offer: tuple[MeetingOffer, MeetingRecording, list[float], Mock],
+    xdisplay: X11Display,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window, recording, now, _ = offer
+    underlay_press = threading.Event()
+    offer_dispatch = threading.Event()
+    press = Mock(return_value=False)
+
+    class Underlay(QWindow):
+        def mousePressEvent(self, event: QMouseEvent) -> None:
+            if event.button() == Qt.LeftButton:
+                underlay_press.set()
+
+    view = window._view
+    underlay = Underlay()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(recording, "press_offer", press)
+            view.pointerDispatched.connect(offer_dispatch.set)
+            window.show("call-browser", 60)
+            wait_until(lambda: window._frame_x_time is not None, timeout=2)
+            assert view.devicePixelRatio() == 1
+            start = window._root.findChild(QQuickItem, "offerStart")
+            local = start.mapToScene(QPointF(start.width() / 2, start.height() / 2)).toPoint()
+            point = view.mapToGlobal(local)
+            assert window._input_region.contains(local)
+            underlay.setGeometry(view.geometry())
+            underlay.show()
+            wait_until(underlay.isExposed, timeout=2)
+            underlay.lower()
+            view.raise_()
+            QGuiApplication.sync()
+
+            now[0] = 100.6
+            window.starting()
+            window.start_failed(ERROR_TEXT["disk-low"])
+            now[0] = 101.099
+            _click_point(xdisplay, point)
+            wait_until(offer_dispatch.is_set)
+            assert not underlay_press.is_set()
+            press.assert_not_called()
+
+            now[0] = 101.1
+            window._failure_input_timer.timeout.emit()
+            assert not window._input_region.contains(local)
+            QGuiApplication.sync()
+            _click_point(xdisplay, point)
+            wait_until(underlay_press.is_set)
+            press.assert_not_called()
+    finally:
+        underlay.close()
 
 
 def test_x4_real_cursor_moves_w1_only_for_the_card(

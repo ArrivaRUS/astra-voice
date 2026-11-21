@@ -53,6 +53,7 @@ def test_u13_fixed_offer_copy_matches_spec_and_qml_has_no_display_literals() -> 
 
 def test_q3_controls_share_one_pressed_action_and_avoid_keyboard_and_theme_colors() -> None:
     offer, control = (path.read_text() for path in (OFFER, CONTROL))
+    assert not re.search(r"^\s*import[ \t]+QtQuick\.Controls\b", offer + "\n" + control, re.M)
     assert re.search(r"Accessible\.role:\s*Accessible\.AlertMessage", offer)
     assert re.search(r"Accessible\.role:\s*Accessible\.Button", control)
     assert re.search(r"Accessible\.name:\s*control\.label", control)

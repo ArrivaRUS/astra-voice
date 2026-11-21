@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import QEvent, QMetaObject, QObject, QPoint, QRect, Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QCursor, QGuiApplication, QMouseEvent, QRegion, QTouchEvent, QWheelEvent
 from PyQt5.QtQuick import QQuickView
 
@@ -27,9 +27,19 @@ class OfferQuickView(QQuickView):
     press_timestamp: int | None = None
 
     def event(self, event: QEvent) -> bool:
+        if isinstance(event, QMouseEvent) and (
+            event.type() == QEvent.MouseButtonDblClick
+            or (
+                event.type() == QEvent.MouseButtonPress
+                and event.flags() & Qt.MouseEventCreatedDoubleClick
+            )
+        ):
+            # Qt also sends a regular-looking press before the double-click event.
+            event.accept()
+            self.pointerDispatched.emit()
+            return True
         if isinstance(event, (QMouseEvent, QTouchEvent)) and event.type() in (
             QEvent.MouseButtonPress,
-            QEvent.MouseButtonDblClick,
             QEvent.TouchBegin,
         ):
             timestamp = int(event.timestamp())
@@ -66,6 +76,10 @@ class MeetingOffer(SurfaceWindow):
         self._open = False
         self._starting = False
         self._start_failed_at_ms: int | None = None
+        self._failure_input_timer = QTimer(self)
+        self._failure_input_timer.setSingleShot(True)
+        self._failure_input_timer.setTimerType(Qt.PreciseTimer)
+        self._failure_input_timer.timeout.connect(self._release_failure_input)
         self._xcb = QGuiApplication.platformName() == "xcb"
         self._waiting_for_expose = False
         self._frame_handler: Callable[[], None] | None = None
@@ -139,11 +153,38 @@ class MeetingOffer(SurfaceWindow):
 
     def start_failed(self, text: str) -> None:
         if self._open:
-            self._start_failed_at_ms = self.recording.offer.now_ms()
+            failed_at = self.recording.offer.now_ms()
+            self._start_failed_at_ms = failed_at
             self._starting = False
             self._root.setProperty("errorText", text)
             self._root.setProperty("startFailed", True)
             self._root.setProperty("starting", False)
+            QMetaObject.invokeMethod(self._root, "forceLayout", Qt.DirectConnection)
+            if self._surface_size()[1] < self._input_region.boundingRect().height():
+                elapsed = self.recording.offer.now_ms() - failed_at
+                self._failure_input_timer.start(max(0, OFFER_GUARD_MS - elapsed))
+            else:
+                self._failure_input_timer.stop()
+
+    def _resize(self) -> None:
+        if (
+            self._failure_input_timer.isActive()
+            and self._surface_size()[1] < self._input_region.boundingRect().height()
+        ):
+            # QML draws the shorter card immediately. Keep the old native
+            # bounds and input shape until the click guard expires.
+            return
+        super()._resize()
+
+    def _release_failure_input(self) -> None:
+        if not self._open or self._start_failed_at_ms is None:
+            return
+        remaining = OFFER_GUARD_MS - (self.recording.offer.now_ms() - self._start_failed_at_ms)
+        if remaining > 0:
+            self._failure_input_timer.start(remaining)
+            return
+        self._failure_input_timer.stop()
+        self._resize()
 
     def _window_position(self, area: QRect, *, at_right: bool) -> QPoint:
         width, _ = self._surface_size()
@@ -297,6 +338,7 @@ class MeetingOffer(SurfaceWindow):
         if self._closed:
             return
         self._open = False
+        self._failure_input_timer.stop()
         self._waiting_for_expose = False
         self._stop_tracking_frames()
         self._first_frame_at_ms = self._frame_x_time = None

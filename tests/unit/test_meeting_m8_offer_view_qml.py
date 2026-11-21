@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from ctypes import CDLL, c_void_p
+from ctypes import CDLL, CFUNCTYPE, POINTER, c_bool, c_int, c_uint64, c_ulong, c_void_p, cast
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -29,6 +29,8 @@ from PyQt5.QtCore import (
     QRect,
     Qt,
     QTimer,
+    QTimerEvent,
+    QUrl,
     pyqtProperty,
     pyqtSignal,
 )
@@ -51,6 +53,7 @@ from PyQt5.QtTest import QTest
 from astra_voice.core.meeting_session import ERROR_TEXT
 from astra_voice.ui.meeting_offer_window import MeetingOffer, OfferQuickView
 from astra_voice.ui.meeting_texts import W1_CALL_TEXTS, W1_TEXTS, W4_TEXTS
+from helpers import meeting_offer as offer_points
 from helpers.qt_app import get_qapplication
 
 if TYPE_CHECKING:
@@ -64,6 +67,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CONTROLS = {"start": "offerStart", "refuse": "offerRefuse", "close": "offerClose"}
 FAILURE_CONTROLS = {"open_meetings": "offerOpenMeetings", "close": "offerClose"}
 SHADOW_MARGIN = 36
+CALL_MEASURED_MS = 100_000
+CALL_GENERATION = 214_084
+CALL_APP_CLASS = "browser"
 
 
 class ThemeSource(QObject):
@@ -186,7 +192,10 @@ def _geometry_at_scale(width: int, ratio: int) -> None:
         def devicePixelRatio(self) -> float:
             return float(ratio)
 
-    with surface(Mock(), cursor_pos=cursor, view_factory=ScaledView) as window:
+    now = Mock(return_value=0)
+    with surface(
+        Mock(offer=Mock(now_ms=now)), cursor_pos=cursor, view_factory=ScaledView
+    ) as window:
         with patcher.context() as patch:
             patch.setattr(window, "_screen_application", lambda: screens)
             patch.setattr(window, "_x11", active)
@@ -228,6 +237,8 @@ def _geometry_at_scale(width: int, ratio: int) -> None:
             cursor.return_value = below
             window.start_failed(ERROR_TEXT["disk-low"])
             QCoreApplication.processEvents()
+            now.return_value += 500
+            window._failure_input_timer.timeout.emit()
             current = window._view.geometry()
             assert window._at_right and cursor.call_count == 2
             assert current.topLeft() == previous.topLeft()
@@ -245,7 +256,9 @@ def visuals(mode: str) -> None:
         view.engine().warnings.connect(lambda rows: warnings.extend(row.toString() for row in rows))
         return view
 
-    with surface(Mock(), cursor_pos=QPoint, view_factory=factory) as window:
+    with surface(
+        Mock(offer=Mock(now_ms=lambda: 0)), cursor_pos=QPoint, view_factory=factory
+    ) as window:
         window._root.setProperty("freezeAnimations", True)
         if mode == "visual-colors":
             visual_colors(window, theme)
@@ -477,16 +490,47 @@ def visual_start_states(window: MeetingOffer, theme: ThemeSource) -> None:
 
 
 def _check_private_id(window: MeetingOffer) -> None:
-    forbidden = ("call-PRIVATE-1", "disk-low")
-    controls = set(CONTROLS.values()) | set(FAILURE_CONTROLS.values())
-    for item in (window._root, *(child(window, name) for name in sorted(controls))):
-        for field in ("name", "description"):
-            value = qml(item, f"Accessible.{field}")
-            assert all(private not in repr(value) for private in forbidden), (
-                item.objectName(),
-                field,
-            )
-    for item in [window._root, *window._root.findChildren(QObject)]:
+    private_numbers = {CALL_MEASURED_MS, CALL_GENERATION}
+    private_strings = ("call-PRIVATE-1", "disk-low", *(str(number) for number in private_numbers))
+
+    def check(value: Any, field: str) -> None:
+        if hasattr(value, "toVariant"):
+            value = value.toVariant()
+        if isinstance(value, QUrl):
+            check(value.toString(), field)
+            check(value.fragment(QUrl.FullyDecoded), field)
+        elif isinstance(value, dict):
+            for name, entry in value.items():
+                check(name, field)
+                check(entry, f"{field}.{name}")
+        elif isinstance(value, (list, tuple)):
+            for entry in value:
+                check(entry, field)
+        elif isinstance(value, (int, float)):
+            assert value not in private_numbers, field
+        else:
+            assert all(private not in repr(value) for private in private_strings), field
+
+    root = window._root
+    kind = root.property("kind")
+    starting = root.property("starting")
+    window_name = W1_CALL_TEXTS[kind]["title"]
+    if starting:
+        window_name = W4_TEXTS["starting"]
+    if root.property("startFailed"):
+        window_name = ERROR_TEXT["disk-low"]
+    accessible_names = {
+        "meetingOffer": window_name,
+        "offerClose": W1_TEXTS["close"],
+        "offerStart": W4_TEXTS["starting"] if starting else W1_TEXTS["start"],
+        "offerRefuse": W1_TEXTS["refuse"],
+        "offerOpenMeetings": W4_TEXTS["openMeetings"],
+    }
+    for item in [root, *root.findChildren(QQuickItem)]:
+        name = item.objectName()
+        assert qml(item, "Accessible.name") == accessible_names.get(name, ""), (name, "name")
+        assert qml(item, "Accessible.description") == "", (name, "description")
+    for item in [root, *root.findChildren(QObject)]:
         meta = item.metaObject()
         for index in range(meta.propertyCount()):
             prop = meta.property(index)
@@ -499,27 +543,43 @@ def _check_private_id(window: MeetingOffer) -> None:
                 "QVariantList",
                 "QVariantHash",
                 "QJSValue",
+                "QUrl",
+                "int",
+                "uint",
+                "long",
+                "ulong",
+                "qlonglong",
+                "qulonglong",
+                "double",
+                "float",
             }:
-                value = prop.read(item)
-                if hasattr(value, "toVariant"):
-                    value = value.toVariant()
-                assert all(private not in repr(value) for private in forbidden), prop.name()
+                check(prop.read(item), prop.name())
         for name in item.dynamicPropertyNames():
-            value = item.property(bytes(name).decode())
-            assert all(private not in repr(value) for private in forbidden), name
+            key = bytes(name).decode()
+            check(item.property(key), key)
+    texts = root.property("texts").toVariant()
+    assert set(texts) == W1_TEXTS.keys() | W1_CALL_TEXTS[kind].keys() | {"starting", "openMeetings"}
+
+
+def _privacy_rig(directory: Path) -> Rig:
+    from test_meeting_recording_bridge import Rig, Supervisor
+
+    class PrivacySupervisor(Supervisor):
+        generation = CALL_GENERATION
+
+    return Rig(directory, role_type=PrivacySupervisor)
 
 
 def starting_input(directory: Path) -> None:
-    from test_meeting_recording_bridge import Rig
-
-    instance = Rig(directory)
+    instance = _privacy_rig(directory)
     recording = instance.recording
     patcher = pytest.MonkeyPatch()
     try:
         with surface(recording) as window, patcher.context() as patch:
             press = Mock(return_value=False)
             patch.setattr(recording, "press_offer", press)
-            start_observing_with_view(instance, window)
+            start_observing_with_view(instance, window, app_class=CALL_APP_CLASS)
+            assert recording._detector_generation == CALL_GENERATION
             instance.now = 100.6
             view, root = window._view, window._root
             start = child(window, "offerStart")
@@ -563,37 +623,47 @@ def starting_input(directory: Path) -> None:
                 button = child(window, name)
                 QTest.mouseClick(view, Qt.LeftButton, pos=button_position(button))
                 qml(button, "Accessible.pressAction()")
-                button.forceActiveFocus()
-                assert button.hasActiveFocus() and view.activeFocusItem() is button
-                for key in keys:
-                    QTest.keyClick(view, key)
-            assert counter.presses == keys * len(CONTROLS)
+            for key in keys:
+                QTest.keyClick(view, key)
+            assert counter.presses == keys
             press.assert_not_called()
 
             window.close()
             assert not view.isVisible()
+            instance.now = 102.0
             window.show("call-app", 60)
             assert countdown.property("running") and not countdown.property("paused")
             assert progress.property("fraction") == 1
             assert start.property("label") == W1_TEXTS["start"]
+            QCoreApplication.processEvents()
+            if window._waiting_for_expose:
+                expose(view)
+            swap_frame(view)
+            assert window._first_frame_at_ms == 102_000
+            instance.now = 102.499
+            QTest.mouseClick(view, Qt.LeftButton, pos=button_position(start))
+            press.assert_not_called()
+            instance.now = 102.5
+            QTest.mouseClick(view, Qt.LeftButton, pos=button_position(start))
+            press.assert_called_once_with("start", 102_500)
     finally:
         instance.bridge.shutdown()
 
 
 def start_failed_input(directory: Path, mode: str) -> None:
-    from test_meeting_recording_bridge import Rig
-
-    instance = Rig(directory)
+    instance = _privacy_rig(directory)
     recording = instance.recording
     patcher = pytest.MonkeyPatch()
     try:
         with surface(recording) as window, patcher.context() as patch:
             press = Mock(return_value=False)
             patch.setattr(recording, "press_offer", press)
-            start_observing_with_view(instance, window)
+            start_observing_with_view(instance, window, app_class=CALL_APP_CLASS)
+            assert recording._detector_generation == CALL_GENERATION
             view = window._view
             instance.now = 100.6
             window.starting()
+            _check_private_id(window)
             old_points = [
                 button_position(child(window, CONTROLS[action])) for action in ("start", "refuse")
             ]
@@ -683,6 +753,268 @@ def show_after_failure(directory: Path) -> None:
             assert press.call_args_list == [(("start", 102_500), {})] * 2
     finally:
         instance.bridge.shutdown()
+
+
+def _platform_mouse_dispatch() -> Any:
+    # QTest.mouseClick(QWindow) omits Qt's flagged press preceding a double click.
+    library = CDLL(str(Path(QLibraryInfo.location(QLibraryInfo.LibrariesPath)) / "libQt5Gui.so.5"))
+    dispatch = library[
+        "_ZN22QWindowSystemInterface16handleMouseEventINS_19SynchronousDeliveryEEEb"
+        "P7QWindowmRK7QPointFS6_6QFlagsIN2Qt11MouseButtonEES7_INS8_16KeyboardModifierEENS8_16MouseEventSourceE"
+    ]
+    dispatch.argtypes = [c_void_p, c_ulong, c_void_p, c_void_p, c_int, c_int, c_int]
+    dispatch.restype = c_bool
+    return dispatch
+
+
+def _platform_click(dispatch: Any, view: QQuickView, point: QPointF, ms: int) -> None:
+    global_point = QPointF(view.mapToGlobal(point.toPoint()))
+    for stamp, buttons in ((ms, Qt.LeftButton), (ms + 10, Qt.NoButton)):
+        dispatch(
+            sip.unwrapinstance(view),
+            stamp,
+            sip.unwrapinstance(point),
+            sip.unwrapinstance(global_point),
+            int(buttons),
+            0,
+            0,
+        )
+
+
+def double_click() -> None:
+    dispatch = _platform_mouse_dispatch()
+    app = get_qapplication()
+    now = Mock(return_value=100_000)
+    recording = Mock(offer=Mock(now_ms=now))
+    patcher = pytest.MonkeyPatch()
+    with surface(recording) as window, patcher.context() as patch:
+        view = window._view
+        events: list[tuple[int, bool]] = []
+
+        class MouseEvents(QObject):
+            def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+                if isinstance(event, QMouseEvent):
+                    events.append(
+                        (event.type(), bool(event.flags() & Qt.MouseEventCreatedDoubleClick))
+                    )
+                return False
+
+        observer = MouseEvents()
+        view.installEventFilter(observer)
+        window._root.setProperty("freezeAnimations", True)
+
+        def click(point: QPointF, ms: int) -> None:
+            now.return_value = ms
+            _platform_click(dispatch, view, point, ms)
+
+        def fail_after_start(action: str, _ms: int) -> None:
+            if action == "start":
+                window.starting()
+                window.start_failed(ERROR_TEXT["disk-low"])
+
+        def show_at(ms: int) -> None:
+            now.return_value = ms
+            window.show("call-app", 60)
+            QCoreApplication.processEvents()
+            swap_frame(view)
+            assert window._first_frame_at_ms == ms
+
+        actions = Mock(side_effect=fail_after_start)
+        patch.setattr(recording, "press_offer", actions)
+        previous_interval = app.doubleClickInterval()
+        app.setDoubleClickInterval(800)
+        try:
+            assert app.doubleClickInterval() == 800
+            point = QPointF(100, 144)
+            show_at(100_000)
+            start = child(window, "offerStart")
+            assert start.contains(start.mapFromScene(point))
+            click(point, 100_600)
+            actions.assert_called_once_with("start", 100_600)
+            meetings = child(window, "offerOpenMeetings")
+            assert meetings.contains(meetings.mapFromScene(point))
+            events.clear()
+            click(point, 101_151)
+            assert (QEvent.MouseButtonPress, True) in events
+            assert any(kind == QEvent.MouseButtonDblClick for kind, _ in events)
+            actions.assert_called_once_with("start", 100_600)
+
+            actions.reset_mock()
+            show_at(103_000)
+            click(point, 103_600)
+            actions.assert_called_once_with("start", 103_600)
+            events.clear()
+            click(QPointF(button_position(meetings)), 104_100)
+            assert (QEvent.MouseButtonPress, False) in events
+            assert actions.call_args_list == [
+                (("start", 103_600), {}),
+                (("open_meetings", 104_100), {}),
+            ]
+        finally:
+            app.setDoubleClickInterval(previous_interval)
+
+
+def focus_click_spacing() -> None:
+    app = get_qapplication()
+    dispatch = _platform_mouse_dispatch()
+    now = Mock(return_value=100_000)
+    recording = Mock(offer=Mock(now_ms=now))
+    with surface(recording) as window, pytest.MonkeyPatch.context() as patch:
+        view = window._view
+        window._root.setProperty("freezeAnimations", True)
+        window.show("call-app", 60)
+        QCoreApplication.processEvents()
+        swap_frame(view)
+        assert window._first_frame_at_ms == 100_000
+        first, second = offer_points.start_click_points(
+            child(window, "offerStart"), app.styleHints()
+        )
+        patch.setattr(window, "_xcb", True)
+        patch.setattr(window, "_frame_x_time", 100_000)
+        previous_interval = app.doubleClickInterval()
+        app.setDoubleClickInterval(800)
+        try:
+            now.return_value = 100_100
+            _platform_click(dispatch, view, QPointF(first), 100_100)
+            recording.press_offer.assert_not_called()
+
+            now.return_value = 100_600
+            patch.setattr(window, "_frame_x_time", 99_500)
+            _platform_click(dispatch, view, QPointF(second), 100_160)
+            recording.press_offer.assert_called_once_with("start", 100_600)
+        finally:
+            app.setDoubleClickInterval(previous_interval)
+
+
+def failure_input_region() -> None:
+    now = Mock(return_value=100_000)
+    recording = Mock(offer=Mock(now_ms=now))
+    with surface(recording) as window:
+        window._root.setProperty("freezeAnimations", True)
+        window.show("call-browser", 60)
+        view = window._view
+        QCoreApplication.processEvents()
+        swap_frame(view)
+        old = window._input_region
+        geometry = view.geometry()
+        point = button_position(child(window, "offerStart"))
+        assert old.contains(point)
+        now.return_value = 100_600
+        window.starting()
+        window.start_failed(ERROR_TEXT["disk-low"])
+        QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
+        width, height = window._surface_size()
+        new = QRegion(SHADOW_MARGIN, SHADOW_MARGIN, width, height)
+        assert not new.contains(point)
+        assert window._input_region == old and view.geometry() == geometry
+        timer = window._failure_input_timer
+        assert timer.isActive() and timer.interval() == 500
+
+        now.return_value = 101_099
+        QCoreApplication.sendEvent(timer, QTimerEvent(timer.timerId()))
+        assert timer.isActive() and timer.interval() == 1
+        assert window._input_region.contains(point)
+        QTest.mouseClick(view, Qt.LeftButton, pos=point)
+        recording.press_offer.assert_not_called()
+        now.return_value = 101_100
+        QCoreApplication.sendEvent(timer, QTimerEvent(timer.timerId()))
+        assert not timer.isActive()
+        assert window._input_region == new and not window._input_region.contains(point)
+        assert view.position() == geometry.topLeft() and view.height() < geometry.height()
+
+        meetings = child(window, "offerOpenMeetings")
+        QTest.mouseClick(view, Qt.LeftButton, pos=button_position(meetings))
+        recording.press_offer.assert_called_once_with("open_meetings", 101_100)
+
+        window.show("call-app", 60)
+        window.start_failed("\n".join(["Строка ошибки."] * 10))
+        QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
+        assert window._input_region.boundingRect().height() == window._surface_size()[1] > height
+        assert not timer.isActive()
+
+        for finish in (window.close, window.shutdown):
+            window.show("call-browser", 60)
+            window.start_failed(ERROR_TEXT["disk-low"])
+            assert timer.isActive()
+            finish()
+            assert not timer.isActive(), finish.__name__
+
+
+def native_accessibility() -> None:
+    library = CDLL(str(Path(QLibraryInfo.location(QLibraryInfo.LibrariesPath)) / "libQt5Gui.so.5"))
+    query = library["_ZN11QAccessible24queryAccessibleInterfaceEP7QObject"]
+    query.argtypes = [c_void_p]
+    query.restype = c_void_p
+
+    def vtable(interface: int) -> Any:
+        assert interface
+        return cast(interface, POINTER(POINTER(c_void_p))).contents
+
+    def disabled(control: QObject) -> bool:
+        interface = query(sip.unwrapinstance(control))
+        # Linux Qt 5 C++ ABI: role() and state() follow rect() in the vtable.
+        table = vtable(interface)
+        assert CFUNCTYPE(c_int, c_void_p)(table[15])(interface) == 43  # QAccessible::Button
+        state = CFUNCTYPE(c_uint64, c_void_p)(table[16])(interface)
+        return bool(state & 1)  # QAccessible::State::disabled
+
+    def accessible_buttons(interface: int) -> set[int]:
+        table = vtable(interface)
+        role = CFUNCTYPE(c_int, c_void_p)(table[15])(interface)
+        buttons = {interface} if role == 43 else set()
+        child_at = CFUNCTYPE(c_void_p, c_void_p, c_int)(table[9])
+        count = CFUNCTYPE(c_int, c_void_p)(table[10])(interface)
+        for index in range(count):
+            descendant = child_at(interface, index)
+            if descendant:
+                buttons.update(accessible_buttons(descendant))
+        return buttons
+
+    with surface(Mock(offer=Mock(now_ms=lambda: 100_000))) as window:
+        window.show("call-app", 60)
+        controls = [child(window, name) for name in CONTROLS.values()]
+        root = window._root
+        interface = query(sip.unwrapinstance(root))
+
+        def assert_offered() -> None:
+            assert all(c.isEnabled() and not disabled(c) for c in controls)
+            assert accessible_buttons(interface) == {query(sip.unwrapinstance(c)) for c in controls}
+            assert qml(child(window, "offerStart"), "Accessible.name") == W1_TEXTS["start"]
+            assert qml(root, "Accessible.name") == W1_CALL_TEXTS["call-app"]["title"]
+
+        assert_offered()
+        window.starting()
+        assert all(not control.isEnabled() for control in controls)
+        assert not accessible_buttons(interface)
+        assert qml(root, "Accessible.name") == W4_TEXTS["starting"]
+        window.close()
+        window.show("call-app", 60)
+        assert_offered()
+
+        window.start_failed(ERROR_TEXT["disk-low"])
+        visible = [child(window, name) for name in FAILURE_CONTROLS.values()]
+        assert not any(map(disabled, visible))
+        assert accessible_buttons(interface) == {query(sip.unwrapinstance(c)) for c in visible}
+        assert qml(root, "Accessible.name") == ERROR_TEXT["disk-low"]
+        window.close()
+        window.show("call-app", 60)
+        assert_offered()
+
+
+def wm_close_states() -> None:
+    recording = Mock(offer=Mock(now_ms=lambda: 100_000))
+    with surface(recording) as window:
+        for state in ("offered", "starting", "start-failed"):
+            window.show("call-app", 60)
+            if state == "starting":
+                window.starting()
+            elif state == "start-failed":
+                window.start_failed(ERROR_TEXT["disk-low"])
+            recording.dismiss_offer.reset_mock()
+            event = QCloseEvent()
+            assert QCoreApplication.sendEvent(window._view, event)
+            assert not event.isAccepted() and window._view.isVisible(), state
+            recording.dismiss_offer.assert_called_once_with()
 
 
 def input_at(directory: Path, mode: str, elapsed: int) -> None:
@@ -1083,7 +1415,7 @@ def keys_and_close(directory: Path) -> None:
 
 
 def start_observing_with_view(
-    instance: Rig, window: MeetingOffer, *, await_frame: bool = True
+    instance: Rig, window: MeetingOffer, *, await_frame: bool = True, app_class: str = "dion"
 ) -> None:
     from test_meeting_m8_offer import show_offer, start_observing
 
@@ -1091,8 +1423,8 @@ def start_observing_with_view(
     start_observing(instance)
     instance.recording._control_timer.stop()
     instance.recording._lease_timer.stop()
-    show_offer(instance, call_id="call-PRIVATE-1")
-    assert_contents(window)
+    show_offer(instance, call_id="call-PRIVATE-1", app_class=app_class)
+    assert_contents(window, "call-browser" if app_class == "browser" else "call-app")
     QCoreApplication.processEvents()
     if not await_frame:
         return
@@ -1184,6 +1516,11 @@ def _run_probe(mode: str, directory: Path) -> None:
         "start-failed-mouse",
         "start-failed-accessible",
         "show-after-failure",
+        "double-click",
+        "focus-click-spacing",
+        "failure-input-region",
+        "native-accessibility",
+        "wm-close-states",
         "keys-close",
         "expose-mouse",
         "expose-accessible",
@@ -1288,6 +1625,16 @@ if __name__ == "__main__":
         start_failed_input(Path(directory), mode.removeprefix("start-failed-"))
     elif mode == "show-after-failure":
         show_after_failure(Path(directory))
+    elif mode == "double-click":
+        double_click()
+    elif mode == "focus-click-spacing":
+        focus_click_spacing()
+    elif mode == "failure-input-region":
+        failure_input_region()
+    elif mode == "native-accessibility":
+        native_accessibility()
+    elif mode == "wm-close-states":
+        wm_close_states()
     elif mode.startswith("expose-"):
         delayed_expose(Path(directory), mode.removeprefix("expose-"))
     elif mode == "x-timestamp":
