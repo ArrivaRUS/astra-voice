@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import struct
 import threading
+import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -85,12 +87,12 @@ class ScriptedPulse(monitor_stream.NativePulse):
         chunk, self.chunk = self.chunk, b""
         return chunk
 
-    def poll_events(self) -> list[tuple[str, int]]:
+    def _poll_events(self) -> tuple[list[tuple[str, int]], bool]:
         if self.poll_error:
             raise ValueError(self.poll_error)
         events = list(self.events)
         self.events.clear()
-        return events
+        return events, False
 
     def sample_clock(self) -> tuple[str, int, int]:
         return self.clock
@@ -189,8 +191,8 @@ def test_silent_member_contributes_zero(mixer: Callable[[int], MixCase], speaker
 def test_no_data_no_output_or_clock_advance(mixer: Callable[[int], MixCase]) -> None:
     case = mixer(2)
     source = case.open()
-    for pulse, length in zip(case.pulses, [100, 200], strict=True):
-        pulse.give(tone(17, length), 1000 + length)
+    for pulse in case.pulses:
+        pulse.give(tone(17, 100), 1100)
     assert source.read_chunk() == tone(34, 100)
     stamp = source.sample_clock()
     case.now += 1000
@@ -280,19 +282,18 @@ def test_silence_window_and_maximum_output_size(mixer: Callable[[int], MixCase])
     assert source.sample_clock() == ("monotonic", 2800, 2800)
 
 
-def test_single_member_releases_immediately_with_real_stamp(
-    mixer: Callable[[int], MixCase],
-) -> None:
-    case = mixer(1)
-    source = case.open()
-    (pulse,) = case.pulses
-    assert source.sample_clock() == ("monotonic", 1000, 1000)
-    payload = struct.pack("<5h", 2, -12, 32767, -32768, 0) * 320
-    for end in [1080, 1182, 1279]:
-        pulse.give(payload, end)
-        case.now = end
-        assert source.read_chunk() == payload
-        assert source.sample_clock() == ("monotonic", end, end)
+def test_single_member_releases_immediately_with_real_stamp() -> None:
+    pulse = ScriptedPulse(RESOLVED)
+    source = monitor_stream.MonitorStreamSource(pulse, "direct", target=PINNED)
+    source.open()
+    try:
+        payload = struct.pack("<5h", 2, -12, 32767, -32768, 0) * 320
+        for end in [1080, 1182, 1279, 800]:
+            pulse.give(payload, end, "pulse")
+            assert source.read_chunk() == payload
+            assert source.sample_clock() == ("pulse", end, end)
+    finally:
+        source.shutdown()
 
 
 def test_member_loss_keeps_survivors_until_all_are_removed(
@@ -475,9 +476,9 @@ def test_only_leader_waits_in_native_read(
 def test_close_waits_for_inflight_read(
     mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
-    case = mixer(1)
+    case = mixer(2)
     source = case.open()
-    (pulse,) = case.pulses
+    pulse, _ = case.pulses
     entered, attempted, release, read_done, closed = (threading.Event() for _ in range(5))
     lock = source._lock
     close_thread: threading.Thread | None = None
@@ -525,14 +526,13 @@ def test_close_waits_for_inflight_read(
     assert pulse.calls == old_calls
 
 
-@pytest.mark.parametrize("count", [1, 2])
 def test_drift_remains_in_output_clock_without_accumulated_reanchors(
-    mixer: Callable[[int], MixCase], count: int
+    mixer: Callable[[int], MixCase],
 ) -> None:
-    case = mixer(count)
+    case = mixer(2)
     source = case.open()
     payload = tone(1, 1000)
-    expected = tone(count, 1000)
+    expected = tone(2, 1000)
     for elapsed in range(1000, 720_001, 1000):
         case.now = 1000 + elapsed + elapsed * 1500 // 1_000_000
         for pulse in case.pulses:
@@ -545,25 +545,26 @@ def test_drift_remains_in_output_clock_without_accumulated_reanchors(
 def test_leader_clock_step_and_clock_kind_change_do_not_reposition_pcm(
     mixer: Callable[[int], MixCase],
 ) -> None:
-    case = mixer(1)
+    case = mixer(2)
     source = case.open()
-    (pulse,) = case.pulses
+    leader, _ = case.pulses
     payload = tone(19, 1000)
-    for elapsed in range(1000, 3_600_001, 1000):
-        case.now = 1000 + elapsed + elapsed * 150 // 1_000_000
-        pulse.give(payload, case.now)
+    for elapsed in range(1000, 72_001, 1000):
+        end = 1000 + elapsed + elapsed * 150 // 1_000_000
+        case.now = end + 200
+        leader.give(payload, end)
         assert source.read_chunk() == payload
     before = source.sample_clock()[2]
     case.now += 400
     assert source.read_chunk() == b"" and source.sample_clock()[2] == before
     case.now += 100
     payload = tone(-17, 100)
-    pulse.give(payload, case.now, "monotonic")
+    leader.give(payload, before + 500, "monotonic")
     assert source.read_chunk() == payload
     assert source.sample_clock() == ("monotonic", before + 500, before + 500)
     # Repositioning by raw time would overlap already released frames here.
     backstep = case.now - 400
-    pulse.give(payload, backstep)
+    leader.give(payload, backstep)
     assert source.read_chunk() == payload
     assert source.sample_clock() == ("monotonic", backstep, backstep)
     assert source.reanchors == source.late_bytes == 0
@@ -589,9 +590,7 @@ def test_member_context_or_buffer_fault_escapes_as_track_failure(
 
 
 @pytest.mark.parametrize("event", ["mismatch", "gone", "removed", "sink-moved", "moved-mismatch"])
-def test_buffer_release_depends_on_verified_end_reason(
-    mixer: Callable[[int], MixCase], event: str
-) -> None:
+def test_discards_buffer_on_loss_or_sink_move(mixer: Callable[[int], MixCase], event: str) -> None:
     case = mixer(2)
     source = case.open()
     leader, follower = case.pulses
@@ -611,11 +610,12 @@ def test_buffer_release_depends_on_verified_end_reason(
 
     if event == "sink-moved":
         assert source.read_chunk() == b"" and source.change == "sink-moved"
+        case.now = 1500
         leader.give(tone(3, 100), 1300)
-        assert source.read_chunk() == tone(6, 100) + tone(3, 100)
+        assert source.read_chunk() == tone(2, 100) + tone(3, 100)
         assert not source.partial
     else:
-        assert source.read_chunk() == tone(6 if event == "removed" else 2, 100)
+        assert source.read_chunk() == tone(2, 100)
         assert source.partial
     assert not source.ended
 
@@ -727,7 +727,7 @@ def test_pending_move_precedes_new_event_even_when_leader_gets_it(
 
 
 @pytest.mark.parametrize("verdict", ["verified", "mismatch", "removed"])
-def test_review_holds_pcm_until_deferred_target_check_resolves(
+def test_discards_deferred_pcm_before_verdict(
     mixer: Callable[[int], MixCase], verdict: str
 ) -> None:
     case = mixer(3)
@@ -737,45 +737,64 @@ def test_review_holds_pcm_until_deferred_target_check_resolves(
     pending.give(tone(20, 200), 1200)
     survivor.give(tone(3, 100), 1100)
     assert source.read_chunk() == tone(24, 100)
-    stamp = source.sample_clock()
 
     move(first)
     first.after_open.append(None)
     pending.events.append(("changed", 8))
     survivor.give(tone(3, 100), 1200)
-    assert source.read_chunk() == b""
-    assert source.sample_clock() == stamp
+    assert source.read_chunk() == tone(3, 100)
 
-    if verdict == "verified":
-        assert source.read_chunk() == tone(23, 100)
+    if verdict == "removed":
+        pending.events.append(("removed", 8))
+    elif verdict == "mismatch":
+        assert pending.target is not None
+        pending.target = replace(pending.target, serial=999)
     else:
-        if verdict == "removed":
-            pending.events.append(("removed", 8))
-        else:
-            assert pending.target is not None
-            pending.target = replace(pending.target, serial=999)
-        survivor.give(tone(3, 100), 1300)
-        assert source.read_chunk() == tone(3, 200)
+        pending.give(tone(21, 100), 1300)
+    survivor.give(tone(3, 100), 1300)
+    assert source.read_chunk() == tone(24 if verdict == "verified" else 3, 100)
 
 
-def test_review_pending_pcm_holds_only_the_interval_at_risk(
-    mixer: Callable[[int], MixCase],
+@pytest.mark.parametrize("removed", [False, True])
+def test_real_queue_overflow_discards_unreleased_pcm(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch, removed: bool
 ) -> None:
-    case = mixer(3)
+    case = mixer(2)
     source = case.open()
-    first, pending, survivor = case.pulses
-    first.give(tone(1, 100), 1100)
-    pending.give(tone(20, 100), 1400)
-    survivor.give(tone(3, 100), 1100)
-    assert source.read_chunk() == tone(4, 100)
+    survivor, overflowing = case.pulses
+    survivor.give(tone(2, 100), 1100)
+    overflowing.give(tone(13, 200), 1200)
+    assert source.read_chunk() == tone(15, 100)
 
-    move(first)
-    first.after_open.append(None)
-    pending.events.append(("changed", 8))
-    survivor.give(tone(3, 300), 1400)
-    assert source.read_chunk() == tone(3, 200)
-    assert source.sample_clock() == ("monotonic", 1300, 1300)
-    assert source.read_chunk() == tone(23, 100)
+    overflowing.events = deque(maxlen=64)
+    overflowing.overflow = False
+    overflowing.pulse = native = Mock()
+    overflowing.context = 1
+    native.context_get_state.return_value = 4
+
+    # Lose the only own changed event. All remaining events are unrelated
+    # unless this case also removes the pinned target.
+    overflowing._event(1, 2, 8, 0)
+    for i in range(64):
+        overflowing._event(1, 2, 100 + i, 0)
+    if removed:
+        overflowing._event(1, 2 | 32, 8, 0)
+    assert overflowing.overflow and ("changed", 8) not in overflowing.events
+    if not removed:
+        overflowing.give(tone(14, 100), 1300)
+    survivor.give(tone(2, 100), 1200)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            overflowing,
+            "_poll_events",
+            monitor_stream.NativePulse._poll_events.__get__(overflowing),
+        )
+        assert source.read_chunk() == tone(2, 100)
+        assert not overflowing.overflow
+        if not removed:
+            survivor.give(tone(2, 100), 1300)
+            assert source.read_chunk() == tone(16, 100)
+    assert source.partial is removed
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "mixed"])
@@ -788,9 +807,9 @@ def test_review_role_stop_during_sink_move_is_not_an_audio_fault(
 
     source: MixedFarSource | monitor_stream.MonitorStreamSource
     if wrapped:
-        case = mixer(1)
+        case = mixer(2)
         source = case.open()
-        (pulse,) = case.pulses
+        pulse, _ = case.pulses
     else:
         pulse = ScriptedPulse(RESOLVED)
         source = monitor_stream.MonitorStreamSource(pulse, "direct", target=PINNED)
@@ -872,12 +891,12 @@ def test_review_skips_uncovered_gap_and_stamps_the_real_next_pcm(
     assert source.sample_clock() == ("monotonic", 5100, 5100)
 
 
-def test_review_provisional_clock_keeps_drift_while_first_member_is_silent(
+def test_first_member_with_pcm_keeps_the_clock_when_others_begin(
     mixer: Callable[[int], MixCase],
 ) -> None:
     case = mixer(2)
     source = case.open()
-    _, follower = case.pulses
+    nominal_first, follower = case.pulses
     packet = tone(3, 1000)
     for elapsed in range(1000, 72_001, 1000):
         end = 1000 + elapsed + elapsed * 1500 // 1_000_000
@@ -885,28 +904,31 @@ def test_review_provisional_clock_keeps_drift_while_first_member_is_silent(
         follower.give(packet, end)
         assert source.read_chunk() == packet
     assert source.sample_clock() == ("monotonic", 73108, 73108)
+    case.now = 74400
+    nominal_first.give(tone(2, 1000), 74158)
+    follower.give(packet, 74110)
+    assert source.read_chunk() == tone(3, 48) + tone(5, 952)
+    assert source.sample_clock() == ("monotonic", 74110, 74110)
+    assert nominal_first.wait_us == 0 and follower.wait_us == 10000
 
 
-@pytest.mark.parametrize("verified_tail", [False, True])
-def test_review_last_removal_yields_only_verified_tail_before_end(
-    mixer: Callable[[int], MixCase], verified_tail: bool
-) -> None:
+@pytest.mark.parametrize("event", ["removed", "mismatch"])
+def test_last_loss_discards_tail_and_ends(mixer: Callable[[int], MixCase], event: str) -> None:
     case = mixer(2)
     source = case.open()
     first, last = case.pulses
     first.give(tone(2, 100), 1100)
     last.give(tone(3, 200), 1200)
     assert source.read_chunk() == tone(5, 100)
+    stamp = source.sample_clock()
     first.events.append(("removed", 7))
-    if verified_tail:
+    if event == "removed":
         last.events.append(("removed", 8))
-        assert source.read_chunk() == tone(3, 100)
-        assert not source.ended
-        assert source.sample_clock() == ("monotonic", 1200, 1200)
     else:
         last.events.append(("changed", 8))
         last.target = None
     assert source.read_chunk() is None and source.ended and not source.partial
+    assert source.sample_clock() == stamp
 
 
 def test_review_oldest_deferred_move_precedes_repeat_of_a_lower_index(
@@ -984,9 +1006,9 @@ def test_review_does_not_start_next_resolve_after_revocation_or_close(
 def test_review_revocation_during_native_open_skips_second_resolve(
     mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    case = mixer(1)
+    case = mixer(2)
     source = case.open()
-    (pulse,) = case.pulses
+    pulse, _ = case.pulses
     stop = threading.Event()
     source.admission_check = lambda: not stop.is_set()
     open_record = pulse.open_record
@@ -1095,10 +1117,11 @@ def test_review_thread_start_failure_closes_every_member_and_joins(
 def test_review_sample_clock_waits_for_the_inflight_pcm(
     mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    case = mixer(1)
+    case = mixer(2)
     source = case.open()
-    (pulse,) = case.pulses
+    pulse, other = case.pulses
     pulse.give(tone(7, 100), 1100)
+    other.give(tone(0, 100), 1100)
     entered, attempted, resume = threading.Event(), threading.Event(), threading.Event()
     original_lock = source._lock
     clock_thread: threading.Thread | None = None
@@ -1136,3 +1159,106 @@ def test_review_sample_clock_waits_for_the_inflight_pcm(
             resume.set()
         assert reading.result(timeout=2) == tone(7, 100)
         assert stamp.result(timeout=2) == ("monotonic", 1100, 1100)
+
+
+def test_buffered_survivor_can_release_after_other_member_is_lost(
+    mixer: Callable[[int], MixCase],
+) -> None:
+    case = mixer(3)
+    source = case.open()
+    first, pending, survivor = case.pulses
+    first.give(tone(1, 100), 1100)
+    pending.give(tone(2, 100), 1100)
+    survivor.give(tone(3, 200), 1200)
+    assert source.read_chunk() == tone(6, 100)
+
+    move(first)
+    first.after_open.append(None)
+    pending.events.append(("changed", 8))
+    assert source.read_chunk() == b""
+    pending.events.append(("removed", 8))
+    assert source.read_chunk() == tone(3, 100)
+    assert source.partial and not source.ended
+
+
+def test_shutdown_releases_unread_pcm_and_leader(mixer: Callable[[int], MixCase]) -> None:
+    case = mixer(2)
+    source = case.open()
+    _, first_with_pcm = case.pulses
+    first_with_pcm.give(tone(7, 100), 1100)
+    assert source.read_chunk() == b""
+    member = source._members[1]
+    assert source._leader is member and sum(len(block) for _, block in member.blocks) == 3200
+
+    reference = weakref.ref(member)
+    source.shutdown()
+    assert not member.blocks
+    assert source._leader is None and not source._members
+    del member
+    gc.collect()
+    assert reference() is None
+
+
+def test_shutdown_joins_context_already_retired_by_read(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    lost, survivor = case.pulses
+    closing, release, arrived, joined = (threading.Event() for _ in range(4))
+    retired_thread: threading.Thread | None = None
+    join = threading.Thread.join
+
+    def on_close() -> None:
+        nonlocal retired_thread
+        retired_thread = threading.current_thread()
+        closing.set()
+        assert release.wait(2)
+
+    def trace_join(thread: threading.Thread, timeout: float | None = None) -> None:
+        if thread is retired_thread:
+            joined.set()
+            arrived.set()
+        join(thread, timeout)
+
+    def finish() -> None:
+        try:
+            source.shutdown()
+        finally:
+            arrived.set()
+
+    lost.on_close = on_close
+    lost.events.append(("removed", 7))
+    survivor.give(tone(2, 100), 1100)
+    with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as executor:
+        patch.setattr(threading.Thread, "join", trace_join)
+        try:
+            assert source.read_chunk() == tone(2, 100)
+            assert closing.wait(2)
+            shutdown = executor.submit(finish)
+            assert arrived.wait(2)
+            assert joined.is_set()
+        finally:
+            release.set()
+        shutdown.result(timeout=2)
+    assert all(p.destroyed and not p.recording for p in case.pulses)
+
+
+def test_removal_closes_context_when_its_closer_cannot_start(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    lost, survivor = case.pulses
+    lost.events.append(("removed", 7))
+    survivor.give(tone(2, 100), 1100)
+
+    def fail(_thread: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", fail)
+        assert source.read_chunk() == tone(2, 100)
+        assert lost.destroyed and not lost.recording and survivor.recording and source.partial
+    source.shutdown()
+    assert all(p.destroyed and not p.recording for p in case.pulses)

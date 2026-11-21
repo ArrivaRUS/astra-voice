@@ -690,7 +690,7 @@ def resolved_target(pinned: PinnedTarget) -> Target:
 
 
 @pytest.mark.parametrize("pause_ms", [0, 400])
-def test_capture_mixes_a_single_pinned_pulse_into_an_unmodified_far_track(
+def test_capture_writes_single_pinned_pulse_directly(
     service: tuple[Rig, CheckDouble],
     capture_events: CaptureEvents,
     monkeypatch: pytest.MonkeyPatch,
@@ -742,6 +742,7 @@ def test_capture_mixes_a_single_pinned_pulse_into_an_unmodified_far_track(
         patch.setattr(rig.state.archive, "put", archive_pcm)
         started = capture_events.finish("opened", "meeting.capture.started")
         assert started["tracks"] == ["mic", "far"] and both_queued.wait(2)
+        assert type(rig.state.sources["far"]) is MonitorStreamSource
         rig.send("stop")
         capture_events.finish("closed", "meeting.capture.closed")
         finalized = capture_events.finish("finalized", "meeting.capture.finalized")
@@ -758,7 +759,7 @@ def test_capture_mixes_a_single_pinned_pulse_into_an_unmodified_far_track(
             assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (16000, 1, 2)
             observed_pcm.extend(wav.readframes(wav.getnframes()))
         sidecar = json.loads(audio.with_suffix(".json").read_text())
-        assert sidecar["clock"] == "monotonic"
+        assert sidecar["clock"] == "pulse"
         assert sidecar["close_reason"] == ("clock_change" if index == 0 and pause_ms else "stop")
         expected_end = mono_start + (100 if index == 0 and pause_ms else 200 + pause_ms)
         assert sidecar["timeline"][-1][1] == expected_end
