@@ -12,6 +12,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent, Qt
 from test_meeting_m8_offer import (
     CALL,
     SHOW,
+    assert_no_capture,
     deliver,
     ended,
     memory,
@@ -275,6 +276,7 @@ def test_u4_unlock_queries_after_five_seconds_and_refreshes_offer(rig: Rig, reas
     tick_at(rig, now + 65_000)
     assert view.calls[-2:] == [("remaining", 1), ("close",)]
     assert memory(rig) == "refused"
+    assert_no_capture(rig)
 
 
 @pytest.mark.parametrize("initial_active", [True, False])

@@ -31,6 +31,7 @@ from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.core.meeting_jobs import JobRole, MeetingJobs
 from astra_voice.core.meeting_session import (
     ERROR_TEXT,
+    TARGET_REFUSALS,
     WARNING_TEXT,
     CaptureSupervisor,
     MeetingController,
@@ -40,20 +41,28 @@ from astra_voice.core.meeting_session import (
 from astra_voice.core.meeting_session import (
     MeetingBridge as ClickBridge,
 )
-from astra_voice.meetings.events import DETECTOR_CODE, DetectorCode, DetectorPurpose, MeetingState
+from astra_voice.meetings.events import (
+    DETECTOR_CODE,
+    START_LATENCY,
+    DetectorCode,
+    DetectorPurpose,
+    MeetingState,
+    StartOrigin,
+    StartOutcome,
+)
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, new_meeting_id
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.session_state import MonitorSnapshot, SessionMonitor
 from astra_voice.ui.meeting_indicator_guard import MeetingIndicatorGuard
 from astra_voice.ui.meeting_offer import OfferController, OfferView, Origin
-from astra_voice.ui.meeting_texts import W2_TEXTS, W4_TEXTS
+from astra_voice.ui.meeting_texts import CALL_LOST_TEXT, W2_TEXTS, W4_TEXTS
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
 Message = dict[str, Any]
 EXIT_QUEUE_WRITE_S = 1.0  # floor for the exit-time «transcribing» write (one meeting.json)
-APP_STREAM_ENABLED = False  # Step 6a wires the role's START admission.
+_START_FAILURES = {"disk-low", "storage-unavailable", "audio-unavailable"}
 log = logging.getLogger(__name__)
 
 
@@ -171,12 +180,15 @@ class MeetingRecording(QObject):
         self._query_req = ""
         self._offer_query_req = ""
         self._closed = False
+        self._shutting_down = False
         self.dialog_open = False
         self.selected_source = "room"
         self._selection_touched = False
         self.call_id = ""
         self.app_class = ""
         self.variant1 = False
+        self._variant1_lost = ""
+        self._offer_no_app_split = False
         self.no_app_split = False
         self._preview_ready = False
         self._preview_serial = 0
@@ -184,6 +196,13 @@ class MeetingRecording(QObject):
         self._storage = StorageStatus(0, False, False)
         self._audio = AudioHints()
         self._accepted_remote = self._accepted_network = False
+        self._prepared_remote = self._prepared_network = False
+        self._start_origin: StartOrigin | None = None
+        self._start_pressed_at: int | None = None
+        self._start_attempt = 0
+        self._pending_call_lost = ""
+        self._pending_offer_dialog = False
+        self._start_remote = False
         self._audio_probe, self._storage_probe = audio_probe, storage_probe
         self._submit = submit or _submit
         self._results: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
@@ -213,6 +232,8 @@ class MeetingRecording(QObject):
             clock=clock,
             on_visibility_changed=self._offer_visibility_changed,
             on_start=self._offer_start_requested,
+            on_open_meetings=self.openMeetingsRequested.emit,
+            on_start_timeout=self._offer_start_timeout,
         )
         role = self._new_supervisor()
         self.controller = MeetingController(
@@ -266,11 +287,12 @@ class MeetingRecording(QObject):
 
     def bind_offer(self, view: OfferView) -> None:
         if not self._closed:
+            self._cancel_offer_start(revoke=True)
             self._offer_query_req = ""
             self.offer.bind(view)
 
     def press_offer(self, action: str, pressed_at_ms: int) -> bool:
-        if self._closed or not self._offer_eligible():
+        if self._closed or (not self.offer.starting_slot and not self._offer_eligible()):
             return False
         self._update_offer_session()
         return self.offer.press(action, pressed_at_ms)
@@ -281,13 +303,31 @@ class MeetingRecording(QObject):
             self.offer.dismiss()
 
     def _offer_visibility_changed(self) -> None:
-        if not self._closed:
+        if not self._closed and not self._shutting_down:
             self._sync_role_ownership()
             self._publish()
 
-    def _offer_start_requested(self) -> None:
-        self.openMeetingsRequested.emit()
-        self.open_dialog()
+    def _offer_start_requested(self, call_id: str, app_class: str) -> None:
+        self._start_pressed_at = self.offer.start_pressed_at_ms
+        self._start_origin = StartOrigin.OFFER
+        if not self._start_allowed():
+            if not self.enabled() or not self.policy_allowed():
+                code = "disabled"
+            elif self.session_kind != SessionKind.FLY and not self._snapshot().allowed:
+                code = "session-blocked"
+            else:
+                code = "busy"
+            self._finish_start_error(code)
+            return
+        self._start_capture(
+            {"kind": "app_stream", "call_id": call_id}, StartOrigin.OFFER, app_class
+        )
+
+    def _offer_start_timeout(self) -> None:
+        if self._start_origin == StartOrigin.OFFER:
+            self._log_start_outcome(StartOutcome.FAILED)
+            self._clear_start()
+            self.clicks.on_stop_clicked()
 
     def _new_supervisor(self) -> Role:
         self._role_serial += 1
@@ -430,18 +470,26 @@ class MeetingRecording(QObject):
         if not self.controller._exit_confirmed:
             self.controller.on_process_exit(3)
 
+    def _reset_dialog_card(self) -> None:
+        self._query_req = ""
+        self.call_id = self.app_class = ""
+        self.variant1 = False
+        self.selected_source = "room"
+        self._selection_touched = False
+
     def open_dialog(self) -> None:
         if self._closed or not self.enabled() or not self.policy_allowed():
             return
+        if self.offer.state == "start-failed":
+            self.offer.start_closed()
         self.dialog_open = True
+        self._reset_dialog_card()
         self._offer_query_req = ""
         self.offer.suspend(for_capture=True)
         if self.busy:
             self._preview_error = "busy"
             self._publish()
             return
-        self.selected_source = "room"
-        self._selection_touched = False
         self._preview_error = ""
         self.controller.error_code = ""
         self._preview_ready = False
@@ -497,6 +545,8 @@ class MeetingRecording(QObject):
                 "audio-unavailable": "error-audio",
                 "busy": "error-busy",
             }[code]
+        if self._variant1_lost:
+            return "call-lost"
         if self.no_app_split:
             return "no-app-split"
         if self._storage.network:
@@ -515,6 +565,10 @@ class MeetingRecording(QObject):
     @property
     def warnings(self) -> list[str]:
         result = []
+        if self._variant1_lost:
+            result.append(CALL_LOST_TEXT[self._variant1_lost])
+        if self._offer_no_app_split:
+            result.append(W4_TEXTS["noAppSplit"])
         if self._storage.network:
             result.append(WARNING_TEXT["storage-network"])
         if self._audio.remote:
@@ -525,27 +579,35 @@ class MeetingRecording(QObject):
     def can_start(self) -> bool:
         return (
             self.dialog_open
-            and self.enabled()
-            and self.policy_allowed()
             and self._preview_ready
             and not self.error
+            and self._start_allowed()
+            and (self.selected_source != "call" or self._call_available and not self.no_app_split)
+        )
+
+    def _start_allowed(self) -> bool:
+        return (
+            self.enabled()
+            and self.policy_allowed()
             and not self.busy
             and self._retire_deadline is None
             and (
                 self.controller.supervisor.ready
                 or self.controller.state == "stopped"
                 and self.controller.supervisor.exited
-                and not self.controller._filesystem_pending
             )
+            and not self.controller._filesystem_pending
             and (self.session_kind == SessionKind.FLY or self._snapshot().allowed)
-            and (self.selected_source != "call" or self._call_available and not self.no_app_split)
         )
 
     @property
     def _call_available(self) -> bool:
         return (
-            APP_STREAM_ENABLED
+            not self._variant1_lost
+            and not self._offer_no_app_split
             and not self._automation_off
+            and not self._prepared_remote
+            and not self._audio.remote
             and bool(self.call_id)
             and self.variant1
             and self.app_class in {"dion", "browser"}
@@ -594,23 +656,44 @@ class MeetingRecording(QObject):
     def begin_clicked(self) -> None:
         if not self.can_start:
             return
-        if self.controller.state == "stopped" and not self._activate():
-            return
-        self._accepted_remote, self._accepted_network = self._audio.remote, self._storage.network
         far: Message = {"kind": "none"}
         if self.selected_source == "all":
             far = {"kind": "sink_monitor"}
         elif self.selected_source == "call" and self._call_available:
             far = {"kind": "app_stream", "call_id": self.call_id}
-        self._notice_app = self.app_class if far["kind"] == "app_stream" else ""
-        if self.clicks.on_start_clicked(far):
+        self._start_pressed_at = self.offer.now_ms()
+        app_class = self.app_class if far["kind"] == "app_stream" else ""
+        self._start_capture(far, StartOrigin.CARD, app_class)
+
+    def _start_capture(self, far: Message, origin: StartOrigin, app_class: str) -> None:
+        self._start_origin = origin
+        self._start_attempt = self.controller._attempt + 1
+        if self.controller.state == "stopped" and not self._activate():
+            self._finish_start_error(self.controller.error_code or "busy")
+            self._publish()
+            return
+        if self._start_origin is None:
+            return  # Session or policy changed while activating the role.
+        self._accepted_remote = origin == StartOrigin.CARD and self._audio.remote
+        self._accepted_network = origin == StartOrigin.CARD and self._storage.network
+        self._notice_app = app_class
+        accepted = self.clicks.on_start_clicked(far)
+        if accepted:
             # A consumed role must exit before replacement; an already launched
             # fresh query-only role can accept its first explicit start click.
             self._standby_role = False
+        elif self._start_origin is not None:
+            self._finish_start_error(self.controller.error_code)
         self._publish()
 
     def close_dialog(self) -> None:
         self.dialog_open = False
+        self._variant1_lost = ""
+        self._offer_no_app_split = False
+        self._prepared_remote = self._prepared_network = False
+        if self._start_origin == StartOrigin.CARD:
+            self._log_start_outcome(StartOutcome.ABORTED)
+            self._clear_start()
         self._query_req = ""
         self._preview_serial += 1
         if self.controller.state in {"preparing", "opening"}:
@@ -631,7 +714,7 @@ class MeetingRecording(QObject):
             return
         observing = self._observation_allowed()
         if not observing:
-            self.offer.suspend(clear_memory=True)
+            self._suspend_automation()
         elif self.dialog_open or self.busy:
             self._offer_query_req = ""
             self.offer.suspend(for_capture=True)
@@ -702,7 +785,8 @@ class MeetingRecording(QObject):
         meeting = controller.meeting
         state = controller.state
         visible = bool(
-            controller._committed
+            controller.capture_started
+            and controller._committed
             and meeting is not None
             and (
                 state in {"recording", "paused", "stopping", "closing-unknown"}
@@ -799,11 +883,11 @@ class MeetingRecording(QObject):
 
     def _session_changed(self, snapshot: object = None) -> None:
         if not self._closed:
-            self.controller.on_session_changed()
             if self.sender() is self._monitor and isinstance(snapshot, SessionSnapshot):
                 self._update_offer_session(snapshot)
             else:
                 self._update_offer_session()
+            self.controller.on_session_changed()
             self._publish()
 
     def policy_changed(self) -> None:
@@ -850,6 +934,7 @@ class MeetingRecording(QObject):
                 revision=snapshot.revision if isinstance(snapshot, MonitorSnapshot) else None,
             ):
                 self._offer_query_req = ""
+                self._cancel_offer_start()
         return snapshot
 
     def _send_offer_query(self) -> None:
@@ -887,7 +972,7 @@ class MeetingRecording(QObject):
         allowed = self._observation_allowed()
         if not self._closed and not allowed:
             # The settings bridge signals this directly, before the next control tick.
-            self.offer.suspend(clear_memory=True)
+            self._suspend_automation()
         controller = self.controller
         role = controller.supervisor
         # Detector request deadlines must not add another failure path during capture.
@@ -950,6 +1035,121 @@ class MeetingRecording(QObject):
         elif kind == "error":
             self._detector_failed(transient=reply["code"] in {"limit", "timeout"})
 
+    def _suspend_automation(self) -> None:
+        if (
+            not self._automation_off
+            or not self.enabled()
+            or not self.policy_allowed()
+            or not self._detector_allowed()
+        ):
+            self._cancel_offer_start(revoke=True)
+        self.offer.suspend(clear_memory=True)
+
+    def _log_start_outcome(self, outcome: StartOutcome) -> None:
+        pressed_at, self._start_pressed_at = self._start_pressed_at, None
+        if self._start_origin is not None and pressed_at is not None:
+            log.info(START_LATENCY, self._start_origin, outcome, self.offer.now_ms() - pressed_at)
+
+    def _clear_start(self) -> None:
+        self._start_origin = None
+        self._start_attempt = 0
+        self._pending_call_lost = ""
+        self._pending_offer_dialog = self._start_remote = False
+
+    def _cancel_offer_start(self, *, revoke: bool = False) -> None:
+        if self._start_origin == StartOrigin.OFFER:
+            stop = (
+                revoke
+                and self.controller._attempt == self._start_attempt
+                and self.controller.state in {"preparing", "opening"}
+                and not self.controller.capture_started
+            )
+            self._log_start_outcome(StartOutcome.ABORTED)
+            if self._pending_offer_dialog:
+                self._prepared_remote = self._prepared_network = False
+            self._clear_start()
+            if stop:
+                self.clicks.on_stop_clicked()
+
+    def _finish_start_error(self, code: str) -> None:
+        origin = self._start_origin
+        failed = code in _START_FAILURES
+        self._log_start_outcome(StartOutcome.FAILED if failed else StartOutcome.ABORTED)
+        self._clear_start()
+        if origin == StartOrigin.OFFER:
+            if failed:
+                self.offer.start_failed(ERROR_TEXT[code])
+            elif code == "disabled":
+                self.offer.start_closed()
+            else:
+                self.offer.start_aborted()
+
+    def _route_offer_dialog(self) -> None:
+        self._pending_offer_dialog = True
+        self.offer.start_resolved()
+        self._log_start_outcome(StartOutcome.FAILED)
+
+    def _resolve_start(self) -> None:
+        origin = self._start_origin
+        if origin is None:
+            return
+        if origin == StartOrigin.OFFER and not self.offer.starting_slot and not self._start_remote:
+            self._cancel_offer_start()
+            return
+        controller = self.controller
+        if controller._attempt != self._start_attempt:
+            return
+        reason, state = controller.far_reason, controller.state
+        if origin == StartOrigin.CARD and self.busy:
+            snapshot = self._snapshot()
+            if (
+                not controller._allowed(snapshot)
+                or snapshot.blocked_epoch != controller._click_epoch
+            ):
+                self._finish_start_error("session-blocked")
+                return
+        if (
+            not self._pending_call_lost
+            and not self._pending_offer_dialog
+            and self._notice_app in CALL_LOST_TEXT
+            and reason in TARGET_REFUSALS
+            and state in {"idle", "closing-unknown", "stopped"}
+            and (not self._start_remote or reason == "target-mismatch")
+        ):
+            self._pending_call_lost = self._notice_app
+            self._query_req = ""
+            if origin == StartOrigin.OFFER:
+                self.offer.start_resolved()
+            self._log_start_outcome(StartOutcome.CALL_LOST)
+        if (
+            origin == StartOrigin.OFFER
+            and self.offer.starting_slot
+            and not self._pending_offer_dialog
+            and reason == "monitor-stream-unsupported"
+        ):
+            self.no_app_split = True
+            self._route_offer_dialog()
+        if self._pending_offer_dialog or self._pending_call_lost:
+            # Only the soft prepare refusal returns a reusable role to idle.
+            if self.busy or (state != "idle" and not controller.supervisor.exited):
+                return
+            if self._pending_call_lost:
+                self._variant1_lost = self._pending_call_lost
+                self.selected_source = "room"
+            if origin == StartOrigin.OFFER:
+                self._offer_no_app_split = reason == "monitor-stream-unsupported"
+            self._clear_start()
+            if origin == StartOrigin.OFFER:
+                self.offer.start_closed()
+                self.openMeetingsRequested.emit()
+                self.open_dialog()
+            return
+        code = controller.error_code
+        if code in {"session-blocked", "disabled", "storage-unavailable", "disk-low"}:
+            self._finish_start_error(code)
+        elif state == "stopped":
+            self._finish_start_error(code or "audio-unavailable")
+
     def _event(self, event: Message) -> None:
         generation = self.controller.supervisor.generation
         if event.get("generation") != generation:
@@ -973,6 +1173,7 @@ class MeetingRecording(QObject):
             if (
                 raw["type"] != "meeting.call.state"
                 or not self.dialog_open
+                or self._variant1_lost
                 or raw["req"] != self._query_req
             ):
                 return
@@ -982,7 +1183,7 @@ class MeetingRecording(QObject):
             if raw["active"]:
                 self.offer.track_call(self.call_id, self.app_class)
             if self._call_available:
-                if not self._selection_touched:
+                if not self._selection_touched and not self.no_app_split:
                     self.selected_source = "call"
             elif self.selected_source == "call":
                 self.selected_source = "room"
@@ -997,6 +1198,10 @@ class MeetingRecording(QObject):
             return
         if raw["type"] == "meeting.detector.code":
             if raw["code"] == DetectorCode.REMOTE and not self._automation_off:
+                self._start_remote = (
+                    raw["purpose"] == DetectorPurpose.START
+                    and self._start_origin == StartOrigin.OFFER
+                )
                 self._automation_off = True
                 self._query_req = self._offer_query_req = ""
                 self.offer.suspend(clear_memory=True)
@@ -1010,43 +1215,77 @@ class MeetingRecording(QObject):
                 raw["duration_ms"],
             )
             return
-        if self._standby_role:
+        controller = self.controller
+        if self._standby_role and controller.state != "preparing":
             # Launch/hello and idle IPC must not touch a previous capture's state.
             self._publish()
             return
         if self.controller._exit_confirmed and raw["type"] == "error":
             # The supervisor fails pending requests after reporting process exit.
             return
-        if raw["type"] == "meeting.capture.prepared":
+        if self._start_origin == StartOrigin.OFFER:
+            self._update_offer_session()
+        if (
+            raw["type"] == "meeting.capture.prepared"
+            and controller.state == "preparing"
+            and controller.meeting is not None
+            and raw["meeting_id"] == controller.meeting.id
+            and raw["meeting_generation"] == controller.meeting.meeting_generation
+            and controller._requests.get(raw["req"]) == raw["request_type"]
+        ):
             # Newly discovered warnings must be visible before a further click;
             # cancel this prepared role without ever granting open.
             network = bool(
                 self.controller.meeting and self.controller.meeting.warnings.storage_network
             )
             remote = not raw["server_local"]
-            if (remote and not self._accepted_remote) or (network and not self._accepted_network):
+            remote_unapproved = remote and (
+                not self._accepted_remote or controller._far["kind"] == "app_stream"
+            )
+            if remote_unapproved or (network and not self._accepted_network):
                 self._audio = AudioHints(remote=remote, speakers=self._audio.speakers)
                 self._storage = StorageStatus(
                     self._storage.free_mb, self._storage.writable, network
                 )
+                self._prepared_remote = remote
+                if remote and self.selected_source == "call":
+                    self.selected_source = "room"
+                if self._start_origin == StartOrigin.OFFER and self.offer.starting_slot:
+                    self._prepared_network = network
+                    self._route_offer_dialog()
                 self.clicks.on_stop_clicked()
-            elif not self.dialog_open or not self.enabled() or not self.policy_allowed():
+            elif (
+                not self.dialog_open
+                and self._start_origin != StartOrigin.OFFER
+                or not self.enabled()
+                or not self.policy_allowed()
+            ):
                 self.clicks.on_stop_clicked()
-        self.controller.handle_event(event)
+        was_started = controller.capture_started
+        controller.handle_event(event)
         if self.controller.far_reason == "monitor-stream-unsupported":
             self.no_app_split = True
             self.controller.error_code = ""
-        if self.controller.state in {"recording", "paused"} and self.controller._committed:
+        started_or_paused = controller.capture_started and controller.state in {
+            "recording",
+            "paused",
+        }
+        if started_or_paused and controller._committed:
             self.dialog_open = False
-        self._publish()
+            self._variant1_lost = ""
+            self._offer_no_app_split = False
+            self._prepared_remote = self._prepared_network = False
+        self._publish(started=not was_started and started_or_paused)
 
     def _exit(self, code: int) -> None:
+        if self.dialog_open:
+            self._reset_dialog_card()
         retiring = self._retire_deadline is not None
         state = self.controller.state
         starting = state in {"preparing", "opening"}
         capture_crashed = code != 0 and state in {"recording", "paused"}
         if (
-            (self._standby_role or starting or capture_crashed)
+            (self._standby_role or starting or capture_crashed or self._start_origin is not None)
             and not retiring
             and self._observation_allowed()
         ):
@@ -1074,7 +1313,14 @@ class MeetingRecording(QObject):
             if kind == "preview":
                 serial, storage, audio, error = value
                 if serial == self._preview_serial and self.dialog_open:
-                    self._storage, self._audio = storage, audio
+                    self._storage = StorageStatus(
+                        storage.free_mb, storage.writable, storage.network or self._prepared_network
+                    )
+                    self._audio = AudioHints(
+                        remote=audio.remote or self._prepared_remote, speakers=audio.speakers
+                    )
+                    if self._audio.remote and self.selected_source == "call":
+                        self.selected_source = "room"
                     self._preview_error, self._preview_ready = error, True
             elif kind == "interrupted":
                 mid, meeting = value
@@ -1095,12 +1341,15 @@ class MeetingRecording(QObject):
             self._exit(3)
         self._sync_role_ownership()
         snapshot = self._update_offer_session()
+        self._resolve_start()
         if self.offer.tick(eligible=self._offer_eligible(), session=snapshot):
             self._send_offer_query()
         self._tick_jobs()
         if (
             self.dialog_open
             and not self._automation_off
+            and not self._variant1_lost
+            and not self._pending_call_lost
             and self._retire_deadline is None
             and self.controller.supervisor.ready
             and not self._query_req
@@ -1175,7 +1424,14 @@ class MeetingRecording(QObject):
             self.openMeetingsRequested.emit()
         self._publish()
 
-    def _publish(self) -> None:
+    def _publish(self, *, started: bool = False) -> None:
+        if started and self._start_origin is not None:
+            origin = self._start_origin
+            self._log_start_outcome(StartOutcome.STARTED)
+            self._clear_start()
+            if origin == StartOrigin.OFFER:
+                self.offer.start_done()
+        self._resolve_start()
         identity = self.controller.meeting.id if self.controller.meeting else ""
         if identity != self._overlay_identity:
             self._overlay_identity = identity
@@ -1208,7 +1464,8 @@ class MeetingRecording(QObject):
             self._overlay_far_deadline = self.clock() + 8
         self._overlay_far_state = far_state
         audio_error = bool(
-            self.controller._committed
+            self.controller.capture_started
+            and self.controller._committed
             and self.controller.state == "stopped"
             and (self.controller._physically_closed or self.controller._exit_confirmed)
             and self.controller.error_code == "audio-unavailable"
@@ -1299,8 +1556,12 @@ class MeetingRecording(QObject):
         controller.tick()
 
     def shutdown(self) -> None:
-        if self._closed:
+        if self._closed or self._shutting_down:
             return
+        self._shutting_down = True
+        self._log_start_outcome(StartOutcome.ABORTED)
+        self._clear_start()
+        self.offer.start_closed()
         self._lease_timer.stop()
         self._control_timer.stop()
         self.unbind_indicators()

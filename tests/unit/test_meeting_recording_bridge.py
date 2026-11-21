@@ -191,6 +191,20 @@ class Rig:
         self.supervisor.event({**event, "generation": 1})
 
 
+def capture_error(rig: Rig, action: str, code: str) -> dict[str, Any]:
+    request_type = f"meeting.capture.{action}"
+    request = next(m for m in reversed(rig.supervisor.messages) if m["type"] == request_type)
+    return {
+        "type": "error",
+        "request_type": request_type,
+        "req": request["req"],
+        "meeting_id": MID,
+        "meeting_generation": 0,
+        "code": code,
+        "message": "meeting-command-failed",
+    }
+
+
 @pytest.fixture
 def rig(tmp_path: Path) -> Iterator[Rig]:
     from helpers.qt_app import get_qapplication
@@ -237,47 +251,30 @@ def test_setting_or_policy_off_keeps_programmatic_w4_and_start_inert(rig: Rig, g
     assert not rig.supervisor.messages and rig.supervisor.starts == 0
 
 
-def test_call_is_hidden_and_cannot_be_selected_or_started_before_step_6a(rig: Rig) -> None:
+def test_current_card_enables_call_and_starts_app_stream_on_click(rig: Rig) -> None:
     rig.bridge.requestRecording()
     rig.supervisor.event(rig.call_state())
     assert rig.recording.call_id == "call1" and rig.recording.variant1
-    assert [row["id"] for row in rig.bridge.startOptions] == ["room", "all"]
-    assert rig.bridge.selectedSource == "room"
-    rig.bridge.selectRecordingSource("call")
-    assert rig.bridge.selectedSource == "room"
+    assert [row["id"] for row in rig.bridge.startOptions] == ["call", "room", "all"]
+    assert rig.bridge.selectedSource == "call"
     rig.bridge.on_start_clicked()
-    assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
-    assert all(
-        message.get("far", {}).get("kind") != "app_stream" for message in rig.supervisor.messages
-    )
+    assert rig.supervisor.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
 
 
 @pytest.mark.parametrize("app_class", ["dion", "browser"])
-def test_only_correlated_call_state_enables_app_stream_with_step_6a(
-    rig: Rig, app_class: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_only_correlated_call_state_enables_app_stream(rig: Rig, app_class: str) -> None:
     rig.bridge.requestRecording()
     event = rig.call_state(app_class)
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.supervisor.event({**event, "req": "stale"})
+    rig.supervisor.event({**event, "req": "stale"})
     assert not rig.recording.call_id and rig.bridge.selectedSource == "room"
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.supervisor.event({**event, "generation": rig.supervisor.generation - 1})
+    rig.supervisor.event({**event, "generation": rig.supervisor.generation - 1})
     assert not rig.recording.call_id and rig.bridge.selectedSource == "room"
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.supervisor.event(event)
+    rig.supervisor.event(event)
     assert rig.bridge.selectedSource == "call"
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rows = rig.bridge.startOptions
+    rows = rig.bridge.startOptions
     assert [row["id"] for row in rows] == ["call", "room", "all"] and rows[0]["enabled"]
     assert rig.bridge.startState == ("browser" if app_class == "browser" else "call")
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.bridge.on_start_clicked()
+    rig.bridge.on_start_clicked()
     assert rig.supervisor.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
 
 
@@ -471,9 +468,7 @@ def test_timer_intervals_keep_control_responsive(rig: Rig) -> None:
 
 
 @pytest.mark.parametrize("payload", ["missing-id", "variant-disabled", "other-app"])
-def test_incomplete_or_unavailable_call_never_enables_call(
-    rig: Rig, payload: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_incomplete_or_unavailable_call_never_enables_call(rig: Rig, payload: str) -> None:
     rig.bridge.requestRecording()
     event = rig.call_state()
     if payload == "missing-id":
@@ -482,12 +477,8 @@ def test_incomplete_or_unavailable_call_never_enables_call(
         event["variant1"] = False
     else:
         event["app_class"] = "other"
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.supervisor.event(event)
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rows = rig.bridge.startOptions
+    rig.supervisor.event(event)
+    rows = rig.bridge.startOptions
     assert [row["id"] for row in rows] == ["room", "all"]
     assert rig.bridge.selectedSource == "room"
 
@@ -526,6 +517,8 @@ def test_new_remote_warning_requires_new_click_after_confirmed_exit(
     rig.recording.tick()
     assert rig.bridge.startCanStart
     assert len(rig.supervisors) == 1
+    assert rig.bridge.selectedSource == "room"
+    rig.bridge.selectRecordingSource(source)
     rig.bridge.on_start_clicked()
     assert len(rig.supervisors) == 2
     assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
@@ -741,15 +734,11 @@ def test_late_list_result_cannot_replace_live_paused_overlay(rig: Rig) -> None:
 
 
 @pytest.mark.parametrize("selection", [None, "room", "all"])
-def test_call_default_respects_explicit_choice(
-    rig: Rig, selection: str | None, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_call_default_respects_explicit_choice(rig: Rig, selection: str | None) -> None:
     rig.bridge.requestRecording()
     if selection is not None:
         rig.bridge.selectRecordingSource(selection)
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.supervisor.event(rig.call_state())
+    rig.supervisor.event(rig.call_state())
     assert rig.bridge.selectedSource == (selection or "call")
 
 
@@ -765,21 +754,13 @@ def test_microphone_choice_frozen_before_async_prepare(rig: Rig) -> None:
     assert rig.supervisor.messages[-1]["mic_device"] == "test-mic"
 
 
-def test_no_app_split_requires_explicit_new_whole_output_click(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_no_app_split_requires_explicit_new_whole_output_click(rig: Rig) -> None:
     rig.bridge.requestRecording()
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.supervisor.event(rig.call_state())
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        rig.bridge.on_start_clicked()
+    rig.supervisor.event(rig.call_state())
+    rig.bridge.on_start_clicked()
     rig.reply("prepared", far_available=False, far_reason="monitor-stream-unsupported")
     assert rig.bridge.startState == "no-app-split"
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        row = rig.bridge.startOptions[0]
+    row = rig.bridge.startOptions[0]
     assert row["id"] == "call" and row["warning"] and not row["enabled"]
     assert not any(m["type"] == "meeting.capture.open" for m in rig.supervisor.messages)
     rig.reply("closed", tracks=[], state_rev=1)
@@ -789,10 +770,8 @@ def test_no_app_split_requires_explicit_new_whole_output_click(
     rig.supervisor.ready, rig.supervisor.exited = False, True
     rig.supervisor.on_exit(0)
     rig.recording.tick()
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
-        can_start = rig.bridge.startCanStart
-    assert not can_start
+    assert rig.bridge.startCanStart and rig.bridge.selectedSource == "room"
+    assert not any(m["type"] == "meeting.capture.open" for m in rig.supervisor.messages)
     rig.bridge.selectRecordingSource("all")
     assert rig.bridge.startCanStart and len(rig.supervisors) == 1
     rig.bridge.on_start_clicked()

@@ -462,7 +462,7 @@ def test_network_storage_warning_persisted_and_thresholds(rig: Rig) -> None:
     assert not rig.bridge.on_start_clicked()
     assert rig.supervisor.messages == []
     assert rig.controller.error_text == (
-        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
+        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
         "место или удалите старые встречи."
     )
     rig.storage = StorageStatus(600, True, True)

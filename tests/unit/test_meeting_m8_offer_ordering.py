@@ -11,6 +11,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent, Qt
 from test_meeting_m8_offer import (
     CALL,
     SHOW,
+    assert_no_capture,
     deliver,
     ended,
     memory,
@@ -18,6 +19,7 @@ from test_meeting_m8_offer import (
     replace_role,
     show_offer,
     started,
+    started_from_w1,
     tick_at,
 )
 from test_meeting_m8_offer_card import QUERY, reply, sleep_or_lock, unlock
@@ -284,6 +286,7 @@ def test_next_tick_checks_call_end_and_full_lock_cycle_before_start(
     assert view.calls == [SHOW, ("close",)]
     assert not rig.bridge.startDialogOpen
     assert command_types(rig.supervisor) == [DETECTOR_START]
+    assert_no_capture(rig)
 
 
 def test_press_before_timeout_is_accepted_on_a_tick_after_timeout(rig: Rig) -> None:
@@ -295,9 +298,10 @@ def test_press_before_timeout_is_accepted_on_a_tick_after_timeout(rig: Rig) -> N
     assert rig.recording.press_offer("start", 159_999)
     assert view.calls == [SHOW]
     tick_at(rig, 160_010)
-    intent.assert_called_once_with()
-    assert view.calls == [SHOW, ("close",)]
-    assert memory(rig) == "accepted" and rig.bridge.startDialogOpen
+    intent.assert_not_called()
+    assert view.calls == [SHOW, ("starting",)]
+    assert memory(rig) == "accepted"
+    started_from_w1(rig, CALL)
 
 
 @pytest.mark.parametrize(("first", "second"), [("refuse", "start"), ("start", "refuse")])
@@ -312,9 +316,13 @@ def test_first_press_keeps_its_action_until_tick(rig: Rig, first: str, second: s
     assert view.calls == [SHOW]
     tick_at(rig, 100_650)
     accepted = first == "start"
-    assert view.calls == [SHOW, ("close",)]
+    assert view.calls == [SHOW, ("starting" if accepted else "close",)]
     assert memory(rig) == ("accepted" if accepted else "refused")
-    assert intent.call_count == int(accepted) and rig.bridge.startDialogOpen is accepted
+    intent.assert_not_called()
+    if accepted:
+        started_from_w1(rig, CALL)
+    else:
+        assert_no_capture(rig)
 
 
 @pytest.mark.parametrize("action", ["refuse", "close"])

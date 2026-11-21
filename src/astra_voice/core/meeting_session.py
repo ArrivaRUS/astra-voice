@@ -33,7 +33,7 @@ MEETING_HARD_LIMIT_MS = 14_400_000
 LOCK_SIGNAL_BY_SESSION = {SessionKind.KDE: "login1", SessionKind.FLY: "none"}
 ERROR_TEXT = {
     "disk-low": (
-        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
+        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
         "место или удалите старые встречи."
     ),
     "audio-unavailable": (
@@ -64,6 +64,7 @@ WARNING_TEXT = {
     ),
 }
 Message = dict[str, Any]
+TARGET_REFUSALS = frozenset({"target-gone", "target-mismatch"})
 
 
 class CaptureSupervisor(Protocol):
@@ -216,6 +217,7 @@ class MeetingController:
         self._filesystem_pending = 0
         self._disk_pending = False
         self._attempt = 0
+        self.capture_started = False
         self._capture_succeeded = False
         self._write_results: queue.SimpleQueue[tuple[str, bool, bool]] = queue.SimpleQueue()
         self._exit_confirmed = False
@@ -335,6 +337,7 @@ class MeetingController:
         self.meeting.warnings.whole_output = self._far["kind"] == "sink_monitor"
         self._reserved = self._committed = False
         self.saved = self._terminal = self._exit_confirmed = self._capture_finalized = False
+        self.capture_started = False
         self._capture_succeeded = False
         self._attempt += 1
         attempt = self._attempt
@@ -538,7 +541,7 @@ class MeetingController:
         if snapshot.preparing_for_sleep or (snapshot.known and not snapshot.active):
             self.stop("sleep" if snapshot.preparing_for_sleep else "session")
         elif self.session_kind != SessionKind.FLY and not self._allowed():
-            if self.state == "preparing":
+            if not self.capture_started:
                 self.stop("lock")
             else:
                 self.pause("unknown" if not snapshot.known else "lock")
@@ -767,6 +770,33 @@ class MeetingController:
             self._submit_filesystem(commit)
             return
         if kind == "error":
+            if event["code"] in TARGET_REFUSALS:
+                if (
+                    event.get("request_type") == "meeting.capture.prepare"
+                    and self.state == "preparing"
+                    and self._prepare_sent
+                    and not self._exit_confirmed
+                ):
+                    # This prepare failed before granting open or publishing a meeting.
+                    meeting_id = self.meeting.id
+                    self._prepare_deadline = None
+                    self._reserved = False
+                    self.meeting = None
+                    self.state = "idle"
+                    self.error_code = ""
+                    self.far_reason = event["code"]
+
+                    def discard() -> Callable[[], None]:
+                        self.store.discard_reserved(meeting_id)
+                        return lambda: None
+
+                    self._submit_filesystem(discard)
+                    return
+                if event.get("request_type") == "meeting.capture.open":
+                    self.error_code = ""
+                    self.far_reason = event["code"]
+                    self._escalate()
+                    return
             if (
                 event.get("request_type") == "meeting.capture.keepalive"
                 and event.get("code") == "not-prepared"
@@ -798,6 +828,11 @@ class MeetingController:
                 return
             if self.state != "opening":
                 return
+            if not self.capture_started:
+                self.on_session_changed()
+                if self.state != "opening":
+                    return
+                self.capture_started = True
             self.state = "recording"
             self._active_at = self.clock()
             self._pause_at = None
