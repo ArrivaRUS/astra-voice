@@ -33,7 +33,7 @@ MEETING_HARD_LIMIT_MS = 14_400_000
 LOCK_SIGNAL_BY_SESSION = {SessionKind.KDE: "login1", SessionKind.FLY: "none"}
 ERROR_TEXT = {
     "disk-low": (
-        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
+        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
         "место или удалите старые встречи."
     ),
     "audio-unavailable": (
@@ -64,6 +64,7 @@ WARNING_TEXT = {
     ),
 }
 Message = dict[str, Any]
+TARGET_REFUSALS = frozenset({"target-gone", "target-mismatch"})
 
 
 class CaptureSupervisor(Protocol):
@@ -767,6 +768,33 @@ class MeetingController:
             self._submit_filesystem(commit)
             return
         if kind == "error":
+            if event["code"] in TARGET_REFUSALS:
+                if (
+                    event.get("request_type") == "meeting.capture.prepare"
+                    and self.state == "preparing"
+                    and self._prepare_sent
+                    and not self._exit_confirmed
+                ):
+                    # This prepare failed before granting open or publishing a meeting.
+                    meeting_id = self.meeting.id
+                    self._prepare_deadline = None
+                    self._reserved = False
+                    self.meeting = None
+                    self.state = "idle"
+                    self.error_code = ""
+                    self.far_reason = event["code"]
+
+                    def discard() -> Callable[[], None]:
+                        self.store.discard_reserved(meeting_id)
+                        return lambda: None
+
+                    self._submit_filesystem(discard)
+                    return
+                if event.get("request_type") == "meeting.capture.open":
+                    self.error_code = ""
+                    self.far_reason = event["code"]
+                    self._escalate()
+                    return
             if (
                 event.get("request_type") == "meeting.capture.keepalive"
                 and event.get("code") == "not-prepared"

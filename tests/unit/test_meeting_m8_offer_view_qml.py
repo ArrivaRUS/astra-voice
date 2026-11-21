@@ -1019,6 +1019,7 @@ def wm_close_states() -> None:
 
 def input_at(directory: Path, mode: str, elapsed: int) -> None:
     """Q4, including intent through the real MeetingRecording adapter."""
+    from test_meeting_m8_offer import assert_no_capture, started_from_w1
     from test_meeting_recording_bridge import Rig
 
     patcher = pytest.MonkeyPatch()
@@ -1056,20 +1057,22 @@ def input_at(directory: Path, mode: str, elapsed: int) -> None:
             if elapsed < 500:
                 intent.assert_not_called()
                 assert not instance.bridge.startDialogOpen and window._view.isVisible()
+                assert_no_capture(instance)
             else:
-                intent.assert_called_once_with()
-                assert instance.bridge.startDialogOpen and not window._view.isVisible()
+                intent.assert_called_once_with("call-PRIVATE-1", "dion")
+                assert window._view.isVisible() and window._root.property("starting")
                 recording.tick()
-                intent.assert_called_once_with()
-            assert not any(
-                msg["type"] in {"meeting.capture.prepare", "meeting.capture.open"}
-                for msg in instance.supervisor.messages
-            )
+                intent.assert_called_once_with("call-PRIVATE-1", "dion")
+                started_from_w1(instance, "call-PRIVATE-1")
+                assert not any(
+                    msg["type"] == "meeting.capture.open" for msg in instance.supervisor.messages
+                )
     finally:
         instance.bridge.shutdown()
 
 
 def delayed_expose(directory: Path, mode: str) -> None:
+    from test_meeting_m8_offer import assert_no_capture, started_from_w1
     from test_meeting_recording_bridge import Rig
 
     instance = Rig(directory)
@@ -1116,17 +1119,20 @@ def delayed_expose(directory: Path, mode: str) -> None:
                 click()
                 press.assert_not_called()
                 intent.assert_not_called()
+                assert_no_capture(instance)
             instance.now = 101.15
             click()
             press.assert_called_once_with("start", 101_150)
-            intent.assert_called_once_with()
-            assert instance.bridge.startDialogOpen
+            intent.assert_called_once_with("call-PRIVATE-1", "dion")
+            assert view.isVisible() and window._root.property("starting")
+            started_from_w1(instance, "call-PRIVATE-1")
     finally:
         instance.bridge.shutdown()
 
 
 def x_timestamp(directory: Path) -> None:
     """Real Qt/QML mouse dispatch with independently controlled GUI and X timestamps."""
+    from test_meeting_m8_offer import assert_no_capture, started_from_w1
     from test_meeting_recording_bridge import Rig
 
     instance = Rig(directory)
@@ -1154,14 +1160,17 @@ def x_timestamp(directory: Path) -> None:
                 click(stamp)
                 press.assert_not_called()
                 assert not instance.bridge.startDialogOpen
+                assert_no_capture(instance)
             click((exposed + 500) % wrap)
             press.assert_called_once_with("start", 100_600)
-            assert instance.bridge.startDialogOpen
+            assert window._view.isVisible() and window._root.property("starting")
+            started_from_w1(instance, "call-PRIVATE-1")
     finally:
         instance.bridge.shutdown()
 
 
 def x_retry(directory: Path) -> None:
+    from test_meeting_m8_offer import started_from_w1
     from test_meeting_recording_bridge import Rig
 
     instance = Rig(directory)
@@ -1204,7 +1213,8 @@ def x_retry(directory: Path) -> None:
             mouse_click_at(view, button, 101_200)
             press.assert_called_once_with("start", 101_200)
             recording.tick()
-            assert instance.bridge.startDialogOpen
+            assert view.isVisible() and window._root.property("starting")
+            started_from_w1(instance, "call-PRIVATE-1")
     finally:
         instance.bridge.shutdown()
 

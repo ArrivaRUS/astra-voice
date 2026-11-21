@@ -194,6 +194,21 @@ CATALOG_LOAD_FAILED = "meeting-catalog-load-failed"
 CAPTURE_STATS = "meeting-capture duration_ms=%d bytes=%d"
 NATIVE_STDERR = "meeting-native-stderr bytes=%d lines=%d"
 DETECTOR_CODE = "meeting-detector purpose=%s code=%s duration_ms=%d"
+START_LATENCY = "meeting-start origin=%s outcome=%s latency_ms=%d"
+
+
+class StartOrigin(StrEnum):
+    OFFER = "offer"
+    CARD = "card"
+
+
+class StartOutcome(StrEnum):
+    STARTED = "started"
+    CALL_LOST = "call-lost"
+    FAILED = "start-failed"
+    ABORTED = "aborted"
+
+
 LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     POLICY_REJECTED: (PolicyCode,),
     SETTING_INVALID: (SettingKey,),
@@ -203,6 +218,7 @@ LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     CAPTURE_STATS: (None, None),
     NATIVE_STDERR: (None, None),
     DETECTOR_CODE: (DetectorPurpose, DetectorCode, None),
+    START_LATENCY: (StartOrigin, StartOutcome, None),
 }
 
 

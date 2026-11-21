@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from astra_voice.core.command_mode import SessionSnapshot
+from astra_voice.core.meeting_session import ERROR_TEXT
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +18,7 @@ OFFER_GUARD_MS = 500
 _DISPLAY_MS = 60_000
 _UNLOCK_QUERY_MS = 5_000
 _INHERIT_MS = 15_000
+_START_TIMEOUT_MS = 6_000
 _KINDS = {"dion": "call-app", "browser": "call-browser"}
 
 Outcome = Literal["shown", "refused", "accepted", "lock_closed"]
@@ -31,6 +33,10 @@ class OfferView(Protocol):
     def update_remaining(self, seconds: int) -> None: ...
 
     def close(self) -> None: ...
+
+    def starting(self) -> None: ...
+
+    def start_failed(self, text: str) -> None: ...
 
 
 @dataclass(repr=False)
@@ -53,6 +59,15 @@ class _Memory:
     deadline: int | None = None
 
 
+@dataclass(repr=False)
+class _StartSlot:
+    call: _Call
+    role_serial: int
+    pressed_at_ms: int
+    deadline: int | None
+    failed: bool = False
+
+
 def _epochs(snapshot: SessionSnapshot) -> tuple[int, int]:
     return snapshot.blocked_epoch, snapshot.sleep_epoch
 
@@ -63,11 +78,15 @@ class OfferController:
         *,
         clock: Callable[[], float],
         on_visibility_changed: Callable[[], None],
-        on_start: Callable[[], None],
+        on_start: Callable[[str, str], None],
+        on_open_meetings: Callable[[], None] = lambda: None,
+        on_start_timeout: Callable[[], None] = lambda: None,
     ) -> None:
         self._clock = clock
         self._visibility_changed = on_visibility_changed
         self.startRequested = on_start
+        self._open_meetings = on_open_meetings
+        self._start_timeout = on_start_timeout
         self._view: OfferView | None = None
         self._tick_number = 0
         self._role_serial: int | None = None
@@ -77,6 +96,7 @@ class OfferController:
         self._memory: dict[str, _Memory] = {}
         self._pending: _Call | None = None
         self._visible: _Call | None = None
+        self._starting: _StartSlot | None = None
         self._shown_at: int | None = None
         self._pressed: tuple[str, int] | None = None
         self._guarded = False
@@ -89,6 +109,7 @@ class OfferController:
         return int(self._clock() * 1000)
 
     def bind(self, view: OfferView | None) -> None:
+        self.start_closed()
         if self._view is view:
             return
         self.suspend()
@@ -103,7 +124,18 @@ class OfferController:
         return self._visible is not None
 
     @property
+    def starting_slot(self) -> bool:
+        return self._starting is not None
+
+    @property
+    def start_pressed_at_ms(self) -> int:
+        assert self._starting is not None
+        return self._starting.pressed_at_ms
+
+    @property
     def state(self) -> str:
+        if self._starting is not None:
+            return "start-failed" if self._starting.failed else "starting"
         if self._visible is not None:
             return "shown_guard" if self._guarded else "shown"
         if self._pending is not None and self._pending.deferred is None:
@@ -213,6 +245,7 @@ class OfferController:
             and session.allowed
             and self._pending is None
             and not self.visible
+            and not self.starting_slot
             and call_id not in self._ended
             and self._fresh(measured_ms, now)
         ):
@@ -234,23 +267,64 @@ class OfferController:
         if call.deferred is not None or not self._suppressed(call):
             self._pending = call
 
-    def _remember(self, call: _Call, outcome: Outcome) -> None:
-        assert self._role_serial is not None
+    def _remember(self, call: _Call, outcome: Outcome, role_serial: int | None = None) -> None:
+        serial = self._role_serial if role_serial is None else role_serial
+        assert serial is not None
         entry = self._memory.get(call.app_class)
         ids = entry.call_ids if entry is not None else set()
         ids.add(call.call_id)
-        self._memory[call.app_class] = _Memory(outcome, ids, self._role_serial, call.origin)
+        deadline = (
+            self.now_ms() + _INHERIT_MS
+            if serial != self._role_serial and self._detector_started
+            else None
+        )
+        self._memory[call.app_class] = _Memory(outcome, ids, serial, call.origin, deadline)
 
-    def _close(self, outcome: Outcome | None = None) -> None:
+    def _take_visible(self) -> _Call | None:
         call, self._visible = self._visible, None
         if call is None:
-            return
-        if outcome is not None:
-            self._remember(call, outcome)
+            return None
         self._shown_at = None
         self._pressed = None
         self._guarded = False
         self._seconds = 0
+        return call
+
+    def _close(self, outcome: Outcome | None = None) -> None:
+        call = self._take_visible()
+        if call is None:
+            return
+        if outcome is not None:
+            self._remember(call, outcome)
+        assert self._view is not None
+        self._view.close()
+        self._visibility_changed()
+
+    def start_resolved(self) -> None:
+        if self._starting is not None:
+            self._starting.deadline = None
+
+    def start_done(self) -> None:
+        self.start_closed()
+
+    def start_failed(self, text: str) -> None:
+        if self._starting is None or self._starting.failed:
+            return
+        self.start_resolved()
+        self._starting.failed = True
+        assert self._view is not None
+        self._view.start_failed(text)
+        self._visibility_changed()
+
+    def start_aborted(self) -> None:
+        if self._starting is not None:
+            self._remember(self._starting.call, "lock_closed", self._starting.role_serial)
+            self.start_closed()
+
+    def start_closed(self) -> None:
+        if self._starting is None:
+            return
+        self._starting = None
         assert self._view is not None
         self._view.close()
         self._visibility_changed()
@@ -268,6 +342,7 @@ class OfferController:
             self._memory.clear()
             self._calls.clear()
             self._ended.clear()
+            self.start_closed()
         self._close("shown" if for_capture else None)
 
     def call_ended(self, call_id: str, reason: str) -> bool:
@@ -326,6 +401,12 @@ class OfferController:
         )
         if epochs_changed or not snapshot.allowed:
             self._query_at = None
+        if self._starting is not None and (
+            not snapshot.allowed
+            or epochs_changed
+            or self._starting.call.epochs != _epochs(snapshot)
+        ):
+            self.start_aborted()
         if not snapshot.allowed or (
             self._visible is not None and self._visible.epochs != _epochs(snapshot)
         ):
@@ -339,6 +420,7 @@ class OfferController:
             and previous is not None
             and (not previous.allowed or missed_block)
             and not self.visible
+            and not self.starting_slot
             and self._pending is None
             and self._has_card_class()
         ):
@@ -352,6 +434,13 @@ class OfferController:
         """Advance W1 after the IPC pump. Return True once when CARD is due."""
         now = self.now_ms()
         self._expire_memory(now)
+        if self._starting is not None:
+            self._ended.clear()
+            deadline = self._starting.deadline
+            if deadline is not None and now >= deadline:
+                self.start_failed(ERROR_TEXT["audio-unavailable"])
+                self._start_timeout()
+            return False
         call = self._pending
         if call is not None and call.received_tick < self._tick_number:
             self._pending = None
@@ -416,6 +505,13 @@ class OfferController:
 
     def press(self, action: str, pressed_at_ms: int) -> bool:
         """Queue the first admitted press for the next tick."""
+        if self._starting is not None:
+            if not self._starting.failed or action not in {"close", "open_meetings"}:
+                return False
+            self.start_closed()
+            if action == "open_meetings":
+                self._open_meetings()
+            return True
         if self._pressed is not None or action not in {"start", "refuse", "close"}:
             return False
         if not self._press_in_window(pressed_at_ms, self.now_ms()):
@@ -441,12 +537,22 @@ class OfferController:
         if not self._press_in_window(pressed_at_ms, pressed_at_ms):
             return False
         if action == "start":
-            self._close("accepted")
-            self.startRequested()
+            call = self._take_visible()
+            assert call is not None and self._role_serial is not None and self._view is not None
+            self._remember(call, "accepted", self._role_serial)
+            self._starting = _StartSlot(
+                call, self._role_serial, pressed_at_ms, pressed_at_ms + _START_TIMEOUT_MS
+            )
+            self._view.starting()
+            self.startRequested(call.call_id, call.app_class)
         else:
             self._close("refused")
         return True
 
     def dismiss(self) -> None:
         """The window manager closed W1. The in-window × uses press()."""
+        if self._starting is not None:
+            if self._starting.failed:
+                self.start_closed()
+            return
         self._close("refused")

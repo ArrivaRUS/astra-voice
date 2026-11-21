@@ -370,6 +370,10 @@ def test_x1_x2_x3_click_focus_and_guard(
         recording.tick()
         assert not recording.dialog_open and window._view.isVisible()
         intent.assert_not_called()
+        assert not any(
+            call.args[0]["type"] in {"meeting.capture.prepare", "meeting.capture.open"}
+            for call in role.send.call_args_list
+        )
 
         now[0] = 100.6
         keycode = xdisplay.d.keysym_to_keycode(XK.string_to_keysym("Return"))
@@ -394,12 +398,18 @@ def test_x1_x2_x3_click_focus_and_guard(
         still_focused()
         _assert_wm_properties(xdisplay, window)
         recording.tick()
-        assert recording.dialog_open and not window._view.isVisible()
-        intent.assert_called_once_with()
-        assert not any(
-            call.args[0]["type"] in {"meeting.capture.prepare", "meeting.capture.open"}
+        assert not recording.dialog_open and window._view.isVisible()
+        assert window._root.property("starting")
+        intent.assert_called_once_with("call-w1", "dion")
+        commands = [
+            call.args[0]
             for call in role.send.call_args_list
-        )
+            if call.args[0]["type"] in {"meeting.capture.prepare", "meeting.capture.open"}
+        ]
+        (request,) = commands
+        assert request["type"] == "meeting.capture.prepare"
+        assert request["far"] == {"kind": "app_stream", "call_id": "call-w1"}
+        assert request["mic_device"] == "test-mic"
 
 
 def test_start_failed_click_focus_and_show_again(

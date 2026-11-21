@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 from PyQt5.QtCore import (
+    QCoreApplication,
+    QEvent,
     QObject,
     QPoint,
     QPointF,
@@ -18,7 +20,7 @@ from PyQt5.QtCore import (
     pyqtSlot,
     qInstallMessageHandler,
 )
-from PyQt5.QtGui import QGuiApplication, QImage, QPainter
+from PyQt5.QtGui import QGuiApplication, QImage, QKeyEvent, QPainter
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtTest import QTest
 from test_meetings_section import Bridge, ThemeSource, grab
@@ -50,7 +52,7 @@ COPY = {
 }
 ERRORS = {
     "error-disk": (
-        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите место "
+        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите место "
         "или удалите старые встречи."
     ),
     "error-audio": (
@@ -428,6 +430,52 @@ def test_w4_starting_ignores_pointer_return_and_space(start_window: Any, dark: b
     assert bridge.starts == 0 and not messages
 
 
+@pytest.mark.parametrize(
+    "key",
+    [Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, None],
+    ids=["space", "return", "keypad-enter", "mouse"],
+)
+@pytest.mark.parametrize(
+    ("state", "button_name", "action"),
+    [
+        ("default", "start", "starts"),
+        ("default", "cancel", "closed"),
+        ("error-audio", "retry", "retries"),
+    ],
+)
+def test_w4_physical_input_activates_button_once(
+    start_window: Any, state: str, button_name: str, action: str, key: Qt.Key | None
+) -> None:
+    window, bridge, messages = start_window(state)
+    (button,) = [
+        item
+        for item in visual_items(window.contentItem())
+        if item.isVisible()
+        and item.property("text") == COPY[button_name]
+        and item.metaObject().indexOfSignal("clicked()") >= 0
+    ]
+    assert button.isEnabled()
+    button.forceActiveFocus(Qt.TabFocusReason)
+    assert button.hasActiveFocus()
+
+    if key is None:
+        center = button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint()
+        QTest.mouseClick(window, Qt.LeftButton, pos=center)
+    else:
+        if key == Qt.Key_Space:
+            QTest.keyPress(window, key)
+        for kind in (QEvent.KeyPress, QEvent.KeyRelease):
+            QCoreApplication.sendEvent(window, QKeyEvent(kind, key, Qt.NoModifier, "", True, 1))
+        assert getattr(bridge, action) == 0
+        if key == Qt.Key_Space:
+            QTest.keyRelease(window, key)
+        else:
+            QTest.keyClick(window, key)
+    assert getattr(bridge, action) == 1
+    assert bridge.starts + bridge.closed + bridge.retries == 1
+    assert not messages, messages
+
+
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_w4_combined_network_remote_warnings_keep_controls_visible(
     start_window: Any, dark: bool
@@ -453,6 +501,44 @@ def test_w4_combined_network_remote_warnings_keep_controls_visible(
         assert warning in texts(window.contentItem())
     image = grab(window)
     write_snapshot(SHOTS, f"w4-combined-warnings-{'dark' if dark else 'light'}.png", image)
+    assert bridge.starts == 0 and not messages
+
+
+def test_w4_call_lost_banner_and_manual_choices(start_window: Any) -> None:
+    window, bridge, messages = start_window("call-lost")
+    line = (
+        "Не удалось однозначно отделить звук DION — "
+        "запишется только микрофон или весь звук компьютера"
+    )
+    bridge._extra_warnings = [line]
+    bridge.changed.emit()
+    QCoreApplication.processEvents()
+    assert [row["id"] for row in bridge.startOptions] == ["room", "all"]
+    labels = texts(window.contentItem())
+    (banner,) = [
+        item
+        for item in visual_items(window.contentItem())
+        if item.objectName() == "meetingStartWarning" and item.property("body") == line
+    ]
+    (label,) = [item for item in visual_items(banner) if item.property("text") == line]
+    top_left = label.mapToScene(QPointF(0, 0))
+    bottom_right = label.mapToScene(QPointF(label.width(), label.height()))
+    assert 0 <= top_left.x() < bottom_right.x() <= window.width()
+    assert 0 <= top_left.y() < bottom_right.y() <= window.height()
+    ancestor = label
+    while ancestor is not None:
+        assert ancestor.isVisible()
+        if ancestor.clip():
+            clip_start = ancestor.mapFromScene(top_left)
+            clip_end = ancestor.mapFromScene(bottom_right)
+            assert 0 <= clip_start.x() < clip_end.x() <= ancestor.width()
+            assert 0 <= clip_start.y() < clip_end.y() <= ancestor.height()
+        ancestor = ancestor.parentItem()
+    assert all(row["title"] in labels for row in bridge.startOptions)
+    assert "Звонок в DION" not in labels
+    start = window.findChild(QObject, "meetingStartConfirm")
+    assert start is not None and start.property("text") == "Начать запись"
+    assert start.property("visible") and start.property("enabled")
     assert bridge.starts == 0 and not messages
 
 

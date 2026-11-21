@@ -14,14 +14,16 @@ from test_meeting_logging import violations
 from test_meeting_m8_role_ownership import command_types, leave, observe
 from test_meeting_recording_bridge import (
     DETECTOR_START,
+    MID,
     Rig,
+    capture_error,
     deliver_detector,
     deliver_remote,
 )
 from test_meeting_recording_bridge import rig as rig
 
 from astra_voice.core.command_mode import SessionSnapshot
-from astra_voice.ui import meeting_offer, meeting_recording
+from astra_voice.ui import meeting_offer
 from astra_voice.ui.meeting_offer import OfferController, Origin
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
@@ -43,6 +45,26 @@ class View:
 
     def close(self) -> None:
         self.calls.append(("close",))
+
+    def starting(self) -> None:
+        self.calls.append(("starting",))
+
+    def start_failed(self, text: str) -> None:
+        self.calls.append(("start-failed", text))
+
+
+def started_from_w1(rig: Rig, call_id: str) -> None:
+    commands = [m for m in rig.supervisor.messages if m["type"] == "meeting.capture.prepare"]
+    (request,) = commands
+    assert request["far"] == {"kind": "app_stream", "call_id": call_id}
+    assert request["mic_device"] == rig.microphone
+    assert not rig.bridge.startDialogOpen
+
+
+def assert_no_capture(rig: Rig) -> None:
+    assert not {"meeting.capture.prepare", "meeting.capture.open"}.intersection(
+        command_types(rig.supervisor)
+    )
 
 
 def tick_at(rig: Rig, ms: int) -> None:
@@ -477,9 +499,15 @@ def test_u7_early_press_is_ignored_and_not_deferred(
     intent.assert_not_called()
     assert view.calls == [SHOW]
     assert not rig.bridge.startDialogOpen and memory(rig) == "shown"
+    assert_no_capture(rig)
     assert rig.recording.press_offer(action, 100_950)
     rig.recording.tick()
-    assert view.calls[-1] == ("close",) and not rig.recording.offer.visible
+    if action == "start":
+        started_from_w1(rig, CALL)
+        assert view.calls == [SHOW, ("starting",)]
+    else:
+        assert view.calls[-1] == ("close",) and not rig.recording.offer.visible
+        assert_no_capture(rig)
 
 
 @pytest.mark.parametrize("at", [500, 600])
@@ -491,14 +519,13 @@ def test_u7_start_at_guard_boundary_is_accepted(rig: Rig, at: int) -> None:
     assert rig.recording.offer.state == "shown"
     assert rig.recording.press_offer("start", 100_300 + at)
     rig.recording.tick()
-    assert view.calls == [SHOW, ("close",)]
-    assert memory(rig) == "accepted" and rig.bridge.startDialogOpen
+    assert view.calls == [SHOW, ("starting",)]
+    assert memory(rig) == "accepted"
+    started_from_w1(rig, CALL)
 
 
-@pytest.mark.parametrize("app_stream_gate", [False, True])
-def test_u9_w1_intent_opens_w4_without_capture(
-    rig: Rig, app_stream_gate: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.parametrize("outcome", ["started", "target-mismatch"])
+def test_u9_w1_start_and_next_call(rig: Rig, outcome: str) -> None:
     view = offer_ready(rig)
     section = Mock()
     rig.bridge.openMeetingsRequested.connect(section)
@@ -514,18 +541,32 @@ def test_u9_w1_intent_opens_w4_without_capture(
     assert view.calls[-1] == ("close",)
     show_offer(rig)
     tick_at(rig, 159_600)
-    with monkeypatch.context() as patch:
-        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", app_stream_gate)
-        assert rig.recording.press_offer("start", 159_600)
-        rig.recording.tick()
+    assert_no_capture(rig)
+    assert rig.recording.press_offer("start", 159_600)
+    rig.recording.tick()
+    started_from_w1(rig, CALL)
+    if outcome == "started":
+        rig.reply("prepared")
+        rig.reply("started", tracks=["mic", "far"])
+        assert rig.recording.active_meeting_id == MID
+        assert not rig.bridge.startDialogOpen
+        section.assert_not_called()
+        assert w4_at_emit == []
+        elapsed = 162_600
+        rig.supervisor.kill()
+        tick_at(rig, elapsed)
+        deliver_detector(rig.supervisor, rig.supervisor.messages[-1], "meeting.detector.started")
+    else:
+        deliver(rig, capture_error(rig, "prepare", outcome))
         assert rig.bridge.startDialogOpen
         assert [row["id"] for row in rig.bridge.startOptions] == ["room", "all"]
-    section.assert_called_once_with()
-    assert w4_at_emit == [False]
-    assert command_types(rig.supervisor) == [DETECTOR_START, "meeting.call.query"]
+        section.assert_called_once_with()
+        assert w4_at_emit == [False]
+        assert command_types(rig.supervisor) == [DETECTOR_START, "meeting.capture.prepare"]
+        rig.bridge.closeStartDialog()
+        elapsed = 159_600
     assert memory(rig) == "accepted"
-    rig.bridge.closeStartDialog()
-    deliver(rig, started(measured=159_600))
+    deliver(rig, started(measured=elapsed))
     rig.recording.tick()
     assert not rig.recording.offer.visible
     deliver(rig, ended())
@@ -868,13 +909,14 @@ def test_press_checks_monitor_before_queued_lock_notification(rig: Rig) -> None:
     assert view.calls == [SHOW, ("close",)] and memory(rig) == "lock_closed"
     rig.recording.tick()
     assert not rig.bridge.startDialogOpen
+    assert_no_capture(rig)
 
     rig.session.value = replace(rig.session.value, locked=False)
     show_offer(rig, app_class="browser", call_id="next-browser")
     tick_at(rig, 101_200)
     assert rig.recording.press_offer("start", 101_200)
     rig.recording.tick()
-    assert rig.bridge.startDialogOpen
+    started_from_w1(rig, "next-browser")
 
 
 def test_a8_session_signal_cannot_emit_w1_intent(rig: Rig) -> None:
@@ -887,11 +929,12 @@ def test_a8_session_signal_cannot_emit_w1_intent(rig: Rig) -> None:
     rig.recording.tick()
     intent.assert_not_called()
     assert view.calls == [SHOW] and not rig.bridge.startDialogOpen
+    assert_no_capture(rig)
 
     assert rig.recording.press_offer("start", 100_600)
     rig.recording.tick()
-    intent.assert_called_once_with()
-    assert rig.bridge.startDialogOpen
+    intent.assert_not_called()
+    started_from_w1(rig, CALL)
 
 
 def test_evicted_candidate_is_discarded_before_display(rig: Rig) -> None:
@@ -956,11 +999,15 @@ def test_press_at_guard_edge_is_decided_on_next_tick(rig: Rig, pressed_ms: int) 
     assert rig.recording.offer.state == "shown_guard"
     assert view.calls == [SHOW] and not rig.bridge.startDialogOpen
     intent.assert_not_called()
+    assert_no_capture(rig)
 
     tick_at(rig, 100_550)
-    assert rig.bridge.startDialogOpen is admitted
-    assert intent.call_count == int(admitted)
-    assert view.calls == ([SHOW, ("close",)] if admitted else [SHOW])
+    if admitted:
+        started_from_w1(rig, CALL)
+    else:
+        assert_no_capture(rig)
+    intent.assert_not_called()
+    assert view.calls == ([SHOW, ("starting",)] if admitted else [SHOW])
     assert memory(rig) == ("accepted" if admitted else "shown")
 
 
@@ -976,6 +1023,7 @@ def test_queued_press_is_discarded_if_role_is_unready_on_next_tick(
         tick_at(rig, 100_550)
     tick_at(rig, 100_600)
     assert view.calls == [SHOW] and not rig.bridge.startDialogOpen
+    assert_no_capture(rig)
     assert rig.recording.press_offer("start", 100_600)
     rig.recording.tick()
-    assert rig.bridge.startDialogOpen
+    started_from_w1(rig, CALL)
