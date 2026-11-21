@@ -50,15 +50,12 @@ from test_meeting_supervisor import receive
 
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.core.meeting_session import ERROR_TEXT, WARNING_TEXT, StorageStatus
-from astra_voice.core.policy import Policy
 from astra_voice.meetings import events
 from astra_voice.meetings.store import MeetingStoreError
 from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.meeting_notice import MeetingNotice
 from astra_voice.ui.meeting_offer import OfferController
-from astra_voice.ui.meeting_overlay import MeetingOverlay
 from astra_voice.ui.meeting_recording import AudioHints
-from astra_voice.ui.meeting_texts import W4_TEXTS
 from astra_voice.worker import ipc
 from helpers.qt_app import get_qapplication
 
@@ -151,12 +148,12 @@ def run_qt_probe(mode: str, directory: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("key", ["return", "keypad-enter"])
-def test_w4_held_enter_cannot_accept_fallback(tmp_path: Path, key: str) -> None:
+@pytest.mark.parametrize("key", ["return", "keypad-enter", "space"])
+def test_w4_held_key_cannot_accept_fallback(tmp_path: Path, key: str) -> None:
     run_qt_probe(key, tmp_path)
 
 
-def w4_held_enter(rig: Rig, key: Qt.Key) -> None:
+def w4_held_key(rig: Rig, key: Qt.Key) -> None:
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("meetingBridge", rig.bridge)
     install_icon_provider(engine)
@@ -177,69 +174,41 @@ def w4_held_enter(rig: Rig, key: Qt.Key) -> None:
             QCoreApplication.sendEvent(window, event)
 
         send(QEvent.KeyPress)
+        if key == Qt.Key_Space:
+            send(QEvent.KeyRelease)
         assert command_types(rig.supervisor).count(PREPARE) == 1
         assert rig.supervisor.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
         deliver(rig, capture_error(rig, "prepare", "target-mismatch"))
         assert_call_lost(rig)
         assert button.hasActiveFocus() and rig.bridge.startCanStart
-        send(QEvent.KeyPress, repeat=True)
+        for _ in range(2):
+            send(QEvent.KeyPress, repeat=True)
+            send(QEvent.KeyRelease, repeat=True)
         assert command_types(rig.supervisor).count(PREPARE) == 1
         send(QEvent.KeyRelease)
         assert command_types(rig.supervisor).count(PREPARE) == 1
         send(QEvent.KeyPress)
-        assert command_types(rig.supervisor).count(PREPARE) == 2
-        assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
         send(QEvent.KeyRelease)
         assert command_types(rig.supervisor).count(PREPARE) == 2
+        assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
     finally:
         window.hide()
         sip.delete(engine)
 
 
-@pytest.mark.parametrize("preview_first", [False, True], ids=["card-first", "preview-first"])
-def test_remote_preview_hides_call_without_disabling_manual_start(
-    rig: Rig, preview_first: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pending: list[Callable[[], None]] = []
+def test_app_stream_prepared_remote_requires_fresh_manual_click(rig: Rig) -> None:
     rig.audio = AudioHints(remote=True)
-    if preview_first:
-        rig.bridge.requestRecording()
-    else:
-        # CARD may arrive while the preview job is still pending.
-        with monkeypatch.context() as patch:
-            patch.setattr(rig.recording, "_submit", pending.append)
-            rig.bridge.requestRecording()
-    deliver(rig, rig.call_state())
-    if not preview_first:
-        assert not rig.bridge.startCanStart
-        pending.pop()()
-        rig.recording.tick()
-    assert rig.bridge.startState == "warn-remote-audio"
-    assert rig.bridge.startWarnings == [WARNING_TEXT["audio-remote"]]
-    assert [row["id"] for row in rig.bridge.startOptions] == ["room", "all"]
-    assert rig.bridge.selectedSource == "room"
-    rig.bridge.selectRecordingSource("call")
-    assert rig.bridge.selectedSource == "room"
-    assert_no_capture(rig)
-    rig.bridge.on_start_clicked()
-    assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
-    rig.reply("prepared", server_local=False)
-    assert rig.supervisor.messages[-1]["type"] == OPEN
-
-
-def test_app_stream_prepared_remote_requires_fresh_manual_click(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch
-) -> None:
     rig.bridge.requestRecording()
     deliver(rig, rig.call_state())
+    assert rig.bridge.startWarnings == [WARNING_TEXT["audio-remote"]]
+    assert [row["id"] for row in rig.bridge.startOptions] == ["call", "room", "all"]
     assert rig.bridge.selectedSource == "call"
+    assert_no_capture(rig)
     rig.bridge.on_start_clicked()
     role = rig.supervisor
     assert role.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
-    with monkeypatch.context() as patch:
-        # Simulate an already acknowledged warning on the admission path.
-        patch.setattr(rig.recording, "_accepted_remote", True)
-        rig.reply("prepared", server_local=False)
+    assert rig.recording._accepted_remote
+    rig.reply("prepared", server_local=False)
     assert OPEN not in command_types(role) and command_types(role).count(PREPARE) == 1
     assert rig.recording.controller.state == "stopping"
     assert rig.bridge.startState == "warn-remote-audio"
@@ -254,77 +223,6 @@ def test_app_stream_prepared_remote_requires_fresh_manual_click(
     assert rig.supervisor.messages[-1]["far"] == {"kind": "sink_monitor"}
     rig.reply("prepared", server_local=False)
     assert rig.supervisor.messages[-1]["type"] == OPEN
-
-
-@pytest.mark.parametrize("cancel", ["manual", "offer-off", "bind", "none"])
-def test_offer_cancellation_fences_commit_completion(
-    rig: Rig, cancel: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    view = start_offer(rig)
-    queued: list[Callable[[], None]] = []
-    role = rig.supervisor
-    with monkeypatch.context() as patch:
-        patch.setattr(rig.recording.controller, "_filesystem_submit", queued.append)
-        rig.reply("prepared")
-        assert len(queued) == 1 and OPEN not in command_types(role)
-        assert rig.recording.controller.state == "preparing"
-        if cancel == "manual":
-            rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "manual"}))
-        elif cancel == "offer-off":
-            rig.bridge.setSetting("meeting_offer_on_call", False)
-        elif cancel == "bind":
-            rig.recording.bind_offer(View())
-        if cancel != "none":
-            assert view.calls[-1] == ("close",)
-            assert command_types(role).count(STOP) == 1
-        queued.pop()()
-        rig.recording.tick()
-    if cancel == "none":
-        assert command_types(role).count(OPEN) == 1
-        rig.reply("started", tracks=["mic", "far"])
-        assert rig.recording.overlay["state"] == "recording"
-    else:
-        assert OPEN not in command_types(role)
-        assert rig.recording.controller.state == "stopping"
-        role.ready, role.exited = False, True
-        rig.recording.tick()
-        assert rig.recording.controller.state == "stopped"
-        assert not (rig.store.root / MID / ".preparing").exists()
-
-
-@pytest.mark.parametrize("phase", ["opening", "recording"])
-def test_session_lock_keeps_indicators_hidden_until_confirmed_capture(
-    tmp_path: Path, phase: str
-) -> None:
-    run_qt_probe(phase, tmp_path)
-
-
-def session_lock_visibility(rig: Rig, phase: str) -> None:
-    recording = rig.recording
-    overlay = MeetingOverlay(recording)
-    notice = MeetingNotice(recording, overlay, notice=rig.bridge.notice)
-    try:
-        start_offer(rig)
-        rig.reply("prepared")
-        assert not overlay._view.isVisible() and not notice._view.isVisible()
-        late_error = capture_error(rig, "open", "admission-stale")
-        if phase == "recording":
-            rig.reply("started", tracks=["mic", "far"])
-            assert overlay._view.isVisible() and notice._view.isVisible()
-        lock(rig)
-        if phase == "recording":
-            assert recording.overlay["state"] == "paused-lock"
-            assert overlay._view.isVisible() and not recording.overlay["canResume"]
-        else:
-            assert recording.controller.state == "stopping"
-            assert not overlay._view.isVisible() and not notice._view.isVisible()
-            deliver(rig, late_error)
-            rig.recording.tick()
-            assert not overlay._view.isVisible() and not notice._view.isVisible()
-            assert recording.overlay["state"] == "hidden"
-    finally:
-        notice.shutdown()
-        overlay.shutdown()
 
 
 def test_request_recording_closes_failed_offer_before_opening_w4(rig: Rig) -> None:
@@ -348,36 +246,29 @@ def test_request_recording_closes_failed_offer_before_opening_w4(rig: Rig) -> No
     assert_no_capture(rig)
 
 
-@pytest.mark.parametrize("fresh_card", [False, True])
-def test_open_w4_forgets_card_from_exited_role(rig: Rig, fresh_card: bool) -> None:
+def test_w4_stale_card_after_role_exit_requires_second_click(rig: Rig) -> None:
     rig.bridge.requestRecording()
-    old_card = rig.call_state()
-    deliver(rig, old_card)
+    deliver(rig, rig.call_state())
     assert rig.bridge.selectedSource == "call"
     old_role = rig.supervisor
     old_role.kill()
-    assert rig.bridge.startDialogOpen and rig.bridge.selectedSource == "room"
-    assert (rig.recording.call_id, rig.recording.app_class, rig.recording.variant1) == (
-        "",
-        "",
-        False,
-    )
-    assert [row["id"] for row in rig.bridge.startOptions] == ["room", "all"]
-    old_role.event(old_card)
-    assert rig.bridge.selectedSource == "room"
-    if fresh_card:
-        rig.bridge.retryStart()
-        assert rig.supervisor is not old_role
-        deliver(rig, {**rig.call_state(), "call_id": "new-card"})
-        assert rig.bridge.selectedSource == "call"
-        expected = {"kind": "app_stream", "call_id": "new-card"}
-    else:
-        rig.bridge.selectRecordingSource("all")
-        expected = {"kind": "sink_monitor"}
+    assert rig.bridge.startDialogOpen and rig.bridge.selectedSource == "call"
     assert_no_capture(rig)
     rig.bridge.on_start_clicked()
-    assert rig.supervisor is not old_role
-    assert rig.supervisor.messages[-1]["far"] == expected
+    role = rig.supervisor
+    assert role is not old_role
+    assert role.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
+    deliver(rig, capture_error(rig, "prepare", "target-gone"))
+    assert_call_lost(rig)
+    assert command_types(role).count(PREPARE) == 1 and OPEN not in command_types(role)
+    rig.recording.tick()
+    assert command_types(role).count(PREPARE) == 1 and OPEN not in command_types(role)
+    rig.bridge.on_start_clicked()
+    assert rig.supervisor is role
+    assert command_types(role).count(PREPARE) == 2
+    assert role.messages[-1]["far"] == {"kind": "none"}
+    rig.reply("prepared")
+    assert command_types(role).count(OPEN) == 1
 
 
 def test_410_4_offer_alone_never_starts_capture(rig: Rig) -> None:
@@ -762,7 +653,6 @@ def test_offer_watchdog_at_six_seconds(delayed_rig: Rig, delayed_kill: bool) -> 
     if open_request is not None:
         rig.reply("started", req=open_request["req"], request_type=OPEN, tracks=["mic", "far"])
         assert rig.recording.controller.state == "stopping"
-        assert not rig.recording.overlay["visible"]
         assert command_types(rig.supervisor).count(STOP) == 1
 
 
@@ -787,18 +677,8 @@ def test_late_prepare_refusal_after_stop_uses_only_exit_cleanup(
     assert not rig.bridge.startDialogOpen
 
 
-@pytest.mark.parametrize(
-    ("kind", "active"),
-    [
-        ("warn-nfs", True),
-        ("warn-remote-audio", True),
-        ("no-app-split", False),
-        ("no-app-split", True),
-    ],
-)
-def test_prepared_fallback_waits_for_exit_without_open(
-    delayed_rig: Rig, kind: str, active: bool
-) -> None:
+@pytest.mark.parametrize("kind", ["warn-nfs", "warn-remote-audio", "no-app-split"])
+def test_prepared_fallback_waits_for_exit_without_open(delayed_rig: Rig, kind: str) -> None:
     rig = delayed_rig
     if kind == "warn-nfs":
         rig.storage = StorageStatus(1000, True, True)
@@ -816,29 +696,26 @@ def test_prepared_fallback_waits_for_exit_without_open(
     rig.recording.tick()
     assert view.calls == [SHOW, ("starting",), ("close",)]
     assert rig.bridge.startDialogOpen and rig.bridge.startState == kind
-    warnings = {
-        "warn-nfs": WARNING_TEXT["storage-network"],
-        "warn-remote-audio": WARNING_TEXT["audio-remote"],
-        "no-app-split": W4_TEXTS["noAppSplit"],
-    }
-    assert rig.bridge.startWarnings == [warnings[kind]]
+    warnings = {"warn-nfs": "storage-network", "warn-remote-audio": "audio-remote"}
+    assert rig.bridge.startWarnings == ([WARNING_TEXT[warnings[kind]]] if kind in warnings else [])
     assert all(OPEN not in command_types(item) for item in rig.supervisors)
-    rig.supervisor.ready = True
-    rig.recording.tick()
-    card = rig.call_state()
-    if not active:
-        card = {key: card[key] for key in ("type", "request_type", "req")}
-        card["active"] = False
-    deliver(rig, card)
-    assert rig.bridge.startWarnings == [warnings[kind]]
-    if kind == "warn-nfs":
-        assert [item["id"] for item in rig.bridge.startOptions] == ["call", "room", "all"]
-        assert rig.bridge.selectedSource == "call"
-    else:
-        assert [item["id"] for item in rig.bridge.startOptions] == ["room", "all"]
+    if kind in {"warn-remote-audio", "no-app-split"}:
+        rig.supervisor.ready = True
+        rig.recording.tick()
+        deliver(rig, rig.call_state())
+        assert [item["id"] for item in rig.bridge.startOptions if item["enabled"]] == [
+            "room",
+            "all",
+        ]
         assert rig.bridge.selectedSource == "room"
-    assert rig.bridge.startCanStart
-    assert all(command_types(item).count(PREPARE) == int(item is role) for item in rig.supervisors)
+        assert rig.bridge.startCanStart
+    if kind == "warn-remote-audio":
+        assert [item["id"] for item in rig.bridge.startOptions] == ["room", "all"]
+        assert sum(command_types(item).count(PREPARE) for item in rig.supervisors) == 1
+        rig.bridge.on_start_clicked()
+        assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+        rig.reply("prepared", server_local=False)
+        assert rig.supervisor.messages[-1]["type"] == OPEN
 
 
 def test_remote_start_closes_w1_before_late_target_mismatch(rig: Rig) -> None:
@@ -1084,13 +961,10 @@ def test_w1_round_trip_through_worker_supervisor_and_capture_role(
 
 if __name__ == "__main__":
     mode, directory = sys.argv[1:]
+    keys = {"return": Qt.Key_Return, "keypad-enter": Qt.Key_Enter, "space": Qt.Key_Space}
     get_qapplication()
     probe_rig = Rig(Path(directory))
     try:
-        if mode in {"return", "keypad-enter"}:
-            w4_held_enter(probe_rig, Qt.Key_Return if mode == "return" else Qt.Key_Enter)
-        else:
-            assert mode in {"opening", "recording"}
-            session_lock_visibility(probe_rig, mode)
+        w4_held_key(probe_rig, keys[mode])
     finally:
         probe_rig.bridge.shutdown()

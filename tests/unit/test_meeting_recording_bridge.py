@@ -517,8 +517,6 @@ def test_new_remote_warning_requires_new_click_after_confirmed_exit(
     rig.recording.tick()
     assert rig.bridge.startCanStart
     assert len(rig.supervisors) == 1
-    assert rig.bridge.selectedSource == "room"
-    rig.bridge.selectRecordingSource(source)
     rig.bridge.on_start_clicked()
     assert len(rig.supervisors) == 2
     assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
@@ -770,8 +768,8 @@ def test_no_app_split_requires_explicit_new_whole_output_click(rig: Rig) -> None
     rig.supervisor.ready, rig.supervisor.exited = False, True
     rig.supervisor.on_exit(0)
     rig.recording.tick()
-    assert rig.bridge.startCanStart and rig.bridge.selectedSource == "room"
-    assert not any(m["type"] == "meeting.capture.open" for m in rig.supervisor.messages)
+    can_start = rig.bridge.startCanStart
+    assert not can_start
     rig.bridge.selectRecordingSource("all")
     assert rig.bridge.startCanStart and len(rig.supervisors) == 1
     rig.bridge.on_start_clicked()

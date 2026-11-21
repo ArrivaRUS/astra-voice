@@ -1170,6 +1170,7 @@ def x_timestamp(directory: Path) -> None:
 
 
 def x_retry(directory: Path) -> None:
+    from test_meeting_m8_offer import started_from_w1
     from test_meeting_recording_bridge import Rig
 
     instance = Rig(directory)
@@ -1212,7 +1213,8 @@ def x_retry(directory: Path) -> None:
             mouse_click_at(view, button, 101_200)
             press.assert_called_once_with("start", 101_200)
             recording.tick()
-            assert instance.bridge.startDialogOpen
+            assert view.isVisible() and window._root.property("starting")
+            started_from_w1(instance, "call-PRIVATE-1")
     finally:
         instance.bridge.shutdown()
 

@@ -217,7 +217,6 @@ class MeetingController:
         self._filesystem_pending = 0
         self._disk_pending = False
         self._attempt = 0
-        self.capture_started = False
         self._capture_succeeded = False
         self._write_results: queue.SimpleQueue[tuple[str, bool, bool]] = queue.SimpleQueue()
         self._exit_confirmed = False
@@ -337,7 +336,6 @@ class MeetingController:
         self.meeting.warnings.whole_output = self._far["kind"] == "sink_monitor"
         self._reserved = self._committed = False
         self.saved = self._terminal = self._exit_confirmed = self._capture_finalized = False
-        self.capture_started = False
         self._capture_succeeded = False
         self._attempt += 1
         attempt = self._attempt
@@ -541,7 +539,7 @@ class MeetingController:
         if snapshot.preparing_for_sleep or (snapshot.known and not snapshot.active):
             self.stop("sleep" if snapshot.preparing_for_sleep else "session")
         elif self.session_kind != SessionKind.FLY and not self._allowed():
-            if not self.capture_started:
+            if self.state == "preparing":
                 self.stop("lock")
             else:
                 self.pause("unknown" if not snapshot.known else "lock")
@@ -828,11 +826,6 @@ class MeetingController:
                 return
             if self.state != "opening":
                 return
-            if not self.capture_started:
-                self.on_session_changed()
-                if self.state != "opening":
-                    return
-                self.capture_started = True
             self.state = "recording"
             self._active_at = self.clock()
             self._pause_at = None
