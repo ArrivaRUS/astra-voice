@@ -205,8 +205,7 @@ class MeetingCallService:
                 Purpose,
             )
 
-            if self._checker is None:
-                self._checker = self._factory(self._observer, self._clock)
+            checker = self._get_checker()
             request = CheckRequest(
                 Purpose(attempt.purpose),
                 attempt.offer.program if attempt.offer is not None else None,
@@ -215,7 +214,7 @@ class MeetingCallService:
             )
             threading.Thread(
                 target=self._run_check,
-                args=(self._checker, request, attempt),
+                args=(checker, request, attempt),
                 name="meeting-check",
                 daemon=True,
             ).start()
@@ -223,25 +222,49 @@ class MeetingCallService:
             # Factory/thread creation failures get a final outcome, with no automatic retry.
             self._role.messages.put({"type": "check-result", "attempt": attempt, "result": None})
 
-    def _run_check(self, checker: Checker, request: CheckRequest, attempt: _Attempt) -> None:
+    def _get_checker(self) -> Checker:
+        if self._checker is None:
+            self._checker = self._factory(self._observer, self._clock)
+        return self._checker
+
+    def start_checker(self) -> Checker | None:
+        """Get the shared checker on the control loop before launching a measurement."""
+        try:
+            return self._get_checker()
+        except Exception:
+            return None
+
+    def run_start(self, checker: Checker | None, request: CheckRequest) -> CheckResult:
+        """Run a check on its worker thread, retaining the private START target."""
+        return self._check(checker, request)
+
+    @staticmethod
+    def _check(checker: Checker | None, request: CheckRequest) -> CheckResult:
         from astra_voice.meetings.apps import AppClass
         from astra_voice.worker.meeting_identity_check import CheckResult, Unsettled
 
-        try:
-            result = checker.run(request)
-        except Exception:
-            result = CheckResult(
-                settled=False,
-                unsettled=Unsettled.PULSE_FAILED,
-                app_class=AppClass.OTHER,
-                offer=False,
-                variant1=False,
-                journal=(),
-                measured_mono_ms=0,
-                attempts=0,
-                anchor=None,
-                target=None,
-            )
+        if checker is not None:
+            try:
+                return checker.run(request)
+            except Exception:
+                pass
+        return CheckResult(
+            settled=False,
+            unsettled=Unsettled.PULSE_FAILED,
+            app_class=AppClass.OTHER,
+            offer=False,
+            variant1=False,
+            journal=(),
+            measured_mono_ms=0,
+            attempts=0,
+            anchor=None,
+            target=None,
+        )
+
+    def _run_check(self, checker: Checker, request: CheckRequest, attempt: _Attempt) -> None:
+        from astra_voice.worker.meeting_identity_check import Unsettled
+
+        result = self._check(checker, request)
         if self._role.terminating or self._role.stopped:
             return
         event: Message = {"type": "check-result", "attempt": attempt}
@@ -344,9 +367,9 @@ class MeetingCallService:
 
     def resolve_server(
         self, observer_events: list[Message], checks: list[Message], output: list[Message]
-    ) -> None:
+    ) -> bool:
         if self._role.terminating or self._role.stopped:
-            return
+            return False
         epoch = self._observer.epoch
         cookies = set()
         if self._server_cookie is not None:
@@ -375,8 +398,10 @@ class MeetingCallService:
             self._end_calls("server_changed", output)
             self._server_generation += 1
             self._server_cookie = observed_cookie
+            return True
         elif cookies:
             self._server_cookie = cookies.pop()
+        return False
 
     def _identify(self, anchor: CallAnchor, output: list[Message]) -> str:
         for call_id, instance in self._instances.items():
@@ -426,6 +451,18 @@ class MeetingCallService:
     def remote_card(self, output: list[Message]) -> None:
         self._emit_code(DetectorPurpose.CARD, DetectorCode.REMOTE, 0, self._clock(), output)
 
+    def finish_start(self, code: DetectorCode, duration_ms: int, output: list[Message]) -> None:
+        if code == DetectorCode.REMOTE:
+            self._disable_automation()
+        self._emit_code(DetectorPurpose.START, code, duration_ms, self._clock(), output)
+        self.sync_automation(output)
+
+    def _disable_automation(self) -> None:
+        observer = self._observer
+        if not observer.automation_off.is_set():
+            observer.automation_off.set()
+            observer.stop()
+
     def sync_automation(self, output: list[Message]) -> None:
         if self._observer.automation_off.is_set() and not self._automation_disabled:
             self._automation_disabled = True
@@ -446,8 +483,7 @@ class MeetingCallService:
             event["report_remote_offer"] = (
                 attempt.offer is not None and attempt.epoch == observer.epoch
             )
-            observer.automation_off.set()
-            observer.stop()
+            self._disable_automation()
 
     def finish(
         self,

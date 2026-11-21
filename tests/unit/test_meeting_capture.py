@@ -62,21 +62,25 @@ class Backend:
     def __init__(self) -> None:
         self.sources: list[Source] = []
         self.prepare_calls: list[dict[str, Any]] = []
+        self.prepare_targets: list[Any] = []
+        self.source_targets: list[Any] = []
         self.close_calls = 0
         self.control = Mock()
         self.context = (51, 1)
         self.server_local = True
 
-    def prepare(self, far: dict[str, Any]) -> dict[str, Any]:
+    def prepare(self, far: dict[str, Any], *, target: Any = None) -> dict[str, Any]:
         self.prepare_calls.append(far)
+        self.prepare_targets.append(target)
         return {
             "server_local": self.server_local,
             "server_kind": "pulseaudio",
             "far_available": True,
         }
 
-    def source(self, far: dict[str, Any]) -> Source:
+    def source(self, far: dict[str, Any], *, target: Any = None) -> Source:
         source = Source()
+        self.source_targets.append(target)
         self.sources.append(source)
         return source
 
@@ -237,18 +241,6 @@ def test_prepare_has_zero_pcm_or_files_and_req_is_idempotent(rig: Rig) -> None:
     assert rig.state.handle(message) == rig.state.handle(message)
     message.update(type="meeting.call.query", request_type="meeting.call.query")
     assert rig.state.handle(message)[0]["code"] == "req-conflict"
-
-
-def test_app_stream_is_rejected_before_accessing_backend(rig: Rig) -> None:
-    assert (
-        rig.request_prepare({"kind": "app_stream", "call_id": "call1"})[0]["type"] == "meeting.ack"
-    )
-    wait_until(
-        lambda: any(event["type"] in {"error", "meeting.capture.prepared"} for event in rig.poll())
-    )
-    assert rig.state.backend is None and not rig.backend.prepare_calls
-    assert rig.until("error")["code"] == "target-mismatch"
-    assert not rig.mics and not rig.backend.sources
 
 
 @pytest.mark.parametrize("code", ["target-gone", "target-mismatch"])

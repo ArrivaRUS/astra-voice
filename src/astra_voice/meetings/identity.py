@@ -219,6 +219,13 @@ class ProcReader:
         except (OSError, UnicodeError):
             raise ProcUnavailable() from None
 
+    def starttime(self, pid: int) -> int:
+        """Read the start time of a same-UID process through its pinned directory."""
+        with self._pinned(pid) as directory:
+            if os.fstat(directory).st_uid != self.uid:
+                raise ProcUnavailable()
+            return self._starttime(directory, pid)
+
     @classmethod
     def _uids(cls, directory: int) -> tuple[int, int, int, int]:
         rows = UID_ROW.findall(cls._read(directory, "status"))

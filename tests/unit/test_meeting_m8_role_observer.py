@@ -505,11 +505,13 @@ def test_reconnect_reports_server_change_and_fences_old_cookie(
                 "meeting.capture.alive",
             ]
             assert not rig.state.stopped and rig.state.exit_code == 0
+            view = registry.snapshot()
+            assert (view.version, view.indexes, view.server_cookie) == (5, frozenset({43}), 2)
             detector(rig, "stop", "stop")
             steps.advance.set()
             wait_until(lambda: not registry.for_observer(12))
             view = registry.snapshot()
-            assert (view.version, view.indexes, view.server_cookie) == (5, frozenset({51}), 1)
+            assert (view.version, view.indexes, view.server_cookie) == (6, frozenset(), None)
         finally:
             rig.state.terminate()
             steps.advance.set()

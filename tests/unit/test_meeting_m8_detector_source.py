@@ -938,7 +938,7 @@ def test_stopping_observer_leaves_active_capture_readable() -> None:
     capture_pulse.default_monitor.return_value = "capture.monitor"
     capture_pulse.poll_events.return_value = []
     capture_pulse.read_chunk.return_value = b"pcm"
-    capture = MonitorStreamSource(capture_pulse, {"kind": "sink_monitor"}, "run")
+    capture = MonitorStreamSource(capture_pulse, "run")
     capture.open()
     try:
         pulse = PulseFake()

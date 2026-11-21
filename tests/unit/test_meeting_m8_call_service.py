@@ -1974,6 +1974,7 @@ def test_role_checker_explicit_address_and_registry(
             assert state["active"]
             ((server, options),) = constructed
             assert server == LOCAL.address and options["apps"] == (APP,)
+            assert "output_limit" not in options
             assert options["clock"] is rig.clock
             assert options["own_contexts"]() == registry.snapshot()
             registry.set("control", (51, COOKIE))

@@ -2,25 +2,61 @@
 
 from __future__ import annotations
 
+import ctypes
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
+from astra_voice.meetings.identity import (
+    IdentityLimit,
+    ProcessGone,
+    ProcessKey,
+    ProcReader,
+    ProcUnavailable,
+)
+from astra_voice.worker import monitor_stream
+from astra_voice.worker.meeting_identity_check import PinnedStream, PinnedTarget
 from astra_voice.worker.monitor_stream import MonitorStreamSource, Target
 
 pytestmark = pytest.mark.unit
 
+RESOLVED = Target(7, 11, 123, 99, "sink-a.monitor", 21, 431)
+PINNED = PinnedTarget(99, (PinnedStream(7, 11, 21, 73, ProcessKey(123, 431)),), 10.0)
+FAR = {"kind": "app_stream", "call_id": "c"}
+MISMATCHES = [
+    ("index", 8),
+    ("serial", 12),
+    ("pid", 555),
+    ("cookie", 100),
+    ("client", 22),
+    ("starttime", 432),
+]
+
+
+def replace_identity_field(target: Target, field: str, value: int) -> Target:
+    change: dict[str, Any] = {field: value}
+    return replace(target, **change)
+
 
 class Pulse:
     def __init__(self) -> None:
-        self.target: Target | None = Target(7, 11, 123, 99, "sink-a.monitor")
+        self.target: Target | None = RESOLVED
+        self.after_open: list[Target | None] = []
+        self.open_error: Exception | None = None
         self.calls: list[tuple[Any, ...]] = []
         self.events: list[tuple[str, int]] = []
         self.default = "sink-a.monitor"
         self.monitor_supported = True
+        self.server_kind = "pulseaudio"
+        self.server_local = True
 
-    def resolve(self, index: int) -> Target | None:
+    def resolve(
+        self, index: int, *, expected_pid: int | None = None, confirm_loss: bool = False
+    ) -> Target | None:
+        self.calls.append(("resolve", index))
         return self.target
 
     def default_monitor(self) -> str:
@@ -28,11 +64,16 @@ class Pulse:
 
     def open_record(self, monitor: str, index: int | None, token: str) -> None:
         self.calls.append((monitor, index, token))
+        if self.after_open:
+            self.target = self.after_open.pop(0)
+        if self.open_error is not None:
+            raise self.open_error
 
     def close_record(self) -> None:
         self.calls.append(("closed",))
 
     def read_chunk(self) -> bytes:
+        self.calls.append(("read",))
         return b"\0\0" * 1600
 
     def poll_events(self) -> list[tuple[str, int]]:
@@ -44,46 +85,265 @@ class Pulse:
 
 
 def make(pulse: Pulse, kind: str = "app_stream") -> MonitorStreamSource:
-    return MonitorStreamSource(pulse, {"kind": kind, "sink_input": 7, "object_serial": 11}, "run1")
+    return MonitorStreamSource(pulse, "run1", target=PINNED if kind == "app_stream" else None)
 
 
 def test_exact_target_before_connect_and_no_default_after_removed() -> None:
     pulse = Pulse()
     source = make(pulse)
     source.open()
-    assert pulse.calls == [("sink-a.monitor", 7, "run1")]
+    assert source.read_chunk() == b"\0\0" * 1600
+    assert pulse.calls == [("resolve", 7), ("sink-a.monitor", 7, "run1"), ("resolve", 7), ("read",)]
     pulse.target = None
     pulse.events.append(("removed", 7))
     assert source.read_chunk() is None and source.ended
-    pulse.target = Target(7, 99, 555, 99, "sink-a.monitor")
+    pulse.target = replace(RESOLVED, serial=99, pid=555)
     for _ in range(100):
         assert source.read_chunk() is None
     assert len([c for c in pulse.calls if len(c) == 3]) == 1
 
 
-@pytest.mark.parametrize("field,value", [("serial", 12), ("pid", 555), ("cookie", 100)])
-def test_identity_change_ends_target(field: str, value: int) -> None:
-    from dataclasses import replace
+@pytest.mark.parametrize("fresh", ["same", "missing", *(field for field, _ in MISMATCHES)])
+def test_prepare_uses_pinned_identity_in_native_backend(
+    monkeypatch: pytest.MonkeyPatch, fresh: str
+) -> None:
+    pulse = Pulse()
+    backend = monitor_stream.CapturePulseBackend()
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor_stream, "NativePulse", lambda: pulse)
+        if fresh == "same":
+            assert backend.prepare(FAR, target=PINNED) == {
+                "server_local": True,
+                "server_kind": "pulseaudio",
+                "far_available": True,
+            }
+        else:
+            pulse.target = (
+                None
+                if fresh == "missing"
+                else replace_identity_field(RESOLVED, fresh, dict(MISMATCHES)[fresh])
+            )
+            reason = "target-gone" if fresh == "missing" else "target-mismatch"
+            with pytest.raises(ValueError, match=reason):
+                backend.prepare(FAR, target=PINNED)
+    assert pulse.calls == [("resolve", 7)]
 
+
+def test_backend_source_retains_start_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor_stream, "NativePulse", Pulse)
+        source = monitor_stream.CapturePulseBackend().source(FAR, target=PINNED)
+    assert source.target is PINNED
+    assert isinstance(source.pulse, Pulse) and source.pulse.calls == []
+
+
+def test_backend_prepare_reports_unsupported_monitor_without_pcm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pulse = Pulse()
+    pulse.monitor_supported = False
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor_stream, "NativePulse", lambda: pulse)
+        info = monitor_stream.CapturePulseBackend().prepare(FAR, target=PINNED)
+    assert info["far_available"] is False and info["far_reason"] == "monitor-stream-unsupported"
+    assert not pulse.calls
+
+
+def fake_native_control(
+    patch: pytest.MonkeyPatch,
+    resolved: Target,
+    *,
+    stream_props: dict[bytes, bytes],
+    client_props: dict[bytes, bytes],
+    server_local: bool = True,
+) -> monitor_stream.NativePulse:
+    row = monitor_stream._InputInfo(
+        index=resolved.index, client=resolved.client, sink=5, proplist=1
+    )
+    client = monitor_stream._ClientInfo(index=resolved.client, proplist=2)
+    sink = monitor_stream._SinkInfo(monitor_name=resolved.monitor.encode())
+    properties = {
+        slot: {key: ctypes.create_string_buffer(value) for key, value in props.items()}
+        for slot, props in ((1, stream_props), (2, client_props))
+    }
+    native = monitor_stream.NativePulse.__new__(monitor_stream.NativePulse)
+    native.cookie, native.context, native.pulse = resolved.cookie, 1, Mock()
+    native.server_kind, native.server_local, native.monitor_supported = (
+        "pulseaudio",
+        server_local,
+        True,
+    )
+
+    def get(proplist: int, key: bytes, pointer: Any, size: Any) -> int:
+        buffer = properties[proplist].get(key)
+        if buffer is None:
+            return -1
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(buffer)
+        ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t))[0] = ctypes.sizeof(buffer)
+        return 0
+
+    def serve(info: Any, expected_index: int) -> Any:
+        def operation(context: int, index: int, receive: Any, userdata: Any) -> int:
+            assert index == expected_index
+            receive(context, ctypes.pointer(info), 0, userdata)
+            receive(context, None, 1, userdata)
+            return 1
+
+        return operation
+
+    native.pulse.lib.pa_proplist_get.side_effect = get
+    native.pulse.lib.pa_context_get_sink_input_info.side_effect = serve(row, resolved.index)
+    native.pulse.lib.pa_context_get_client_info.side_effect = serve(client, resolved.client)
+    native.pulse.lib.pa_context_get_sink_info_by_index.side_effect = serve(sink, 5)
+    native.pulse.lib.pa_context_get_index.return_value = 51
+    patch.setattr(native, "_server", lambda: None)
+    patch.setattr(native, "_wait", lambda ready: ready())
+    return native
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "serial",
+        "pid",
+        "client",
+        "parse",
+        "uid",
+        "client-pid",
+        "conflict",
+        OSError,
+        ProcUnavailable,
+        ProcessGone,
+        IdentityLimit,
+    ],
+)
+def test_native_resolve_reads_client_and_proc_starttime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: Any
+) -> None:
+    proc = tmp_path / "proc"
+    directory = proc / "123"
+    directory.mkdir(parents=True)
+    stat_fields = " ".join(["S", *(["0"] * 18), "431"])
+    (directory / "stat").write_text(
+        "bad stat" if fault == "parse" else f"123 (dion ) app) {stat_fields}\n"
+    )
+    owner = directory.stat().st_uid
+    reader = ProcReader(proc, uid=owner + (fault == "uid"))
+    stream_props = {b"object.serial": b"11"}
+    if fault == "serial":
+        stream_props.clear()
+    if fault not in {"pid", "client-pid"}:
+        stream_props[b"application.process.id"] = b"123"
+    # The valid stat for the conflicting client makes PID rejection observable
+    # even if a regression falls through to reading its stat.
+    if fault == "client-pid":
+        other = proc / "124"
+        other.mkdir()
+        (other / "stat").write_text(f"124 (dion) {stat_fields}\n")
+    client_props = (
+        {b"application.process.id": b"124"} if fault in {"client-pid", "conflict"} else {}
+    )
+    with monkeypatch.context() as patch:
+        native = fake_native_control(
+            patch,
+            replace(RESOLVED, client=0xFFFFFFFF) if fault == "client" else RESOLVED,
+            stream_props=stream_props,
+            client_props=client_props,
+        )
+        patch.setattr(monitor_stream, "ProcReader", lambda **_: reader)
+        if fault == "uid":
+            with pytest.raises(ProcUnavailable):
+                reader.starttime(123)
+        elif isinstance(fault, type):
+            patch.setattr(reader, "starttime", Mock(side_effect=fault))
+        resolved = native.resolve(7, expected_pid=123)
+    assert resolved == (RESOLVED if fault is None else None)
+
+
+def test_first_resolve_rejects_wrong_client_before_connect() -> None:
+    pulse = Pulse()
+    pulse.target = replace(RESOLVED, client=RESOLVED.client + 1)
+    pulse.after_open.append(RESOLVED)
+    with pytest.raises(ValueError, match="^target-mismatch$"):
+        make(pulse).open()
+    assert pulse.calls == [("resolve", RESOLVED.index)]
+
+
+@pytest.mark.parametrize("moving", [False, True])
+def test_connect_failure_with_live_target_preserves_audio_failed(moving: bool) -> None:
+    pulse = Pulse()
+    source = make(pulse)
+    monitor = RESOLVED.monitor
+    if moving:
+        source.open()
+        monitor = "sink-b.monitor"
+        pulse.target = replace(RESOLVED, monitor=monitor)
+        pulse.events.append(("changed", RESOLVED.index))
+    pulse.calls.clear()
+    pulse.open_error = ValueError("audio-failed")
+    with pytest.raises(ValueError, match="^audio-failed$"):
+        source.read_chunk() if moving else source.open()
+    assert pulse.calls == [
+        ("resolve", RESOLVED.index),
+        *([("closed",)] if moving else []),
+        (monitor, RESOLVED.index, "run1"),
+        ("closed",),
+        ("resolve", RESOLVED.index),
+    ]
+    assert not source.opened and not source.ended
+
+
+@pytest.mark.parametrize("field,value", [*MISMATCHES, ("missing", 0)])
+def test_second_resolve_rejects_change_during_connect(field: str, value: int) -> None:
+    pulse = Pulse()
+    pulse.after_open.append(
+        None if field == "missing" else replace_identity_field(RESOLVED, field, value)
+    )
+    source = make(pulse)
+    reason = "target-gone" if field == "missing" else "target-mismatch"
+    with pytest.raises(ValueError, match=reason):
+        source.open()
+    assert pulse.calls == [
+        ("resolve", 7),
+        ("sink-a.monitor", 7, "run1"),
+        ("resolve", 7),
+        ("closed",),
+    ]
+    assert not source.opened and source.read_chunk() is None
+
+
+@pytest.mark.parametrize("field,value", MISMATCHES)
+@pytest.mark.parametrize("event", [("changed", 7), ("server", 0)])
+def test_identity_change_ends_target(field: str, value: int, event: tuple[str, int]) -> None:
     pulse = Pulse()
     source = make(pulse)
     source.open()
     assert pulse.target is not None
-    changes: dict[str, Any] = {field: value}
-    pulse.target = replace(pulse.target, **changes)
-    pulse.events.append(("changed", 7))
+    pulse.target = replace_identity_field(pulse.target, field, value)
+    pulse.events.append(event)
     assert source.read_chunk() is None and source.ended
 
 
-def test_sink_move_reopens_exact_target_and_marks_clock_boundary() -> None:
+@pytest.mark.parametrize("field,value", [("same", 0), *MISMATCHES, ("missing", 0)])
+def test_sink_move_reopens_exact_target_and_marks_clock_boundary(field: str, value: int) -> None:
     pulse = Pulse()
     source = make(pulse)
     source.open()
-    pulse.target = Target(7, 11, 123, 99, "sink-b.monitor")
+    pulse.target = replace(RESOLVED, monitor="sink-b.monitor")
+    if field != "same":
+        pulse.after_open.append(
+            None if field == "missing" else replace_identity_field(pulse.target, field, value)
+        )
+    pulse.calls.clear()
     pulse.events.append(("changed", 7))
-    assert source.read_chunk() == b""
-    assert source.change == "sink-moved"
-    assert pulse.calls[-1] == ("sink-b.monitor", 7, "run1")
+    expected = [("resolve", 7), ("closed",), ("sink-b.monitor", 7, "run1"), ("resolve", 7)]
+    if field == "same":
+        assert source.read_chunk() == b"" and source.change == "sink-moved"
+        assert pulse.calls == expected
+    else:
+        assert source.read_chunk() is None and source.ended and source.change is None
+        assert pulse.calls == [*expected, ("closed",)]
 
 
 def test_server_event_verifies_target_and_explicit_a_follows_default() -> None:
@@ -297,9 +557,11 @@ def test_session_guard_refuses_far_reopen_after_resolution(kind: str) -> None:
     source.open()
     if kind == "app_stream":
 
-        def resolve(index: int) -> Target | None:
+        def resolve(
+            index: int, *, expected_pid: int | None = None, confirm_loss: bool = False
+        ) -> Target | None:
             allowed[0] = False
-            return Target(7, 11, 123, 99, "sink-b.monitor")
+            return replace(RESOLVED, monitor="sink-b.monitor")
 
         pulse.resolve = resolve  # type: ignore[method-assign]
         pulse.events.append(("changed", 7))

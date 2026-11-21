@@ -38,6 +38,7 @@ from astra_voice.worker.meeting_detector import (
     project_properties,
 )
 from astra_voice.worker.monitor_stream import _ChannelMap, _InputInfo, _ServerInfo, _Volume
+from astra_voice.worker.monitor_stream import _ClientInfo as _ClientInfo
 from astra_voice.worker.pulse_stream import (
     PA_CONTEXT_FAILED,
     PA_CONTEXT_NOAUTOSPAWN,
@@ -86,16 +87,6 @@ class _SourceOutput(C.Structure):
         ("corked", C.c_int),
         ("volume", _Volume),
         ("mute", C.c_int),
-    ]
-
-
-class _ClientInfo(C.Structure):
-    _fields_ = [
-        ("index", C.c_uint32),
-        ("name", C.c_char_p),
-        ("owner", C.c_uint32),
-        ("driver", C.c_char_p),
-        ("proplist", C.c_void_p),
     ]
 
 
