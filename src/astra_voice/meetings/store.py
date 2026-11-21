@@ -396,6 +396,8 @@ class MeetingWriter:
                     if isinstance(prepared.document, Transcript):
                         self._transcripts.pop(filename, None)  # disk state unknown: re-read
                     raise
+        except BlockingIOError:
+            raise MeetingStoreBusy("Писатель встречи занят") from None
         except (OSError, ValueError, TypeError, RecursionError):
             raise MeetingStoreError("Не удалось сохранить данные встречи") from None
 

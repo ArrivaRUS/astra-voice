@@ -95,6 +95,7 @@ class Rig:
         role_type: type[Supervisor] = Supervisor,
         settings: Settings | None = None,
         bind_recording: bool = True,
+        submit: Callable[[Callable[[], None]], None] | None = lambda job: job(),
     ) -> None:
         self.now = 100.0
         self.session = Session()
@@ -130,7 +131,7 @@ class Rig:
             storage_probe=lambda path: self.storage,
             audio_probe=lambda: self.audio,
             microphone=lambda: self.microphone,
-            submit=lambda job: job(),
+            submit=submit,
             id_factory=lambda: MID,
             # One exit budget incl. the metadata drain (production 3 s). Fake roles
             # never exit by themselves: keep teardown of a live capture short; the

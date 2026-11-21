@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from astra_voice.meetings.events import DetectorCode
 from astra_voice.meetings.segments import CaptureJournal, ClockAnchor, SegmentSidecar
-from astra_voice.meetings.store import MeetingStore, Writer
+from astra_voice.meetings.store import MeetingStore, MeetingStoreBusy, MeetingWriter, Writer
 from astra_voice.security.files import private_directory
 from astra_voice.worker import ipc
 from astra_voice.worker.meeting_audio_local import (
@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 Message = dict[str, Any]
 MAX_PCM_BYTES = 128000  # total across the two tracks
 MAX_TRACK_PCM_BYTES = 64000  # two seconds, including the block being written
+ARCHIVE_WRITE_RETRY_SECONDS = 0.5
 CLOSE_SECONDS = 1.0
 TARGET_SECONDS = 3.0
 FINAL_STATUS_RANK = {"succeeded": 0, "partial": 1, "failed": 2}
@@ -114,9 +115,13 @@ class _Archive:
         index: int,
         fsync: Callable[[int], None],
         emit_event: Callable[[Message], None],
+        *,
+        retry_clock: Callable[[], float] = time.monotonic,
+        retry_wait: Callable[[float], None] = time.sleep,
     ) -> None:
         self.directory, self.identity = directory, identity
         self.fsync, self.emit_event = fsync, emit_event
+        self._retry_clock, self._retry_wait = retry_clock, retry_wait
         self.jobs: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=256)
         self.lock = threading.Lock()
         self.pending_bytes = 0
@@ -163,7 +168,26 @@ class _Archive:
                 self.pending_track_bytes[payload[0]] += size
         return True
 
-    def _edge(self, payload: Message, owner: Any) -> None:
+    def _write_with_retry(
+        self, owner: MeetingWriter, filename: str, document: CaptureJournal | SegmentSidecar
+    ) -> None:
+        deadline = self._retry_clock() + ARCHIVE_WRITE_RETRY_SECONDS
+        delay = 0.01
+        while True:
+            try:
+                owner.write(filename, document)
+                return
+            except MeetingStoreBusy:
+                remaining = deadline - self._retry_clock()
+                if remaining <= 0:
+                    raise
+                # `stopping` may already be set while the final close is queued.
+                self._retry_wait(min(delay, remaining))
+                if self._retry_clock() >= deadline:
+                    raise
+                delay = min(delay * 2, 0.05)
+
+    def _edge(self, payload: Message, owner: MeetingWriter) -> None:
         if payload["kind"] == "close" and len(self.intervals) % 2 == 0:
             return
         self.journal.boundaries.append(
@@ -185,7 +209,7 @@ class _Archive:
             self.intervals.append({key: payload[key] for key in ("t_mono_ms", "recorded_ms")})
         if "state_rev" in payload:
             self.identity["state_rev"] = payload["state_rev"]
-        owner.write("capture.json", self.journal)
+        self._write_with_retry(owner, "capture.json", self.journal)
 
     def _start(
         self,
@@ -237,7 +261,7 @@ class _Archive:
             file.close()
             raise
 
-    def _checkpoint(self, track: str, owner: Any) -> None:
+    def _checkpoint(self, track: str, owner: MeetingWriter) -> None:
         wav, file, sidecar = self.segments[track]
         wav.writeframes(b"")  # update WAV header before fsync, including open segments
         file.flush()
@@ -251,7 +275,7 @@ class _Archive:
         if sidecar.sample_end > timeline[-1][0]:
             sidecar.timeline = [*timeline, [sidecar.sample_end, mono]]
         try:
-            owner.write(f"audio/{track}-{sidecar.index:04d}.json", sidecar)
+            self._write_with_retry(owner, f"audio/{track}-{sidecar.index:04d}.json", sidecar)
         finally:
             sidecar.timeline = timeline
 
