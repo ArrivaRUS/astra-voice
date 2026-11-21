@@ -230,7 +230,7 @@ def test_native_meeting_frag_proplist_and_hole_refusal(monkeypatch: pytest.Monke
         native.peek(22)
 
 
-def test_native_prepare_and_detector_context_never_create_pcm(
+def test_native_prepare_and_own_context_never_create_pcm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from unittest.mock import Mock
@@ -246,17 +246,46 @@ def test_native_prepare_and_detector_context_never_create_pcm(
     pulse.context_get_state.return_value = 4
     pulse.context_subscribe.return_value = 4
     pulse.lib.pa_context_get_index.return_value = 42
-    monkeypatch.setattr(module, "_meeting_pulse_type", lambda: lambda: pulse)
-    monkeypatch.setattr(module.NativePulse, "_server", lambda self: None)
-    backend = module.CapturePulseBackend()
-    try:
-        backend.prepare({"kind": "none"})
-        assert backend.detector_start() == 42
-        pulse.stream_new.assert_not_called()
-        pulse.stream_connect_record.assert_not_called()
-        pulse.lib.pa_stream_new_with_proplist.assert_not_called()
-    finally:
-        backend.close()
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "_meeting_pulse_type", lambda: lambda: pulse)
+        patch.setattr(module.NativePulse, "_server", lambda self: None)
+        backend = module.CapturePulseBackend()
+        assert backend.own_context() is None
+        assert not hasattr(module.CapturePulseBackend, "detector_start")
+        try:
+            backend.prepare({"kind": "none"})
+            assert backend.own_context() == (42, 0)
+            pulse.lib.pa_context_get_index.return_value = 0xFFFFFFFF
+            assert backend.own_context() is None
+            pulse.stream_new.assert_not_called()
+            pulse.stream_connect_record.assert_not_called()
+            pulse.lib.pa_stream_new_with_proplist.assert_not_called()
+        finally:
+            backend.close()
+
+
+def test_capture_context_new_and_connect_take_the_observer_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from astra_voice.worker import monitor_stream, pulse_stream
+    from astra_voice.worker.meeting_audio_local import CONNECT_LOCK
+
+    lib = Mock()
+
+    def locked_call(*args: Any) -> int:
+        assert CONNECT_LOCK.locked()
+        return 1
+
+    lib.pa_context_new.side_effect = locked_call
+    lib.pa_context_connect.side_effect = locked_call
+    with monkeypatch.context() as patch:
+        patch.setattr(pulse_stream._PulseAsync, "__init__", lambda self: setattr(self, "lib", lib))
+        native = monitor_stream._meeting_pulse_type()()
+        assert native.context_new(2, b"test") == 1
+        assert native.context_connect(1, None, pulse_stream.PA_CONTEXT_NOAUTOSPAWN, None) == 1
+    assert not CONNECT_LOCK.locked()
 
 
 @pytest.mark.parametrize("kind", ["app_stream", "sink_monitor"])

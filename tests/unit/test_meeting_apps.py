@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -171,3 +172,23 @@ def test_revision_catalog_size_boundary_and_path(tmp_path: Path) -> None:
     link.symlink_to(path)
     with pytest.raises(apps.AppDataError):
         apps.load_apps_for_tests(link)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"binary": ["astra-voice"]},
+        {"binary": ["astra_voice"]},
+        {"binary": ["own-interpreter"]},
+        {"exe": ["/usr/bin/astra-voice"]},
+        {"exe": ["/usr/bin/own-interpreter"]},
+    ],
+)
+def test_catalog_rejects_own_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changes: dict[str, object]
+) -> None:
+    monkeypatch.setattr(sys, "executable", "/usr/bin/own-interpreter")
+    catalog = tmp_path / "apps.json"
+    catalog.write_text(json.dumps({"schema": 1, "apps": [entry(**changes)]}))
+    with pytest.raises(apps.AppDataError, match="Не удалось загрузить список программ встреч"):
+        apps.load_apps_for_tests(catalog)

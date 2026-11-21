@@ -8,21 +8,27 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.core.meeting_session import StorageStatus
+from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
-from astra_voice.meetings.events import MeetingState
+from astra_voice.meetings.apps import AppClass, AppDefinition
+from astra_voice.meetings.events import DETECTOR_CODE, MeetingState, log_arguments
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.segments import CaptureJournal
 from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui import meeting_recording
 from astra_voice.ui.meeting_bridge import MeetingBridge
+from astra_voice.ui.meeting_offer import OfferView
 from astra_voice.ui.meeting_recording import AudioHints, MeetingRecording
 from astra_voice.worker import ipc
+from astra_voice.worker.supervisor import WorkerSupervisor
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 MID = "2026-11-01_120000-abcd"
@@ -87,6 +93,7 @@ class Rig:
         *,
         kind: SessionKind = SessionKind.KDE,
         role_type: type[Supervisor] = Supervisor,
+        settings: Settings | None = None,
     ) -> None:
         self.now = 100.0
         self.session = Session()
@@ -95,7 +102,13 @@ class Rig:
         self.microphone = "test-mic"
         self.store = MeetingStore(root / "meetings")
         self.supervisors: list[Supervisor] = []
-        self.bridge = MeetingBridge(Settings(meetings_enabled=True), store=self.store, session=kind)
+        self.bridge = MeetingBridge(
+            settings if settings is not None else Settings(meetings_enabled=True),
+            store=self.store,
+            session=kind,
+            save=lambda settings: None,
+            known_apps=(AppDefinition("dion", "DION", ("dion",), (), AppClass.DION),),
+        )
 
         def factory(
             event: Callable[[dict[str, Any]], None], exit: Callable[[int], None]
@@ -108,6 +121,7 @@ class Rig:
             self.store,
             enabled=lambda: self.bridge.enabled,
             policy_allowed=lambda: self.bridge.canEnable,
+            detector_allowed=self.bridge.detector_allowed,
             session_kind=kind,
             session_factory=lambda: self.session,
             supervisor_factory=factory,
@@ -127,6 +141,25 @@ class Rig:
     @property
     def supervisor(self) -> Supervisor:
         return self.supervisors[-1]
+
+    def call_state(self, app_class: str = "dion", *, req: str | None = None) -> dict[str, Any]:
+        if req is None:
+            req = next(
+                message["req"]
+                for message in reversed(self.supervisor.messages)
+                if message["type"] == "meeting.call.query"
+            )
+        return {
+            "type": "meeting.call.state",
+            "request_type": "meeting.call.query",
+            "req": req,
+            "active": True,
+            "app_class": app_class,
+            "call_id": "call1",
+            "variant1": True,
+            "measured_mono_ms": 100000,
+            "generation": self.supervisor.generation,
+        }
 
     def reply(self, action: str, **fields: Any) -> None:
         request = self.supervisor.messages[-1]
@@ -202,30 +235,137 @@ def test_setting_or_policy_off_keeps_programmatic_w4_and_start_inert(rig: Rig, g
     assert not rig.supervisor.messages and rig.supervisor.starts == 0
 
 
-@pytest.mark.parametrize("app_class", ["dion", "browser"])
-def test_only_correlated_validated_target_enables_call(rig: Rig, app_class: str) -> None:
+def test_call_is_hidden_and_cannot_be_selected_or_started_before_step_6a(rig: Rig) -> None:
     rig.bridge.requestRecording()
-    rig.recording.tick()
-    query = rig.supervisor.messages[-1]
-    assert query["type"] == "meeting.call.query"
-    event = {
-        "type": "meeting.call.state",
-        "request_type": query["type"],
-        "req": query["req"],
-        "active": True,
-        "app_class": app_class,
-        "call_id": "call1",
-        "target": {"sink_input": 7, "object_serial": 19, "verified": "declared-verified"},
-        "generation": 1,
-    }
-    rig.supervisor.event({**event, "req": "stale"})
-    assert len(rig.bridge.startOptions) == 2
-    rig.supervisor.event(event)
-    assert len(rig.bridge.startOptions) == 3
+    rig.supervisor.event(rig.call_state())
+    assert rig.recording.call_id == "call1" and rig.recording.variant1
+    assert [row["id"] for row in rig.bridge.startOptions] == ["room", "all"]
+    assert rig.bridge.selectedSource == "room"
     rig.bridge.selectRecordingSource("call")
-    assert rig.bridge.startState == ("browser" if app_class == "browser" else "call")
+    assert rig.bridge.selectedSource == "room"
     rig.bridge.on_start_clicked()
-    assert rig.supervisor.messages[-1]["far"]["sink_input"] == 7
+    assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+    assert all(
+        message.get("far", {}).get("kind") != "app_stream" for message in rig.supervisor.messages
+    )
+
+
+@pytest.mark.parametrize("app_class", ["dion", "browser"])
+def test_only_correlated_call_state_enables_app_stream_with_step_6a(
+    rig: Rig, app_class: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.bridge.requestRecording()
+    event = rig.call_state(app_class)
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.supervisor.event({**event, "req": "stale"})
+    assert not rig.recording.call_id and rig.bridge.selectedSource == "room"
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.supervisor.event({**event, "generation": rig.supervisor.generation - 1})
+    assert not rig.recording.call_id and rig.bridge.selectedSource == "room"
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.supervisor.event(event)
+    assert rig.bridge.selectedSource == "call"
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rows = rig.bridge.startOptions
+    assert [row["id"] for row in rows] == ["call", "room", "all"] and rows[0]["enabled"]
+    assert rig.bridge.startState == ("browser" if app_class == "browser" else "call")
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.bridge.on_start_clicked()
+    assert rig.supervisor.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
+
+
+@pytest.mark.parametrize("observing", [False, True])
+def test_closed_w4_ignores_call_state_even_with_its_own_req(rig: Rig, observing: bool) -> None:
+    view = Mock(spec=OfferView)
+    rig.recording.bind_offer(view)
+    if observing:
+        rig.bridge.setSetting("meeting_offer_on_call", True)
+        rig.recording.tick()
+        deliver_detector(rig.supervisor, rig.supervisor.messages[-1], "meeting.detector.started")
+    rig.bridge.requestRecording()
+    event = rig.call_state()
+    rig.recording.dialog_open = False
+    rig.supervisor.event(event)
+    rig.recording.tick()
+    assert not rig.recording.call_id
+    view.show.assert_not_called()
+    if observing:
+        rig.session.value = SessionSnapshot(known=True, locked=True)
+        rig.recording.tick()
+        rig.session.value = SessionSnapshot(known=True, locked=False)
+        rig.recording.tick()
+        rig.now = 105.0
+        rig.recording.tick()
+        req = rig.recording._offer_query_req
+        assert req and req != event["req"]
+        rig.supervisor.event({**rig.call_state(req=req), "measured_mono_ms": 105000})
+        rig.recording.tick()
+        view.show.assert_called_once_with("call-app", 60)
+        assert not rig.recording.call_id
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "meeting.call.started",
+            "call_id": "call1",
+            "app_class": "dion",
+            "variant1": True,
+            "measured_mono_ms": 100000,
+        },
+        {"type": "meeting.call.ended", "call_id": "call1", "reason": "detector_off"},
+        {
+            "type": "meeting.detector.code",
+            "purpose": "observe",
+            "code": "identity_mismatch_counter",
+            "duration_ms": 7,
+        },
+    ],
+    ids=["call-started", "call-ended", "detector-code"],
+)
+def test_call_and_detector_events_are_accepted_only_from_current_generation(
+    rig: Rig,
+    event: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rig.bridge.requestRecording()
+    dispatch = Mock()
+    delivered = Mock(wraps=rig.recording._event)
+    role = WorkerSupervisor(delivered, role="meeting-capture", use_qt=False)
+    role.state = "running"
+    role.generation = 2
+    frame = ipc.encode(event, role="meeting-capture")
+    caplog.set_level(logging.INFO, logger=meeting_recording.__name__)
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.recording.controller, "handle_event", dispatch)
+        patch.setattr(rig.recording.controller, "supervisor", role)
+        hello = ipc.encode(ipc.make_hello(role=role.role), role=role.role)
+        role._receive(hello, role.generation)
+        assert role.ready
+        delivered.reset_mock()
+        dispatch.reset_mock()
+        role.dropped_late = 0
+        role._receive(frame, role.generation - 1)
+        delivered.assert_not_called()
+        assert role.dropped_late == 1
+        role._receive(frame, role.generation)
+    delivered.assert_called_once_with({**event, "generation": role.generation})
+    dispatch.assert_not_called()
+    assert not rig.recording.call_id and rig.bridge.selectedSource == "room"
+    records = [entry for entry in caplog.records if entry.name == meeting_recording.__name__]
+    if event["type"] == "meeting.detector.code":
+        (record,) = records
+        assert record.msg == DETECTOR_CODE
+        assert log_arguments(record.msg, record.args) == ("observe", "identity_mismatch_counter", 7)
+    else:
+        assert not records
 
 
 @pytest.mark.parametrize("kind", [SessionKind.KDE, SessionKind.FLY])
@@ -328,24 +468,26 @@ def test_timer_intervals_keep_control_responsive(rig: Rig) -> None:
     assert rig.recording._control_timer.interval() <= 100
 
 
-@pytest.mark.parametrize("payload", ["missing-id", "mismatch", "unverified"])
-def test_incomplete_or_unverified_target_never_enables_call(rig: Rig, payload: str) -> None:
+@pytest.mark.parametrize("payload", ["missing-id", "variant-disabled", "other-app"])
+def test_incomplete_or_unavailable_call_never_enables_call(
+    rig: Rig, payload: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rig.bridge.requestRecording()
-    query = rig.supervisor.messages[-1]
-    event = {
-        "type": "meeting.call.state",
-        "request_type": query["type"],
-        "req": query["req"],
-        "active": True,
-        "app_class": "dion",
-        "target": {"sink_input": 7, "object_serial": 19, "verified": "declared-verified"},
-        "generation": 1,
-    }
-    if payload != "missing-id":
-        event["call_id"] = "call1"
-        event["target"]["verified"] = payload
-    rig.supervisor.event(event)
-    assert len(rig.bridge.startOptions) == 2
+    event = rig.call_state()
+    if payload == "missing-id":
+        del event["call_id"]
+    elif payload == "variant-disabled":
+        event["variant1"] = False
+    else:
+        event["app_class"] = "other"
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.supervisor.event(event)
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rows = rig.bridge.startOptions
+    assert [row["id"] for row in rows] == ["room", "all"]
+    assert rig.bridge.selectedSource == "room"
 
 
 def test_no_call_reply_preserves_explicit_whole_output_choice(rig: Rig) -> None:
@@ -364,8 +506,15 @@ def test_no_call_reply_preserves_explicit_whole_output_choice(rig: Rig) -> None:
     assert rig.bridge.selectedSource == "all"
 
 
-def test_new_remote_warning_requires_new_click_after_confirmed_exit(rig: Rig) -> None:
+@pytest.mark.parametrize("source", ["all", "room"])
+def test_new_remote_warning_requires_new_click_after_confirmed_exit(
+    rig: Rig, caplog: pytest.LogCaptureFixture, source: str
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=meeting_recording.__name__)
+    rig.bridge.setSetting("meeting_offer_on_call", True)
     rig.bridge.requestRecording()
+    deliver_remote(rig.supervisor)
+    rig.bridge.selectRecordingSource(source)
     rig.bridge.on_start_clicked()
     rig.reply("prepared", server_local=False)
     assert not any(m["type"] == "meeting.capture.open" for m in rig.supervisor.messages)
@@ -378,6 +527,14 @@ def test_new_remote_warning_requires_new_click_after_confirmed_exit(rig: Rig) ->
     rig.bridge.on_start_clicked()
     assert len(rig.supervisors) == 2
     assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
+    assert rig.supervisor.messages[-1]["far"] == {
+        "kind": "sink_monitor" if source == "all" else "none"
+    }
+    rig.reply("prepared", server_local=False)
+    assert rig.supervisor.messages[-1]["type"] == "meeting.capture.open"
+    assert not background_commands(rig.supervisor)
+    for marker in ("private-pulse-host.example", "private-pulse-path-marker", "PULSE_SERVER"):
+        assert marker not in caplog.text
 
 
 def test_cancel_during_prepare_blocks_late_open(rig: Rig) -> None:
@@ -439,6 +596,7 @@ def test_app_binds_capture_and_borrows_runtime_monitor(
     assert options["session_factory"]() is rig.session
     runtime._ensure_session_monitor.assert_called_once_with()
     assert options["microphone"]() == "chosen-mic"
+    assert options["detector_allowed"] is bridge.detector_allowed
     assert "dev_enabled" not in options
     bridge.bindRecording.assert_called_once_with(factory.return_value)
     # No dev gate: overlay, notices and the transcription queue are always bound;
@@ -569,23 +727,15 @@ def test_late_list_result_cannot_replace_live_paused_overlay(rig: Rig) -> None:
 
 
 @pytest.mark.parametrize("selection", [None, "room", "all"])
-def test_call_default_respects_explicit_choice(rig: Rig, selection: str | None) -> None:
+def test_call_default_respects_explicit_choice(
+    rig: Rig, selection: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rig.bridge.requestRecording()
     if selection is not None:
         rig.bridge.selectRecordingSource(selection)
-    query = rig.supervisor.messages[-1]
-    rig.supervisor.event(
-        {
-            "type": "meeting.call.state",
-            "request_type": query["type"],
-            "req": query["req"],
-            "active": True,
-            "app_class": "dion",
-            "call_id": "call1",
-            "target": {"sink_input": 7, "object_serial": 19, "verified": "declared-verified"},
-            "generation": 1,
-        }
-    )
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.supervisor.event(rig.call_state())
     assert rig.bridge.selectedSource == (selection or "call")
 
 
@@ -601,25 +751,22 @@ def test_microphone_choice_frozen_before_async_prepare(rig: Rig) -> None:
     assert rig.supervisor.messages[-1]["mic_device"] == "test-mic"
 
 
-def test_no_app_split_requires_explicit_new_whole_output_click(rig: Rig) -> None:
+def test_no_app_split_requires_explicit_new_whole_output_click(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rig.bridge.requestRecording()
-    query = rig.supervisor.messages[-1]
-    rig.supervisor.event(
-        {
-            "type": "meeting.call.state",
-            "request_type": query["type"],
-            "req": query["req"],
-            "active": True,
-            "app_class": "dion",
-            "call_id": "call1",
-            "target": {"sink_input": 7, "object_serial": 19, "verified": "declared-verified"},
-            "generation": 1,
-        }
-    )
-    rig.bridge.on_start_clicked()
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.supervisor.event(rig.call_state())
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        rig.bridge.on_start_clicked()
     rig.reply("prepared", far_available=False, far_reason="monitor-stream-unsupported")
     assert rig.bridge.startState == "no-app-split"
-    assert rig.bridge.startOptions[0]["warning"] and not rig.bridge.startOptions[0]["enabled"]
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        row = rig.bridge.startOptions[0]
+    assert row["id"] == "call" and row["warning"] and not row["enabled"]
     assert not any(m["type"] == "meeting.capture.open" for m in rig.supervisor.messages)
     rig.reply("closed", tracks=[], state_rev=1)
     rig.reply(
@@ -628,7 +775,10 @@ def test_no_app_split_requires_explicit_new_whole_output_click(rig: Rig) -> None
     rig.supervisor.ready, rig.supervisor.exited = False, True
     rig.supervisor.on_exit(0)
     rig.recording.tick()
-    assert not rig.bridge.startCanStart
+    with monkeypatch.context() as patch:
+        patch.setattr(meeting_recording, "APP_STREAM_ENABLED", True)
+        can_start = rig.bridge.startCanStart
+    assert not can_start
     rig.bridge.selectRecordingSource("all")
     assert rig.bridge.startCanStart and len(rig.supervisors) == 1
     rig.bridge.on_start_clicked()
@@ -736,14 +886,524 @@ def delayed_rig(tmp_path: Path) -> Iterator[Rig]:
     instance.bridge.shutdown()
 
 
+DETECTOR_START = "meeting.detector.start"
+DETECTOR_STOP = "meeting.detector.stop"
+
+
+def detector_commands(role: Supervisor) -> list[dict[str, Any]]:
+    return [msg for msg in role.messages if msg["type"] in {DETECTOR_START, DETECTOR_STOP}]
+
+
+def background_commands(role: Supervisor) -> list[str]:
+    return [
+        message["type"]
+        for message in role.messages
+        if message["type"] in {DETECTOR_START, "meeting.call.query"}
+    ]
+
+
+def deliver_remote(role: Supervisor, *, purpose: str = "observe", stale: bool = False) -> None:
+    role.event(
+        {
+            "type": "meeting.detector.code",
+            "purpose": purpose,
+            "code": "remote",
+            "duration_ms": 0,
+            "generation": role.generation - int(stale),
+        }
+    )
+
+
+@pytest.mark.parametrize("purpose", ["observe", "offer", "card", "start"])
+def test_remote_stops_start_and_query_for_current_generation(rig: Rig, purpose: str) -> None:
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    pending = rig.call_state()
+    assert background_commands(role) == ["meeting.call.query"]
+    deliver_remote(role, purpose=purpose)
+    role.event(pending)
+    assert not rig.recording.call_id
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.recording.tick()
+    assert background_commands(role) == ["meeting.call.query"]
+
+
+def test_remote_keeps_detector_stop_available(rig: Rig) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    (start,) = detector_commands(role)
+    deliver_detector(role, start, "meeting.detector.started")
+    deliver_remote(role, purpose="card")
+    rig.bridge.setSetting("meeting_offer_on_call", False)
+    assert [message["type"] for message in detector_commands(role)] == [
+        DETECTOR_START,
+        DETECTOR_STOP,
+    ]
+
+
+@pytest.mark.parametrize("remote", ["current", "stale", "none", "ordinary"])
+@pytest.mark.parametrize("replace", ["reopen", "exit-with-open-dialog", "after-capture"])
+def test_remote_latch_survives_role_replacement(
+    rig: Rig, remote: str, replace: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    previous = rig.supervisor
+    expected = [DETECTOR_START, "meeting.call.query"]
+    assert background_commands(previous) == expected
+    if remote == "ordinary":
+        with caplog.at_level(logging.INFO, logger=meeting_recording.__name__):
+            previous.event(
+                {
+                    "type": "meeting.detector.code",
+                    "purpose": "observe",
+                    "code": "identity_mismatch_counter",
+                    "duration_ms": 7,
+                    "generation": previous.generation,
+                }
+            )
+        (record,) = [entry for entry in caplog.records if entry.msg == DETECTOR_CODE]
+        assert log_arguments(record.msg, record.args) == ("observe", "identity_mismatch_counter", 7)
+        assert not rig.recording._automation_off
+    elif remote != "none":
+        deliver_remote(previous, stale=remote == "stale")
+
+    if replace == "after-capture":
+        rig.bridge.on_start_clicked()
+        rig.reply("prepared")
+        rig.reply("started")
+        assert rig.recording.controller.state == "recording"
+        rig.recording.controller.stop()
+        finish_capture_close(rig)
+    else:
+        rig.bridge.closeStartDialog()
+        if replace == "exit-with-open-dialog":
+            rig.bridge.requestRecording()
+            assert rig.supervisor is previous and rig.bridge.startDialogOpen
+    previous.ready, previous.exited = False, True
+    previous.on_exit(0)
+    if replace != "exit-with-open-dialog":
+        rig.bridge.requestRecording()
+    elif remote != "current":
+        # Closing W4 left observation running. Its unexpected exit backs off.
+        rig.recording.tick()
+        assert rig.supervisor is previous
+        rig.now += 2
+        expected.append("meeting.call.query")
+    rig.recording.tick()
+    assert rig.supervisor is not previous and rig.supervisor.ready
+    assert background_commands(previous) == expected
+    assert background_commands(rig.supervisor) == (
+        [] if remote == "current" else [DETECTOR_START, "meeting.call.query"]
+    )
+
+
+def detector_reply(request: dict[str, Any], kind: str, **fields: Any) -> dict[str, Any]:
+    reply = {"type": kind, "req": request["req"], "request_type": request["type"], **fields}
+    if kind == "meeting.detector.started":
+        reply["apps_version"] = request["apps_version"]
+    if kind == "error":
+        reply["message"] = "meeting-command-failed"
+    return reply
+
+
+def deliver_detector(role: Supervisor, request: dict[str, Any], kind: str, **fields: Any) -> None:
+    role.event(detector_reply(request, kind, generation=role.generation, **fields))
+
+
+def start_recording(rig: Rig) -> None:
+    rig.bridge.requestRecording()
+    rig.bridge.on_start_clicked()
+    rig.reply("prepared")
+    rig.reply("started")
+    assert rig.recording.controller.state == "recording"
+
+
+def finish_capture_close(rig: Rig) -> None:
+    rig.reply("closed", tracks=["mic"], state_rev=2)
+    rig.reply(
+        "finalized", segments={"mic": 0, "far": 0}, intervals=[], status="succeeded", state_rev=2
+    )
+
+
+@pytest.mark.parametrize("gate", ["off", "manual", "toggle-off"])
+def test_detector_does_not_start_when_effectively_disabled(rig: Rig, gate: str) -> None:
+    if gate != "toggle-off":
+        rig.bridge.setSetting("meeting_offer_on_call", True)
+        rig.bridge.refreshPolicy(Policy(raw={"meeting_record": gate}))
+    else:
+        assert rig.bridge.detectorEnabled  # The UI capability is not the opt-in.
+    assert not rig.bridge.detector_allowed()
+    rig.bridge.requestRecording()
+    rig.recording.tick()
+    assert not any(
+        message["type"] == "meeting.detector.start"
+        for role in rig.supervisors
+        for message in role.messages
+    )
+
+
+@pytest.mark.parametrize("change", ["off", "manual", "toggle-off"])
+def test_detector_starts_after_hello_once_and_stops_on_effective_change(
+    delayed_rig: Rig, change: str
+) -> None:
+    rig = delayed_rig
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    assert rig.bridge.detector_allowed()
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    assert not role.messages
+    role.ready = True
+    rig.recording.tick()
+    rig.recording.tick()
+    started = [message for message in role.messages if message["type"] == "meeting.detector.start"]
+    assert [message["apps_version"] for message in started] == [1]
+    deliver_detector(role, started[0], "meeting.detector.started")
+    assert rig.recording._detector_running is True
+    rig.bridge.changed.emit()
+    rig.recording.tick()
+    assert detector_commands(role) == started
+
+    if change == "toggle-off":
+        rig.bridge.setSetting("meeting_offer_on_call", False)
+    else:
+        rig.bridge.refreshPolicy(Policy(raw={"meeting_record": change}))
+    assert not rig.bridge.detector_allowed()
+    types = [message["type"] for message in role.messages]
+    assert types.count("meeting.detector.stop") == 1
+    if change == "off":
+        assert types.index("meeting.detector.stop") < types.index("meeting.capture.shutdown")
+    else:
+        assert "meeting.capture.shutdown" not in types and rig.bridge.startDialogOpen
+    rig.recording.tick()
+    assert [message["type"] for message in role.messages] == types
+
+
+@pytest.mark.parametrize("initially_running", [False, True], ids=["start", "stop"])
+@pytest.mark.parametrize(
+    "state", ["preparing", "opening", "recording", "paused", "stopping", "closing-unknown"]
+)
+def test_busy_window_suppresses_detector_commands(
+    rig: Rig, state: str, initially_running: bool
+) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", initially_running)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    if initially_running:
+        (first,) = detector_commands(role)
+        deliver_detector(role, first, "meeting.detector.started")
+    rig.bridge.on_start_clicked()
+    if state != "preparing":
+        rig.reply("prepared")
+    if state not in {"preparing", "opening"}:
+        rig.reply("started")
+    if state == "paused":
+        rig.recording.controller.pause()
+        finish_capture_close(rig)
+    if state in {"stopping", "closing-unknown"}:
+        rig.recording.controller.stop()
+    if state == "closing-unknown":
+        rig.recording.controller.state = state
+    assert rig.recording.controller.state == state and rig.recording.busy
+    before = detector_commands(role)
+    role.messages.clear()
+
+    rig.bridge.setSetting("meeting_offer_on_call", not initially_running)
+    rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "manual"}))
+    rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "prompt"}))
+    if state in {"opening", "recording", "paused"}:
+        rig.now += 1.1
+        rig.recording.tick()
+        assert [
+            message["seq"]
+            for message in role.messages
+            if message["type"] == "meeting.capture.keepalive"
+        ]
+    else:
+        rig.recording.tick()
+        assert not any(message["type"] == "meeting.capture.keepalive" for message in role.messages)
+    rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "off"}))
+    assert len(before) == int(initially_running)
+    assert detector_commands(role) == []
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_new_ready_role_syncs_detector_after_capture_ends(rig: Rig, allowed: bool) -> None:
+    start_recording(rig)
+    previous = rig.supervisor
+    rig.bridge.setSetting("meeting_offer_on_call", allowed)
+    rig.recording.controller.stop()
+    finish_capture_close(rig)
+    previous.ready, previous.exited = False, True
+    previous.on_exit(0)
+    rig.recording.tick()
+    assert detector_commands(previous) == []
+
+    rig.bridge.requestRecording()
+    assert rig.supervisor is not previous and rig.supervisor.ready
+    rig.recording.tick()
+    rig.bridge.changed.emit()
+    assert [msg["type"] for msg in detector_commands(rig.supervisor)] == (
+        [DETECTOR_START] if allowed else []
+    )
+
+
+def test_retiring_role_receives_only_shutdown(delayed_rig: Rig) -> None:
+    rig = delayed_rig
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    role.ready = True
+    rig.recording.tick()
+    (start,) = detector_commands(role)
+    deliver_detector(role, start, "meeting.detector.started")
+    rig.bridge.setSetting("meeting_offer_on_call", False)
+    assert detector_commands(role)[-1]["type"] == DETECTOR_STOP
+    role.ready = False
+    rig.bridge.closeStartDialog()
+    role.ready = True
+    role.messages.clear()
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.recording.tick()
+    assert [msg["type"] for msg in role.messages] == ["meeting.capture.shutdown"]
+
+
+def test_sync_limit_retries_detector_with_bounded_backoff(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    send = role.send
+
+    def reject(message: dict[str, Any]) -> dict[str, Any]:
+        sent = send(message)
+        deliver_detector(role, message, "error", code="limit")
+        return sent
+
+    delays = [1, 2, 4, 8, 16, 30, 30]
+    with monkeypatch.context() as patch:
+        patch.setattr(role, "send", reject)
+        rig.bridge.setSetting("meeting_offer_on_call", True)
+        for attempt, delay in enumerate(delays, 1):
+            assert len(detector_commands(role)) == attempt
+            rig.now += delay - 0.25
+            rig.recording.tick()
+            assert len(detector_commands(role)) == attempt
+            rig.now += 0.25
+            if attempt < len(delays):
+                rig.recording.tick()
+
+    rig.recording.tick()
+    commands = detector_commands(role)
+    assert len(commands) == len(delays) + 1
+    assert {command["type"] for command in commands} == {DETECTOR_START}
+    assert len({command["req"] for command in commands}) == len(commands)
+    deliver_detector(role, commands[-1], "meeting.detector.started")
+    rig.now += 30
+    rig.recording.tick()
+    assert detector_commands(role) == commands
+
+    with monkeypatch.context() as patch:
+        patch.setattr(role, "send", reject)
+        rig.bridge.setSetting("meeting_offer_on_call", False)
+    (stop,) = detector_commands(role)[len(commands) :]
+    assert stop["type"] == DETECTOR_STOP
+    rig.now += 0.75
+    rig.recording.tick()
+    assert detector_commands(role) == [*commands, stop]
+    rig.now += 0.25
+    rig.recording.tick()
+    (retry,) = detector_commands(role)[len(commands) + 1 :]
+    assert retry["type"] == DETECTOR_STOP and retry["req"] != stop["req"]
+
+
+def test_detector_stop_supersedes_start_and_ignores_its_late_reply(rig: Rig) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    (start,) = detector_commands(role)
+    rig.bridge.setSetting("meeting_offer_on_call", False)
+    assert [msg["type"] for msg in detector_commands(role)] == [DETECTOR_START, DETECTOR_STOP]
+    stop = detector_commands(role)[-1]
+    deliver_detector(role, start, "meeting.detector.started")
+    assert rig.recording._detector_pending == (stop["req"], DETECTOR_STOP)
+    assert rig.recording._detector_running is False
+    deliver_detector(role, stop, "meeting.detector.stopped")
+    rig.recording.tick()
+    assert rig.recording._detector_running is False
+    assert detector_commands(role) == [start, stop]
+
+
+def test_detector_timeout_after_ack_retries_stop_when_disallowed(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    (start,) = detector_commands(role)
+    dispatch = Mock()
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.recording.controller, "handle_event", dispatch)
+        deliver_detector(role, start, "meeting.detector.started")
+        rig.bridge.setSetting("meeting_offer_on_call", False)
+        stop = detector_commands(role)[-1]
+        assert stop["type"] == DETECTOR_STOP
+        deliver_detector(role, stop, "meeting.ack")
+        assert rig.recording._detector_pending == (stop["req"], DETECTOR_STOP)
+        assert rig.recording._detector_running is True
+        deliver_detector(role, stop, "error", code="timeout")
+    dispatch.assert_not_called()
+    assert rig.recording._detector_running is None
+    rig.now += 0.75
+    rig.recording.tick()
+    assert detector_commands(role) == [start, stop]
+    rig.now += 0.25
+    rig.recording.tick()
+    assert [msg["type"] for msg in detector_commands(role)] == [
+        DETECTOR_START,
+        DETECTOR_STOP,
+        DETECTOR_STOP,
+    ]
+
+
+def test_detector_permanent_error_blocks_this_generation(rig: Rig) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    (start,) = detector_commands(role)
+    deliver_detector(role, start, "error", code="not-prepared")
+    assert rig.recording._detector_running is None
+    for allowed in (True, False, True):
+        rig.bridge.setSetting("meeting_offer_on_call", allowed)
+        rig.now += 31
+        rig.recording.tick()
+    assert detector_commands(role) == [start]
+    role.generation += 1
+    rig.recording.tick()
+    assert [msg["type"] for msg in detector_commands(role)] == [DETECTOR_START, DETECTOR_START]
+
+
+def test_detector_send_exception_can_be_retried(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    disconnected = Mock(side_effect=OSError("test-transport"))
+    with monkeypatch.context() as patch:
+        patch.setattr(role, "send", disconnected)
+        rig.bridge.setSetting("meeting_offer_on_call", True)
+    disconnected.assert_called_once()
+    assert rig.recording._detector_running is None
+    assert not detector_commands(role)
+    rig.now += 0.75
+    rig.recording.tick()
+    assert not detector_commands(role)
+    rig.now += 0.25
+    rig.recording.tick()
+    (start,) = detector_commands(role)
+    assert start["type"] == DETECTOR_START
+
+
+def test_detector_ignores_old_generation_reply_and_starts_new_generation_once(rig: Rig) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    (old_start,) = detector_commands(role)
+    role.generation += 1
+    rig.recording.tick()
+    new_start = detector_commands(role)[-1]
+    # Keep the current req to isolate the generation check from the req check.
+    role.event(
+        detector_reply(new_start, "meeting.detector.started", generation=role.generation - 1)
+    )
+    assert rig.recording._detector_running is False
+    assert rig.recording._detector_pending == (new_start["req"], DETECTOR_START)
+    deliver_detector(role, new_start, "meeting.detector.started")
+    assert rig.recording._detector_running is True
+    rig.bridge.changed.emit()
+    rig.recording.tick()
+    assert detector_commands(role) == [old_start, new_start]
+    assert old_start["req"] != new_start["req"]
+
+
+@pytest.mark.parametrize("gate", ["off", "manual", "toggle-off"])
+def test_detector_retries_never_start_after_permission_is_withdrawn(rig: Rig, gate: str) -> None:
+    rig.bridge.setSetting("meeting_offer_on_call", True)
+    rig.bridge.requestRecording()
+    role = rig.supervisor
+    deliver_detector(role, detector_commands(role)[-1], "error", code="limit")
+    rig.now += 1
+    rig.recording.tick()
+    deliver_detector(role, detector_commands(role)[-1], "error", code="timeout")
+    if gate == "toggle-off":
+        rig.bridge.setSetting("meeting_offer_on_call", False)
+    else:
+        rig.bridge.refreshPolicy(Policy(raw={"meeting_record": gate}))
+    assert not rig.bridge.detector_allowed()
+    before = detector_commands(role)
+    assert [msg["type"] for msg in before] == [DETECTOR_START, DETECTOR_START]
+    for _ in range(3):
+        rig.now += 31
+        rig.recording.tick()
+        if gate != "off":
+            stop = detector_commands(role)[-1]
+            assert stop["type"] == DETECTOR_STOP
+            deliver_detector(role, stop, "error", code="limit")
+    assert [msg for msg in detector_commands(role) if msg["type"] == DETECTOR_START] == before
+
+
+def test_detector_retries_after_real_supervisor_queue_limit(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.bridge.requestRecording()
+    on_event = Mock(wraps=rig.recording._event)
+    role = WorkerSupervisor(on_event, role="meeting-capture", clock=lambda: rig.now, use_qt=False)
+    role.state = "running"
+    role._receive(ipc.encode(ipc.make_hello(role=role.role), role=role.role), role.generation)
+    assert role.ready
+    on_event.reset_mock()
+    full_queue = 4 * ipc.MAX_FRAME_BYTES
+    role._outgoing.extend(bytes(full_queue))
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.recording.controller, "supervisor", role)
+        rig.bridge.setSetting("meeting_offer_on_call", True)
+        on_event.assert_called_once()
+        rejected = on_event.call_args.args[0]
+        assert {key: rejected[key] for key in ("type", "request_type", "code")} == {
+            "type": "error",
+            "request_type": DETECTOR_START,
+            "code": "limit",
+        }
+        assert len(role._outgoing) == full_queue and not role._pending
+        role._outgoing.clear()
+        rig.now += 0.75
+        rig.recording.sync_detector()
+        assert not role._outgoing
+        rig.now += 0.25
+        rig.recording.sync_detector()
+        assert role._outgoing
+        sent = ipc.decode(bytes(role._outgoing[4:]), role=role.role)
+        assert sent["type"] == DETECTOR_START and sent["req"] != rejected["req"]
+        started = detector_reply(sent, "meeting.detector.started")
+        role._receive(ipc.encode(started, role=role.role), role.generation)
+        assert not role._pending
+        role._outgoing.clear()
+        rig.recording.sync_detector()
+        assert not role._outgoing
+
+
 @pytest.mark.parametrize("ready", [False, True], ids=["before-hello", "after-hello"])
-@pytest.mark.parametrize("reason", ["close", "disabled", "policy"])
+@pytest.mark.parametrize(
+    ("reason", "observing"),
+    [("close", False), ("close", True), ("disabled", False), ("policy", False)],
+    ids=["close", "close-with-observation", "disabled", "policy"],
+)
 def test_unused_role_retires_after_close_or_revocation(
-    delayed_rig: Rig, ready: bool, reason: str
+    delayed_rig: Rig, ready: bool, reason: str, observing: bool
 ) -> None:
     from astra_voice.core.policy import Policy
 
     rig = delayed_rig
+    rig.bridge.setSetting("meeting_offer_on_call", observing)
     rig.bridge.requestRecording()
     role = rig.supervisor
     role.ready = ready
@@ -754,9 +1414,15 @@ def test_unused_role_retires_after_close_or_revocation(
         rig.recording.policy_changed()
     else:
         rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "off"}))
-    # Late hello must finish retirement, never revive discovery/capture.
     role.ready = True
     rig.recording.tick()
+    assert not rig.bridge.startDialogOpen
+    if observing:
+        assert [m["type"] for m in role.messages] == [DETECTOR_START]
+        assert rig.session.closes == 0
+        assert rig.session.receivers(rig.session.changed) == 1
+        return
+    # Late hello must finish retirement, never revive discovery/capture.
     assert [m["type"] for m in role.messages] == ["meeting.capture.shutdown"]
     assert rig.session.closes == 1
     assert rig.session.receivers(rig.session.changed) == 0

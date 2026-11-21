@@ -399,6 +399,9 @@ class MeetingBridge(QObject):
     def _effective(self) -> EffectiveMeetingSettings:
         return effective_settings(self._stored, self._parsed)
 
+    def detector_allowed(self) -> bool:
+        return self._effective().detector_allowed
+
     @pyqtProperty(str, notify=changed)
     def sectionState(self) -> str:
         if not self._parsed.recording_allowed:
@@ -926,6 +929,7 @@ class MeetingBridge(QObject):
         if capture.jobs is not None:
             capture.jobs.release_files = self._release_files
         capture.changed.connect(self._capture_changed)
+        self.changed.connect(capture.sync_detector)
         capture.openMeetingsRequested.connect(self.openMeetingsRequested)
         capture.participantsRequested.connect(self.participantsRequested)
         self._capture_changed()

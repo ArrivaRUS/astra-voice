@@ -18,6 +18,8 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
+from astra_voice.worker.meeting_audio_local import CONNECT_LOCK
+
 
 class _Timeval(ctypes.Structure):
     _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long)]
@@ -325,6 +327,14 @@ def _meeting_pulse_type() -> Any:
             self.token = uuid.uuid4().hex
             self.admission_check: Callable[[], bool] = lambda: True
             self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
+
+        def context_new(self, api: int, name: bytes) -> int | None:
+            with CONNECT_LOCK:
+                return super().context_new(api, name)
+
+        def context_connect(self, ctx: int, server: bytes | None, flags: int, spawn: None) -> int:
+            with CONNECT_LOCK:
+                return super().context_connect(ctx, server, flags, spawn)
 
         def iterate(self, timeout_us: int) -> int:
             # One libpulse socket dispatch can consume only a packet header or
@@ -775,8 +785,6 @@ class CapturePulseBackend:
         self.control: NativePulse | None = None
         self.prepared_target: Target | None = None
         self.lock = threading.RLock()
-        self.detector_stop_event = threading.Event()
-        self.detector_thread: threading.Thread | None = None
         self.token = uuid.uuid4().hex
 
     def _control(self) -> NativePulse:
@@ -814,37 +822,15 @@ class CapturePulseBackend:
         source.target = self.prepared_target
         return source
 
-    def detector_start(self) -> int:
+    def own_context(self) -> tuple[int, int] | None:
         with self.lock:
-            control = self._control()
+            control = self.control
+            if control is None or control.context is None:
+                return None
             index = int(control.pulse.lib.pa_context_get_index(control.context))
-            if index == 0xFFFFFFFF:
-                raise ValueError("audio-failed")
-            if self.detector_thread is None:
-                self.detector_stop_event.clear()
-                self.detector_thread = threading.Thread(
-                    target=self._observe, name="meeting-pulse-events", daemon=True
-                )
-                self.detector_thread.start()
-            return index
-
-    def _observe(self) -> None:
-        while not self.detector_stop_event.wait(0.1):
-            try:
-                with self.lock:
-                    if self.control:
-                        self.control.poll_events()  # subscription only; M8 decides calls
-            except Exception:
-                return
-
-    def detector_stop(self) -> None:
-        self.close()
+            return None if index == 0xFFFFFFFF else (index, control.cookie)
 
     def close(self) -> None:
-        self.detector_stop_event.set()
-        thread, self.detector_thread = self.detector_thread, None
-        if thread:
-            thread.join()
         with self.lock:
             control, self.control = self.control, None
             if control is not None:

@@ -23,7 +23,21 @@ from astra_voice.meetings.segments import CaptureJournal, ClockAnchor, SegmentSi
 from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.security.files import private_directory
 from astra_voice.worker import ipc
+from astra_voice.worker.meeting_audio_local import (
+    LocalAudioServer,
+    SocketFds,
+    own_socket_fds,
+    resolve_local_server,
+    socket_family,
+)
+from astra_voice.worker.meeting_call_service import CheckFactory, MeetingCallService, role_checker
 from astra_voice.worker.meeting_contract import COMMAND_FIELDS, RequestLedger
+from astra_voice.worker.meeting_observer import (
+    MeetingObserver,
+    ObserverFactory,
+    ObserverWait,
+    observer_metadata,
+)
 from astra_voice.worker.meeting_roles import failure
 from astra_voice.worker.meeting_session import MeetingSession, SessionAdmission
 
@@ -49,8 +63,6 @@ class Source(Protocol):
 class Backend(Protocol):
     def prepare(self, far: Message) -> Message: ...
     def source(self, far: Message) -> Source: ...
-    def detector_start(self) -> int: ...
-    def detector_stop(self) -> None: ...
     def close(self) -> None: ...
 
 
@@ -64,6 +76,14 @@ def _microphone() -> Source:
     from astra_voice.worker.monitor_stream import microphone_source
 
     return microphone_source()  # type: ignore[no-any-return]
+
+
+def _observer_address() -> LocalAudioServer | None:
+    return resolve_local_server(os.environ, os.getuid())
+
+
+def _observer_wait(wake: threading.Event, seconds: float) -> bool:
+    return wake.wait(seconds)
 
 
 class _Archive:
@@ -407,6 +427,12 @@ class MeetingCaptureState:
         free_mb: Callable[[], int] | None = None,
         fsync: Callable[[int], None] = os.fsync,
         session: SessionAdmission | None = None,
+        observer_address: Callable[[], LocalAudioServer | None] = _observer_address,
+        observer_factory: ObserverFactory = observer_metadata,
+        observer_fds: Callable[[], SocketFds] = own_socket_fds,
+        observer_family: Callable[[int, int], int | None] = socket_family,
+        observer_wait: ObserverWait = _observer_wait,
+        check_factory: CheckFactory = role_checker,
     ) -> None:
         self.session_monitor = MeetingSession.production() if session is None else None
         self.session = session if session is not None else self.session_monitor.state  # type: ignore[union-attr]
@@ -435,6 +461,16 @@ class MeetingCaptureState:
         self.sources: dict[str, Source] = {}
         self.track_states = {"mic": "ended", "far": "ended"}
         self.messages: queue.SimpleQueue[Message] = queue.SimpleQueue()
+        self.observer = MeetingObserver(
+            address=observer_address(),
+            factory=observer_factory,
+            read_fds=observer_fds,
+            family=observer_family,
+            wait=observer_wait,
+            clock=clock,
+            emit=lambda message: self.messages.put(message),
+        )
+        self.calls = MeetingCallService(self, check_factory)
         self.audio_stop = threading.Event()
         self.stopped = False
         self.exit_code = 0
@@ -452,7 +488,6 @@ class MeetingCaptureState:
         self.finalizing = False
         self.final_status = "succeeded"
         self.lost_estimate_ms = 0
-        self.control_busy = False
         self.open_thread: threading.Thread | None = None
         self.readers: dict[str, threading.Thread] = {}
         self.shutdown_request: Message | None = None
@@ -461,6 +496,7 @@ class MeetingCaptureState:
         self.termination_deadline: float | None = None
         self.seq = 0
         self.preparing = False
+        self.prepare_starts = 0
         self.prepare_request: Message | None = None
         self.prepare_deadline: float | None = None
         self.disk_sampling = False
@@ -663,6 +699,7 @@ class MeetingCaptureState:
         return self.backend
 
     def handle(self, message: Message) -> list[Message]:
+        arrived_at = self.clock() if message.get("type") == "meeting.call.query" else 0.0
         message = ipc.decode(
             ipc.encode(message, role="meeting-capture")[4:], role="meeting-capture"
         )
@@ -687,17 +724,13 @@ class MeetingCaptureState:
             if action == "ping":
                 return self._remember(message, [self._reply("pong", message)])
             if action in {"meeting.detector.start", "meeting.detector.stop"}:
-                if self.preparing or self.control_busy:
-                    raise ValueError("not-prepared")
                 self._detector(message)
                 reply = self._reply("meeting.ack", message)
                 if message["req"] in self.ledger.requests:
                     self.pending[message["req"]] = [reply]
                 return self._remember(message, [reply])
             if action == "meeting.call.query":
-                return self._remember(
-                    message, [self._reply("meeting.call.state", message, active=False)]
-                )
+                return self.calls.query(message, arrived_at)
             if action == "meeting.capture.shutdown":
                 if not self.sources and not self.opening and not self.finalizing:
                     self.terminate()
@@ -714,7 +747,6 @@ class MeetingCaptureState:
             if action == "meeting.capture.prepare":
                 if (
                     self.preparing
-                    or self.control_busy
                     or self.opening
                     or self.finalizing
                     or self.sources
@@ -898,24 +930,23 @@ class MeetingCaptureState:
             return self._remember(message, [failure(message, code)])
 
     def _detector(self, request: Message) -> None:
-        self.control_busy = True
-
-        def work() -> None:
-            try:
-                if request["type"] == "meeting.detector.start":
-                    index = self._get_backend().detector_start()
-                    reply = self._reply("meeting.detector.started", request, own_client_index=index)
-                else:
-                    if self.backend:
-                        self.backend.detector_stop()
-                    reply = self._reply("meeting.detector.stopped", request)
-            except Exception:
-                reply = failure(request, "audio-failed")
-            self.messages.put({"type": "detector-result", "request": request, "reply": reply})
-
-        threading.Thread(target=work, name="meeting-detector-control", daemon=True).start()
+        starting = request["type"] == "meeting.detector.start"
+        if starting:
+            reply = self._reply(
+                "meeting.detector.started", request, apps_version=request["apps_version"]
+            )
+        else:
+            reply = self._reply("meeting.detector.stopped", request)
+        self.messages.put({"type": "detector-result", "request": request, "reply": reply})
+        if starting:
+            self.observer.start()
+        else:
+            self.observer.stop()
+            self.messages.put({"type": "detector-clear"})
 
     def _prepare(self, request: Message) -> None:
+        self.prepare_starts += 1
+        self.calls.cancel_offer_retries()
         self.preparing = True
         self.prepare_request = request
         self.prepare_deadline = self.clock() + 5.0
@@ -925,6 +956,10 @@ class MeetingCaptureState:
 
         def work() -> None:
             try:
+                far = request["far"]
+                if far["kind"] == "app_stream":
+                    # Step 6a authorizes a fresh private target for this call_id.
+                    raise ValueError("target-mismatch")
                 assert self.directory is not None
                 if self.directory.name != request["meeting_id"]:
                     raise ValueError("dir-unwritable")
@@ -938,13 +973,10 @@ class MeetingCaptureState:
                 free = self.free_mb()
                 if free < 600:
                     raise ValueError("limit")
-                far = request["far"]
-                if (
-                    far["kind"] == "app_stream"
-                    and not {"sink_input", "object_serial"} <= far.keys()
-                ):
-                    raise ValueError("target-mismatch")
-                info = self._get_backend().prepare(far)
+                backend = self._get_backend()
+                info = backend.prepare(far)
+                own_context = getattr(backend, "own_context", None)
+                self.observer.registry.set("control", own_context() if own_context else None)
                 self.messages.put(
                     {"type": "prepared", "request": request, "info": info, "free": free}
                 )
@@ -952,7 +984,8 @@ class MeetingCaptureState:
                 code = (
                     str(exc)
                     if isinstance(exc, ValueError)
-                    and str(exc) in {"limit", "target-mismatch", "dir-unwritable", "not-prepared"}
+                    and str(exc)
+                    in {"limit", "target-gone", "target-mismatch", "dir-unwritable", "not-prepared"}
                     else "audio-failed"
                 )
                 self.messages.put({"type": "prepare-failed", "request": request, "code": code})
@@ -1083,8 +1116,8 @@ class MeetingCaptureState:
                     {
                         "type": "open-failed",
                         "request": request,
-                        "code": "admission-stale"
-                        if str(exc) == "admission-stale"
+                        "code": str(exc)
+                        if str(exc) in {"admission-stale", "target-gone", "target-mismatch"}
                         else "audio-failed",
                     }
                 )
@@ -1268,6 +1301,9 @@ class MeetingCaptureState:
 
     def poll(self) -> list[Message]:
         result: list[Message] = []
+        checks: list[Message] = []
+        server_events: list[Message] = []
+        self.calls.sync_automation(result)
         self._session_events(result)
         self._expire_pause()
         while True:
@@ -1279,8 +1315,22 @@ class MeetingCaptureState:
             if kind == "session-event":
                 result.append(event["event"])
             elif kind == "detector-result":
-                self.control_busy = False
                 result.append(self._outcome(event["request"], event["reply"]))
+            elif kind == "detector-code":
+                result.append(event["event"])
+            elif kind == "detector-clear":
+                self.calls.detector_stopped(result)
+            elif kind == "card-remote":
+                self.calls.remote_card(result)
+            elif kind == "card-cancelled":
+                self.calls.finish_card(event["request"], {"active": False}, result)
+            elif kind == "check-result":
+                checks.append(event)
+                self.calls.note_result(event)
+            elif kind == "detector-server-changed":
+                server_events.append(event)
+            elif kind in {"detector-candidate", "detector-call-ended"}:
+                self.calls.observer_event(event, result)
             elif kind in {"prepared", "prepare-failed"}:
                 if not self.preparing or event["request"] != self.prepare_request:
                     continue
@@ -1686,6 +1736,18 @@ class MeetingCaptureState:
             self.stopped = True
             if self.archive:
                 self.archive.put("quit", None)
+        # Apply queued lifecycle changes and session updates before accepting checks.
+        self.calls.resolve_server(server_events, checks, result)
+        self.calls.sync_automation(result)
+        for event in checks:
+            self.calls.finish(
+                event["attempt"],
+                event["result"],
+                result,
+                report_remote_offer=event.get("report_remote_offer", False),
+                measured_server=event.get("measured_server"),
+            )
+        self.calls.retry_offers()
         return result
 
     def _autopause(self, reason: str, wire_reason: str, result: list[Message]) -> None:
@@ -1713,25 +1775,31 @@ class MeetingCaptureState:
         if self.terminating:
             return
         self.terminating = True
+        self.termination_deadline = time.monotonic() + 1.0
+        self.observer.stop(exiting=True)
+        self.calls.terminate()
         self.preparing = False
         self.prepare_deadline = None
-        self.termination_deadline = time.monotonic() + 1.0
         if self.sources or self.opening:
             self._close(None, "stop")
         elif not self.finalizing:
             self.stopped = True
             if self.archive:
                 self.archive.put("quit", None)
+        self.calls.shutdown(self.termination_deadline)
 
     def cleanup(self) -> None:
         """Transport loss/signal: bounded physical cleanup, storage may be abandoned."""
         self.terminate()  # Start physical close before bounded helper reaping.
         if self.session_monitor is not None:
             self.session_monitor.close()
-        deadline = time.monotonic() + 1.0
+        assert self.termination_deadline is not None
+        deadline = self.termination_deadline
         while not self.stopped and time.monotonic() < deadline:
             self.poll()
             time.sleep(0.005)
+        self.observer.join(max(0.0, deadline - time.monotonic()))
+        self.calls.cleanup(deadline)
         # An escalated close can already have set stopped while storage is
         # finishing. It still owns a worker that must receive its exit request.
         if self.archive is not None:

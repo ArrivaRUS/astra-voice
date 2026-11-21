@@ -8,6 +8,7 @@ import time
 import wave
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -60,25 +61,35 @@ class Source:
 class Backend:
     def __init__(self) -> None:
         self.sources: list[Source] = []
-        self.detecting = False
+        self.prepare_calls: list[dict[str, Any]] = []
+        self.close_calls = 0
+        self.control = Mock()
+        self.context = (51, 1)
+        self.server_local = True
 
     def prepare(self, far: dict[str, Any]) -> dict[str, Any]:
-        return {"server_local": True, "server_kind": "pulseaudio", "far_available": True}
+        self.prepare_calls.append(far)
+        return {
+            "server_local": self.server_local,
+            "server_kind": "pulseaudio",
+            "far_available": True,
+        }
 
     def source(self, far: dict[str, Any]) -> Source:
         source = Source()
         self.sources.append(source)
         return source
 
-    def detector_start(self) -> int:
-        self.detecting = True
-        return 42
-
-    def detector_stop(self) -> None:
-        self.detecting = False
+    def own_context(self) -> tuple[int, int] | None:
+        return self.context
 
     def close(self) -> None:
-        self.detecting = False
+        self.close_calls += 1
+        self.control.close()
+
+
+def _unexpected_observer(*args: object) -> Any:
+    pytest.fail("test has not supplied an observer backend")
 
 
 def wait_until(predicate: Any) -> None:
@@ -100,6 +111,15 @@ class Rig:
             session = SessionAdmission(kind="KDE", clock=self.clock, max_age=float("inf"))
             session.update(known=True, active=True, locked=False, sleeping=False)
             kwargs["session"] = session
+        kwargs.setdefault("observer_address", lambda: None)
+        kwargs.setdefault("observer_factory", _unexpected_observer)
+        self.unexpected_checks = 0
+
+        def unexpected_check(*args: object) -> Any:
+            self.unexpected_checks += 1
+            pytest.fail("test has not supplied a call checker")
+
+        kwargs.setdefault("check_factory", unexpected_check)
         self.state = MeetingCaptureState(
             clock=self.clock,
             mic_factory=self.mic,
@@ -133,15 +153,18 @@ class Rig:
         self._identity(result)
         return result
 
-    def prepare(self, kind: str = "app_stream") -> None:
-        replies = self.send(
+    def request_prepare(self, far: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.send(
             "prepare",
             dir=str(self.directory),
-            far={"kind": kind, "sink_input": 7, "object_serial": 11, "call_id": "call1"},
+            far=far,
             segment_s=300,
             fsync_s=10,
             segment_index_from=0,
         )
+
+    def prepare(self, kind: str = "sink_monitor") -> None:
+        replies = self.request_prepare({"kind": kind})
         prepared = self.until("meeting.capture.prepared")
         assert prepared["type"] == "meeting.capture.prepared", replies
         self.identity.update({key: prepared[key] for key in ("capture_id", "state_rev")})
@@ -196,6 +219,7 @@ class Rig:
 
     def cleanup(self) -> None:
         self.state.cleanup()
+        assert self.unexpected_checks == 0
 
 
 @pytest.fixture
@@ -213,6 +237,86 @@ def test_prepare_has_zero_pcm_or_files_and_req_is_idempotent(rig: Rig) -> None:
     assert rig.state.handle(message) == rig.state.handle(message)
     message.update(type="meeting.call.query", request_type="meeting.call.query")
     assert rig.state.handle(message)[0]["code"] == "req-conflict"
+
+
+def test_app_stream_is_rejected_before_accessing_backend(rig: Rig) -> None:
+    assert (
+        rig.request_prepare({"kind": "app_stream", "call_id": "call1"})[0]["type"] == "meeting.ack"
+    )
+    wait_until(
+        lambda: any(event["type"] in {"error", "meeting.capture.prepared"} for event in rig.poll())
+    )
+    assert rig.state.backend is None and not rig.backend.prepare_calls
+    assert rig.until("error")["code"] == "target-mismatch"
+    assert not rig.mics and not rig.backend.sources
+
+
+@pytest.mark.parametrize("code", ["target-gone", "target-mismatch"])
+def test_prepare_preserves_backend_target_error(rig: Rig, code: str) -> None:
+    prepare = Mock(side_effect=ValueError(code))
+    rig.backend.prepare = prepare  # type: ignore[method-assign]
+    far = {"kind": "sink_monitor"}
+    assert rig.request_prepare(far)[0]["type"] == "meeting.ack"
+    assert rig.until("error")["code"] == code
+    prepare.assert_called_once_with(far)
+
+
+@pytest.mark.parametrize("code", ["target-gone", "target-mismatch"])
+def test_open_preserves_backend_target_error(rig: Rig, code: str) -> None:
+    rig.prepare()
+    source = Source()
+    open_source = source.open
+
+    def partial_open(device: str | None = None) -> None:
+        open_source(device)
+        raise ValueError(code)
+
+    shutdown = Mock(wraps=source.shutdown)
+    source.open = partial_open  # type: ignore[method-assign]
+    source.shutdown = shutdown  # type: ignore[method-assign]
+    rig.backend.source = Mock(return_value=source)  # type: ignore[method-assign]
+    replies = rig.send("open", blocked_epoch=0, admission_mono_ms=100000)
+    assert replies[0]["type"] == "meeting.ack"
+    assert rig.until("error")["code"] == code
+    closed = rig.until("meeting.capture.closed")
+    assert set(closed["tracks"]) == {"mic", "far"}
+    shutdown.assert_called_once_with()
+    assert not source.opened and not any(mic.opened for mic in rig.mics)
+
+
+def test_detector_replies_without_backend_and_does_not_block_prepare(rig: Rig) -> None:
+    start = {
+        "type": "meeting.detector.start",
+        "request_type": "meeting.detector.start",
+        "req": "det-start",
+        "apps_version": 42,
+    }
+    stop = {
+        "type": "meeting.detector.stop",
+        "request_type": "meeting.detector.stop",
+        "req": "det-stop",
+    }
+    receipt = rig.state.handle(start)
+    assert receipt[0]["type"] == "meeting.ack"
+    assert rig.state.handle(start) == receipt
+    assert rig.state.handle(stop)[0]["type"] == "meeting.ack"
+    assert rig.state.backend is None
+    assert rig.request_prepare({"kind": "none"})[0]["type"] == "meeting.ack"
+    started = rig.until("meeting.detector.started")
+    assert started == {
+        "type": "meeting.detector.started",
+        "req": start["req"],
+        "request_type": start["type"],
+        "apps_version": 42,
+    }
+    assert rig.state.handle(start) == [*receipt, started]
+    assert rig.until("meeting.detector.stopped")["req"] == stop["req"]
+    rig.until("meeting.capture.prepared")
+    assert not rig.mics and not rig.backend.sources
+    query = "meeting.call.query"
+    assert rig.state.handle({"type": query, "request_type": query, "req": "query1"}) == [
+        {"type": "meeting.call.state", "request_type": query, "req": "query1", "active": False}
+    ]
 
 
 @pytest.mark.parametrize("age", [-1, 1001])

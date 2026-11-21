@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -15,6 +17,7 @@ from astra_voice.security.files import read_private
 
 MAX_APPS_BYTES = 64 * 1024
 MAX_APPS = 128
+OWN_BINARIES = frozenset({"astra-voice", "astra_voice"})
 APP_SCHEMA = obj(
     {
         "id": {"type": "string", "pattern": r"^[a-z0-9][a-z0-9_-]{0,63}$"},
@@ -22,7 +25,9 @@ APP_SCHEMA = obj(
         "binary": array(text_schema(255, 1), 32, unique=True),
         "exe": array(text_schema(255, 1), 32, unique=True),
         "class": choices("dion", "browser", "other"),
-    }
+        "verification": choices("executable", "declared-only"),
+    },
+    required=["id", "title", "binary", "exe", "class"],
 )
 APPS_SCHEMA = obj({"schema": {"type": "integer", "const": 1}, "apps": array(APP_SCHEMA, MAX_APPS)})
 
@@ -31,6 +36,11 @@ class AppClass(StrEnum):
     DION = "dion"
     BROWSER = "browser"
     OTHER = "other"
+
+
+class AppVerification(StrEnum):
+    EXECUTABLE = "executable"
+    DECLARED_ONLY = "declared-only"
 
 
 class AppDataError(ValueError):
@@ -56,6 +66,9 @@ def _validated(data: object) -> dict[str, Any]:
             if isinstance(raw.get(key), list):
                 raw[key] = [_name(item) if isinstance(item, str) else item for item in raw[key]]
         validate(raw, APP_SCHEMA)
+        raw.setdefault("verification", "executable" if raw["exe"] else "declared-only")
+        if bool(raw["exe"]) != (raw["verification"] == "executable"):
+            raise AppDataError("Несогласованная проверка программы")
         if not raw["binary"] and not raw["exe"]:
             raise AppDataError("Не задана идентичность программы")
         if any("/" in name or name in {".", ".."} for name in raw["binary"]):
@@ -77,12 +90,26 @@ class AppDefinition:
     binary: tuple[str, ...]
     exe: tuple[str, ...]
     app_class: AppClass
+    verification: AppVerification | None = None
+
+    def __post_init__(self) -> None:
+        if self.verification is None:
+            object.__setattr__(
+                self,
+                "verification",
+                AppVerification.EXECUTABLE if self.exe else AppVerification.DECLARED_ONLY,
+            )
 
     @classmethod
     def from_dict(cls, data: object) -> Self:
         raw = _validated(data)
         return cls(
-            raw["id"], raw["title"], tuple(raw["binary"]), tuple(raw["exe"]), AppClass(raw["class"])
+            raw["id"],
+            raw["title"],
+            tuple(raw["binary"]),
+            tuple(raw["exe"]),
+            AppClass(raw["class"]),
+            AppVerification(raw["verification"]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +120,13 @@ class AppDefinition:
                 "binary": list(self.binary),
                 "exe": list(self.exe),
                 "class": self.app_class.value,
+                "verification": (
+                    self.verification.value
+                    if self.verification is not None
+                    else "executable"
+                    if self.exe
+                    else "declared-only"
+                ),
             }
         )
 
@@ -137,10 +171,20 @@ def _load_apps(path: Path) -> tuple[AppDefinition, ...]:
         if type(document["schema"]) is not int:
             raise AppDataError("Недопустимая версия списка программ")
         apps = tuple(AppDefinition.from_dict(item) for item in document["apps"])
+        # In the .deb and AppImage the running executable can be the
+        # Python interpreter. Its canonical path is what /proc/PID/exe shows.
+        own_executables = {sys.executable, os.path.realpath(sys.executable)}
+        own_binaries = OWN_BINARIES | {Path(path).name for path in own_executables}
         ids: set[str] = set()
         binaries: set[str] = set()
         executables: set[str] = set()
         for app in apps:
+            if (
+                own_binaries.intersection(app.binary)
+                or own_executables.intersection(app.exe)
+                or any(name.rsplit("/", 1)[-1] in OWN_BINARIES for name in app.exe)
+            ):
+                raise AppDataError("Список программ включает Astra Voice")
             if (
                 app.id in ids
                 or binaries.intersection(app.binary)

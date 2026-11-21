@@ -10,6 +10,7 @@ import contextlib
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -592,12 +593,20 @@ def _fly_process_present(proc: Path = Path("/proc")) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class MonitorSnapshot(SessionSnapshot):
+    """One publication in the lifetime of a SessionMonitor."""
+
+    revision: int = 0
+
+
 class _SessionWorker(QObject):
     updated = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
-        self.snapshot = SessionSnapshot()
+        self.snapshot: SessionSnapshot = MonitorSnapshot()
+        self._revision = 0
         self.state: SessionState | None = None
         self.screen_bus: Any = None
         self.screen_name = CONNECTION_NAME + "-screensaver"
@@ -669,7 +678,8 @@ class _SessionWorker(QObject):
             self._blocked_epoch += 1
         if self.state.suspending and not self.snapshot.preparing_for_sleep:
             self._sleep_epoch += 1
-        self.snapshot = SessionSnapshot(
+        self._revision += 1
+        self.snapshot = MonitorSnapshot(
             known=self.state.known,
             locked=self.state.locked,
             active=self.state.active,
@@ -679,6 +689,7 @@ class _SessionWorker(QObject):
             blocked_epoch=self._blocked_epoch,
             cue_epoch=self._cue_epoch,
             sleep_epoch=self._sleep_epoch,
+            revision=self._revision,
         )
         self.updated.emit(self.snapshot)
 
@@ -686,7 +697,8 @@ class _SessionWorker(QObject):
     def stop(self) -> None:
         if self.state is not None:
             self.state.stop()
-        self.snapshot = SessionSnapshot()
+        self._revision += 1
+        self.snapshot = MonitorSnapshot(revision=self._revision)
         if self.screen_bus is not None:
             self.screen_bus.disconnect(
                 "org.freedesktop.ScreenSaver",
