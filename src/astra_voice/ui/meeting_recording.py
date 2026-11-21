@@ -44,8 +44,9 @@ from astra_voice.meetings.events import DETECTOR_CODE, DetectorCode, DetectorPur
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, MeetingStoreError, new_meeting_id
 from astra_voice.platform.session import SessionKind
-from astra_voice.platform.session_state import SessionMonitor
+from astra_voice.platform.session_state import MonitorSnapshot, SessionMonitor
 from astra_voice.ui.meeting_indicator_guard import MeetingIndicatorGuard
+from astra_voice.ui.meeting_offer import OfferController, OfferView, Origin
 from astra_voice.ui.meeting_texts import W2_TEXTS, W4_TEXTS
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
@@ -163,10 +164,12 @@ class MeetingRecording(QObject):
         self.session_kind, self.clock = session_kind, clock
         self.session_factory, self.owns_session = session_factory, owns_session
         self._monitor: Any = None
+        self._offer_monitor: Any = None
         self._supervisor_factory = supervisor_factory
         self._role_serial = 0
         self._role_started = False
         self._query_req = ""
+        self._offer_query_req = ""
         self._closed = False
         self.dialog_open = False
         self.selected_source = "room"
@@ -206,6 +209,11 @@ class MeetingRecording(QObject):
         self.jobs: MeetingJobs | None = None
         self._jobs_saved = ""
         self._jobs_recover_pending = False  # initialize() asked, policy not yet allowed
+        self.offer = OfferController(
+            clock=clock,
+            on_visibility_changed=self._offer_visibility_changed,
+            on_start=self._offer_start_requested,
+        )
         role = self._new_supervisor()
         self.controller = MeetingController(
             store,
@@ -256,9 +264,36 @@ class MeetingRecording(QObject):
             self._indicator_guard.shutdown()
             self._indicator_guard = None
 
+    def bind_offer(self, view: OfferView) -> None:
+        if not self._closed:
+            self._offer_query_req = ""
+            self.offer.bind(view)
+
+    def press_offer(self, action: str, pressed_at_ms: int) -> bool:
+        if self._closed or not self._offer_eligible():
+            return False
+        self._update_offer_session()
+        return self.offer.press(action, pressed_at_ms)
+
+    def dismiss_offer(self) -> None:
+        if not self._closed:
+            self._update_offer_session()
+            self.offer.dismiss()
+
+    def _offer_visibility_changed(self) -> None:
+        if not self._closed:
+            self._sync_role_ownership()
+            self._publish()
+
+    def _offer_start_requested(self) -> None:
+        self.openMeetingsRequested.emit()
+        self.open_dialog()
+
     def _new_supervisor(self) -> Role:
         self._role_serial += 1
         serial = self._role_serial
+        self._offer_query_req = ""
+        self.offer.new_role(serial)
 
         def event(message: Message) -> None:
             if serial == self._role_serial and not self._closed:
@@ -345,6 +380,10 @@ class MeetingRecording(QObject):
     def _ensure_session(self) -> None:
         if self._monitor is None:
             self._monitor = self.session_factory()
+            if self._monitor is not self._offer_monitor:
+                self.offer.reset_session()
+                self._offer_monitor = self._monitor
+            self._update_offer_session(can_query=False)
             self._monitor.changed.connect(self._session_changed)
             self._monitor.start()
 
@@ -394,12 +433,13 @@ class MeetingRecording(QObject):
     def open_dialog(self) -> None:
         if self._closed or not self.enabled() or not self.policy_allowed():
             return
+        self.dialog_open = True
+        self._offer_query_req = ""
+        self.offer.suspend(for_capture=True)
         if self.busy:
             self._preview_error = "busy"
-            self.dialog_open = True
             self._publish()
             return
-        self.dialog_open = True
         self.selected_source = "room"
         self._selection_touched = False
         self._preview_error = ""
@@ -583,13 +623,19 @@ class MeetingRecording(QObject):
         if monitor is not None:
             monitor.changed.disconnect(self._session_changed)
             if self.owns_session:
+                self._offer_monitor = None
                 monitor.close()
 
     def _sync_role_ownership(self) -> None:
         if self._closed:
             return
         observing = self._observation_allowed()
-        owned = observing or self.dialog_open or self.busy
+        if not observing:
+            self.offer.suspend(clear_memory=True)
+        elif self.dialog_open or self.busy:
+            self._offer_query_req = ""
+            self.offer.suspend(for_capture=True)
+        owned = observing or self.offer.visible or self.dialog_open or self.busy
         if owned:
             self._ensure_session()
         if (
@@ -754,6 +800,10 @@ class MeetingRecording(QObject):
     def _session_changed(self, snapshot: object = None) -> None:
         if not self._closed:
             self.controller.on_session_changed()
+            if self.sender() is self._monitor and isinstance(snapshot, SessionSnapshot):
+                self._update_offer_session(snapshot)
+            else:
+                self._update_offer_session()
             self._publish()
 
     def policy_changed(self) -> None:
@@ -772,7 +822,61 @@ class MeetingRecording(QObject):
             self._query_req = request
         self.controller.supervisor.send({"type": kind, "request_type": kind, "req": request})
 
+    def _offer_eligible(self) -> bool:
+        role = self.controller.supervisor
+        return (
+            self._observation_allowed()
+            and not self.dialog_open
+            and not self.busy
+            and self._standby_role
+            and self._role_started
+            and self._retire_deadline is None
+            and role.ready
+            and not role.exited
+            and self._detector_generation == role.generation
+            and self._detector_running is True
+            and self._detector_pending is None
+        )
+
+    def _update_offer_session(
+        self, snapshot: SessionSnapshot | None = None, *, can_query: bool = True
+    ) -> SessionSnapshot:
+        if snapshot is None:
+            snapshot = self._snapshot()
+        if self._monitor is not None:
+            if self.offer.session_changed(
+                snapshot,
+                can_query=can_query and self.offer.bound and self._offer_eligible(),
+                revision=snapshot.revision if isinstance(snapshot, MonitorSnapshot) else None,
+            ):
+                self._offer_query_req = ""
+        return snapshot
+
+    def _send_offer_query(self) -> None:
+        request = uuid4().hex
+        self._offer_query_req = request
+        try:
+            self.controller.supervisor.send(
+                {"type": "meeting.call.query", "request_type": "meeting.call.query", "req": request}
+            )
+        except (RuntimeError, ValueError):
+            if self._offer_query_req == request:
+                self._offer_query_req = ""
+
+    def _receive_offer(
+        self, raw: Message, origin: Origin, snapshot: SessionSnapshot, *, current: bool = True
+    ) -> None:
+        self.offer.receive(
+            call_id=raw.get("call_id", ""),
+            app_class=raw.get("app_class", ""),
+            measured_ms=raw.get("measured_mono_ms", 0),
+            origin=origin,
+            eligible=current and self._offer_eligible(),
+            session=snapshot,
+        )
+
     def _reset_detector(self, generation: int | None) -> None:
+        self._offer_query_req = ""
         self._detector_generation = generation
         self._detector_running: bool | None = False
         self._detector_pending: tuple[str, str] | None = None
@@ -780,6 +884,10 @@ class MeetingRecording(QObject):
         self._detector_retry_delay = 1.0
 
     def sync_detector(self) -> None:
+        allowed = self._observation_allowed()
+        if not self._closed and not allowed:
+            # The settings bridge signals this directly, before the next control tick.
+            self.offer.suspend(clear_memory=True)
         controller = self.controller
         role = controller.supervisor
         # Detector request deadlines must not add another failure path during capture.
@@ -789,7 +897,6 @@ class MeetingRecording(QObject):
             return  # A consumed role still owes finalization and exit.
         if self._detector_generation != role.generation:
             self._reset_detector(role.generation)
-        allowed = self._observation_allowed()
         kind = "meeting.detector.start" if allowed else "meeting.detector.stop"
         if self.clock() < self._detector_retry_at:
             return
@@ -804,6 +911,8 @@ class MeetingRecording(QObject):
         message: Message = {"type": kind, "request_type": kind, "req": request}
         if allowed:
             message["apps_version"] = 1
+        else:
+            self._offer_query_req = ""
         # send() can deliver a rejection synchronously.
         self._detector_pending = pending
         try:
@@ -820,6 +929,7 @@ class MeetingRecording(QObject):
             self._detector_retry_delay = min(30.0, self._detector_retry_delay * 2)
         else:
             self._detector_retry_at = math.inf
+            self.offer.detector_unavailable()
 
     def _detector_reply(self, reply: Message, generation: int) -> None:
         if self._detector_generation != generation or self._detector_pending != (
@@ -834,6 +944,7 @@ class MeetingRecording(QObject):
             self._detector_retry_at = 0.0
             self._detector_retry_delay = 1.0
             if self._detector_running:
+                self.offer.detector_started()
                 self._observation_retry_at = 0.0
                 self._observation_retry_delay = 2.0
         elif kind == "error":
@@ -851,16 +962,25 @@ class MeetingRecording(QObject):
         if raw.get("request_type") in {"meeting.detector.start", "meeting.detector.stop"}:
             self._detector_reply(raw, generation)
             return
-        if raw["type"] == "meeting.call.state":
+        if raw.get("request_type") == "meeting.call.query":
+            if self._offer_query_req and raw["req"] == self._offer_query_req:
+                snapshot = self._update_offer_session()
+                if raw["type"] in {"meeting.call.state", "error"}:
+                    current = self._offer_query_req == raw["req"]
+                    self._offer_query_req = ""
+                    self._receive_offer(raw, "card", snapshot, current=current)
+                return
             if (
-                not self.dialog_open
-                or raw.get("req") != self._query_req
-                or raw.get("request_type") != "meeting.call.query"
+                raw["type"] != "meeting.call.state"
+                or not self.dialog_open
+                or raw["req"] != self._query_req
             ):
                 return
             self.call_id = raw.get("call_id", "")
             self.app_class = raw.get("app_class", "")
             self.variant1 = raw.get("variant1", False)
+            if raw["active"]:
+                self.offer.track_call(self.call_id, self.app_class)
             if self._call_available:
                 if not self._selection_touched:
                     self.selected_source = "call"
@@ -868,12 +988,18 @@ class MeetingRecording(QObject):
                 self.selected_source = "room"
             self._publish()
             return
-        if raw["type"] in {"meeting.call.started", "meeting.call.ended"}:
+        if raw["type"] == "meeting.call.started":
+            self._receive_offer(raw, "offer", self._update_offer_session())
+            return
+        if raw["type"] == "meeting.call.ended":
+            if self.offer.call_ended(raw["call_id"], raw["reason"]):
+                self._offer_query_req = ""
             return
         if raw["type"] == "meeting.detector.code":
             if raw["code"] == DetectorCode.REMOTE and not self._automation_off:
                 self._automation_off = True
-                self._query_req = ""
+                self._query_req = self._offer_query_req = ""
+                self.offer.suspend(clear_memory=True)
                 if self.selected_source == "call":
                     self.selected_source = "room"
                 self._publish()
@@ -919,6 +1045,8 @@ class MeetingRecording(QObject):
             self.controller.on_process_exit(code)
         self._role_started = False
         self._retire_deadline = None
+        self._offer_query_req = ""
+        self.offer.role_ended(self._role_serial)
         if retiring and self.dialog_open:
             # W4 may have been reopened while the old role was retiring.
             # Restore only its query/preview role, never implicit capture.
@@ -928,6 +1056,7 @@ class MeetingRecording(QObject):
     def tick(self) -> None:
         if self._closed:
             return
+        self.offer.begin_tick()
         while not self._results.empty():
             kind, value = self._results.get_nowait()
             if kind == "preview":
@@ -953,6 +1082,9 @@ class MeetingRecording(QObject):
         if self._role_started and self.controller.supervisor.exited:
             self._exit(3)
         self._sync_role_ownership()
+        snapshot = self._update_offer_session()
+        if self.offer.tick(eligible=self._offer_eligible(), session=snapshot):
+            self._send_offer_query()
         self._tick_jobs()
         if (
             self.dialog_open
@@ -1079,6 +1211,8 @@ class MeetingRecording(QObject):
                 self.controller.recorded_ms // 1000,
                 self.controller.saved,
                 self.dialog_open,
+                self.offer.state,
+                self.offer.presentation,
                 self.state,
                 self.error,
                 self.warnings,
@@ -1179,6 +1313,7 @@ class MeetingRecording(QObject):
                 log.warning("meeting-exit-drain-failed")
             queued = self._queue_saved()
         self._closed = True
+        self.offer.bind(None)
         if self.jobs is not None:
             remaining = max(0.0, deadline - time.monotonic())
             if queued:

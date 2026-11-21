@@ -25,6 +25,7 @@ from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui import meeting_recording
 from astra_voice.ui.meeting_bridge import MeetingBridge
+from astra_voice.ui.meeting_offer import OfferView
 from astra_voice.ui.meeting_recording import AudioHints, MeetingRecording
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
@@ -92,6 +93,7 @@ class Rig:
         *,
         kind: SessionKind = SessionKind.KDE,
         role_type: type[Supervisor] = Supervisor,
+        settings: Settings | None = None,
     ) -> None:
         self.now = 100.0
         self.session = Session()
@@ -101,7 +103,7 @@ class Rig:
         self.store = MeetingStore(root / "meetings")
         self.supervisors: list[Supervisor] = []
         self.bridge = MeetingBridge(
-            Settings(meetings_enabled=True),
+            settings if settings is not None else Settings(meetings_enabled=True),
             store=self.store,
             session=kind,
             save=lambda settings: None,
@@ -140,16 +142,17 @@ class Rig:
     def supervisor(self) -> Supervisor:
         return self.supervisors[-1]
 
-    def call_state(self, app_class: str = "dion") -> dict[str, Any]:
-        query = next(
-            message
-            for message in reversed(self.supervisor.messages)
-            if message["type"] == "meeting.call.query"
-        )
+    def call_state(self, app_class: str = "dion", *, req: str | None = None) -> dict[str, Any]:
+        if req is None:
+            req = next(
+                message["req"]
+                for message in reversed(self.supervisor.messages)
+                if message["type"] == "meeting.call.query"
+            )
         return {
             "type": "meeting.call.state",
-            "request_type": query["type"],
-            "req": query["req"],
+            "request_type": "meeting.call.query",
+            "req": req,
             "active": True,
             "app_class": app_class,
             "call_id": "call1",
@@ -276,12 +279,34 @@ def test_only_correlated_call_state_enables_app_stream_with_step_6a(
     assert rig.supervisor.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
 
 
-def test_closed_w4_ignores_call_state_even_with_matching_req(rig: Rig) -> None:
+@pytest.mark.parametrize("observing", [False, True])
+def test_closed_w4_ignores_call_state_even_with_its_own_req(rig: Rig, observing: bool) -> None:
+    view = Mock(spec=OfferView)
+    rig.recording.bind_offer(view)
+    if observing:
+        rig.bridge.setSetting("meeting_offer_on_call", True)
+        rig.recording.tick()
+        deliver_detector(rig.supervisor, rig.supervisor.messages[-1], "meeting.detector.started")
     rig.bridge.requestRecording()
     event = rig.call_state()
     rig.recording.dialog_open = False
     rig.supervisor.event(event)
+    rig.recording.tick()
     assert not rig.recording.call_id
+    view.show.assert_not_called()
+    if observing:
+        rig.session.value = SessionSnapshot(known=True, locked=True)
+        rig.recording.tick()
+        rig.session.value = SessionSnapshot(known=True, locked=False)
+        rig.recording.tick()
+        rig.now = 105.0
+        rig.recording.tick()
+        req = rig.recording._offer_query_req
+        assert req and req != event["req"]
+        rig.supervisor.event({**rig.call_state(req=req), "measured_mono_ms": 105000})
+        rig.recording.tick()
+        view.show.assert_called_once_with("call-app", 60)
+        assert not rig.recording.call_id
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,7 @@ from test_meeting_recording_bridge import (
 from test_meeting_recording_bridge import rig as rig
 
 from astra_voice.core.meeting_session import StorageStatus
+from astra_voice.ui.meeting_offer import OfferView
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
@@ -87,12 +88,28 @@ def test_observation_starts_one_role_without_dialog_or_pcm(
 
 
 @pytest.mark.parametrize("gate", ["setting", "policy", "toggle", "remote"])
+@pytest.mark.parametrize("show_w1", [False, True])
 def test_revoke_one_observation_gate_retires_role_without_dialog(
-    rig: Rig, gate: str, monkeypatch: pytest.MonkeyPatch
+    rig: Rig, gate: str, show_w1: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    view = Mock(spec=OfferView)
+    rig.recording.bind_offer(view)
     start = observe(rig)
     role = rig.supervisor
     deliver_detector(role, start, "meeting.detector.started")
+    if show_w1:
+        role.event(
+            {
+                "type": "meeting.call.started",
+                "generation": role.generation,
+                "call_id": "current-call",
+                "app_class": "dion",
+                "variant1": True,
+                "measured_mono_ms": 100_000,
+            }
+        )
+        rig.recording.tick()
+        view.show.assert_called_once_with("call-app", 60)
     assert rig.session.closes == 0 and rig.session.receivers(rig.session.changed) == 1
 
     with monkeypatch.context() as patch:
@@ -107,6 +124,10 @@ def test_revoke_one_observation_gate_retires_role_without_dialog(
             deliver_remote(role)
         rig.recording.tick()
         assert command_types(role) == [DETECTOR_START, DETECTOR_STOP, SHUTDOWN]
+        if show_w1:
+            view.close.assert_called_once_with()
+        else:
+            view.close.assert_not_called()
         assert not rig.bridge.startDialogOpen
         assert rig.session.closes == 1 and rig.session.receivers(rig.session.changed) == 0
         leave(role)
