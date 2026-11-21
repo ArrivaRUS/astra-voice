@@ -959,10 +959,13 @@ class MeetingController:
         def write() -> None:
             deadline = self._metadata_retry_clock() + METADATA_RETRY_SECONDS
             delay = 0.01
+            succeeded = False
             try:
-                while True:
+                # Preserve the last disk state once exit has stopped the drain.
+                while not self._metadata_retry_stop.is_set():
                     try:
                         self.store.write(snapshot.id, "meeting.json", snapshot, writer=Writer.GUI)
+                        succeeded = True
                         break
                     except MeetingStoreBusy:
                         remaining = deadline - self._metadata_retry_clock()
@@ -972,9 +975,8 @@ class MeetingController:
                         self._metadata_retry_wait(self._metadata_retry_stop, min(delay, remaining))
                         delay = min(delay * 2, 0.2)
             except (MeetingStoreError, OSError):
-                self._write_results.put((snapshot.id, False, final))
-            else:
-                self._write_results.put((snapshot.id, True, final))
+                pass
+            self._write_results.put((snapshot.id, succeeded, final))
 
         try:
             self._metadata_submit(write)

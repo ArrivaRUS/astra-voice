@@ -274,53 +274,150 @@ def test_exit_retries_final_snapshot_until_drained(
         assert isinstance(meeting, Meeting) and meeting.state == MeetingState.TRANSCRIBING
 
 
-def test_exit_deadline_interrupts_wait_and_later_snapshot_tries_once(
+def test_exit_retries_busy_recorded_snapshot_within_budget(
     room: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prepare_room(room, monkeypatch)
+    room.reply("started")
+    await_gui_writer(room)
+    controller = room.recording.controller
+    jobs = bind_exit_jobs(room)
+    on_recorded = Mock(wraps=jobs.on_recorded)
+    room.recording._exit_stop_timeout = WATCHDOG
+    retry = RetryTime()
+    waiting, released = threading.Event(), threading.Event()
+    write = room.store.write
+    attempts: list[float] = []
+
+    def observe_write(meeting_id: str, filename: str, document: Meeting, *, writer: Writer) -> None:
+        if filename == "meeting.json" and document.state == MeetingState.RECORDED:
+            attempts.append(retry.now)
+        write(meeting_id, filename, document, writer=writer)
+
+    def wait(interrupt: threading.Event, seconds: float) -> bool:
+        waiting.set()
+        if not released.wait(WATCHDOG):
+            raise OSError("test exit join watchdog")
+        return retry.wait_for_gui(interrupt, seconds)
+
+    with monkeypatch.context() as patch, store_lock(room.store.root / MID) as fd:
+        patch.setattr(controller, "_metadata_retry_clock", retry.clock)
+        patch.setattr(controller, "_metadata_retry_wait", wait)
+        patch.setattr(room.store, "write", observe_write)
+        patch.setattr(jobs, "on_recorded", on_recorded)
+        try:
+            finish(room)
+            assert waiting.wait(WATCHDOG)
+            assert attempts == [0.0]
+            assert not controller.saved
+            thread = controller._writer._thread
+            assert thread is not None
+            join = thread.join
+
+            def release_at_join(timeout: float | None = None) -> None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                released.set()
+                join(timeout)
+
+            patch.setattr(thread, "join", release_at_join)
+            room.recording.shutdown()
+        finally:
+            released.set()
+            assert controller.close(timeout=WATCHDOG)
+        assert attempts == [0.0, 0.01]
+        assert not controller._metadata_retry_stop.is_set()
+        assert controller.saved
+        on_recorded.assert_called_once_with(MID)
+        meeting = room.store.read(MID, "meeting.json")
+        assert isinstance(meeting, Meeting) and meeting.state == MeetingState.TRANSCRIBING
+
+
+def test_exit_deadline_discards_waiting_and_queued_snapshots_then_recovers(
+    room: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepare_room(room, monkeypatch)
+    room.reply("started")
+    await_gui_writer(room)
+    room.store.write(
+        MID,
+        "capture.json",
+        CaptureJournal(
+            MID,
+            0,
+            "capture1",
+            boundaries=[
+                {"kind": "open", "t_mono_ms": 100000, "recorded_ms": 0, "reason": None},
+                {"kind": "close", "t_mono_ms": 105000, "recorded_ms": 5000, "reason": "stop"},
+            ],
+        ),
+        writer=Writer.CAPTURE,
+    )
     jobs = bind_exit_jobs(room)
     on_recorded = Mock(wraps=jobs.on_recorded)
     controller = room.recording.controller
     room.recording._exit_stop_timeout = 0.0
+    retry = RetryTime()
     waiting, drained = threading.Event(), threading.Event()
     states: list[MeetingState] = []
     write = room.store.write
+    results = Mock(wraps=controller._write_results)
 
     def observe_write(meeting_id: str, filename: str, document: Meeting, *, writer: Writer) -> None:
         states.append(document.state)
         write(meeting_id, filename, document, writer=writer)
 
     def wait(interrupt: threading.Event, seconds: float) -> bool:
+        retry.wait(seconds)
         waiting.set()
-        # Model an in-progress wait when the exit budget expires.
-        return interrupt.wait(WATCHDOG)
+        if not interrupt.wait(WATCHDOG):
+            raise OSError("test exit signal watchdog")
+        # A forbidden post-exit attempt could publish successfully now.
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
 
-    with monkeypatch.context() as patch:
+    with monkeypatch.context() as patch, store_lock(room.store.root / MID) as fd:
+        patch.setattr(controller, "_metadata_retry_clock", retry.clock)
         patch.setattr(controller, "_metadata_retry_wait", wait)
+        patch.setattr(controller, "_write_results", results)
         patch.setattr(room.store, "write", observe_write)
         patch.setattr(jobs, "on_recorded", on_recorded)
-        with store_lock(room.store.root / MID):
-            try:
-                room.reply("started")
-                assert waiting.wait(WATCHDOG)
-                finish(room)
-                controller._writer.submit(drained.set)
-                room.recording.shutdown()
-                assert drained.wait(1), "metadata writer did not wake on exit timeout"
-                controller._drain_writes()
-                assert states == [
-                    MeetingState.RECORDING,
-                    MeetingState.RECORDING,
-                    MeetingState.RECORDED,
-                ]
-                assert not controller.saved
-                assert controller.error_code == "storage-unavailable"
-                meeting = room.store.read(MID, "meeting.json")
-                assert isinstance(meeting, Meeting) and meeting.state == MeetingState.RECORDING
-                on_recorded.assert_not_called()
-            finally:
-                controller._metadata_retry_stop.set()
-                assert controller.close(timeout=WATCHDOG)
+        try:
+            finish(room)
+            assert waiting.wait(WATCHDOG)
+            assert states == [MeetingState.RECORDED]
+            assert 0 < retry.now < meeting_session.METADATA_RETRY_SECONDS
+            assert controller.meeting is not None
+            controller._enqueue_metadata(controller.meeting)
+            controller._writer.submit(drained.set)
+            room.recording.shutdown()
+            assert drained.wait(1), "metadata writer did not wake on exit timeout"
+            controller._drain_writes()
+            assert states == [MeetingState.RECORDED]
+            assert retry.delays == [0.01]
+            assert results.put.call_args_list == [
+                call((MID, False, True)),
+                call((MID, False, False)),
+            ]
+            assert not controller.saved
+            assert controller.error_code == "storage-unavailable"
+            meeting = room.store.read(MID, "meeting.json")
+            assert isinstance(meeting, Meeting) and meeting.state == MeetingState.RECORDING
+            on_recorded.assert_not_called()
+        finally:
+            controller._metadata_retry_stop.set()
+            assert controller.close(timeout=WATCHDOG)
+
+    restarted = Rig(room.store.root.parent)
+    try:
+        restarted.recording.initialize()
+        restarted.recording.tick()
+        assert restarted.bridge.interruptedOpen
+        assert restarted.bridge.interruptedText == "Запись встречи прервалась. Сохранено 0:00:05"
+        recovered = restarted.store.read(MID, "meeting.json")
+        assert isinstance(recovered, Meeting) and recovered.state == MeetingState.INTERRUPTED
+        assert recovered.recorded_ms == 5000
+    finally:
+        restarted.bridge.shutdown()
 
 
 @contextmanager
@@ -675,6 +772,39 @@ def test_store_eagain_outside_flock_is_io(
             else:
                 store.write(MID, "meeting.json", meeting, writer=Writer.GUI)
         assert injected
+        assert type(result.value) is MeetingStoreError
+
+
+@pytest.mark.parametrize("name", [".writer-gui.lock", ".store.lock"])
+def test_store_eagain_reopening_existing_lock_is_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    store = MeetingStore(tmp_path / "meetings")
+    meeting = Meeting(id=MID, started_at="2026-11-01T12:00:00+00:00")
+    store.create(meeting)
+    with store_lock(store.root / MID, name):
+        pass
+    original_open = os.open
+    exclusive: list[bool] = []
+
+    def open_lock(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if os.fspath(path) == name:
+            exclusive.append(bool(flags & os.O_EXCL))
+            if not exclusive[-1]:
+                raise BlockingIOError(errno.EAGAIN, "test existing lock file I/O")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", open_lock)
+        with pytest.raises(MeetingStoreError) as result:
+            store.write(MID, "meeting.json", meeting, writer=Writer.GUI)
+        assert exclusive == [True, False]
         assert type(result.value) is MeetingStoreError
 
 
