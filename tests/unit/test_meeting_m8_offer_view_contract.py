@@ -65,9 +65,11 @@ def test_q3_controls_share_one_pressed_action_and_avoid_keyboard_and_theme_color
         "start",
         "refuse",
         "close",
+        "open_meetings",
     }
     assert not re.search(
-        r"\b(?:Keys\.|activeFocusOnTab|focusPolicy|focus:\s*true|(?:AbstractButton|Button|ToolButton|ToolTip|Timer)\s*\{)",
+        r"\b(?:Keys\.|activeFocusOnTab|focusPolicy|focus:\s*true|QtQuick\.Shapes"
+        r"|(?:AbstractButton|Button|ToolButton|ToolTip|Timer)\s*\{)",
         offer + control,
     )
     colors = re.findall(r"^\s*(?:(?:border\.)?color|\w+Color):\s*(.+)", offer + control, re.M)

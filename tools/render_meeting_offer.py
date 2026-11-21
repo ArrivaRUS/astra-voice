@@ -15,9 +15,17 @@ from types import SimpleNamespace
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
+STATES = (
+    ("call-app", "call-app", 42),
+    ("call-browser", "call-browser", 51),
+    ("call-app-60", "call-app", 60),
+    ("hover-start", "call-app", 42),
+    ("starting", "call-app", 37),
+    ("start-failed", "call-app", 42),
+)
 
 
-def render(out: Path) -> list[dict[str, Any]]:
+def render(out: Path, only: list[str] | None = None) -> list[dict[str, Any]]:
     for key in (
         "DISPLAY",
         "WAYLAND_DISPLAY",
@@ -51,6 +59,7 @@ def render(out: Path) -> list[dict[str, Any]]:
     from PyQt5.QtTest import QTest
 
     sys.path.insert(0, str(REPO / "src"))
+    from astra_voice.core.meeting_session import ERROR_TEXT
     from astra_voice.ui.meeting_offer_window import MeetingOffer
 
     QQuickWindow.setSceneGraphBackend("software")
@@ -81,21 +90,21 @@ def render(out: Path) -> list[dict[str, Any]]:
     root.setProperty("freezeAnimations", True)
     out.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    states = (
-        ("call-app", "call-app", 42),
-        ("call-browser", "call-browser", 51),
-        ("call-app-60", "call-app", 60),
-        ("hover-start", "call-app", 42),
-    )
     try:
-        for theme_name in ("light", "dark"):
-            theme.value = theme_name == "dark"
-            theme.changed.emit()
-            for state, kind, seconds in states:
-                window.show(kind, 60)
-                window.update_remaining(seconds)
-                progress = root.findChild(QQuickItem, "offerProgress")
-                progress.setProperty("fraction", seconds / 60)
+        for state, kind, seconds in STATES:
+            if only is not None and state not in only:
+                continue
+            window.show(kind, 60)
+            window.update_remaining(seconds)
+            progress = root.findChild(QQuickItem, "offerProgress")
+            progress.setProperty("fraction", seconds / 60)
+            if state == "starting":
+                window.starting()
+            elif state == "start-failed":
+                window.start_failed(ERROR_TEXT["disk-low"])
+            for theme_name in ("light", "dark"):
+                theme.value = theme_name == "dark"
+                theme.changed.emit()
                 app.processEvents()
                 dark = QQmlExpression(QQmlEngine.contextForObject(root), root, "Theme.dark")
                 if dark.evaluate()[0] != theme.value or dark.hasError():
@@ -143,7 +152,7 @@ def render(out: Path) -> list[dict[str, Any]]:
                         },
                     }
                 )
-                window.close()
+            window.close()
         if warnings:
             raise RuntimeError("\n".join(warnings))
     finally:
@@ -161,8 +170,9 @@ def render(out: Path) -> list[dict[str, Any]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True, help="Destination for PNGs and manifest")
+    parser.add_argument("--only", nargs="+", choices=[state for state, _, _ in STATES])
     args = parser.parse_args()
-    for row in render(args.out.resolve()):
+    for row in render(args.out.resolve(), args.only):
         print(f"{row['file']}: {row['width']}x{row['height']}")
     return 0
 
