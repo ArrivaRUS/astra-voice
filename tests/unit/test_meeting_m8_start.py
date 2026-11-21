@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import queue
 import re
+import struct
 import threading
+import wave
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -684,6 +687,83 @@ def resolved_target(pinned: PinnedTarget) -> Target:
         client=stream.client,
         starttime=stream.process.starttime,
     )
+
+
+@pytest.mark.parametrize("pause_ms", [0, 400])
+def test_capture_writes_single_pinned_pulse_directly(
+    service: tuple[Rig, CheckDouble],
+    capture_events: CaptureEvents,
+    monkeypatch: pytest.MonkeyPatch,
+    pause_ms: int,
+) -> None:
+    rig, checks = service
+    far = app_far(rig, checks)
+    target = replace(TARGET, measured_at=rig.clock())
+    prepare_allowed(rig, checks, far, target)
+    payloads = (
+        struct.pack("<4h", 1, 769, -3, 32767) * 400,
+        struct.pack("<4h", -121, 325, 0, -32768) * 400,
+    )
+    both_queued = threading.Event()
+    queued: list[bytes] = []
+    mono_start = int(rig.clock() * 1000)
+
+    class NativeDouble(Pulse):
+        def __init__(self) -> None:
+            super().__init__()
+            self.target = resolved_target(target)
+            self.packets = iter(payloads)
+            self.end = mono_start
+
+        def read_chunk(self) -> bytes:
+            data = next(self.packets, b"")
+            if data:
+                self.end += 100 + (pause_ms if data == payloads[1] else 0)
+            return data
+
+        def sample_clock(self) -> tuple[str, int, int]:
+            return "pulse", self.end - mono_start, self.end
+
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor_stream, "NativePulse", NativeDouble)
+        patch.setattr(rig.backend, "source", monitor_stream.CapturePulseBackend().source)
+        assert rig.send("open", **admission(rig))[0]["type"] == "meeting.ack"
+        assert rig.state.archive is not None
+        put = rig.state.archive.put
+
+        def archive_pcm(kind: str, payload: Any) -> bool:
+            accepted = put(kind, payload)
+            if accepted and kind == "pcm" and payload[0] == "far":
+                queued.append(payload[1])
+                if len(queued) == len(payloads):
+                    both_queued.set()
+            return accepted
+
+        patch.setattr(rig.state.archive, "put", archive_pcm)
+        started = capture_events.finish("opened", "meeting.capture.started")
+        assert started["tracks"] == ["mic", "far"] and both_queued.wait(2)
+        assert type(rig.state.sources["far"]) is MonitorStreamSource
+        rig.send("stop")
+        capture_events.finish("closed", "meeting.capture.closed")
+        finalized = capture_events.finish("finalized", "meeting.capture.finalized")
+
+    expected_segments = 2 if pause_ms else 1
+    assert queued == list(payloads) and finalized["segments"]["far"] == expected_segments
+    # capture.json owns capture edges; audio clocks are in per-segment sidecars.
+    journal = json.loads((rig.directory / "capture.json").read_text())
+    assert [edge["kind"] for edge in journal["boundaries"]] == ["open", "close"]
+    observed_pcm = bytearray()
+    for index in range(expected_segments):
+        audio = rig.directory / "audio" / f"far-{index:04d}"
+        with wave.open(str(audio.with_suffix(".wav"))) as wav:
+            assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (16000, 1, 2)
+            observed_pcm.extend(wav.readframes(wav.getnframes()))
+        sidecar = json.loads(audio.with_suffix(".json").read_text())
+        assert sidecar["clock"] == "pulse"
+        assert sidecar["close_reason"] == ("clock_change" if index == 0 and pause_ms else "stop")
+        expected_end = mono_start + (100 if index == 0 and pause_ms else 200 + pause_ms)
+        assert sidecar["timeline"][-1][1] == expected_end
+    assert observed_pcm == b"".join(payloads)
 
 
 @pytest.mark.parametrize("code", ["target-gone", "target-mismatch"])

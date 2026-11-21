@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ctypes
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -129,12 +131,261 @@ def test_prepare_uses_pinned_identity_in_native_backend(
     assert pulse.calls == [("resolve", 7)]
 
 
-def test_backend_source_retains_start_target(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_single_member_uses_direct_native_trace(monkeypatch: pytest.MonkeyPatch) -> None:
+    trace: list[tuple[object, ...]] = []
+
+    class NativeDouble(Pulse):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = trace
+            trace.append(("context-open",))
+
+        def poll_events(self) -> list[tuple[str, int]]:
+            trace.append(("poll",))
+            return super().poll_events()
+
+        def sample_clock(self) -> tuple[str, int, int]:
+            trace.append(("clock",))
+            return super().sample_clock()
+
+        def close(self) -> None:
+            trace.append(("context-close",))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor_stream, "NativePulse", NativeDouble)
+        backend = monitor_stream.CapturePulseBackend()
+        backend.token = "trace"
+        source = backend.source(FAR, target=PINNED)
+        assert type(source) is MonitorStreamSource
+        assert source.target is PINNED and trace == [("context-open",)]
+        source.open()
+        try:
+            assert source.read_chunk() == b"\0\0" * 1600
+            assert source.sample_clock() == ("pulse", 100, 100100)
+            native = source.pulse
+            assert isinstance(native, NativeDouble)
+            native.target = replace(RESOLVED, monitor="sink-b.monitor")
+            native.events.append(("changed", 7))
+            assert source.read_chunk() == b"" and source.change == "sink-moved"
+            assert source.read_chunk() == b"\0\0" * 1600
+            assert source.sample_clock() == ("pulse", 100, 100100)
+        finally:
+            source.shutdown()
+    # This is the trace from the same double on 9138d4f.
+    assert trace == [
+        ("context-open",),
+        ("resolve", 7),
+        ("sink-a.monitor", 7, "trace"),
+        ("resolve", 7),
+        ("poll",),
+        ("read",),
+        ("clock",),
+        ("poll",),
+        ("resolve", 7),
+        ("closed",),
+        ("sink-b.monitor", 7, "trace"),
+        ("resolve", 7),
+        ("poll",),
+        ("read",),
+        ("clock",),
+        ("closed",),
+        ("context-close",),
+    ]
+
+
+def test_multi_member_backend_captures_factory_without_constructing_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[Pulse] = []
+    target = replace(PINNED, streams=(PINNED.streams[0], replace(PINNED.streams[0], sink_input=8)))
+
+    class NativeDouble(Pulse):
+        def __init__(self) -> None:
+            super().__init__()
+            self.target = replace(RESOLVED, index=7 + len(created))
+            created.append(self)
+
+    class UnexpectedNative:
+        def __init__(self) -> None:
+            pytest.fail("the backend must capture the factory when creating the source")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor_stream, "NativePulse", NativeDouble)
+        source = monitor_stream.CapturePulseBackend().source(FAR, target=target)
+        assert isinstance(source, monitor_stream.MixedFarSource)
+        assert source.target is target and created == []
+        patch.setattr(monitor_stream, "NativePulse", UnexpectedNative)
+        source.open()
+        try:
+            assert len(created) == 2
+            for index, native in enumerate(created, 7):
+                assert native.calls == [
+                    ("resolve", index),
+                    (RESOLVED.monitor, index, source.token),
+                    ("resolve", index),
+                ]
+        finally:
+            source.shutdown()
+
+
+def test_backend_prepare_rejects_mismatch_in_any_pinned_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = replace(
+        PINNED,
+        streams=tuple(replace(PINNED.streams[0], sink_input=i) for i in range(7, 10)),
+    )
+    checked: list[int] = []
+    mismatch: int | None = None
+
+    class NativeDouble(Pulse):
+        def resolve(
+            self, index: int, *, expected_pid: int | None = None, confirm_loss: bool = False
+        ) -> Target:
+            checked.append(index)
+            return replace(RESOLVED, index=index, serial=RESOLVED.serial + (index == mismatch))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(monitor_stream, "NativePulse", NativeDouble)
+        backend = monitor_stream.CapturePulseBackend()
+        assert backend.prepare(FAR, target=target)["far_available"]
+        assert checked == [7, 8, 9]
+        for mismatch in [8, 9]:
+            checked.clear()
+            with pytest.raises(ValueError, match="^target-mismatch$"):
+                backend.prepare(FAR, target=target)
+            assert checked == list(range(7, mismatch + 1))
+
+
+@pytest.mark.parametrize("count,reason", [(0, "target-gone"), (9, "target-mismatch")])
+def test_backend_rejects_targets_outside_the_member_limit(
+    monkeypatch: pytest.MonkeyPatch, count: int, reason: str
+) -> None:
+    target = replace(PINNED, streams=PINNED.streams * count)
+    backend = monitor_stream.CapturePulseBackend()
     with monkeypatch.context() as patch:
         patch.setattr(monitor_stream, "NativePulse", Pulse)
-        source = monitor_stream.CapturePulseBackend().source(FAR, target=PINNED)
-    assert source.target is PINNED
-    assert isinstance(source.pulse, Pulse) and source.pulse.calls == []
+        with pytest.raises(ValueError, match=f"^{reason}$"):
+            backend.source(FAR, target=target)
+        assert backend.control is None
+        with pytest.raises(ValueError, match=f"^{reason}$"):
+            backend.prepare(FAR, target=target)
+        assert isinstance(backend.control, Pulse) and backend.control.calls == []
+
+
+@pytest.mark.parametrize("boundary", [None, "create", "connect"])
+def test_mixer_propagates_admission_check_and_guard_to_native_boundaries(
+    monkeypatch: pytest.MonkeyPatch, boundary: str | None
+) -> None:
+    from astra_voice.worker import pulse_stream
+
+    libs: list[Mock] = []
+    allowed = True
+    guard_held = False
+    target = replace(PINNED, streams=(PINNED.streams[0], replace(PINNED.streams[0], sink_input=8)))
+
+    @contextmanager
+    def guard() -> Iterator[None]:
+        nonlocal guard_held
+        assert not guard_held
+        guard_held = True
+        try:
+            yield
+        finally:
+            guard_held = False
+
+    def init(pulse: Any) -> None:
+        pulse.lib = lib = Mock()
+        pulse.mainloop = None
+        second = bool(libs)
+        libs.append(lib)
+        disconnected = False
+        connected = False
+
+        def gated_create(*_args: object) -> int:
+            assert guard_held and allowed
+            return 22
+
+        def gated_connect(*_args: object) -> int:
+            nonlocal connected
+            assert guard_held and allowed
+            connected = True
+            return 0
+
+        def proplist_set(*_args: object) -> int:
+            nonlocal allowed
+            if second and boundary == "create":
+                allowed = False
+            return 0
+
+        def set_monitor(*_args: object) -> int:
+            nonlocal allowed
+            if second and boundary == "connect":
+                allowed = False
+            return 0
+
+        def disconnect(*_args: object) -> int:
+            nonlocal disconnected
+            if not connected:
+                return -15
+            disconnected = True
+            return 0
+
+        lib.pa_proplist_new.return_value = 10
+        lib.pa_proplist_sets.side_effect = proplist_set
+        lib.pa_stream_new_with_proplist.side_effect = gated_create
+        lib.pa_stream_set_monitor_stream.side_effect = set_monitor
+        lib.pa_stream_connect_record.side_effect = gated_connect
+        lib.pa_stream_disconnect.side_effect = disconnect
+        lib.pa_context_get_state.return_value = 4
+        lib.pa_stream_get_state.side_effect = lambda _: 4 if disconnected else 2 if connected else 0
+
+    class NativeDouble(monitor_stream.NativePulse):
+        def _connect(self) -> None:
+            self.context = 1
+
+        def resolve(
+            self, index: int, *, expected_pid: int | None = None, confirm_loss: bool = False
+        ) -> Target:
+            return replace(RESOLVED, index=index)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pulse_stream._PulseAsync, "__init__", init)
+        patch.setattr(monitor_stream, "NativePulse", NativeDouble)
+        source = monitor_stream.CapturePulseBackend().source(FAR, target=target)
+        assert isinstance(source, monitor_stream.MixedFarSource)
+        assert libs == []
+        source.admission_check = lambda: allowed
+        source.admission_guard = guard
+        try:
+            if boundary is None:
+                source.open()
+            else:
+                with pytest.raises(ValueError, match="^admission-stale$"):
+                    source.open()
+            first, second = libs
+            first.pa_stream_new_with_proplist.assert_called_once()
+            first.pa_stream_set_monitor_stream.assert_called_once_with(22, 7)
+            first.pa_stream_connect_record.assert_called_once()
+            assert second.pa_stream_new_with_proplist.call_count == (boundary != "create")
+            if boundary == "create":
+                second.pa_stream_set_monitor_stream.assert_not_called()
+            else:
+                second.pa_stream_set_monitor_stream.assert_called_once_with(22, 8)
+            assert second.pa_stream_connect_record.call_count == (boundary is None)
+            if boundary == "connect":
+                second.pa_stream_disconnect.assert_not_called()
+                second.pa_stream_unref.assert_called_once_with(22)
+            for lib in libs:
+                steps = [
+                    call[0]
+                    for call in lib.method_calls
+                    if call[0] in {"pa_stream_set_monitor_stream", "pa_stream_connect_record"}
+                ]
+                if lib.pa_stream_connect_record.called:
+                    assert steps == ["pa_stream_set_monitor_stream", "pa_stream_connect_record"]
+        finally:
+            source.shutdown()
 
 
 def test_backend_prepare_reports_unsupported_monitor_without_pcm(
