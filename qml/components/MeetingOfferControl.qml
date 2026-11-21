@@ -8,6 +8,7 @@ Rectangle {
     property bool primary: false
     property bool closeControl: false
     property bool inert: false
+    enabled: !inert
     property bool spinning: false
     property bool freezeAnimations: false
     readonly property bool hasActionGlyph: !closeControl && !spinning && glyph.length > 0
@@ -26,6 +27,8 @@ Rectangle {
     antialiasing: true
     Accessible.role: Accessible.Button
     Accessible.name: control.label
+    // Qt Quick 5 does not expose Item.enabled in the accessible state.
+    Accessible.ignored: control.inert || !control.visible
     Accessible.onPressAction: control.pressed(false)
 
     Icon {

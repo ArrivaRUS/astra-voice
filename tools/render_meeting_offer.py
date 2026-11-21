@@ -60,6 +60,7 @@ def render(out: Path, only: list[str] | None = None) -> list[dict[str, Any]]:
 
     sys.path.insert(0, str(REPO / "src"))
     from astra_voice.core.meeting_session import ERROR_TEXT
+    from astra_voice.ui.meeting_offer import OFFER_GUARD_MS
     from astra_voice.ui.meeting_offer_window import MeetingOffer
 
     QQuickWindow.setSceneGraphBackend("software")
@@ -84,7 +85,8 @@ def render(out: Path, only: list[str] | None = None) -> list[dict[str, Any]]:
         view.engine().warnings.connect(lambda rows: warnings.extend(row.toString() for row in rows))
         return view
 
-    recording = SimpleNamespace(offer=SimpleNamespace(now_ms=lambda: 0))
+    now_ms = 0
+    recording = SimpleNamespace(offer=SimpleNamespace(now_ms=lambda: now_ms))
     window = MeetingOffer(recording, cursor_pos=QPoint, view_factory=create_view)
     view, root = window._view, window._root
     root.setProperty("freezeAnimations", True)
@@ -102,6 +104,9 @@ def render(out: Path, only: list[str] | None = None) -> list[dict[str, Any]]:
                 window.starting()
             elif state == "start-failed":
                 window.start_failed(ERROR_TEXT["disk-low"])
+                # Capture the settled window. Its card is already at the final height.
+                now_ms += OFFER_GUARD_MS
+                window._release_failure_input()
             for theme_name in ("light", "dark"):
                 theme.value = theme_name == "dark"
                 theme.changed.emit()
