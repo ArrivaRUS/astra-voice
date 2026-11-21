@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
+import sys
 import threading
 import time
 import uuid
+from array import array
 from collections import deque
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from astra_voice.meetings.identity import ProcReader, ProcUnavailable
@@ -23,7 +26,7 @@ from astra_voice.worker.meeting_audio_local import CONNECT_LOCK
 from astra_voice.worker.meeting_detector import INVALID_INDEX, project_properties
 
 if TYPE_CHECKING:
-    from astra_voice.worker.meeting_identity_check import PinnedTarget
+    from astra_voice.worker.meeting_identity_check import PinnedStream, PinnedTarget
 
 _PID = "application.process.id"
 _SERIAL = "object.serial"
@@ -90,17 +93,16 @@ class MonitorPulse(Protocol):
     def sample_clock(self) -> tuple[str, int, int]: ...
 
 
-def _resolve_target(
-    pulse: MonitorPulse, target: PinnedTarget, *, confirm_loss: bool = False
+def _resolve_stream(
+    pulse: MonitorPulse, cookie: int, stream: PinnedStream, *, confirm_loss: bool = False
 ) -> Target:
-    (stream,) = target.streams
     fresh = pulse.resolve(
         stream.sink_input, expected_pid=stream.process.pid, confirm_loss=confirm_loss
     )
     if fresh is None:
         raise ValueError("target-gone")
     if (
-        fresh.cookie != target.server_cookie
+        fresh.cookie != cookie
         or fresh.index != stream.sink_input
         or fresh.serial != stream.stream_serial
         or fresh.client != stream.client
@@ -119,13 +121,17 @@ class MonitorStreamSource:
         self.lock = threading.RLock()
         self.monitor = ""
         self.ended = False
+        self.end_reason: str | None = None
         self.change: str | None = None
         self.opened = False
+        self.pending_recheck = False
+        self.reopen_attempted = False
         self.admission_check: Callable[[], bool] = lambda: True
         self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
-        if isinstance(pulse, NativePulse):
-            pulse.admission_check = lambda: self.admission_check()
-            pulse.admission_guard = lambda: self.admission_guard()
+        if hasattr(pulse, "admission_guard") or isinstance(pulse, NativePulse):
+            native = cast(NativePulse, pulse)
+            native.admission_check = lambda: self.admission_check()
+            native.admission_guard = lambda: self.admission_guard()
 
     def open(self, device: str | None = None) -> None:
         with self.lock:
@@ -135,11 +141,19 @@ class MonitorStreamSource:
         if self.target is not None:
             if not self.pulse.monitor_supported:
                 raise ValueError("monitor-stream-unsupported")
-            fresh = _resolve_target(self.pulse, self.target)
+            fresh = self._resolve()
             self._open_record(fresh.monitor, fresh.index)
         else:
             self._open_record(self.pulse.default_monitor(), None)
         self.ended = False
+        self.end_reason = self.change = None
+        self.pending_recheck = False
+
+    def _resolve(self, *, confirm_loss: bool = False) -> Target:
+        assert self.target is not None
+        return _resolve_stream(
+            self.pulse, self.target.server_cookie, self.target.streams[0], confirm_loss=confirm_loss
+        )
 
     def _open_record(self, monitor: str, index: int | None) -> None:
         if not self.admission_check():
@@ -150,11 +164,12 @@ class MonitorStreamSource:
             try:
                 self.close()
             finally:
-                if isinstance(self.pulse, NativePulse) and not self.pulse.context_ready():
+                context_ready = getattr(self.pulse, "context_ready", None)
+                if context_ready is not None and not context_ready():
                     raise ValueError("audio-failed") from connect_error
             if self.target is not None and str(connect_error) != "admission-stale":
                 try:
-                    _resolve_target(self.pulse, self.target, confirm_loss=True)
+                    self._resolve(confirm_loss=True)
                 except Exception as target_error:
                     if isinstance(target_error, ValueError) and str(target_error) in {
                         "target-gone",
@@ -165,7 +180,7 @@ class MonitorStreamSource:
             raise
         try:
             if self.target is not None:
-                _resolve_target(self.pulse, self.target)
+                self._resolve()
             if not self.admission_check():
                 raise ValueError("admission-stale")
         except Exception:
@@ -178,24 +193,35 @@ class MonitorStreamSource:
         with self.lock:
             return self._read_chunk()
 
-    def _read_chunk(self) -> bytes | None:
+    def _read_chunk(self, *, allow_reopen: bool = True) -> bytes | None:
+        self.reopen_attempted = False
         if self.ended or not self.opened:
             return None
         self.change = None
-        for kind, index in self.pulse.poll_events():
-            if self.ended:
-                break
-            if self.target is not None:
-                target_index = self.target.streams[0].sink_input
+        events = self.pulse.poll_events()
+        if self.target is not None:
+            target_index = self.target.streams[0].sink_input
+            for kind, index in events:
                 if kind == "removed" and index == target_index:
+                    self.close()
                     self.ended = True
+                    self.end_reason = "removed"
+                    return None
                 elif kind == "server" or index == target_index:
-                    self._check_recording_target()
-                    if self.ended or not self.opened:
-                        return None
-                    if self.change:
-                        return b""
-            elif kind == "server":
+                    self.pending_recheck = True
+            if self.pending_recheck:
+                if not allow_reopen:
+                    return b""
+                self.pending_recheck = False
+                self._check_recording_target()
+                if self.ended or not self.opened:
+                    return None
+                if self.change:
+                    return b""
+        else:
+            for kind, _ in events:
+                if kind != "server":
+                    continue
                 fresh_monitor = self.pulse.default_monitor()
                 if fresh_monitor != self.monitor:
                     self.pulse.close_record()
@@ -209,16 +235,14 @@ class MonitorStreamSource:
                         return None
                     self.change = "sink-moved"
                     return b""
-        if self.ended:
-            self.close()
-            return None
         return self.pulse.read_chunk()
 
     def _check_recording_target(self) -> None:
         assert self.target is not None
         try:
-            fresh = _resolve_target(self.pulse, self.target)
+            fresh = self._resolve()
             if fresh.monitor != self.monitor:
+                self.reopen_attempted = True
                 self.close()
                 self._open_record(fresh.monitor, fresh.index)
                 self.change = "sink-moved"
@@ -230,6 +254,7 @@ class MonitorStreamSource:
             if self.opened:
                 self.close()
             self.ended = True
+            self.end_reason = str(exc)
 
     def sample_clock(self) -> tuple[str, int, int]:
         with self.lock:
@@ -242,10 +267,12 @@ class MonitorStreamSource:
 
     def shutdown(self) -> None:
         with self.lock:
-            self.close()
-            close = getattr(self.pulse, "close", None)
-            if close is not None:
-                close()
+            try:
+                self.close()
+            finally:
+                close = getattr(self.pulse, "close", None)
+                if close is not None:
+                    close()
 
 
 class _ServerInfo(ctypes.Structure):
@@ -541,6 +568,8 @@ def _meeting_pulse_type() -> Any:
 class NativePulse:
     """One serialized native context. Callback payloads copied before returning."""
 
+    wait_us = 10000
+
     def __init__(self) -> None:
         from astra_voice.worker.pulse_stream import SubscribeCallback
 
@@ -806,7 +835,7 @@ class NativePulse:
     def read_chunk(self) -> bytes | None:
         if self.stream is None:
             return None
-        self.pulse.iterate(10000)
+        self.pulse.iterate(self.wait_us)
         if (
             self.pulse.context_get_state(self.context) != 4
             or self.pulse.stream_get_state(self.stream) != 2
@@ -857,6 +886,305 @@ class NativePulse:
         if self.pulse.mainloop is not None:
             self.pulse.mainloop_free(self.pulse.mainloop)
             self.pulse.mainloop = None
+
+
+_FRAMES_PER_MS = 16  # 16 kHz mono s16le
+_MAX_OUTPUT_FRAMES = 1000 * _FRAMES_PER_MS
+_MAX_BUFFER_FRAMES = 1200 * _FRAMES_PER_MS
+_SILENCE_MS = 200
+
+
+def _check_stream_count(target: PinnedTarget) -> None:
+    if not target.streams:
+        raise ValueError("target-gone")
+    if len(target.streams) > 8:
+        raise ValueError("target-mismatch")
+
+
+def _monotonic_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
+
+
+@dataclass
+class _FarMember:
+    source: MonitorStreamSource
+    last_data_ms: int
+    # Positions are in frames. Unreleased blocks are disjoint and ordered.
+    blocks: deque[tuple[int, bytes]] = field(default_factory=deque)
+    end: int | None = None
+    mono_ms: int | None = None
+    retained_until: int | None = None
+    waiting_after_move: bool = False
+
+    @property
+    def buffered_end(self) -> int | None:
+        if not self.blocks:
+            return None
+        start, data = self.blocks[-1]
+        return start + len(data) // 2
+
+    def discard_before(self, pos: int) -> None:
+        while self.blocks and self.blocks[0][0] < pos:
+            start, data = self.blocks.popleft()
+            if start + len(data) // 2 > pos:
+                self.blocks.appendleft((pos, data[(pos - start) * 2 :]))
+                break
+
+    def discard_current_tail(self) -> None:
+        while self.blocks and (
+            self.retained_until is None or self.blocks[-1][0] >= self.retained_until
+        ):
+            self.blocks.pop()
+
+    def moved(self) -> None:
+        self.retained_until = self.buffered_end
+        self.mono_ms = None
+        self.waiting_after_move = True
+
+
+class MixedFarSource:
+    """A single far track for a fixed, independently verified set of streams."""
+
+    def __init__(
+        self,
+        target: PinnedTarget,
+        token: str,
+        *,
+        factory: Callable[[], NativePulse],
+        now_ms: Callable[[], int] = _monotonic_ms,
+    ) -> None:
+        _check_stream_count(target)
+        self.target, self.token = target, token
+        self._factory, self._now_ms = factory, now_ms
+        self._lock = threading.RLock()
+        self._members: list[_FarMember] = []
+        self.admission_check: Callable[[], bool] = lambda: True
+        self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
+        self._reset_mix()
+
+    def _reset_mix(self) -> None:
+        self.ended = self.partial = False
+        self.change: str | None = None
+        self.reanchors = self.late_bytes = 0
+        self._out_pos = 0
+        self._axis: tuple[int, int] | None = None
+        self._leader_observed = False
+        self._stamp = self._now_ms()
+
+    def open(self, device: str | None = None) -> None:
+        with self._lock:
+            self.shutdown()
+            self._reset_mix()
+            try:
+                for stream in self.target.streams:
+                    if not self.admission_check():
+                        raise ValueError("admission-stale")
+                    pulse = self._factory()
+                    source = MonitorStreamSource(
+                        pulse, self.token, target=replace(self.target, streams=(stream,))
+                    )
+                    source.admission_check = lambda: self.admission_check()
+                    source.admission_guard = lambda: self.admission_guard()
+                    self._members.append(_FarMember(source, self._stamp))
+                    source.open(device)
+                opened_ms = self._now_ms()
+                for member in self._members:
+                    member.last_data_ms = opened_ms
+            except BaseException as open_error:
+                try:
+                    self.shutdown()
+                except Exception as close_error:
+                    raise open_error from close_error
+                raise
+
+    def read_chunk(self) -> bytes | None:
+        with self._lock:
+            self.change = None
+            live = [member for member in self._members if not member.source.ended]
+            if not live:
+                return None
+            # Retry deferred events first. The wait allowance belongs to the
+            # first live stream in target order, even when another is retried.
+            allow_reopen = True
+            chunks: list[tuple[_FarMember, bytes, int]] = []
+            for member in sorted(live, key=lambda m: not m.source.pending_recheck):
+                source = member.source
+                with source.lock:
+                    cast(NativePulse, source.pulse).wait_us = 10000 if member is live[0] else 0
+                    data = source._read_chunk(allow_reopen=allow_reopen)
+                    allow_reopen = allow_reopen and not source.reopen_attempted
+                    if data is None:
+                        if not source.ended:
+                            raise ValueError("audio-failed")
+                        live.remove(member)
+                        if source.end_reason != "removed":
+                            member.blocks.clear()
+                    elif source.change:
+                        member.moved()
+                        self.change = source.change
+                    elif data:
+                        _, _, mono_ms = source.sample_clock()
+                        chunks.append((member, data, mono_ms))
+
+            self.partial = 0 < len(live) < len(self._members)
+            if not live:
+                self.ended = True
+                return None
+            if not chunks:
+                return b""
+
+            leader = live[0]
+            now = self._now_ms()
+            # Place the leader first so every other clock is projected against
+            # its latest observation. If it has never delivered a block, the
+            # first available block establishes a provisional origin.
+            chunks.sort(key=lambda chunk: chunk[0] is not leader)
+            if leader.mono_ms is not None and leader.end is not None:
+                self._axis = leader.end, leader.mono_ms
+                self._leader_observed = True
+            for member, data, mono_ms in chunks:
+                self._place(member, data, mono_ms, now, leading=member is leader)
+            if self.change:
+                return b""
+            return self._release(live, now)
+
+    def _place(
+        self, member: _FarMember, data: bytes, mono_ms: int, now: int, *, leading: bool
+    ) -> None:
+        frames = len(data) // 2
+        previous_end, previous_ms = member.end, member.mono_ms
+        if leading:
+            # A real clock step is visible to the archive via the timestamp.
+            # It must not change which samples the leader contributes.
+            start = max(self._out_pos, previous_end if previous_end is not None else self._out_pos)
+            if not self._leader_observed and self._axis is not None and self._out_pos == 0:
+                # Before any release, include a first leader block that
+                # overlaps or precedes what a follower has already provided.
+                axis_end, axis_ms = self._axis
+                start = axis_end + (mono_ms - axis_ms) * _FRAMES_PER_MS - frames
+                self._out_pos = min(0, start)
+            self._axis = start + frames, mono_ms
+            self._leader_observed = True
+        else:
+            # Same per-block tolerance as the archive's PCM clock check.
+            duration = frames / _FRAMES_PER_MS
+            discontinuous = (
+                previous_ms is not None
+                and abs(mono_ms - previous_ms - duration) > 250 + duration * 200 / 1_000_000
+            )
+            if discontinuous:
+                member.discard_current_tail()
+                self.reanchors += 1
+            if self._axis is None:
+                self._axis = self._out_pos + frames, mono_ms
+            if previous_end is None or previous_ms is None or discontinuous:
+                axis_end, axis_ms = self._axis
+                start = axis_end + (mono_ms - axis_ms) * _FRAMES_PER_MS - frames
+            else:
+                start = previous_end
+
+        end = start + frames
+        member.end, member.mono_ms = end, mono_ms
+        member.last_data_ms = now
+        member.waiting_after_move = False
+        buffered_end = member.buffered_end
+        # Keep verified PCM from before a move if the next clock overlaps it.
+        start_kept = max(start, self._out_pos, buffered_end if buffered_end is not None else start)
+        self.late_bytes += max(0, min(end, self._out_pos) - start) * 2
+        if start_kept < end:
+            member.blocks.append((start_kept, data[(start_kept - start) * 2 : frames * 2]))
+        if member.blocks and member.blocks[0][0] < end - _MAX_BUFFER_FRAMES:
+            member.discard_before(end - _MAX_BUFFER_FRAMES)
+            if not leading:
+                member.mono_ms = None
+            self.reanchors += 1
+
+    def _release(self, live: list[_FarMember], now: int) -> bytes:
+        assert self._axis is not None
+        axis_end, axis_ms = self._axis
+        start = self._out_pos
+        available = [end for member in self._members if (end := member.buffered_end) is not None]
+        end = min(max(available, default=start), start + _MAX_OUTPUT_FRAMES)
+        if len(self._members) > 1:
+            cutoff = axis_end + (now - axis_ms - _SILENCE_MS) * _FRAMES_PER_MS
+            for member in live:
+                if member.waiting_after_move:
+                    continue
+                frontier = member.end if member.end is not None else start
+                if now - member.last_data_ms > _SILENCE_MS:
+                    frontier = max(frontier, cutoff)
+                end = min(end, frontier)
+        if end <= start:
+            return b""
+        data = self._mix(start, end)
+        self._out_pos = end
+        self._stamp = axis_ms + (end - axis_end) // _FRAMES_PER_MS
+        for member in self._members:
+            member.discard_before(end)
+        return data
+
+    def _mix(self, start: int, end: int) -> bytes:
+        if len(self._members) == 1:
+            blocks = self._members[0].blocks
+            pos, block = blocks[0]
+            if pos <= start and pos + len(block) // 2 >= end:
+                return block[(start - pos) * 2 : (end - pos) * 2]
+            result_bytes = bytearray((end - start) * 2)
+            for pos, block in blocks:
+                if pos >= end:
+                    break
+                first, last = max(start, pos), min(end, pos + len(block) // 2)
+                result_bytes[(first - start) * 2 : (last - start) * 2] = block[
+                    (first - pos) * 2 : (last - pos) * 2
+                ]
+            return bytes(result_bytes)
+
+        total = array("i", [0]) * (end - start)
+        for member in self._members:
+            for pos, block in member.blocks:
+                if pos >= end:
+                    break
+                first = max(pos, start)
+                last = min(pos + len(block) // 2, end)
+                samples = array("h")
+                samples.frombytes(block[(first - pos) * 2 : (last - pos) * 2])
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                for offset, sample in enumerate(samples, first - start):
+                    total[offset] += sample
+        result = array("h", (min(32767, max(-32768, sample)) for sample in total))
+        if sys.byteorder != "little":
+            result.byteswap()
+        return result.tobytes()
+
+    def sample_clock(self) -> tuple[str, int, int]:
+        with self._lock:
+            return "monotonic", self._stamp, self._stamp
+
+    def close(self) -> None:
+        self.shutdown()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            members, self._members = self._members, []
+            errors: queue.SimpleQueue[Exception] = queue.SimpleQueue()
+
+            def close_one(member: _FarMember) -> None:
+                try:
+                    member.source.shutdown()
+                except Exception as exc:
+                    errors.put(exc)
+
+            threads = [
+                threading.Thread(target=close_one, args=(member,), daemon=True)
+                for member in members
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            if not errors.empty():
+                raise errors.get_nowait()
 
 
 def _sample_clock(pulse: Any, stream: int, buffered: int, owner: Any) -> tuple[str, int, int]:
@@ -936,10 +1264,12 @@ class CapturePulseBackend:
         if far["kind"] == "app_stream":
             if target is None:
                 raise ValueError("target-gone")
+            _check_stream_count(target)
             if not p.monitor_supported:
                 available, reason = False, "monitor-stream-unsupported"
             else:
-                _resolve_target(p, target)
+                for stream in target.streams:
+                    _resolve_stream(p, target.server_cookie, stream)
         return {
             "server_local": p.server_local,
             "server_kind": p.server_kind,
@@ -949,12 +1279,12 @@ class CapturePulseBackend:
 
     def source(
         self, far: dict[str, Any], *, target: PinnedTarget | None = None
-    ) -> MonitorStreamSource:
+    ) -> MonitorStreamSource | MixedFarSource:
         if far["kind"] != "app_stream":
             return MonitorStreamSource(NativePulse(), self.token)
         if target is None:
             raise ValueError("target-gone")
-        return MonitorStreamSource(NativePulse(), self.token, target=target)
+        return MixedFarSource(target, self.token, factory=NativePulse)
 
     def own_context(self) -> tuple[int, int] | None:
         with self.lock:
