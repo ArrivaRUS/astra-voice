@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -38,6 +39,7 @@ class ScriptedPulse(monitor_stream.NativePulse):
         self.on_read: Callable[[], None] = lambda: None
         self.on_close: Callable[[], None] = lambda: None
         self.destroyed = False
+        self.destroyed_event = threading.Event()
         self.recording = False
 
     def give(self, chunk: bytes, mono: int, kind: str = "pulse") -> None:
@@ -72,6 +74,7 @@ class ScriptedPulse(monitor_stream.NativePulse):
     def close(self) -> None:
         assert not self.recording
         self.destroyed = True
+        self.destroyed_event.set()
 
     def read_chunk(self) -> bytes:
         assert self.recording
@@ -249,7 +252,7 @@ def test_wholly_late_nonleader_packet_stays_out_of_pcm(mixer: Callable[[int], Mi
     case = mixer(2)
     source = case.open()
     leader, follower = case.pulses
-    case.now = 1501
+    case.now = 1500
     leader.give(tone(1, 300), 1300)
     assert source.read_chunk() == tone(1, 300)
     leader.give(tone(2, 100), 1400)
@@ -284,10 +287,11 @@ def test_single_member_releases_immediately_with_real_stamp(
     source = case.open()
     (pulse,) = case.pulses
     assert source.sample_clock() == ("monotonic", 1000, 1000)
+    payload = struct.pack("<5h", 2, -12, 32767, -32768, 0) * 320
     for end in [1080, 1182, 1279]:
-        pulse.give(tone(2, 100), end)
+        pulse.give(payload, end)
         case.now = end
-        assert source.read_chunk() == tone(2, 100)
+        assert source.read_chunk() == payload
         assert source.sample_clock() == ("monotonic", end, end)
 
 
@@ -302,7 +306,8 @@ def test_member_loss_keeps_survivors_until_all_are_removed(
     first.give(tone(1, 100), 1100)
     third.give(tone(3, 100), 1100)
     assert source.read_chunk() == tone(4, 100)
-    assert source.partial and not source.ended and not second.recording
+    assert source.partial and not source.ended
+    assert second.destroyed_event.wait(2) and not second.recording
     assert source.read_chunk() == b""
     first.events.append(("removed", 7))
     third.events.append(("removed", 9))
@@ -556,6 +561,11 @@ def test_leader_clock_step_and_clock_kind_change_do_not_reposition_pcm(
     pulse.give(payload, case.now, "monotonic")
     assert source.read_chunk() == payload
     assert source.sample_clock() == ("monotonic", before + 500, before + 500)
+    # Repositioning by raw time would overlap already released frames here.
+    backstep = case.now - 400
+    pulse.give(payload, backstep)
+    assert source.read_chunk() == payload
+    assert source.sample_clock() == ("monotonic", backstep, backstep)
     assert source.reanchors == source.late_bytes == 0
 
 
@@ -714,3 +724,415 @@ def test_pending_move_precedes_new_event_even_when_leader_gets_it(
     assert [len(opens(p)) for p in case.pulses] == [1, 2, 2]
     assert source.read_chunk() == b"" and source.change == "sink-moved"
     assert [len(opens(p)) for p in case.pulses] == [2, 2, 2]
+
+
+@pytest.mark.parametrize("verdict", ["verified", "mismatch", "removed"])
+def test_review_holds_pcm_until_deferred_target_check_resolves(
+    mixer: Callable[[int], MixCase], verdict: str
+) -> None:
+    case = mixer(3)
+    source = case.open()
+    first, pending, survivor = case.pulses
+    first.give(tone(1, 100), 1100)
+    pending.give(tone(20, 200), 1200)
+    survivor.give(tone(3, 100), 1100)
+    assert source.read_chunk() == tone(24, 100)
+    stamp = source.sample_clock()
+
+    move(first)
+    first.after_open.append(None)
+    pending.events.append(("changed", 8))
+    survivor.give(tone(3, 100), 1200)
+    assert source.read_chunk() == b""
+    assert source.sample_clock() == stamp
+
+    if verdict == "verified":
+        assert source.read_chunk() == tone(23, 100)
+    else:
+        if verdict == "removed":
+            pending.events.append(("removed", 8))
+        else:
+            assert pending.target is not None
+            pending.target = replace(pending.target, serial=999)
+        survivor.give(tone(3, 100), 1300)
+        assert source.read_chunk() == tone(3, 200)
+
+
+def test_review_pending_pcm_holds_only_the_interval_at_risk(
+    mixer: Callable[[int], MixCase],
+) -> None:
+    case = mixer(3)
+    source = case.open()
+    first, pending, survivor = case.pulses
+    first.give(tone(1, 100), 1100)
+    pending.give(tone(20, 100), 1400)
+    survivor.give(tone(3, 100), 1100)
+    assert source.read_chunk() == tone(4, 100)
+
+    move(first)
+    first.after_open.append(None)
+    pending.events.append(("changed", 8))
+    survivor.give(tone(3, 300), 1400)
+    assert source.read_chunk() == tone(3, 200)
+    assert source.sample_clock() == ("monotonic", 1300, 1300)
+    assert source.read_chunk() == tone(23, 100)
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "mixed"])
+def test_review_role_stop_during_sink_move_is_not_an_audio_fault(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch, wrapped: bool
+) -> None:
+    from types import SimpleNamespace
+
+    from astra_voice.worker.meeting_capture import MeetingCaptureState
+
+    source: MixedFarSource | monitor_stream.MonitorStreamSource
+    if wrapped:
+        case = mixer(1)
+        source = case.open()
+        (pulse,) = case.pulses
+    else:
+        pulse = ScriptedPulse(RESOLVED)
+        source = monitor_stream.MonitorStreamSource(pulse, "direct", target=PINNED)
+        source.open()
+    stop = threading.Event()
+    source.admission_check = lambda: not stop.is_set()
+    resolve = pulse.resolve
+
+    def revoke(index: int, **kwargs: Any) -> Target | None:
+        stop.set()
+        return resolve(index, **kwargs)
+
+    move(pulse)
+    role: Any = SimpleNamespace(archive=Mock(), messages=Mock())
+    with monkeypatch.context() as patch:
+        patch.setattr(pulse, "resolve", revoke)
+        try:
+            MeetingCaptureState._read(role, "far", source, stop)
+        finally:
+            source.shutdown()
+    assert stop.is_set() and len(opens(pulse)) == 1
+    role.messages.put.assert_not_called()
+    role.archive.put.assert_not_called()
+
+
+@pytest.mark.parametrize("same_tick", [False, True])
+def test_review_start_includes_earliest_verified_block(
+    mixer: Callable[[int], MixCase], same_tick: bool
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    leader, early = case.pulses
+    early.give(tone(2, 100), 1063)
+    if not same_tick:
+        assert source.read_chunk() == b""
+    leader.give(tone(1, 100), 1100)
+    assert source.read_chunk() == tone(2, 37) + tone(3, 63)
+    assert source.sample_clock() == ("monotonic", 1063, 1063)
+
+
+def test_review_regular_delivery_of_old_pcm_does_not_hold_fresh_data(
+    mixer: Callable[[int], MixCase],
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    leader, lagging = case.pulses
+    for pulse in case.pulses:
+        pulse.give(tone(2, 100), 1100)
+    case.now = 1100
+    assert source.read_chunk() == tone(4, 100)
+    for now in range(1200, 3001, 100):
+        case.now = now
+        leader.give(tone(2, 100), now)
+        lagging.give(tone(2, 100), now - 500)
+        source.read_chunk()
+    assert source.sample_clock() == ("monotonic", 2800, 2800)
+
+
+@pytest.mark.parametrize("same_tick", [False, True], ids=["buffered", "ready"])
+def test_review_skips_uncovered_gap_and_stamps_the_real_next_pcm(
+    mixer: Callable[[int], MixCase], same_tick: bool
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    _, follower = case.pulses
+    for pulse in case.pulses:
+        pulse.give(tone(2, 100), 1100)
+    case.now = 1100
+    assert source.read_chunk() == tone(4, 100)
+    case.now = 5000
+    assert source.read_chunk() == b""
+    assert source.sample_clock() == ("monotonic", 1100, 1100)
+    follower.give(tone(3, 100), 5100)
+    if not same_tick:
+        # The frontier still falls before the first new sample.
+        assert source.read_chunk() == b""
+    case.now = 5400
+    assert source.read_chunk() == tone(3, 100)
+    assert source.sample_clock() == ("monotonic", 5100, 5100)
+
+
+def test_review_provisional_clock_keeps_drift_while_first_member_is_silent(
+    mixer: Callable[[int], MixCase],
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    _, follower = case.pulses
+    packet = tone(3, 1000)
+    for elapsed in range(1000, 72_001, 1000):
+        end = 1000 + elapsed + elapsed * 1500 // 1_000_000
+        case.now = end + 201
+        follower.give(packet, end)
+        assert source.read_chunk() == packet
+    assert source.sample_clock() == ("monotonic", 73108, 73108)
+
+
+@pytest.mark.parametrize("verified_tail", [False, True])
+def test_review_last_removal_yields_only_verified_tail_before_end(
+    mixer: Callable[[int], MixCase], verified_tail: bool
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    first, last = case.pulses
+    first.give(tone(2, 100), 1100)
+    last.give(tone(3, 200), 1200)
+    assert source.read_chunk() == tone(5, 100)
+    first.events.append(("removed", 7))
+    if verified_tail:
+        last.events.append(("removed", 8))
+        assert source.read_chunk() == tone(3, 100)
+        assert not source.ended
+        assert source.sample_clock() == ("monotonic", 1200, 1200)
+    else:
+        last.events.append(("changed", 8))
+        last.target = None
+    assert source.read_chunk() is None and source.ended and not source.partial
+
+
+def test_review_oldest_deferred_move_precedes_repeat_of_a_lower_index(
+    mixer: Callable[[int], MixCase],
+) -> None:
+    case = mixer(3)
+    source = case.open()
+    first, _, last = case.pulses
+    for pulse in case.pulses:
+        move(pulse)
+    assert source.read_chunk() == b"" and source.change == "sink-moved"
+    assert first.target is not None
+    first.target = replace(first.target, monitor="sink-a.monitor")
+    first.events.append(("changed", 7))
+    assert source.read_chunk() == b"" and source.change == "sink-moved"
+    assert [len(opens(p)) for p in case.pulses] == [2, 2, 1]
+    assert source.read_chunk() == b"" and source.change == "sink-moved"
+    assert len(opens(last)) == 2 and len(opens(first)) == 2
+    assert source.read_chunk() == b"" and source.change == "sink-moved"
+    assert len(opens(first)) == 3
+
+
+@pytest.mark.parametrize("trigger", ["admission", "shutdown"])
+def test_review_does_not_start_next_resolve_after_revocation_or_close(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch, trigger: str
+) -> None:
+    case = mixer(8)
+    source = case.open()
+    first, *others = case.pulses
+    resolve = first.resolve
+    entered, close_waiting = threading.Event(), threading.Event()
+    allowed = True
+    lock = source._lock
+    closer: threading.Thread | None = None
+    source.admission_check = lambda: allowed
+
+    class ObservableLock:
+        def __enter__(self) -> None:
+            if threading.current_thread() is closer:
+                close_waiting.set()
+            lock.acquire()
+
+        def __exit__(self, *_args: object) -> None:
+            lock.release()
+
+    def first_resolve(index: int, **kwargs: Any) -> Target | None:
+        nonlocal allowed
+        entered.set()
+        if trigger == "admission":
+            allowed = False
+        else:
+            assert close_waiting.wait(2)
+        return resolve(index, **kwargs)
+
+    def close() -> None:
+        nonlocal closer
+        closer = threading.current_thread()
+        source.shutdown()
+
+    for pulse in case.pulses:
+        pulse.calls.clear()
+        pulse.events.append(("server", 0))
+    with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=2) as executor:
+        patch.setattr(source, "_lock", ObservableLock())
+        patch.setattr(first, "resolve", first_resolve)
+        reading = executor.submit(source.read_chunk)
+        assert entered.wait(2)
+        closing = executor.submit(close) if trigger == "shutdown" else None
+        assert reading.result(timeout=3) == b""
+        if closing is not None:
+            closing.result(timeout=2)
+    assert [call for p in others for call in p.calls if call[0] == "resolve"] == []
+
+
+def test_review_revocation_during_native_open_skips_second_resolve(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(1)
+    source = case.open()
+    (pulse,) = case.pulses
+    stop = threading.Event()
+    source.admission_check = lambda: not stop.is_set()
+    open_record = pulse.open_record
+
+    def open_then_revoke(monitor: str, index: int | None, token: str) -> None:
+        open_record(monitor, index, token)
+        stop.set()
+
+    move(pulse)
+    pulse.calls.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(pulse, "open_record", open_then_revoke)
+        assert source.read_chunk() == b""
+    assert source.change is None and not source.ended
+    assert [call for call in pulse.calls if call[0] == "resolve"] == [("resolve", 7)]
+    assert len(opens(pulse)) == 1 and not pulse.recording
+
+
+def test_review_lost_context_is_closed_before_global_shutdown(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    survivor, lost = case.pulses
+    lost.events.append(("removed", 8))
+    survivor.give(tone(2, 100), 1100)
+    closed = threading.Event()
+    native_close = lost.close
+
+    def close() -> None:
+        native_close()
+        closed.set()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(lost, "close", close)
+        assert source.read_chunk() == tone(2, 100)
+        assert closed.wait(2)
+    assert lost.destroyed and survivor.recording and source.partial
+
+
+def test_review_lost_context_close_runs_while_survivor_is_read(
+    mixer: Callable[[int], MixCase],
+) -> None:
+    case = mixer(2)
+    source = case.open()
+    lost, survivor = case.pulses
+    closing, release = threading.Event(), threading.Event()
+
+    def on_close() -> None:
+        closing.set()
+        assert release.wait(2)
+
+    lost.on_close = on_close
+    lost.events.append(("removed", 7))
+    survivor.give(tone(2, 100), 1100)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reading = executor.submit(source.read_chunk)
+        try:
+            assert closing.wait(2)
+            assert reading.result(timeout=2) == tone(2, 100)
+        finally:
+            release.set()
+    assert lost.destroyed_event.wait(2)
+
+
+def test_review_thread_start_failure_closes_every_member_and_joins(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(3)
+    source = case.open()
+    real_start = threading.Thread.start
+    real_join = threading.Thread.join
+    tries: list[threading.Thread] = []
+    joined: list[threading.Thread] = []
+    ran_on: list[threading.Thread] = []
+
+    def fail_second(thread: threading.Thread) -> None:
+        tries.append(thread)
+        if len(tries) == 2:
+            raise RuntimeError("can't start new thread")
+        real_start(thread)
+
+    def observe_join(thread: threading.Thread, timeout: float | None = None) -> None:
+        joined.append(thread)
+        real_join(thread, timeout)
+
+    for pulse in case.pulses:
+        pulse.on_close = lambda: ran_on.append(threading.current_thread())
+
+    error = None
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", fail_second)
+        patch.setattr(threading.Thread, "join", observe_join)
+        try:
+            source.shutdown()
+        except RuntimeError as exc:
+            error = exc
+    source.shutdown()
+    assert all(p.destroyed and not p.recording for p in case.pulses)
+    assert error is None
+    assert len(tries) == 2 and not tries[0].is_alive()
+    assert joined == tries[:1]
+    assert ran_on.count(tries[0]) == 1 and ran_on.count(threading.current_thread()) == 2
+
+
+def test_review_sample_clock_waits_for_the_inflight_pcm(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(1)
+    source = case.open()
+    (pulse,) = case.pulses
+    pulse.give(tone(7, 100), 1100)
+    entered, attempted, resume = threading.Event(), threading.Event(), threading.Event()
+    original_lock = source._lock
+    clock_thread: threading.Thread | None = None
+
+    class ObservableLock:
+        def __enter__(self) -> None:
+            if threading.current_thread() is clock_thread:
+                attempted.set()
+            original_lock.acquire()
+
+        def __exit__(self, *_args: object) -> None:
+            original_lock.release()
+
+    def on_read() -> None:
+        entered.set()
+        assert resume.wait(2)
+
+    def clock() -> tuple[str, int, int]:
+        nonlocal clock_thread
+        clock_thread = threading.current_thread()
+        try:
+            return source.sample_clock()
+        finally:
+            attempted.set()
+
+    pulse.on_read = on_read
+    with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=2) as executor:
+        patch.setattr(source, "_lock", ObservableLock())
+        reading = executor.submit(source.read_chunk)
+        try:
+            assert entered.wait(2)
+            stamp = executor.submit(clock)
+            assert attempted.wait(2)
+        finally:
+            resume.set()
+        assert reading.result(timeout=2) == tone(7, 100)
+        assert stamp.result(timeout=2) == ("monotonic", 1100, 1100)

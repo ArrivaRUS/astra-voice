@@ -296,9 +296,22 @@ def test_mixer_propagates_admission_check_and_guard_to_native_boundaries(
                     source.open()
             first, second = libs
             first.pa_stream_new_with_proplist.assert_called_once()
+            first.pa_stream_set_monitor_stream.assert_called_once_with(22, 7)
             first.pa_stream_connect_record.assert_called_once()
             assert second.pa_stream_new_with_proplist.call_count == (boundary != "create")
+            if boundary == "create":
+                second.pa_stream_set_monitor_stream.assert_not_called()
+            else:
+                second.pa_stream_set_monitor_stream.assert_called_once_with(22, 8)
             assert second.pa_stream_connect_record.call_count == (boundary is None)
+            for lib in libs:
+                steps = [
+                    call[0]
+                    for call in lib.method_calls
+                    if call[0] in {"pa_stream_set_monitor_stream", "pa_stream_connect_record"}
+                ]
+                if lib.pa_stream_connect_record.called:
+                    assert steps == ["pa_stream_set_monitor_stream", "pa_stream_connect_record"]
         finally:
             source.shutdown()
 

@@ -6,6 +6,7 @@ import ctypes
 import json
 import queue
 import re
+import struct
 import threading
 import wave
 from collections.abc import Iterator
@@ -699,7 +700,10 @@ def test_capture_mixes_a_single_pinned_pulse_into_an_unmodified_far_track(
     far = app_far(rig, checks)
     target = replace(TARGET, measured_at=rig.clock())
     prepare_allowed(rig, checks, far, target)
-    payloads = (b"\x01\x03" * 1600, b"\x87\xff" * 1600)
+    payloads = (
+        struct.pack("<4h", 1, 769, -3, 32767) * 400,
+        struct.pack("<4h", -121, 325, 0, -32768) * 400,
+    )
     both_queued = threading.Event()
     queued: list[bytes] = []
     mono_start = int(rig.clock() * 1000)

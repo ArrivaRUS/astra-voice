@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import queue
 import sys
 import threading
 import time
@@ -126,6 +125,7 @@ class MonitorStreamSource:
         self.opened = False
         self.pending_recheck = False
         self.reopen_attempted = False
+        self.reopen_cancelled = False
         self.admission_check: Callable[[], bool] = lambda: True
         self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
         if hasattr(pulse, "admission_guard") or isinstance(pulse, NativePulse):
@@ -151,6 +151,8 @@ class MonitorStreamSource:
 
     def _resolve(self, *, confirm_loss: bool = False) -> Target:
         assert self.target is not None
+        if not self.admission_check():
+            raise ValueError("admission-stale")
         return _resolve_stream(
             self.pulse, self.target.server_cookie, self.target.streams[0], confirm_loss=confirm_loss
         )
@@ -193,8 +195,9 @@ class MonitorStreamSource:
         with self.lock:
             return self._read_chunk()
 
-    def _read_chunk(self, *, allow_reopen: bool = True) -> bytes | None:
+    def _read_chunk(self, *, allow_reopen: bool = True, close_on_loss: bool = True) -> bytes | None:
         self.reopen_attempted = False
+        self.reopen_cancelled = False
         if self.ended or not self.opened:
             return None
         self.change = None
@@ -203,10 +206,10 @@ class MonitorStreamSource:
             target_index = self.target.streams[0].sink_input
             for kind, index in events:
                 if kind == "removed" and index == target_index:
-                    self.close()
                     self.ended = True
-                    self.end_reason = "removed"
-                    return None
+                    self.end_reason = "target-gone" if self.pending_recheck else "removed"
+                    self.pending_recheck = False
+                    break
                 elif kind == "server" or index == target_index:
                     self.pending_recheck = True
             if self.pending_recheck:
@@ -214,10 +217,15 @@ class MonitorStreamSource:
                     return b""
                 self.pending_recheck = False
                 self._check_recording_target()
-                if self.ended or not self.opened:
-                    return None
                 if self.change:
                     return b""
+            if self.ended:
+                if close_on_loss and self.opened:
+                    self.close()
+                return None
+            if self.reopen_cancelled or not self.admission_check():
+                self.reopen_cancelled = True
+                return None
         else:
             for kind, _ in events:
                 if kind != "server":
@@ -248,11 +256,10 @@ class MonitorStreamSource:
                 self.change = "sink-moved"
         except ValueError as exc:
             if str(exc) == "admission-stale":
+                self.reopen_cancelled = True
                 return
             if str(exc) not in {"target-gone", "target-mismatch"}:
                 raise
-            if self.opened:
-                self.close()
             self.ended = True
             self.end_reason = str(exc)
 
@@ -908,13 +915,22 @@ def _monotonic_ms() -> int:
 @dataclass
 class _FarMember:
     source: MonitorStreamSource
-    last_data_ms: int
     # Positions are in frames. Unreleased blocks are disjoint and ordered.
     blocks: deque[tuple[int, bytes]] = field(default_factory=deque)
     end: int | None = None
     mono_ms: int | None = None
     retained_until: int | None = None
     waiting_after_move: bool = False
+    pending_since: int | None = None
+    close_started: bool = False
+    closer: threading.Thread | None = None
+    close_error: Exception | None = None
+
+    def close_native(self) -> None:
+        try:
+            self.source.shutdown()
+        except Exception as exc:
+            self.close_error = exc
 
     @property
     def buffered_end(self) -> int | None:
@@ -957,6 +973,8 @@ class MixedFarSource:
         self.target, self.token = target, token
         self._factory, self._now_ms = factory, now_ms
         self._lock = threading.RLock()
+        self._close_gate = threading.Lock()
+        self._close_requests = 0
         self._members: list[_FarMember] = []
         self.admission_check: Callable[[], bool] = lambda: True
         self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
@@ -967,32 +985,38 @@ class MixedFarSource:
         self.change: str | None = None
         self.reanchors = self.late_bytes = 0
         self._out_pos = 0
+        self._has_output = False
         self._axis: tuple[int, int] | None = None
         self._leader_observed = False
+        self._provisional_leader: _FarMember | None = None
+        self._next_pending_since = 0
         self._stamp = self._now_ms()
+
+    def _can_operate(self) -> bool:
+        if not self.admission_check():
+            return False
+        with self._close_gate:
+            return self._close_requests == 0
 
     def open(self, device: str | None = None) -> None:
         with self._lock:
-            self.shutdown()
+            self._shutdown_members()
             self._reset_mix()
             try:
                 for stream in self.target.streams:
-                    if not self.admission_check():
+                    if not self._can_operate():
                         raise ValueError("admission-stale")
                     pulse = self._factory()
                     source = MonitorStreamSource(
                         pulse, self.token, target=replace(self.target, streams=(stream,))
                     )
-                    source.admission_check = lambda: self.admission_check()
+                    source.admission_check = self._can_operate
                     source.admission_guard = lambda: self.admission_guard()
-                    self._members.append(_FarMember(source, self._stamp))
+                    self._members.append(_FarMember(source))
                     source.open(device)
-                opened_ms = self._now_ms()
-                for member in self._members:
-                    member.last_data_ms = opened_ms
             except BaseException as open_error:
                 try:
-                    self.shutdown()
+                    self._shutdown_members()
                 except Exception as close_error:
                     raise open_error from close_error
                 raise
@@ -1000,41 +1024,67 @@ class MixedFarSource:
     def read_chunk(self) -> bytes | None:
         with self._lock:
             self.change = None
-            live = [member for member in self._members if not member.source.ended]
-            if not live:
+            if not self._members:
                 return None
+            if not self._can_operate():
+                return b""
+            for member in self._members:
+                if member.close_error is not None:
+                    raise member.close_error
+            live = [member for member in self._members if not member.source.ended]
             # Retry deferred events first. The wait allowance belongs to the
             # first live stream in target order, even when another is retried.
             allow_reopen = True
+            rechecked = False
             chunks: list[tuple[_FarMember, bytes, int]] = []
-            for member in sorted(live, key=lambda m: not m.source.pending_recheck):
+            for member in sorted(
+                live, key=lambda m: (m.pending_since is None, m.pending_since or 0)
+            ):
+                if not self._can_operate():
+                    return b""
                 source = member.source
                 with source.lock:
                     cast(NativePulse, source.pulse).wait_us = 10000 if member is live[0] else 0
-                    data = source._read_chunk(allow_reopen=allow_reopen)
+                    data = source._read_chunk(allow_reopen=allow_reopen, close_on_loss=False)
+                    if source.reopen_cancelled:
+                        return b""
                     allow_reopen = allow_reopen and not source.reopen_attempted
+                    if source.pending_recheck:
+                        if member.pending_since is None:
+                            member.pending_since = self._next_pending_since
+                            self._next_pending_since += 1
+                    elif member.pending_since is not None:
+                        member.pending_since = None
+                        rechecked |= not source.ended
                     if data is None:
                         if not source.ended:
                             raise ValueError("audio-failed")
                         live.remove(member)
                         if source.end_reason != "removed":
                             member.blocks.clear()
+                        if not self._start_close(member):
+                            member.close_started = True
+                            member.close_native()
                     elif source.change:
                         member.moved()
                         self.change = source.change
                     elif data:
+                        if not self._can_operate():
+                            return b""
                         _, _, mono_ms = source.sample_clock()
                         chunks.append((member, data, mono_ms))
 
+            if not self._can_operate():
+                return b""
             self.partial = 0 < len(live) < len(self._members)
             if not live:
+                tail = self._release(live, self._now_ms())
+                if tail:
+                    return tail
                 self.ended = True
                 return None
-            if not chunks:
-                return b""
 
             leader = live[0]
-            now = self._now_ms()
             # Place the leader first so every other clock is projected against
             # its latest observation. If it has never delivered a block, the
             # first available block establishes a provisional origin.
@@ -1043,26 +1093,23 @@ class MixedFarSource:
                 self._axis = leader.end, leader.mono_ms
                 self._leader_observed = True
             for member, data, mono_ms in chunks:
-                self._place(member, data, mono_ms, now, leading=member is leader)
+                self._place(member, data, mono_ms, leading=member is leader)
             if self.change:
                 return b""
-            return self._release(live, now)
+            return self._release(live, self._now_ms(), allow_contiguous=bool(chunks or rechecked))
 
-    def _place(
-        self, member: _FarMember, data: bytes, mono_ms: int, now: int, *, leading: bool
-    ) -> None:
+    def _place(self, member: _FarMember, data: bytes, mono_ms: int, *, leading: bool) -> None:
         frames = len(data) // 2
         previous_end, previous_ms = member.end, member.mono_ms
         if leading:
             # A real clock step is visible to the archive via the timestamp.
             # It must not change which samples the leader contributes.
             start = max(self._out_pos, previous_end if previous_end is not None else self._out_pos)
-            if not self._leader_observed and self._axis is not None and self._out_pos == 0:
+            if not self._leader_observed and self._axis is not None and not self._has_output:
                 # Before any release, include a first leader block that
                 # overlaps or precedes what a follower has already provided.
                 axis_end, axis_ms = self._axis
                 start = axis_end + (mono_ms - axis_ms) * _FRAMES_PER_MS - frames
-                self._out_pos = min(0, start)
             self._axis = start + frames, mono_ms
             self._leader_observed = True
         else:
@@ -1084,13 +1131,19 @@ class MixedFarSource:
                 start = previous_end
 
         end = start + frames
+        if not self._leader_observed:
+            if self._provisional_leader is None or self._provisional_leader.source.ended:
+                self._provisional_leader = member
+            if member is self._provisional_leader:
+                self._axis = end, mono_ms
         member.end, member.mono_ms = end, mono_ms
-        member.last_data_ms = now
         member.waiting_after_move = False
         buffered_end = member.buffered_end
         # Keep verified PCM from before a move if the next clock overlaps it.
-        start_kept = max(start, self._out_pos, buffered_end if buffered_end is not None else start)
-        self.late_bytes += max(0, min(end, self._out_pos) - start) * 2
+        start_kept = max(start, buffered_end if buffered_end is not None else start)
+        if self._has_output:
+            start_kept = max(start_kept, self._out_pos)
+            self.late_bytes += max(0, min(end, self._out_pos) - start) * 2
         if start_kept < end:
             member.blocks.append((start_kept, data[(start_kept - start) * 2 : frames * 2]))
         if member.blocks and member.blocks[0][0] < end - _MAX_BUFFER_FRAMES:
@@ -1099,25 +1152,36 @@ class MixedFarSource:
                 member.mono_ms = None
             self.reanchors += 1
 
-    def _release(self, live: list[_FarMember], now: int) -> bytes:
+    def _release(self, live: list[_FarMember], now: int, *, allow_contiguous: bool = True) -> bytes:
+        spans = sorted(
+            (pos, pos + len(data) // 2) for member in self._members for pos, data in member.blocks
+        )
+        if not spans:
+            return b""
         assert self._axis is not None
         axis_end, axis_ms = self._axis
-        start = self._out_pos
-        available = [end for member in self._members if (end := member.buffered_end) is not None]
-        end = min(max(available, default=start), start + _MAX_OUTPUT_FRAMES)
+        start = spans[0][0]
+        if not allow_contiguous and (not self._has_output or start <= self._out_pos):
+            return b""
+        end = start
+        for pos, block_end in spans:
+            if pos > end:
+                break
+            end = max(end, block_end)
+        end = min(end, start + _MAX_OUTPUT_FRAMES)
         if len(self._members) > 1:
             cutoff = axis_end + (now - axis_ms - _SILENCE_MS) * _FRAMES_PER_MS
             for member in live:
-                if member.waiting_after_move:
-                    continue
-                frontier = member.end if member.end is not None else start
-                if now - member.last_data_ms > _SILENCE_MS:
-                    frontier = max(frontier, cutoff)
-                end = min(end, frontier)
+                if not member.waiting_after_move:
+                    frontier = member.end if member.end is not None else start
+                    end = min(end, max(frontier, cutoff))
+                if member.source.pending_recheck and member.blocks:
+                    end = min(end, member.blocks[0][0])
         if end <= start:
             return b""
         data = self._mix(start, end)
         self._out_pos = end
+        self._has_output = True
         self._stamp = axis_ms + (end - axis_end) // _FRAMES_PER_MS
         for member in self._members:
             member.discard_before(end)
@@ -1165,26 +1229,43 @@ class MixedFarSource:
         self.shutdown()
 
     def shutdown(self) -> None:
-        with self._lock:
-            members, self._members = self._members, []
-            errors: queue.SimpleQueue[Exception] = queue.SimpleQueue()
+        # Publish the stop before waiting for an in-flight native call.
+        with self._close_gate:
+            self._close_requests += 1
+        try:
+            with self._lock:
+                self._shutdown_members()
+        finally:
+            with self._close_gate:
+                self._close_requests -= 1
 
-            def close_one(member: _FarMember) -> None:
-                try:
-                    member.source.shutdown()
-                except Exception as exc:
-                    errors.put(exc)
+    def _start_close(self, member: _FarMember) -> bool:
+        thread = threading.Thread(target=member.close_native, daemon=True)
+        try:
+            thread.start()
+        except (OSError, RuntimeError):
+            return False
+        member.closer = thread
+        member.close_started = True
+        return True
 
-            threads = [
-                threading.Thread(target=close_one, args=(member,), daemon=True)
-                for member in members
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join()
-            if not errors.empty():
-                raise errors.get_nowait()
+    def _shutdown_members(self) -> None:
+        start_workers = True
+        for member in self._members:
+            if member.close_started:
+                continue
+            if start_workers:
+                start_workers = self._start_close(member)
+            if not start_workers:
+                member.close_started = True
+                member.close_native()
+        for member in self._members:
+            if member.closer is not None:
+                member.closer.join()
+        members, self._members = self._members, []
+        for member in members:
+            if member.close_error is not None:
+                raise member.close_error
 
 
 def _sample_clock(pulse: Any, stream: int, buffered: int, owner: Any) -> tuple[str, int, int]:
