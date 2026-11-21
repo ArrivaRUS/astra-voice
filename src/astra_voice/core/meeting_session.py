@@ -968,12 +968,8 @@ class MeetingController:
                         remaining = deadline - self._metadata_retry_clock()
                         if remaining <= 0 or self._metadata_retry_stop.is_set():
                             raise
-                        if self._metadata_retry_wait(
-                            self._metadata_retry_stop, min(delay, remaining)
-                        ):
-                            raise
-                        if self._metadata_retry_clock() >= deadline:
-                            raise
+                        # The lock may have cleared while this wait was ending.
+                        self._metadata_retry_wait(self._metadata_retry_stop, min(delay, remaining))
                         delay = min(delay * 2, 0.2)
             except (MeetingStoreError, OSError):
                 self._write_results.put((snapshot.id, False, final))

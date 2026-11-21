@@ -183,8 +183,6 @@ class _Archive:
                     raise
                 # `stopping` may already be set while the final close is queued.
                 self._retry_wait(min(delay, remaining))
-                if self._retry_clock() >= deadline:
-                    raise
                 delay = min(delay * 2, 0.05)
 
     def _edge(self, payload: Message, owner: MeetingWriter) -> None:
