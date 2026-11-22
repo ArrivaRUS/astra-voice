@@ -49,6 +49,7 @@ from astra_voice.worker.meeting_roles import failure
 from astra_voice.worker.meeting_session import MeetingSession, SessionAdmission
 
 if TYPE_CHECKING:
+    from astra_voice.worker.meeting_detector import ProgramKey
     from astra_voice.worker.meeting_identity_check import CallAnchor, PinnedStream, PinnedTarget
 
 Message = dict[str, Any]
@@ -457,6 +458,11 @@ class _Archive:
                 file.close()
 
 
+@dataclass(frozen=True, repr=False)
+class _FarProgram:
+    key: ProgramKey
+
+
 class MeetingCaptureState:
     def __init__(
         self,
@@ -500,6 +506,7 @@ class MeetingCaptureState:
         self.prepared_target: PinnedTarget | None = None
         self.capture_target: PinnedTarget | None = None
         self._prepared_anchor: CallAnchor | None = None
+        self._far_program: _FarProgram | None = None
         self._target_epoch: int | None = None
         self.mic_device: str | None = None
         self.archive: _Archive | None = None
@@ -1040,6 +1047,7 @@ class MeetingCaptureState:
     def _drop_target(self) -> None:
         self.prepared_target = None
         self.capture_target = None
+        self._far_program = None
         self._prepared_anchor = None
         self._target_epoch = None
 
@@ -1550,6 +1558,32 @@ class MeetingCaptureState:
             return True
         return False
 
+    def _check_unpinned_far(self, now: float) -> None:
+        target, program = self.capture_target, self._far_program
+        observer = self.observer
+        if (
+            self.state != "recording"
+            or self.track_states["far"] != "live"
+            or self.far["kind"] != "app_stream"
+            or target is None
+            or program is None
+            or self._far_incomplete
+            or observer.automation_off.is_set()
+        ):
+            return
+        if not observer.rule_lock.acquire(blocking=False):
+            return
+        try:
+            outputs = observer.rule.outputs(program.key, now)
+        finally:
+            observer.rule_lock.release()
+        if not outputs or observer.registry.snapshot().server_cookie != target.server_cookie:
+            return
+        pinned = {(stream.sink_input, stream.stream_serial) for stream in target.streams}
+        if outputs - pinned:
+            self._far_incomplete = True
+            self._far_partial_pending = True
+
     def _finish_prepare(self, event: Message, result: list[Message]) -> None:
         control: _PreparedControl = event["control"]
         if not self.preparing or event["request"] != self.prepare_request:
@@ -1591,6 +1625,7 @@ class MeetingCaptureState:
         self.final_status = "succeeded"
         self.lost_estimate_ms = 0
         self.track_states = {"mic": "ended", "far": "ended"}
+        self._far_program = _FarProgram(anchor.program) if anchor is not None else None
         self._far_incomplete = False
         self._far_partial_pending = False
         self._last_far_partial = float("-inf")
@@ -1723,6 +1758,7 @@ class MeetingCaptureState:
             self.track_states[track] = "live"
             self.archive.put("track_start", (track, source.sample_clock(), self.recorded_ms))
             self._start_reader(track, source)
+        self._check_unpinned_far(self.clock())
         if self.track_states["far"] == "live" and (
             new_loss or (self._far_incomplete and self._last_far_partial == float("-inf"))
         ):
@@ -2043,6 +2079,11 @@ class MeetingCaptureState:
                 self._autopause("lease", "lease", result)
             if self.state == "recording" and self._recorded() >= self.limit_ms:
                 self._close(None, "limit")
+        alive_due = (
+            bool(self.identity) and now - self.last_alive >= 1 and self.state != "closing-unknown"
+        )
+        if alive_due:
+            self._check_unpinned_far(now)
         if (
             self._far_partial_pending
             and self.state == "recording"
@@ -2052,7 +2093,7 @@ class MeetingCaptureState:
             self._far_partial_pending = False
             self._last_far_partial = now
             result.append(self._track_event("far", "live", "partial"))
-        if self.identity and now - self.last_alive >= 1 and self.state != "closing-unknown":
+        if alive_due:
             self.last_alive, self.seq = now, self.seq + 1
             elapsed = now - self.cpu_at
             cpu_time = time.process_time()
