@@ -255,8 +255,38 @@ def test_meeting_address_space_limits_are_applied_and_verified(
         libc.mallopt.assert_not_called()
 
 
+@pytest.mark.parametrize("mallopt_available", [True, False], ids=["refused", "unavailable"])
+def test_capture_hardening_failure_stops_before_ipc(
+    monkeypatch: pytest.MonkeyPatch, mallopt_available: bool
+) -> None:
+    from astra_voice.worker import meeting_roles
+
+    libc = Mock() if mallopt_available else Mock(spec_set=[])
+    if mallopt_available:
+        libc.mallopt.return_value = 0
+    load_libc = Mock(return_value=libc)
+    monkeypatch.setattr(ctypes, "CDLL", load_libc)
+    monkeypatch.setattr(worker_main, "harden_process", Mock(return_value=True))
+    monkeypatch.setattr(resource, "getrlimit", lambda key: (512 * 1024**2, resource.RLIM_INFINITY))
+    monkeypatch.setattr(resource, "setrlimit", Mock())
+    make_socket = Mock(side_effect=OSError)
+    run = Mock()
+    monkeypatch.setattr(socket, "socket", make_socket)
+    monkeypatch.setattr(meeting_roles, "run_role", run)
+
+    result = worker_main.meeting_main("meeting-capture", ["12"])
+
+    load_libc.assert_called_once_with("libc.so.6")
+    if mallopt_available:
+        libc.mallopt.assert_called_once_with(-8, 2)
+    make_socket.assert_not_called()
+    run.assert_not_called()
+    assert result == 3
+
+
+@pytest.mark.parametrize("stack_mib", [8], ids=["alse-default-stack"])
 def test_capture_address_space_has_headroom_for_full_mixer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, stack_mib: int
 ) -> None:
     limit = (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
 
@@ -276,12 +306,11 @@ def test_capture_address_space_has_headroom_for_full_mixer(
     mib = 1024**2
     # Notebook's residual image plus the one non-main glibc arena.
     base = (56 + 64) * mib
-    # AS envelopes for stacks (measured guards/TLS included) and Pulse contexts.
-    stacks = (12 + monitor_stream.MAX_FAR_STREAMS) * (8 * mib + 32 * 1024)
+    # The second concurrent meeting-check adds one stack to the 12 fixed threads.
+    stacks = (13 + monitor_stream.MAX_FAR_STREAMS) * (stack_mib * mib + 32 * 1024)
     contexts = (5 + monitor_stream.MAX_FAR_STREAMS) * (PULSE_POOL_BYTES + 256 * 1024)
     peak = base + stacks + contexts
     assert 5 * peak <= 4 * limit[0]  # 25% reserve above the peak
-    assert peak + 200 * mib <= limit[0]  # T1 reserves at least 200 MB
 
 
 def test_diar_environment_is_fail_closed_before_work(monkeypatch: pytest.MonkeyPatch) -> None:

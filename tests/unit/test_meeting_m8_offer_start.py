@@ -875,6 +875,48 @@ def test_room_start_failure_logs_the_role_error(rig: Rig, caplog: pytest.LogCapt
     )
 
 
+def test_room_retry_with_disk_low_does_not_log_previous_role_error(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="astra_voice.meetings")
+    rig.bridge.requestRecording()
+    rig.bridge.on_start_clicked()
+    rig.reply("prepared")
+    deliver(rig, capture_error(rig, "open", "audio-failed"))
+    rig.recording.tick()
+    assert rig.bridge.startError == ERROR_TEXT["audio-unavailable"]
+
+    rig.bridge.closeStartDialog()
+    rig.bridge.requestRecording()
+    rig.storage = StorageStatus(599, True, False)
+    rig.bridge.on_start_clicked()
+    rig.recording.tick()
+
+    assert rig.bridge.startError == ERROR_TEXT["disk-low"]
+    assert [
+        record.getMessage() for record in caplog.records if record.msg == events.START_FAILED
+    ] == [
+        "meeting-start-failed code=audio-failed request=meeting.capture.open",
+        "meeting-start-failed code=other request=other",
+    ]
+
+
+def test_start_failure_log_ignores_role_error_from_another_attempt(
+    rig: Rig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caplog.set_level(logging.INFO, logger="astra_voice.meetings")
+    recording = rig.recording
+    recording._start_origin = events.StartOrigin.CARD
+    recording._start_pressed_at = recording.offer.now_ms()
+    recording._start_attempt = recording.controller._attempt + 1
+    monkeypatch.setattr(recording.controller, "role_start_error", ("audio-failed", OPEN))
+
+    recording._log_start_outcome(events.StartOutcome.FAILED)
+
+    (record,) = [record for record in caplog.records if record.msg == events.START_FAILED]
+    assert record.getMessage() == "meeting-start-failed code=other request=other"
+
+
 @pytest.mark.parametrize("outcome", list(events.StartOutcome))
 def test_start_failure_log_filters_unknown_fields(
     rig: Rig,

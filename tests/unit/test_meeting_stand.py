@@ -18,6 +18,8 @@ from unittest.mock import Mock
 import pytest
 from tools import meeting_stand as stand
 
+from astra_voice.core import audio_env
+
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
 
@@ -41,6 +43,25 @@ def test_private_environment_ignores_inherited_endpoints(
     for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
         assert Path(env[key]).is_relative_to(tmp_path)
         assert Path(env[key]).stat().st_mode & 0o777 == 0o700
+
+
+def test_private_client_config_matches_app_pool_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = stand.private_environment(tmp_path / "stand")
+    user_config = tmp_path / "app" / "config" / "pulse" / "client.conf"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("enable-shm = yes\nshm-size-bytes = 0\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_config.parent.parent))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "app" / "cache"))
+    monkeypatch.delenv("PULSE_CLIENTCONFIG", raising=False)
+
+    audio_env.deny_pulse_autospawn()
+
+    app_lines = Path(os.environ["PULSE_CLIENTCONFIG"]).read_text(encoding="utf-8").splitlines()
+    stand_lines = Path(env["PULSE_CLIENTCONFIG"]).read_text(encoding="utf-8").splitlines()
+    include_index = app_lines.index(f".include {user_config}")
+    assert stand_lines[:3] == app_lines[include_index + 1 :]
 
 
 def test_missing_binary_fails_without_start(monkeypatch: pytest.MonkeyPatch) -> None:

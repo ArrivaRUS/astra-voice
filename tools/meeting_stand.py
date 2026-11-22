@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from astra_voice.core.audio_env import PULSE_POOL_BYTES
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, new_meeting_id
 from astra_voice.worker.supervisor import WorkerSupervisor, worker_command
@@ -59,7 +60,12 @@ def private_environment(root: Path) -> dict[str, str]:
     pulse_config = root / "config/pulse"
     pulse_config.mkdir(mode=0o700, exist_ok=True)
     client = pulse_config / "client.conf"
-    client.write_text("autospawn = no\nauto-connect-localhost = no\nauto-connect-display = no\n")
+    client.write_text(
+        "enable-shm = no\n"
+        f"shm-size-bytes = {PULSE_POOL_BYTES}\n"
+        "autospawn = no\nauto-connect-localhost = no\nauto-connect-display = no\n",
+        encoding="utf-8",
+    )
     env.update(
         {
             "PATH": "/usr/bin:/bin",
