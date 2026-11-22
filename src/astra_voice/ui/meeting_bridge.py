@@ -43,7 +43,6 @@ from astra_voice.meetings.settings_ext import (
     MEETING_DEFAULTS,
     EffectiveMeetingSettings,
     effective_settings,
-    normalize_participant_text,
 )
 from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.meetings.templates import (
@@ -104,14 +103,14 @@ def _edited_setting(name: str, value: object) -> bool | int | str:
     if value == "":
         return default
     limits = {
+        "meeting_notice_text": 500,
+        "meeting_invite_text": 500,
         "meeting_self_label": 40,
         "meeting_ai_endpoint": 2048,
         "meeting_ai_model": 128,
     }
     if name == "meeting_self_label":
         return normalize_self_label(value)
-    if name in {"meeting_notice_text", "meeting_invite_text"}:
-        return normalize_participant_text(value)
     normalized = normalize_text(value, limits[name])
     return validate_endpoint(normalized) if name == "meeting_ai_endpoint" else normalized
 

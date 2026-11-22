@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import Mock, call
 
 import pytest
-from PyQt5.QtCore import QMetaObject, QPoint, QRect
+from PyQt5.QtCore import QMetaObject
 from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtTest import QSignalSpy
 from test_meeting_recording_bridge import Rig
@@ -19,7 +19,7 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.ui import meeting_overlay
 from astra_voice.ui.meeting_overlay import MeetingOverlay
 from astra_voice.ui.meeting_recording import MeetingRecording
-from astra_voice.ui.overlay import SHADOW_MARGIN, WINDOW_FLAGS, OverlayWindow
+from astra_voice.ui.overlay import WINDOW_FLAGS
 from astra_voice.ui.tray_icons import TrayState
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
@@ -231,30 +231,6 @@ def test_w2_x11_properties_and_focus_across_passive_and_keyboard_shows(
         ("show",),
         *normal,
     ]
-
-
-@pytest.mark.parametrize("ratio", [1, 2])
-def test_w2_right_inset_respects_scaled_workarea_and_available_geometry(ratio: int) -> None:
-    screen = Mock(
-        devicePixelRatio=Mock(return_value=ratio),
-        geometry=Mock(return_value=QRect(0, 0, 1920, 1080)),
-        availableGeometry=Mock(return_value=QRect(0, 24, 1860, 1056)),
-    )
-    target: Any = SimpleNamespace(
-        _active_screen=lambda: screen,
-        _dragged_position=None,
-        _net_workarea=lambda: QRect(0, 0, 1840 * ratio, 1080 * ratio),
-        _view=Mock(width=Mock(return_value=400), height=Mock(return_value=80)),
-        geometryChanged=Mock(),
-        _shadow_margin=SHADOW_MARGIN,
-        _shadow_offset_y=6,
-    )
-    target._overlay_workarea = lambda screen: OverlayWindow._overlay_workarea(target, screen)
-    target._clamped = lambda point, area: MeetingOverlay._clamped(target, point, area)
-    MeetingOverlay._place(target)
-    target._view.setPosition.assert_called_once_with(
-        QPoint(1840 - 12 - 400 + SHADOW_MARGIN, 24 + 12 - SHADOW_MARGIN)
-    )
 
 
 def test_disabled_pill_cannot_hide_w2_or_recording_tray(rig: Rig) -> None:

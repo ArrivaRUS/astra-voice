@@ -927,8 +927,8 @@ def _wire_meeting_windows(
     bridge: Any, focuser: _WindowFocuser, app_info: Any
 ) -> Callable[[], None]:
     def show_meetings() -> None:
-        app_info.show_section(SECTION_MEETINGS)
         focuser.focus_shell()
+        app_info.show_section(SECTION_MEETINGS)
 
     bridge.openMeetingsRequested.connect(show_meetings)
     bridge.recordingRequested.connect(focuser.focus_meeting_start)
@@ -1204,26 +1204,14 @@ class _WindowFocuser(QObject):
 
     def focus_shell(self, timestamp: int = 0) -> None:
         """Показывает shell; положительный X timestamp обновляет user time окна."""
-        if self._stopped:
-            return
-        shell = _root_window(self._shell)
-        dialog = self._meeting_start_window(shell)
-        if dialog is not None and dialog.isVisible():
-            _restore(shell)
-            self.focus(dialog, timestamp, restore=False)
-        else:
-            self.focus(shell, timestamp)
-
-    @staticmethod
-    def _meeting_start_window(shell: Any) -> Any:
-        from PyQt5.QtGui import QWindow
-
-        return (
-            shell.findChild(QWindow, "meetingStartWindow") if isinstance(shell, QObject) else None
-        )
+        self.focus(self._shell, timestamp)
 
     def focus_meeting_start(self) -> None:
-        self.focus(self._meeting_start_window(_root_window(self._shell)), restore=False)
+        from PyQt5.QtGui import QWindow
+
+        shell = _root_window(self._shell)
+        if shell is not None:
+            self.focus(shell.findChild(QWindow, "meetingStartWindow"), restore=False)
 
     def focus(self, target: Any, timestamp: int = 0, *, restore: bool = True) -> None:
         if self._stopped:

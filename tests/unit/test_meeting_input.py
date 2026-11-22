@@ -64,12 +64,7 @@ def editor() -> Iterator[tuple[MeetingBridge, Settings, Settings, Mock]]:
     + [("meeting_retention_days", value) for value in (-1, 7, 366, False, "30", 30.0)]
     + [("meeting_diarization", value) for value in (0, 1, "false")]
     + [(key, "a" * (limit + 1)) for key, limit in TEXT_LIMITS.items()]
-    + [(key, "bad" + char) for key in TEXT_LIMITS for char in ("\x00", "\u202e")]
-    + [
-        (key, "bad\n")
-        for key in TEXT_LIMITS
-        if key not in {"meeting_notice_text", "meeting_invite_text"}
-    ]
+    + [(key, "bad" + char) for key in TEXT_LIMITS for char in ("\x00", "\n", "\u202e")]
     + [
         ("meeting_ai_endpoint", value)
         for value in (

@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from PyQt5.QtCore import QObject, QPoint, QRect, QRectF, Qt, QUrl
+from PyQt5.QtCore import QObject, QPoint, QRect, Qt, QUrl
 from PyQt5.QtGui import QGuiApplication, QScreen
 from PyQt5.QtQuick import QQuickView
 
@@ -98,18 +98,7 @@ class OverlayWindow(QObject):
         area = screen.availableGeometry()
         workarea = self._net_workarea()
         if workarea is not None:
-            # X11's root work area is in pixels, QScreen reports logical coordinates.
-            ratio = screen.devicePixelRatio()
-            workarea = (
-                QRectF(
-                    workarea.x() / ratio,
-                    workarea.y() / ratio,
-                    workarea.width() / ratio,
-                    workarea.height() / ratio,
-                )
-                .toRect()
-                .intersected(area)
-            )
+            workarea = workarea.intersected(screen.geometry())
             if not workarea.isEmpty():
                 area = workarea
         return area

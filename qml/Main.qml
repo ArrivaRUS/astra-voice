@@ -124,10 +124,8 @@ ApplicationWindow {
 
         function onShowSection(section) {
             window.show()
-            if (!meetingStartDialog.visible) {
-                window.raise()
-                window.requestActivate()
-            }
+            window.raise()
+            window.requestActivate()
             if (window.sectionIndices.hasOwnProperty(section))
                 sidebar.currentIndex = window.sectionIndices[section]
         }

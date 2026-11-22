@@ -549,7 +549,7 @@ NATIVE_SETUP = r"""
 import sys
 from pathlib import Path
 from PyQt5.QtCore import QObject, QMetaObject, Qt, pyqtSignal
-from PyQt5.QtGui import QGuiApplication, QFontDatabase
+from PyQt5.QtGui import QGuiApplication, QFontDatabase, QWindow
 from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5 import sip
@@ -608,6 +608,22 @@ try:
     root.dragRequested.emit(-100000, -100000)
     assert view.x() + 18 >= area.left()
     assert view.y() + 18 >= area.top()
+    other = QWindow()
+    try:
+        other.show()
+        other.requestActivate()
+        app.processEvents()
+        assert app.focusWindow() == other
+        assert not root.property('keyboardMode')
+        focus_changes = QSignalSpy(app.focusWindowChanged)
+        view.setWindowState(Qt.WindowMinimized)
+        app.processEvents()
+        assert not (view.windowStates() & Qt.WindowMinimized)
+        assert view.isVisible()
+        assert app.focusWindow() == other and not focus_changes, 'passive W2 took focus'
+        assert not root.property('keyboardMode')
+    finally:
+        other.close()
     owner.activate_keyboard()
     app.processEvents()
     active = app.focusWindow()

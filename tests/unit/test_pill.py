@@ -1011,7 +1011,6 @@ def test_visible_edge_offset_matches_live_kde(harness: Harness) -> None:
 
 def test_workarea_overrides_available_geometry(harness: Harness) -> None:
     screen = harness.app.primaryScreen.return_value
-    screen.devicePixelRatio.return_value = 1
     screen.geometry.return_value = QRect(0, 0, 1920, 1200)
     screen.availableGeometry.return_value = QRect(0, 0, 1920, 1200)
     harness.x11.root.get_full_property.side_effect = lambda atom, kind: (
@@ -1026,7 +1025,6 @@ def test_workarea_uses_current_desktop_and_selected_monitor(harness: Harness) ->
     harness.x11.active_window.return_value = 91
     harness.x11.window_geometry.return_value = (2100, 0, 800, 600)
     screen = harness.app.screenAt.return_value
-    screen.devicePixelRatio.return_value = 1
     screen.geometry.return_value = QRect(1920, 0, 1920, 1200)
     screen.availableGeometry.return_value = QRect(1920, 0, 1920, 1200)
     harness.x11.root.get_full_property.side_effect = lambda atom, kind: Mock(
