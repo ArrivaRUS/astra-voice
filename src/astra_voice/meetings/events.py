@@ -196,6 +196,7 @@ NATIVE_STDERR = "meeting-native-stderr bytes=%d lines=%d"
 DETECTOR_CODE = "meeting-detector purpose=%s code=%s duration_ms=%d"
 START_LATENCY = "meeting-start origin=%s outcome=%s latency_ms=%d"
 START_FAILED = "meeting-start-failed code=%s request=%s"
+OFFER_LIFECYCLE = "meeting-offer event=%s reason=%s shown_ms=%d"
 
 
 class StartOrigin(StrEnum):
@@ -278,7 +279,94 @@ class StartFailureRequest(StrEnum):
         return cls.OTHER
 
 
-LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
+class OfferEvent(StrEnum):
+    RECEIVED = "received"
+    DROPPED = "dropped"
+    SUPPRESSED = "suppressed"
+    SHOWN = "shown"
+    FIRST_FRAME = "first-frame"
+    START = "start"
+    CLOSED = "closed"
+    MEMORY = "memory"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "OfferEvent":
+        return cls.OTHER
+
+
+class OfferReason(StrEnum):
+    OFFER = "offer"
+    CARD = "card"
+    CARD_ERROR = "card-error"
+    UNKNOWN_CLASS = "unknown-class"
+    NO_ROLE = "no-role"
+    UNBOUND = "unbound"
+    NOT_ELIGIBLE = "not-eligible"
+    SESSION_BLOCKED = "session-blocked"
+    PENDING = "pending"
+    VISIBLE = "visible"
+    STARTING = "starting"
+    CALL_ENDED = "call-ended"
+    STALE = "stale"
+    EPOCH_CHANGED = "epoch-changed"
+    DEFERRED_SUPPRESSED = "deferred-suppressed"
+    SHOW_FAILED = "show-failed"
+    OLD_SERIAL = "old-serial"
+    GENERATION = "generation"
+    DECODE = "decode"
+    CARD_REQ = "card-req"
+    UNKNOWN_CALL = "unknown-call"
+    CARD_MEMORY = "card-memory"
+    INHERITED = "inherited"
+    SAME_CALL = "same-call"
+    LOCK_CLOSED = "lock-closed"
+    CARD_ORIGIN = "card-origin"
+    PLACED = "placed"
+    NO_WORKAREA = "no-workarea"
+    FRAME_SWAPPED = "frame-swapped"
+    BIND = "bind"
+    UNBIND = "unbind"
+    ROLE_ENDED = "role-ended"
+    ROLE_REPLACED = "role-replaced"
+    SERVER_CHANGED = "server-changed"
+    DETECTOR_OFF = "detector-off"
+    OPEN_DIALOG = "open-dialog"
+    RECORDING = "recording"
+    POLICY = "policy"
+    REMOTE = "remote"
+    MIC_RELEASED = "mic-released"
+    APP_GONE = "app-gone"
+    EVICTED = "evicted"
+    TIMEOUT = "timeout"
+    REFUSED = "refused"
+    CLOSE_BUTTON = "close-button"
+    WM_CLOSE = "wm-close"
+    ACCEPTED = "accepted"
+    STARTED = "started"
+    START_FAILED = "start-failed"
+    START_ABORTED = "start-aborted"
+    OPEN_MEETINGS = "open-meetings"
+    CALL_LOST = "call-lost"
+    NO_APP_SPLIT = "no-app-split"
+    SHUTDOWN = "shutdown"
+    REMEMBER_SHOWN = "remember-shown"
+    REMEMBER_REFUSED = "remember-refused"
+    REMEMBER_ACCEPTED = "remember-accepted"
+    REMEMBER_LOCK_CLOSED = "remember-lock-closed"
+    RESET = "reset"
+    INHERIT = "inherit"
+    EXPIRE = "expire"
+    DROP = "drop"
+    CLEAR = "clear"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "OfferReason":
+        return cls.OTHER
+
+
+LOG_FIELDS: dict[str, tuple[type[StrEnum] | type[int] | None, ...]] = {
     POLICY_REJECTED: (PolicyCode,),
     SETTING_INVALID: (SettingKey,),
     EXCEPTION: (ExceptionClass,),
@@ -289,6 +377,7 @@ LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     DETECTOR_CODE: (DetectorPurpose, DetectorCode, None),
     START_LATENCY: (StartOrigin, StartOutcome, None),
     START_FAILED: (StartFailureCode, StartFailureRequest),
+    OFFER_LIFECYCLE: (OfferEvent, OfferReason, int),
 }
 
 
@@ -330,8 +419,8 @@ def log_arguments(message: object, args: object) -> tuple[object, ...] | None:
         return None
     result: list[object] = []
     for value, kind in zip(args, fields, strict=True):
-        if kind is None:
-            if not is_number(value):
+        if kind is None or kind is int:
+            if not is_number(value) or (kind is int and type(value) is not int):
                 return None
             result.append(value)
         elif not isinstance(value, kind):

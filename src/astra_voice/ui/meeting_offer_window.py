@@ -9,7 +9,9 @@ from PyQt5.QtCore import QEvent, QMetaObject, QObject, QPoint, QRect, Qt, QTimer
 from PyQt5.QtGui import QCursor, QGuiApplication, QMouseEvent, QRegion, QTouchEvent, QWheelEvent
 from PyQt5.QtQuick import QQuickView
 
+from astra_voice.core.logging import log_meeting_offer
 from astra_voice.core.paths import qml_dir
+from astra_voice.meetings.events import OfferEvent, OfferReason
 from astra_voice.platform.x11 import TIMESTAMP_ATOM, X11Display
 from astra_voice.ui.meeting_notice import NOTICE_SHADOW_MARGIN, NOTICE_SHADOW_OFFSET_Y
 from astra_voice.ui.meeting_offer import OFFER_GUARD_MS
@@ -84,6 +86,7 @@ class MeetingOffer(SurfaceWindow):
         self._waiting_for_expose = False
         self._frame_handler: Callable[[], None] | None = None
         self._first_frame_at_ms: int | None = None
+        self._show_logged_at_ms: int | None = None
         self._frame_x_time: int | None = None
         self._restoring_user_time = False
         self._workarea: QRect | None = None
@@ -145,6 +148,10 @@ class MeetingOffer(SurfaceWindow):
         self._waiting_for_expose = True
         self._view.setProperty("_q_showWithoutActivating", True)
         self._view.show()
+        if self._open:
+            self._show_logged_at_ms = self.recording.offer.now_ms()
+            reason = OfferReason.NO_WORKAREA if self._workarea is None else OfferReason.PLACED
+            log_meeting_offer(OfferEvent.SHOWN, reason)
 
     def starting(self) -> None:
         if self._open and self._start_failed_at_ms is None:
@@ -231,6 +238,9 @@ class MeetingOffer(SurfaceWindow):
             return
         if self._first_frame_at_ms is None:
             self._first_frame_at_ms = self.recording.offer.now_ms()
+            shown_at = self._show_logged_at_ms
+            shown_ms = self._first_frame_at_ms - shown_at if shown_at is not None else 0
+            log_meeting_offer(OfferEvent.FIRST_FRAME, OfferReason.FRAME_SWAPPED, shown_ms)
         if self._xcb:
             self._frame_x_time = self._sample_x_time()
             if self._frame_x_time is None:
@@ -342,6 +352,7 @@ class MeetingOffer(SurfaceWindow):
         self._waiting_for_expose = False
         self._stop_tracking_frames()
         self._first_frame_at_ms = self._frame_x_time = None
+        self._show_logged_at_ms = None
         self._workarea = None
         self._view.hide()
         self._root.setProperty("presented", False)

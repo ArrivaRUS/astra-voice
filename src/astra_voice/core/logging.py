@@ -59,6 +59,14 @@ _MEETING_LOGGERS = frozenset(
 )
 
 
+def log_meeting_offer(
+    event: meeting_events.OfferEvent, reason: meeting_events.OfferReason, shown_ms: int = 0
+) -> None:
+    logging.getLogger("astra_voice.meetings").info(
+        meeting_events.OFFER_LIFECYCLE, event, reason, round(max(0, shown_ms), -2)
+    )
+
+
 def _meeting_record(record: logging.LogRecord) -> bool:
     return (
         record.name == "astra_voice.meetings"

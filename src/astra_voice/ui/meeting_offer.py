@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from astra_voice.core.command_mode import SessionSnapshot
+from astra_voice.core.logging import log_meeting_offer
 from astra_voice.core.meeting_session import ERROR_TEXT
+from astra_voice.meetings.events import OfferEvent, OfferReason
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +22,13 @@ _UNLOCK_QUERY_MS = 5_000
 _INHERIT_MS = 15_000
 _START_TIMEOUT_MS = 6_000
 _KINDS = {"dion": "call-app", "browser": "call-browser"}
+_CALL_END_LOG_REASONS = {
+    "mic_released": OfferReason.MIC_RELEASED,
+    "app_gone": OfferReason.APP_GONE,
+    "server_changed": OfferReason.SERVER_CHANGED,
+    "detector_off": OfferReason.DETECTOR_OFF,
+    "evicted": OfferReason.EVICTED,
+}
 
 Outcome = Literal["shown", "refused", "accepted", "lock_closed"]
 Origin = Literal["offer", "card"]
@@ -65,6 +74,7 @@ class _StartSlot:
     role_serial: int
     pressed_at_ms: int
     deadline: int | None
+    shown_at_ms: int | None
     failed: bool = False
 
 
@@ -109,10 +119,11 @@ class OfferController:
         return int(self._clock() * 1000)
 
     def bind(self, view: OfferView | None) -> None:
-        self.start_closed()
+        reason = OfferReason.UNBIND if view is None else OfferReason.BIND
+        self.start_closed(reason=reason)
         if self._view is view:
             return
-        self.suspend()
+        self.suspend(reason=reason)
         self._view = view
 
     @property
@@ -149,11 +160,11 @@ class OfferController:
 
     def new_role(self, serial: int) -> None:
         if self._role_serial is not None:
-            self.role_ended(self._role_serial)
+            self.role_ended(self._role_serial, reason=OfferReason.ROLE_REPLACED)
         self._role_serial = serial
         self._detector_started = False
 
-    def role_ended(self, serial: int) -> None:
+    def role_ended(self, serial: int, *, reason: OfferReason = OfferReason.OTHER) -> None:
         if serial != self._role_serial:
             return
         self.detector_unavailable()
@@ -162,10 +173,13 @@ class OfferController:
         self._calls.clear()
         self._ended.clear()
         for entry in self._memory.values():
+            reset_deadline = entry.deadline is not None and entry.deadline > ended_at
+            if entry.call_ids or reset_deadline:
+                log_meeting_offer(OfferEvent.MEMORY, OfferReason.RESET)
             entry.call_ids.clear()
-            if entry.deadline is not None and entry.deadline > ended_at:
+            if reset_deadline:
                 entry.deadline = None
-        self.suspend()
+        self.suspend(reason=reason)
 
     def detector_started(self) -> None:
         self._detector_started = True
@@ -173,19 +187,24 @@ class OfferController:
         for entry in self._memory.values():
             if entry.role_serial != self._role_serial and entry.deadline is None:
                 entry.deadline = deadline
+                log_meeting_offer(OfferEvent.MEMORY, OfferReason.INHERIT)
 
     def detector_unavailable(self) -> None:
         if not self._detector_started:
+            count = len(self._memory)
             self._memory = {
                 key: entry
                 for key, entry in self._memory.items()
                 if entry.role_serial == self._role_serial
             }
+            if len(self._memory) < count:
+                log_meeting_offer(OfferEvent.MEMORY, OfferReason.DROP)
 
     def _expire_memory(self, now: int) -> None:
         for app_class, entry in tuple(self._memory.items()):
             if entry.deadline is not None and now >= entry.deadline:
                 del self._memory[app_class]
+                log_meeting_offer(OfferEvent.MEMORY, OfferReason.EXPIRE)
 
     def _card_allowed(self, app_class: str) -> bool:
         entry = self._memory.get(app_class)
@@ -199,22 +218,27 @@ class OfferController:
         if entry is None:
             return False
         if call.origin == "card":
-            suppressed = not self._card_allowed(call.app_class)
+            if self._card_allowed(call.app_class):
+                return False
+            reason = OfferReason.CARD_MEMORY
         elif entry.role_serial != self._role_serial:
             assert self._role_serial is not None
-            suppressed = True
+            reason = OfferReason.INHERITED
             entry.role_serial = self._role_serial
             entry.origin = "offer"
             entry.deadline = None
+            log_meeting_offer(OfferEvent.MEMORY, OfferReason.BIND)
+        elif call.call_id in entry.call_ids:
+            reason = OfferReason.SAME_CALL
+        elif entry.state == "lock_closed":
+            reason = OfferReason.LOCK_CLOSED
+        elif entry.origin == "card":
+            reason = OfferReason.CARD_ORIGIN
         else:
-            suppressed = (
-                call.call_id in entry.call_ids
-                or entry.state == "lock_closed"
-                or entry.origin == "card"
-            )
-        if suppressed:
-            entry.call_ids.add(call.call_id)
-        return suppressed
+            return False
+        entry.call_ids.add(call.call_id)
+        log_meeting_offer(OfferEvent.SUPPRESSED, reason)
+        return True
 
     def _fresh(self, measured_ms: int, now: int) -> bool:
         return measured_ms > 0 and 0 <= now - measured_ms <= _FRESH_MS
@@ -235,20 +259,35 @@ class OfferController:
     ) -> None:
         if origin == "card":
             self._query_at = None
-        if app_class not in _KINDS or self._role_serial is None:
+        if app_class not in _KINDS:
+            log_meeting_offer(OfferEvent.DROPPED, OfferReason.UNKNOWN_CLASS)
+            return
+        if self._role_serial is None:
+            log_meeting_offer(OfferEvent.DROPPED, OfferReason.NO_ROLE)
             return
         self.track_call(call_id, app_class)
         now = self.now_ms()
-        if not (
-            self.bound
-            and eligible
-            and session.allowed
-            and self._pending is None
-            and not self.visible
-            and not self.starting_slot
-            and call_id not in self._ended
-            and self._fresh(measured_ms, now)
-        ):
+        reason: OfferReason | None
+        if not self.bound:
+            reason = OfferReason.UNBOUND
+        elif not eligible:
+            reason = OfferReason.NOT_ELIGIBLE
+        elif not session.allowed:
+            reason = OfferReason.SESSION_BLOCKED
+        elif self._pending is not None:
+            reason = OfferReason.PENDING
+        elif self.visible:
+            reason = OfferReason.VISIBLE
+        elif self.starting_slot:
+            reason = OfferReason.STARTING
+        elif call_id in self._ended:
+            reason = OfferReason.CALL_ENDED
+        elif not self._fresh(measured_ms, now):
+            reason = OfferReason.STALE
+        else:
+            reason = None
+        if reason is not None:
+            log_meeting_offer(OfferEvent.DROPPED, reason)
             return
         entry = self._memory.get(app_class)
         # Preserve the event at the deadline without consuming or reviving the old entry.
@@ -279,6 +318,7 @@ class OfferController:
             else None
         )
         self._memory[call.app_class] = _Memory(outcome, ids, serial, call.origin, deadline)
+        log_meeting_offer(OfferEvent.MEMORY, OfferReason("remember-" + outcome.replace("_", "-")))
 
     def _take_visible(self) -> _Call | None:
         call, self._visible = self._visible, None
@@ -290,13 +330,18 @@ class OfferController:
         self._seconds = 0
         return call
 
-    def _close(self, outcome: Outcome | None = None) -> None:
+    def _close(
+        self, outcome: Outcome | None = None, *, reason: OfferReason = OfferReason.OTHER
+    ) -> None:
+        shown_at = self._shown_at
         call = self._take_visible()
         if call is None:
             return
         if outcome is not None:
             self._remember(call, outcome)
         assert self._view is not None
+        shown_ms = self.now_ms() - shown_at if shown_at is not None else 0
+        log_meeting_offer(OfferEvent.CLOSED, reason, shown_ms)
         self._view.close()
         self._visibility_changed()
 
@@ -305,7 +350,7 @@ class OfferController:
             self._starting.deadline = None
 
     def start_done(self) -> None:
-        self.start_closed()
+        self.start_closed(reason=OfferReason.STARTED)
 
     def start_failed(self, text: str) -> None:
         if self._starting is None or self._starting.failed:
@@ -319,19 +364,29 @@ class OfferController:
     def start_aborted(self) -> None:
         if self._starting is not None:
             self._remember(self._starting.call, "lock_closed", self._starting.role_serial)
-            self.start_closed()
+            self.start_closed(reason=OfferReason.START_ABORTED)
 
-    def start_closed(self) -> None:
-        if self._starting is None:
+    def start_closed(self, *, reason: OfferReason = OfferReason.OTHER) -> None:
+        slot, self._starting = self._starting, None
+        if slot is None:
             return
-        self._starting = None
         assert self._view is not None
+        shown_ms = self.now_ms() - slot.shown_at_ms if slot.shown_at_ms is not None else 0
+        log_meeting_offer(OfferEvent.CLOSED, reason, shown_ms)
         self._view.close()
         self._visibility_changed()
 
-    def suspend(self, *, for_capture: bool = False, clear_memory: bool = False) -> None:
+    def suspend(
+        self,
+        *,
+        for_capture: bool = False,
+        clear_memory: bool = False,
+        reason: OfferReason = OfferReason.OTHER,
+    ) -> None:
         pending, self._pending = self._pending, None
         self._query_at = None
+        if pending is not None and pending.deferred != "shown":
+            log_meeting_offer(OfferEvent.DROPPED, reason)
         if for_capture and pending is not None:
             if pending.deferred is None:
                 self._remember(pending, "shown")
@@ -339,42 +394,55 @@ class OfferController:
                 pending.deferred = "shown"
                 self._pending = pending
         if clear_memory:
-            self._memory.clear()
+            if self._memory:
+                self._memory.clear()
+                log_meeting_offer(OfferEvent.MEMORY, OfferReason.CLEAR)
             self._calls.clear()
             self._ended.clear()
-            self.start_closed()
-        self._close("shown" if for_capture else None)
+            self.start_closed(reason=reason)
+        self._close("shown" if for_capture else None, reason=reason)
 
     def call_ended(self, call_id: str, reason: str) -> bool:
         """Apply a known end event. Return True when it invalidates CARD."""
         app_class = self._calls.pop(call_id, None)
         self._ended.add(call_id)
         if app_class is None:
+            log_meeting_offer(OfferEvent.DROPPED, OfferReason.UNKNOWN_CALL)
             return False
         pending, visible = self._pending, self._visible
+        log_reason = _CALL_END_LOG_REASONS.get(reason, OfferReason.OTHER)
         if reason in {"mic_released", "app_gone"}:
             if pending is not None and pending.app_class == app_class:
                 self._pending = None
-            self._memory.pop(app_class, None)
+                if pending.deferred != "shown":
+                    log_meeting_offer(OfferEvent.DROPPED, log_reason)
+            if self._memory.pop(app_class, None) is not None:
+                log_meeting_offer(OfferEvent.MEMORY, OfferReason.CLEAR)
             if visible is not None and visible.app_class == app_class:
-                self._close()
+                self._close(reason=log_reason)
         elif reason in {"server_changed", "detector_off"}:
             if reason == "server_changed":
                 entry = self._memory.get(app_class)
                 if entry is not None:
+                    changed = call_id in entry.call_ids or entry.state == "lock_closed"
                     entry.call_ids.discard(call_id)
                     if entry.state == "lock_closed":
                         entry.state = "shown"
-            self.suspend()
+                    if changed:
+                        log_meeting_offer(OfferEvent.MEMORY, OfferReason.SERVER_CHANGED)
+            self.suspend(reason=log_reason)
             return reason == "server_changed"
         else:  # evicted
             if pending is not None and pending.call_id == call_id:
                 self._pending = None
+                if pending.deferred != "shown":
+                    log_meeting_offer(OfferEvent.DROPPED, log_reason)
             if visible is not None and visible.call_id == call_id:
-                self._close("shown")
+                self._close("shown", reason=log_reason)
             entry = self._memory.get(app_class)
-            if entry is not None:
+            if entry is not None and call_id in entry.call_ids:
                 entry.call_ids.discard(call_id)
+                log_meeting_offer(OfferEvent.MEMORY, OfferReason.EVICTED)
         return False
 
     def reset_session(self) -> None:
@@ -410,9 +478,11 @@ class OfferController:
         if not snapshot.allowed or (
             self._visible is not None and self._visible.epochs != _epochs(snapshot)
         ):
+            reason = OfferReason.EPOCH_CHANGED if snapshot.allowed else OfferReason.SESSION_BLOCKED
             if self._pending is not None and self._pending.deferred != "shown":
                 self._pending = None
-            self._close("lock_closed")
+                log_meeting_offer(OfferEvent.DROPPED, reason)
+            self._close("lock_closed", reason=reason)
         if (
             can_query
             and ready
@@ -446,13 +516,17 @@ class OfferController:
             self._pending = None
             if call.deferred == "shown":
                 self._remember(call, "shown")
-            elif (
-                eligible
-                and session.allowed
-                and call.epochs == _epochs(session)
-                and self._fresh(call.measured_ms, now)
-                and (call.deferred is None or not self._suppressed(call))
-            ):
+            elif not eligible:
+                log_meeting_offer(OfferEvent.DROPPED, OfferReason.NOT_ELIGIBLE)
+            elif not session.allowed:
+                log_meeting_offer(OfferEvent.DROPPED, OfferReason.SESSION_BLOCKED)
+            elif call.epochs != _epochs(session):
+                log_meeting_offer(OfferEvent.DROPPED, OfferReason.EPOCH_CHANGED)
+            elif not self._fresh(call.measured_ms, now):
+                log_meeting_offer(OfferEvent.DROPPED, OfferReason.STALE)
+            elif call.deferred is not None and self._suppressed(call):
+                log_meeting_offer(OfferEvent.DROPPED, OfferReason.DEFERRED_SUPPRESSED)
+            else:
                 self._show(call)
         elif self._shown_at is not None:
             elapsed = now - self._shown_at
@@ -462,7 +536,7 @@ class OfferController:
                 self._ended.clear()
                 return False
             if remaining <= 0:
-                self._close("refused")
+                self._close("refused", reason=OfferReason.TIMEOUT)
             else:
                 seconds = (remaining + 999) // 1000
                 if seconds != self._seconds:
@@ -492,6 +566,7 @@ class OfferController:
             self._view.show(_KINDS[call.app_class], self._seconds)
         except Exception:
             log.warning("meeting-offer-show-failed")
+            log_meeting_offer(OfferEvent.DROPPED, OfferReason.SHOW_FAILED)
             if self._visible is call:
                 self._visible = None
                 self._guarded = False
@@ -508,7 +583,10 @@ class OfferController:
         if self._starting is not None:
             if not self._starting.failed or action not in {"close", "open_meetings"}:
                 return False
-            self.start_closed()
+            reason = (
+                OfferReason.OPEN_MEETINGS if action == "open_meetings" else OfferReason.START_FAILED
+            )
+            self.start_closed(reason=reason)
             if action == "open_meetings":
                 self._open_meetings()
             return True
@@ -537,22 +615,26 @@ class OfferController:
         if not self._press_in_window(pressed_at_ms, pressed_at_ms):
             return False
         if action == "start":
+            shown_at = self._shown_at
             call = self._take_visible()
             assert call is not None and self._role_serial is not None and self._view is not None
             self._remember(call, "accepted", self._role_serial)
             self._starting = _StartSlot(
-                call, self._role_serial, pressed_at_ms, pressed_at_ms + _START_TIMEOUT_MS
+                call, self._role_serial, pressed_at_ms, pressed_at_ms + _START_TIMEOUT_MS, shown_at
             )
+            shown_ms = pressed_at_ms - shown_at if shown_at is not None else 0
+            log_meeting_offer(OfferEvent.START, OfferReason.ACCEPTED, shown_ms)
             self._view.starting()
             self.startRequested(call.call_id, call.app_class)
         else:
-            self._close("refused")
+            reason = OfferReason.REFUSED if action == "refuse" else OfferReason.CLOSE_BUTTON
+            self._close("refused", reason=reason)
         return True
 
     def dismiss(self) -> None:
         """The window manager closed W1. The in-window × uses press()."""
         if self._starting is not None:
             if self._starting.failed:
-                self.start_closed()
+                self.start_closed(reason=OfferReason.WM_CLOSE)
             return
-        self._close("refused")
+        self._close("refused", reason=OfferReason.WM_CLOSE)
