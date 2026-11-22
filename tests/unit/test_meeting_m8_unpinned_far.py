@@ -24,16 +24,18 @@ from test_meeting_m8_start import (
 from test_meeting_m8_start import capture_events as capture_events
 
 from astra_voice.meetings.apps import AppClass
+from astra_voice.meetings.model import Meeting
 from astra_voice.worker import ipc
 from astra_voice.worker.meeting_detector import (
     Direction,
     EventKind,
     NormalizedEvent,
+    PictureConnection,
     PictureTiming,
     ProgramKey,
     StreamKey,
 )
-from astra_voice.worker.meeting_identity_check import PinnedStream
+from astra_voice.worker.meeting_identity_check import PinnedStream, PinnedTarget
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
@@ -48,7 +50,7 @@ def output(
             1,
             Direction.OUTPUT,
             stream.sink_input,
-            stream.sink_input,
+            stream.sink_input + 10_000,
             stream.stream_serial,
         ),
         program,
@@ -62,12 +64,15 @@ def picture(
     kind: EventKind = EventKind.RESET,
     confirmed: bool = True,
     age: float = 0,
+    cookie: int = ANCHOR.server_cookie,
 ) -> None:
     at = rig.clock() - age
     observer = rig.state.observer
     events = (NormalizedEvent(kind, at), *(replace(event, at=at) for event in outputs))
     with observer.rule_lock:
-        observer.rule.update(events, timing=PictureTiming(at, None, confirmed))
+        observer.rule.update(
+            events, timing=PictureTiming(at, None, confirmed, PictureConnection(cookie, 1))
+        )
 
 
 def decode_tracks(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -79,7 +84,10 @@ def decode_tracks(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 @pytest.mark.parametrize("reused_index", [False, True], ids=["new-index", "new-serial"])
 def test_dion_marks_unpinned_far_once_on_alive_tick(
-    service: tuple[Rig, CheckDouble], capture_events: CaptureEvents, reused_index: bool
+    service: tuple[Rig, CheckDouble],
+    capture_events: CaptureEvents,
+    reused_index: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rig, checks = service
     target = pinned_outputs(1, rig.clock())
@@ -99,7 +107,7 @@ def test_dion_marks_unpinned_far_once_on_alive_tick(
             tuple(rig.backend.source_targets),
         )
 
-    before, threads = audio_calls(), set(threading.enumerate())
+    before = audio_calls()
     rig.clock.now += 1
     sounding = output(rig, pinned)
     picture(rig, sounding)
@@ -117,7 +125,19 @@ def test_dion_marks_unpinned_far_once_on_alive_tick(
     assert not rig.state._far_incomplete
 
     rig.clock.now += 0.5
-    tick = rig.poll()
+    calls = len(rig.backend.control.mock_calls)
+    starts: list[threading.Thread] = []
+    start = threading.Thread.start
+
+    def start_thread(thread: threading.Thread) -> None:
+        starts.append(thread)
+        start(thread)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", start_thread)
+        tick = rig.poll()
+    assert len(rig.backend.control.mock_calls) == calls
+    assert not starts
     assert of_type(tick, "capture.alive")
     (notice,) = decode_tracks(tick)
     assert (notice["track"], notice["state"], notice["kind"]) == (
@@ -149,7 +169,6 @@ def test_dion_marks_unpinned_far_once_on_alive_tick(
     assert not decode_tracks(rig.poll())
     assert rig.state.capture_target is target
     assert audio_calls() == before
-    assert set(threading.enumerate()) <= threads
 
 
 @pytest.mark.parametrize(
@@ -209,10 +228,9 @@ def test_far_tick_ignores_unusable_observer_picture(
         kind=EventKind.UNAVAILABLE if case == "unavailable" else EventKind.RESET,
         confirmed=case != "unconfirmed",
         age=2.001 if case == "stale" else 0,
+        cookie=target.server_cookie + 1 if case == "wrong-cookie" else target.server_cookie,
     )
     observer = rig.state.observer
-    if case == "wrong-cookie":
-        observer.registry.set("observer", (42, target.server_cookie + 1))
     if case == "automation-off":
         observer.automation_off.set()
     assert not decode_tracks(rig.poll())
@@ -220,7 +238,6 @@ def test_far_tick_ignores_unusable_observer_picture(
 
     rig.clock.now += 1
     observer.automation_off.clear()
-    observer.registry.set("observer", (42, target.server_cookie))
     picture(rig, output(rig, pinned), output(rig, new), age=2)
     assert_far_track(rig.poll(), "live", "partial")
 
@@ -241,25 +258,37 @@ def test_card_can_start_far_without_an_observer_picture(
     assert not rig.state._far_incomplete
 
 
+def prepare_browser(
+    rig: Rig, checks: CheckDouble, program: ProgramKey, target: PinnedTarget
+) -> None:
+    decision = replace(
+        ALLOWED, app_class=AppClass.BROWSER, anchor=replace(ANCHOR, program=program), target=target
+    )
+    card, _ = checked_card(rig, checks, f"card-{len(checks.requests)}", decision)
+    assert card["app_class"] == "browser" and card["variant1"]
+    run = checks.plan(decision)
+    request_prepare(rig, {"kind": "app_stream", "call_id": card["call_id"]})
+    run.complete()
+    prepared(rig, rig.poll())
+
+
 def test_browser_compares_picture_at_first_open(
     service: tuple[Rig, CheckDouble], capture_events: CaptureEvents
 ) -> None:
     rig, checks = service
     target = pinned_outputs(2, rig.clock())
     program = ProgramKey("browser", "chromium")
-    decision = replace(
-        ALLOWED, app_class=AppClass.BROWSER, anchor=replace(ANCHOR, program=program), target=target
-    )
-    card, _ = checked_card(rig, checks, "card", decision)
-    assert card["app_class"] == "browser" and card["variant1"]
-    run = checks.plan(decision)
-    request_prepare(rig, {"kind": "app_stream", "call_id": card["call_id"]})
-    run.complete()
-    prepared(rig, rig.poll())
+    prepare_browser(rig, checks, program, target)
     picture(rig, *(output(rig, stream, program=program) for stream in pinned_outputs(3).streams))
     open_capture(rig, capture_events)
     assert not of_type(rig.inbox, "capture.alive")
     assert_far_track(rig.inbox, "live", "partial")
+    assert rig.state._prepared_anchor is None
+    assert program.binary not in repr(vars(rig.state))
+
+
+def unexpected_anchor(_call_id: str) -> None:
+    pytest.fail("the active capture looked up its call anchor")
 
 
 def test_far_skips_paused_tick_and_compares_picture_on_resume(
@@ -298,8 +327,10 @@ def test_far_skips_paused_tick_and_compares_picture_on_resume(
         rig.poll()
         capture_events.finish("finalized", "meeting.capture.finalized")
 
-    assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
-    capture_events.finish("opened", "meeting.capture.started")
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.state.calls, "anchor_for", unexpected_anchor)
+        assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
+        capture_events.finish("opened", "meeting.capture.started")
     assert len(of_type(rig.inbox, "capture.alive")) == 1
     assert_far_track(rig.inbox, "live", "partial")
 
@@ -314,9 +345,6 @@ def test_far_tick_uses_the_program_pinned_on_prepare(
     pinned, new = pinned_outputs(2, rig.clock()).streams
     prepare_allowed(rig, checks, app_far(rig, checks), target)
     open_capture(rig, capture_events)
-
-    def unexpected_anchor(_call_id: str) -> None:
-        pytest.fail("the active capture looked up its call anchor")
 
     rig.clock.now += 1
     picture(rig, output(rig, pinned), output(rig, new))
@@ -375,3 +403,66 @@ def test_far_tick_shares_incomplete_flag_with_reader_losses(
         assert_far_track(lose_output(), "live", "partial")
     current = rig.state.capture_target
     assert current is not None and current.streams == (survivor,)
+
+
+def test_second_pinned_output_wakes_without_partial(
+    service: tuple[Rig, CheckDouble], capture_events: CaptureEvents
+) -> None:
+    rig, checks = service
+    target = pinned_outputs(2, rig.clock())
+    first, second = target.streams
+    prepare_allowed(rig, checks, app_far(rig, checks), target)
+    picture(rig, output(rig, first), output(rig, second, corked=True))
+    open_capture(rig, capture_events)
+
+    rig.clock.now += 1
+    picture(rig, output(rig, first), output(rig, second))
+    assert not decode_tracks(rig.inbox + rig.poll())
+    assert not rig.state._far_incomplete
+
+
+def test_firefox_output_is_not_chromium_output(
+    service: tuple[Rig, CheckDouble], capture_events: CaptureEvents
+) -> None:
+    rig, checks = service
+    target = pinned_outputs(1, rig.clock())
+    firefox = ProgramKey("browser", "firefox")
+    chromium = ProgramKey("browser", "chromium")
+    prepare_browser(rig, checks, chromium, target)
+    open_capture(rig, capture_events)
+
+    rig.clock.now += 1
+    pinned, other = pinned_outputs(2).streams
+    picture(rig, output(rig, pinned, program=chromium), output(rig, other, program=firefox))
+    assert not decode_tracks(rig.poll())
+    assert not rig.state._far_incomplete
+
+
+def test_new_meeting_on_role_replaces_program_and_partial_flag(
+    service: tuple[Rig, CheckDouble], capture_events: CaptureEvents
+) -> None:
+    rig, checks = service
+    target = pinned_outputs(1, rig.clock())
+    new_output = pinned_outputs(2).streams[1]
+    prepare_allowed(rig, checks, app_far(rig, checks), target)
+    picture(rig, output(rig, new_output))
+    open_capture(rig, capture_events)
+    assert_far_track(rig.inbox, "live", "partial")
+    rig.send("stop")
+    capture_events.finish("closed", "meeting.capture.closed")
+    capture_events.finish("finalized", "meeting.capture.finalized")
+
+    rig.inbox.clear()
+    meeting = "2026-11-01_120000-ab12"
+    rig.store.create(Meeting(id=meeting, started_at="2026-11-01T12:00:00+00:00"))
+    rig.directory = rig.directory.parent / meeting
+    rig.identity = {"meeting_id": meeting, "meeting_generation": 1}
+    chromium = ProgramKey("browser", "chromium")
+    prepare_browser(rig, checks, chromium, pinned_outputs(1, rig.clock()))
+    open_capture(rig, capture_events)
+    assert not decode_tracks(rig.inbox)
+    assert not rig.state._far_incomplete
+
+    rig.clock.now += 1
+    picture(rig, output(rig, new_output, program=chromium))
+    assert_far_track(rig.poll(), "live", "partial")

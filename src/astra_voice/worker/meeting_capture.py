@@ -458,6 +458,11 @@ class _Archive:
                 file.close()
 
 
+@dataclass(frozen=True, repr=False)
+class _FarProgram:
+    key: ProgramKey
+
+
 class MeetingCaptureState:
     def __init__(
         self,
@@ -501,7 +506,7 @@ class MeetingCaptureState:
         self.prepared_target: PinnedTarget | None = None
         self.capture_target: PinnedTarget | None = None
         self._prepared_anchor: CallAnchor | None = None
-        self._far_program: ProgramKey | None = None
+        self._far_program: _FarProgram | None = None
         self._target_epoch: int | None = None
         self.mic_device: str | None = None
         self.archive: _Archive | None = None
@@ -1566,14 +1571,18 @@ class MeetingCaptureState:
             or observer.automation_off.is_set()
         ):
             return
-        with observer.rule_lock:
-            outputs = observer.rule.outputs(program, now)
-        if not outputs or observer.registry.snapshot().server_cookie != target.server_cookie:
+        if not observer.rule_lock.acquire(blocking=False):
             return
-        pinned = {(stream.sink_input, stream.stream_serial) for stream in target.streams}
-        if outputs - pinned:
-            self._far_incomplete = True
-            self._far_partial_pending = True
+        try:
+            snapshot = observer.rule.outputs(program.key, now)
+            if snapshot is None or snapshot.connection.cookie != target.server_cookie:
+                return
+            pinned = {(stream.sink_input, stream.stream_serial) for stream in target.streams}
+            if snapshot.streams - pinned:
+                self._far_incomplete = True
+                self._far_partial_pending = True
+        finally:
+            observer.rule_lock.release()
 
     def _finish_prepare(self, event: Message, result: list[Message]) -> None:
         control: _PreparedControl = event["control"]
@@ -1616,7 +1625,7 @@ class MeetingCaptureState:
         self.final_status = "succeeded"
         self.lost_estimate_ms = 0
         self.track_states = {"mic": "ended", "far": "ended"}
-        self._far_program = anchor.program if anchor is not None else None
+        self._far_program = _FarProgram(anchor.program) if anchor is not None else None
         self._far_incomplete = False
         self._far_partial_pending = False
         self._last_far_partial = float("-inf")

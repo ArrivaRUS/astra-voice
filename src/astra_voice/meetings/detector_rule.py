@@ -14,6 +14,7 @@ from astra_voice.worker.meeting_detector import (
     Direction,
     EventKind,
     NormalizedEvent,
+    PictureConnection,
     PictureTiming,
     ProgramKey,
 )
@@ -31,6 +32,12 @@ class Candidate:
 @dataclass(frozen=True)
 class CallEnded:
     program: ProgramKey
+
+
+@dataclass(frozen=True, repr=False)
+class OutputSnapshot:
+    connection: PictureConnection
+    streams: frozenset[tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,7 @@ class MeetingDetectorRule:
         self._available = True
         self._confirmed = True
         self._updated_at: float | None = None
+        self._output_connection: PictureConnection | None = None
         # The source's incarnation counter uniquely identifies a stream in its picture.
         self._streams: dict[int, _Stream] = {}
         self._programs: dict[ProgramKey, _Program] = {}
@@ -91,6 +99,7 @@ class MeetingDetectorRule:
             self._apply(event)
         self._confirmed = self._available and (timing is None or timing.confirmed)
         self._updated_at = seconds
+        self._output_connection = timing.connection if self._confirmed and timing else None
         if self._available:
             return self._evaluate(now)
         return ()
@@ -102,16 +111,22 @@ class MeetingDetectorRule:
             return None
         return Candidate(program, state.offered)
 
-    def outputs(self, program: ProgramKey, now: float) -> frozenset[tuple[int, int]] | None:
+    def invalidate_outputs(self) -> None:
+        """Revoke the playback picture with the observer lock held."""
+        self._output_connection = None
+
+    def outputs(self, program: ProgramKey, now: float) -> OutputSnapshot | None:
         """Read audible outputs from a fresh picture with the observer lock held."""
+        connection = self._output_connection
         if (
             not self._available
             or not self._confirmed
+            or connection is None
             or self._updated_at is None
             or now - self._updated_at > 2
         ):
             return None
-        return frozenset(
+        streams = frozenset(
             (stream.index, stream.serial)
             for stream in self._streams.values()
             if stream.direction is Direction.OUTPUT
@@ -119,6 +134,7 @@ class MeetingDetectorRule:
             and stream.audible
             and stream.serial is not None
         )
+        return OutputSnapshot(connection, streams)
 
     def mark_offered(self, program: ProgramKey) -> bool:
         """Record an offer for a current candidate after the role's checks."""

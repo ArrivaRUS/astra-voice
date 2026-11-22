@@ -91,12 +91,19 @@ class NormalizedEvent:
 
 
 @dataclass(frozen=True)
+class PictureConnection:
+    cookie: int = field(repr=False)
+    generation: int
+
+
+@dataclass(frozen=True)
 class PictureTiming:
     """Observation time and the earliest pending change in this poll."""
 
     at: float
     changes_since: float | None
     confirmed: bool
+    connection: PictureConnection | None = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +280,13 @@ class MeetingDetectorSource:
             self._changes_since,
             self._phase is _Phase.LIVE and self._pending_since is None,
         )
+
+    @property
+    def picture_backend(self) -> tuple[MetadataBackend, int] | None:
+        """Read the picture's backend and connection generation from the source owner."""
+        if self._backend is None or self._closing:
+            return None
+        return self._backend, self._server_generation
 
     def _now(self) -> float:
         now = self.clock()
