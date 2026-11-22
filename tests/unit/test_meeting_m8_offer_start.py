@@ -51,6 +51,7 @@ from test_meeting_supervisor import receive
 from test_monitor_stream import fake_native_control
 
 from astra_voice.core.command_mode import SessionSnapshot
+from astra_voice.core.logging import RedactTextFilter
 from astra_voice.core.meeting_session import ERROR_TEXT, WARNING_TEXT, StorageStatus
 from astra_voice.meetings import events
 from astra_voice.meetings.store import MeetingStoreError
@@ -854,6 +855,50 @@ def test_start_latency_is_once_and_contains_only_fixed_fields(
     assert events.log_arguments(record.msg, record.args) == record.args
     line = record.getMessage()
     assert all(value not in line for value in (CALL, MID, "capture1", "target-", "call1"))
+
+
+def test_room_start_failure_logs_the_role_error(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="astra_voice.meetings")
+    rig.bridge.requestRecording()
+    assert rig.bridge.selectedSource == "room"
+    rig.bridge.on_start_clicked()
+    rig.reply("prepared")
+    deliver(rig, capture_error(rig, "open", "audio-failed"))
+    rig.recording.tick()
+
+    assert rig.bridge.startError == ERROR_TEXT["audio-unavailable"]
+    (record,) = [record for record in caplog.records if record.msg == events.START_FAILED]
+    assert RedactTextFilter().filter(record)
+    assert record.__dict__["session_kind"] == "MEETING"
+    assert (
+        record.getMessage() == "meeting-start-failed code=audio-failed request=meeting.capture.open"
+    )
+
+
+@pytest.mark.parametrize("outcome", list(events.StartOutcome))
+def test_start_failure_log_filters_unknown_fields(
+    rig: Rig,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: events.StartOutcome,
+) -> None:
+    caplog.set_level(logging.INFO, logger="astra_voice.meetings")
+    recording = rig.recording
+    recording._start_origin = events.StartOrigin.CARD
+    recording._start_attempt = recording.controller._attempt
+    recording._start_pressed_at = recording.offer.now_ms()
+    # Unknown role data is rejected by IPC, so inject it at the logging boundary.
+    with monkeypatch.context() as patch:
+        patch.setattr(recording.controller, "role_start_error", ("PRIVATE", "/PRIVATE/path"))
+        recording._log_start_outcome(outcome)
+
+    records = [record for record in caplog.records if record.msg == events.START_FAILED]
+    if outcome is events.StartOutcome.FAILED:
+        (record,) = records
+        assert RedactTextFilter().filter(record)
+        assert record.getMessage() == "meeting-start-failed code=other request=other"
+    else:
+        assert records == []
 
 
 def _script_single_native_refusal(

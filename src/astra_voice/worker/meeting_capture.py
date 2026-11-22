@@ -1100,6 +1100,7 @@ class MeetingCaptureState:
                         Purpose,
                         TargetError,
                     )
+                    from astra_voice.worker.monitor_stream import MAX_FAR_STREAMS
 
                     check = self.calls.run_start(
                         checker,
@@ -1111,7 +1112,7 @@ class MeetingCaptureState:
                         check.settled
                         and check.variant1
                         and target is not None
-                        and 1 <= len(target.streams) <= 8
+                        and 1 <= len(target.streams) <= MAX_FAR_STREAMS
                     ):
                         error = check.target_error or TargetError.MISMATCH
                         diagnostic = result_code(check)

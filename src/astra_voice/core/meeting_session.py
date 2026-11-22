@@ -248,6 +248,7 @@ class MeetingController:
         self.mic_only_available = False
         self.saved = False
         self.error_code = ""
+        self.role_start_error: tuple[str, str] = ("", "")
         self.warnings: list[str] = []
         self.interrupted_dialog_ids: list[str] = []
         self.tracks: dict[str, str] = {}
@@ -326,6 +327,7 @@ class MeetingController:
 
     def start(self, far: Message | None = None) -> bool:
         """Click-only API; construction, recovery and polling never invoke it."""
+        self.role_start_error = ("", "")
         if not self.enabled() or not self.policy_allowed():
             return self._error("disabled")
         if (
@@ -827,6 +829,8 @@ class MeetingController:
                 self._epoch_pending = True
                 self._error("session-blocked")
                 return
+            if self.state in {"preparing", "opening"}:
+                self.role_start_error = (event["code"], event.get("request_type", ""))
             self._error("audio-unavailable")
             self._escalate()
             return

@@ -16,8 +16,9 @@ PULSE_CLIENTCONFIG: pa_open_config_file открывает только указ
 файле default-server. Через .include сохраняем пользовательский client.conf,
 а при его отсутствии — /etc/pulse/client.conf. Системный .d, способный вернуть
 autospawn, намеренно не подключаем. Первая и последняя строки нашего файла —
-autospawn = no; .include находится между ними. Без обоих исходных файлов
-остаётся только пара запретов.
+autospawn = no; .include находится между ними, настройки пула — после .include.
+Отключаем SHM и уменьшаем частный пул каждого контекста, чтобы несколько
+контекстов libpulse помещались в лимит адресного пространства роли записи.
 Парсер поддерживает .include, но не .ifexists/.nofail: если подключаемый файл
 исчезнет, разбор прервётся, однако первый запрет уже будет применён; последний
 запрет перебивает autospawn = yes при успешном подключении.
@@ -47,6 +48,7 @@ from astra_voice.core import paths
 
 logger = logging.getLogger(__name__)
 SYSTEM_CLIENT_CONFIG = Path("/etc/pulse/client.conf")
+PULSE_POOL_BYTES = 2 * 1024**2  # 32 слота libpulse по 64 КиБ.
 _CONFIG_NAME = "pulse-client.conf"
 _MAX_CONFIG_SIZE = 64 * 1024
 
@@ -138,7 +140,7 @@ def deny_pulse_autospawn() -> None:
             logger.debug("Не подключаем client.conf: путь содержит символы #, ;, LF или CR.")
         elif include.is_file():
             lines.append(f".include {include}")
-        lines.append("autospawn = no")
+        lines.extend(("enable-shm = no", f"shm-size-bytes = {PULSE_POOL_BYTES}", "autospawn = no"))
         payload = ("\n".join(lines) + "\n").encode("utf-8")
         current = _read_config(path)
         if current != payload:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import resource
 import select
@@ -13,7 +14,9 @@ import pytest
 from test_meeting_ipc import COMMANDS, command
 
 from astra_voice import bootstrap
+from astra_voice.core.audio_env import PULSE_POOL_BYTES
 from astra_voice.worker import main as worker_main
+from astra_voice.worker import monitor_stream
 from astra_voice.worker.meeting_roles import MeetingRole, run_role
 
 pytestmark = pytest.mark.unit
@@ -237,11 +240,48 @@ def test_meeting_address_space_limits_are_applied_and_verified(
     monkeypatch: pytest.MonkeyPatch, role: str, expected: int
 ) -> None:
     limits = {resource.RLIMIT_AS: (resource.RLIM_INFINITY, resource.RLIM_INFINITY)}
-    monkeypatch.setattr(resource, "getrlimit", lambda key: limits[key])
-    monkeypatch.setattr(resource, "setrlimit", lambda key, value: limits.update({key: value}))
-    monkeypatch.setattr(os, "getpriority", lambda which, who: 19)
-    assert worker_main.harden_meeting_limits(role)
+    libc = Mock()
+    libc.mallopt.return_value = 1
+    with monkeypatch.context() as patch:
+        patch.setattr(resource, "getrlimit", lambda key: limits[key])
+        patch.setattr(resource, "setrlimit", lambda key, value: limits.update({key: value}))
+        patch.setattr(os, "getpriority", lambda which, who: 19)
+        patch.setattr(ctypes, "CDLL", Mock(return_value=libc))
+        assert worker_main.harden_meeting_limits(role)
     assert limits[resource.RLIMIT_AS][0] == expected
+    if role == "meeting-capture":
+        libc.mallopt.assert_called_once_with(-8, 2)
+    else:
+        libc.mallopt.assert_not_called()
+
+
+def test_capture_address_space_has_headroom_for_full_mixer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+
+    def set_limit(key: int, value: tuple[int, int]) -> None:
+        nonlocal limit
+        assert key == resource.RLIMIT_AS
+        limit = value
+
+    libc = Mock()
+    libc.mallopt.return_value = 1
+    with monkeypatch.context() as patch:
+        patch.setattr(resource, "getrlimit", lambda key: limit)
+        patch.setattr(resource, "setrlimit", set_limit)
+        patch.setattr(ctypes, "CDLL", Mock(return_value=libc))
+        assert worker_main.harden_meeting_limits("meeting-capture")
+
+    mib = 1024**2
+    # Notebook's residual image plus the one non-main glibc arena.
+    base = (56 + 64) * mib
+    # AS envelopes for stacks (measured guards/TLS included) and Pulse contexts.
+    stacks = (12 + monitor_stream.MAX_FAR_STREAMS) * (8 * mib + 32 * 1024)
+    contexts = (5 + monitor_stream.MAX_FAR_STREAMS) * (PULSE_POOL_BYTES + 256 * 1024)
+    peak = base + stacks + contexts
+    assert 5 * peak <= 4 * limit[0]  # 25% reserve above the peak
+    assert peak + 200 * mib <= limit[0]  # T1 reserves at least 200 MB
 
 
 def test_diar_environment_is_fail_closed_before_work(monkeypatch: pytest.MonkeyPatch) -> None:

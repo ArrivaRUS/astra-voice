@@ -27,6 +27,7 @@ from astra_voice.worker.meeting_detector import INVALID_INDEX, project_propertie
 if TYPE_CHECKING:
     from astra_voice.worker.meeting_identity_check import PinnedStream, PinnedTarget
 
+MAX_FAR_STREAMS = 8
 _PID = "application.process.id"
 _SERIAL = "object.serial"
 
@@ -895,7 +896,7 @@ _SILENCE_MS = 200
 def _check_stream_count(target: PinnedTarget) -> None:
     if not target.streams:
         raise ValueError("target-gone")
-    if len(target.streams) > 8:
+    if len(target.streams) > MAX_FAR_STREAMS:
         raise ValueError("target-mismatch")
 
 

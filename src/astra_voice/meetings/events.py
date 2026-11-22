@@ -195,6 +195,7 @@ CAPTURE_STATS = "meeting-capture duration_ms=%d bytes=%d"
 NATIVE_STDERR = "meeting-native-stderr bytes=%d lines=%d"
 DETECTOR_CODE = "meeting-detector purpose=%s code=%s duration_ms=%d"
 START_LATENCY = "meeting-start origin=%s outcome=%s latency_ms=%d"
+START_FAILED = "meeting-start-failed code=%s request=%s"
 
 
 class StartOrigin(StrEnum):
@@ -209,6 +210,74 @@ class StartOutcome(StrEnum):
     ABORTED = "aborted"
 
 
+class StartFailureCode(StrEnum):
+    # Wire vocabulary from worker.meeting_contract.ERROR_CODES.
+    BAD_FIELD = "bad-field"
+    BAD_FRAME = "bad-frame"
+    UNKNOWN_MESSAGE = "unknown-message"
+    NOT_PREPARED = "not-prepared"
+    ADMISSION_STALE = "admission-stale"
+    REQ_CONFLICT = "req-conflict"
+    HARDENING_FAILED = "hardening-failed"
+    AUDIO_NO_DEVICE = "audio-no-device"
+    AUDIO_BUSY = "audio-busy"
+    AUDIO_FAILED = "audio-failed"
+    TARGET_GONE = "target-gone"
+    TARGET_MISMATCH = "target-mismatch"
+    DIR_UNWRITABLE = "dir-unwritable"
+    LIMIT = "limit"
+    MODEL = "model"
+    MODEL_UNTRUSTED = "model-untrusted"
+    EXTERNAL_DATA = "external-data"
+    MEMORY = "memory"
+    IO = "io"
+    TIMEOUT = "timeout"
+    HELLO_TIMEOUT = "hello-timeout"
+    PROTOCOL_MISMATCH = "protocol-mismatch"
+    WORKER_CRASHED = "worker-crashed"
+    LOAD_TIMEOUT = "load-timeout"
+    RESTART_LIMIT = "restart-limit"
+    WORKER_START = "worker-start"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "StartFailureCode":
+        return cls.OTHER
+
+
+class StartFailureRequest(StrEnum):
+    # Wire vocabulary from worker.meeting_contract.COMMAND_FIELDS.
+    DETECTOR_START = "meeting.detector.start"
+    DETECTOR_STOP = "meeting.detector.stop"
+    CALL_QUERY = "meeting.call.query"
+    CAPTURE_PREPARE = "meeting.capture.prepare"
+    CAPTURE_OPEN = "meeting.capture.open"
+    CAPTURE_KEEPALIVE = "meeting.capture.keepalive"
+    CAPTURE_PAUSE = "meeting.capture.pause"
+    CAPTURE_RESUME = "meeting.capture.resume"
+    CAPTURE_TRACK_RESUME = "meeting.capture.track.resume"
+    CAPTURE_EXTEND = "meeting.capture.extend"
+    CAPTURE_STOP = "meeting.capture.stop"
+    CAPTURE_SHUTDOWN = "meeting.capture.shutdown"
+    PING = "ping"
+    MODEL_LOAD = "model.load"
+    MODEL_UNLOAD = "model.unload"
+    MEASURE = "measure"
+    JOB_START = "meeting.job.start"
+    JOB_CREDIT = "meeting.job.credit"
+    JOB_CANCEL = "meeting.job.cancel"
+    JOB_APPLIED = "meeting.job.applied"
+    DIAR_LOAD = "diar.load"
+    DIAR_BLOCK = "diar.block"
+    DIAR_FINISH = "diar.finish"
+    DIAR_CANCEL = "diar.cancel"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "StartFailureRequest":
+        return cls.OTHER
+
+
 LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     POLICY_REJECTED: (PolicyCode,),
     SETTING_INVALID: (SettingKey,),
@@ -219,6 +288,7 @@ LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
     NATIVE_STDERR: (None, None),
     DETECTOR_CODE: (DetectorPurpose, DetectorCode, None),
     START_LATENCY: (StartOrigin, StartOutcome, None),
+    START_FAILED: (StartFailureCode, StartFailureRequest),
 }
 
 

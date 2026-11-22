@@ -41,6 +41,7 @@ from astra_voice.worker.meeting_detector import (
     project_properties,
 )
 from astra_voice.worker.meeting_metadata import PulseMetadata
+from astra_voice.worker.monitor_stream import MAX_FAR_STREAMS
 
 _PID = "application.process.id"
 _BINARY = "application.process.binary"
@@ -626,7 +627,7 @@ class IdentityCheck:
         proc: ProcReader | None = None,
         metadata: Callable[..., PulseMetadata] = PulseMetadata,
     ) -> None:
-        if not 1 <= output_limit <= 8:
+        if not 1 <= output_limit <= MAX_FAR_STREAMS:
             raise ValueError("invalid output limit")
         if apps is None:
             try:

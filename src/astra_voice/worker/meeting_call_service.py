@@ -79,6 +79,7 @@ CheckFactory = Callable[["MeetingObserver", Callable[[], float]], Checker]
 def role_checker(observer: MeetingObserver, clock: Callable[[], float]) -> Checker:
     from astra_voice.meetings.apps import AppDataError
     from astra_voice.worker import meeting_identity_check as check
+    from astra_voice.worker.monitor_stream import MAX_FAR_STREAMS
 
     assert observer.address is not None
     # Use the checker's loader binding so the role and the measurement share one catalog.
@@ -91,7 +92,7 @@ def role_checker(observer: MeetingObserver, clock: Callable[[], float]) -> Check
         own_contexts=observer.registry.snapshot,
         clock=clock,
         metadata=_check_metadata,
-        output_limit=8,
+        output_limit=MAX_FAR_STREAMS,
     )
 
 

@@ -43,10 +43,13 @@ from astra_voice.core.meeting_session import (
 )
 from astra_voice.meetings.events import (
     DETECTOR_CODE,
+    START_FAILED,
     START_LATENCY,
     DetectorCode,
     DetectorPurpose,
     MeetingState,
+    StartFailureCode,
+    StartFailureRequest,
     StartOrigin,
     StartOutcome,
 )
@@ -1041,6 +1044,16 @@ class MeetingRecording(QObject):
         pressed_at, self._start_pressed_at = self._start_pressed_at, None
         if self._start_origin is not None and pressed_at is not None:
             log.info(START_LATENCY, self._start_origin, outcome, self.offer.now_ms() - pressed_at)
+            if outcome is StartOutcome.FAILED:
+                controller = self.controller
+                code, request = (
+                    controller.role_start_error
+                    if self._start_attempt == controller._attempt
+                    else ("", "")
+                )
+                logging.getLogger("astra_voice.meetings").info(
+                    START_FAILED, StartFailureCode(code), StartFailureRequest(request)
+                )
 
     def _clear_start(self) -> None:
         self._start_origin = None
