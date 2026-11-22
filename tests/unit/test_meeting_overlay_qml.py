@@ -404,7 +404,7 @@ elif mode == "actions":
         "pauseClicked",
         "resumeClicked",
         "stopClicked",
-        "participantsClicked",
+        "copyParticipantsClicked",
         "extendClicked",
         "resumeMicrophoneClicked",
         "releaseKeyboardRequested",
@@ -414,7 +414,7 @@ elif mode == "actions":
     for control, signal in [
         ("meetingPause", "pauseClicked"),
         ("meetingStop", "stopClicked"),
-        ("meetingParticipants", "participantsClicked"),
+        ("meetingParticipants", "copyParticipantsClicked"),
     ]:
         click(control)
         assert received.pop() == signal
@@ -461,6 +461,10 @@ elif mode == "actions":
     assert item("meetingStop").property("activeFocus")
     QTest.keyClick(window, Qt.Key_Return)
     assert received.pop() == "stopClicked"
+    QTest.keyClick(window, Qt.Key_Tab)
+    assert item("meetingParticipants").property("activeFocus")
+    QTest.keyClick(window, Qt.Key_Return)
+    assert received.pop() == "copyParticipantsClicked"
     QTest.keyClick(window, Qt.Key_Escape)
     assert root.property("compact") and root.property("visible")
     assert received.pop() == "releaseKeyboardRequested"
@@ -547,7 +551,7 @@ from pathlib import Path
 from PyQt5.QtCore import QObject, QMetaObject, Qt, pyqtSignal
 from PyQt5.QtGui import QGuiApplication, QFontDatabase
 from PyQt5.QtQuick import QQuickView, QQuickWindow
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5 import sip
 repo = Path(sys.argv[1])
 sys.path.insert(0, str(repo / 'src'))
@@ -576,7 +580,7 @@ def make_view():
     return view
 
 recording = Recording()
-owner = MeetingOverlay(recording, view_factory=make_view)
+owner = MeetingOverlay(recording, notice=lambda: ('Текст встречи', False), view_factory=make_view)
 view = owner._view
 root = view.rootObject()
 """
@@ -585,17 +589,22 @@ NATIVE_PROBE = (
     NATIVE_SETUP
     + r"""
 try:
-    QTest.qWait(30)
+    app.processEvents()
     assert view.isVisible()
     assert view.flags() & Qt.WindowDoesNotAcceptFocus
     assert view.flags() & Qt.WindowStaysOnTopHint
     area = view.screen().availableGeometry()
-    assert abs(view.x() - (area.x() + (area.width() - view.width()) // 2)) <= 1
+    if view.width() != owner._surface_size()[0] + 36:
+        assert QSignalSpy(view.widthChanged).wait(1000)
+    assert owner.surface_rect().right() == area.right() - 12
     assert view.y() + 18 == area.y() + 12
     original = view.position()
-    root.dragRequested.emit(50, 20)
-    assert view.position().x() == original.x() + 50
+    root.dragRequested.emit(-50, 20)
+    assert view.position().x() == original.x() - 50
     assert view.position().y() == original.y() + 20
+    dragged = view.position()
+    recording.changed.emit()
+    assert view.position() == dragged
     root.dragRequested.emit(-100000, -100000)
     assert view.x() + 18 >= area.left()
     assert view.y() + 18 >= area.top()
@@ -603,7 +612,7 @@ try:
         recording.overlay.update(state=state, paused=state == 'paused')
         recording.changed.emit()
         owner.activate_keyboard()
-        QTest.qWait(20)
+        app.processEvents()
         assert not (view.flags() & Qt.WindowDoesNotAcceptFocus)
         assert view.isVisible()
         view.close()
@@ -612,7 +621,7 @@ try:
     recording.overlay.update(state='paused', paused=True)
     recording.changed.emit()
     owner.activate_keyboard()
-    QTest.qWait(20)
+    app.processEvents()
     QMetaObject.invokeMethod(root, 'focusFirstControl', Qt.DirectConnection)
     QTest.keyClick(view, Qt.Key_Escape)
     assert root.property('compact')
@@ -620,8 +629,7 @@ try:
     assert view.flags() & Qt.WindowDoesNotAcceptFocus
     assert not root.property('keyboardMode')
     for signal, action in [('pauseClicked', 'pause'), ('resumeClicked', 'resume'),
-                           ('stopClicked', 'stop'), ('participantsClicked', 'participants'),
-                           ('extendClicked', 'extend')]:
+                           ('stopClicked', 'stop'), ('extendClicked', 'extend')]:
         getattr(root, signal).emit()
         assert recording.actions.pop() == action
     assert not warnings, warnings

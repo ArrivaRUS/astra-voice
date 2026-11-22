@@ -557,28 +557,25 @@ Column {
                 divider: false
                 objectName: "meetingNoticeField"
                 label: root.txt("noticeLabel", "Текст для чата встречи")
-                sub: root.txt("noticeCaption", "Показывается при каждом начале записи — с кнопкой «Скопировать для чата»")
+                sub: root.txt("noticeCaption", "Копируется кнопкой на плашке записи и пунктом «Текст для участников…» в меню значка в трее")
                 value: root.value("meeting_notice_text", "Я веду запись и расшифровку этой встречи для протокола.")
                 rowEnabled: root.editable("meeting_notice_text")
+                copyLabel: root.txt("copy", "Скопировать")
+                copyText: function() { return root.bridge && root.bridge.copyNoticeText() }
                 onCommitted: root.commit("meeting_notice_text", value)
             }
             MeetingSettingField {
                 width: parent.width
+                objectName: "meetingInviteField"
+                inputObjectName: "Input"
                 label: root.txt("inviteLabel", "Текст для приглашения на встречу")
                 sub: root.txt("inviteCaption", "Предупредить заранее надёжнее всего — добавьте этот текст в приглашение")
                 value: root.value("meeting_invite_text", "На встрече может вестись запись и расшифровка для протокола. Запись хранится только на компьютере участника, который её ведёт.")
                 rowEnabled: root.editable("meeting_invite_text")
+                wrapText: true
+                copyLabel: root.txt("copy", "Скопировать")
+                copyText: function() { return root.bridge && root.bridge.copyInviteText() }
                 onCommitted: root.commit("meeting_invite_text", value)
-            }
-            SettingRow {
-                width: parent.width
-                AvButton {
-                    id: copyInvite
-                    text: copyTimer.running ? root.txt("copied", "✓ Скопировано") : root.txt("copy", "Скопировать")
-                    iconName: "copy"
-                    onClicked: if (root.bridge && root.bridge.copyInviteText()) copyTimer.restart()
-                    Timer { id: copyTimer; interval: 1200 }
-                }
             }
         }
         SettingGroup {

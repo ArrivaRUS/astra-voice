@@ -128,7 +128,7 @@ from pathlib import Path
 from PyQt5.QtCore import QObject, QPoint, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import QCloseEvent, QFontDatabase, QGuiApplication, QRegion
 from PyQt5.QtQuick import QQuickView, QQuickWindow
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy
 from PyQt5 import sip
 repo = Path(sys.argv[1])
 sys.path.insert(0, str(repo / 'src'))
@@ -173,17 +173,19 @@ def start(mid):
     recording.overlay = {'visible': True, 'active': True, 'state': 'recording'}
     recording.active_meeting_id = mid
     recording.changed.emit()
-    QTest.qWait(30)
+    app.processEvents()
 
 try:
     assert not view.isVisible() and not owner.is_open
-    # Not recording: neither W2 «💬» nor the tray opens W3.
+    # Not recording: the tray cannot open W3.
     recording.participantsRequested.emit()
     assert not view.isVisible()
     area = view.screen().availableGeometry()
     overlay.rect = QRect(area.x() + 300, area.y() + 12, 482, 36)
     start('m1')
-    assert view.isVisible() and owner.is_open, 'W3 opens with every new recording'
+    assert not view.isVisible() and not owner.is_open, 'Recording leaves W3 closed'
+    recording.participantsRequested.emit()
+    assert view.isVisible() and owner.is_open
     assert view.flags() & Qt.WindowDoesNotAcceptFocus
     assert view.flags() & Qt.WindowStaysOnTopHint
     body = QRect(view.x() + 36, view.y() + 36, 340, view.height() - 36 * 2 - 14)
@@ -198,21 +200,20 @@ try:
     root.copyClicked.emit()
     assert copies == ['Текст встречи'] and owner.copy_state == 'copied'
     assert root.property('presentation').toVariant()['copyState'] == 'copied'
-    QTest.qWait(1100)
-    assert owner.copy_state == 'copied'
-    QTest.qWait(300)
+    assert owner._copied.interval() == 1200 and owner._copied.isActive()
+    expired = QSignalSpy(owner._copied.timeout)
+    assert expired.wait(1800)
     assert owner.copy_state == 'default'
     outcome[0] = False
     root.copyClicked.emit()
     assert owner.copy_state == 'failed'
-    QTest.qWait(1400)
-    assert owner.copy_state == 'failed', 'manual copy hint stays'
+    assert not owner._copied.isActive(), 'manual copy hint stays'
     # «×» closes; the same recording does not reopen by itself.
     root.closeClicked.emit()
     assert not view.isVisible() and not owner.is_open
     recording.changed.emit()
     assert not view.isVisible()
-    # «💬» / tray reopen in the default state.
+    # The tray reopens W3 in the default state.
     recording.participantsRequested.emit()
     assert view.isVisible() and owner.copy_state == 'default'
     # Manual Ctrl+C (review 3/4) reuses the text/plain publication.
@@ -237,8 +238,10 @@ try:
     recording.overlay = {'visible': False, 'active': False, 'state': 'hidden'}
     recording.active_meeting_id = ''
     recording.changed.emit()
-    # Next recording opens it again.
+    # The next recording leaves W3 closed again.
     start('m2')
+    assert not view.isVisible()
+    recording.participantsRequested.emit()
     assert view.isVisible()
     # No W2 surface: top-centre fallback under the default W2 row.
     overlay.rect = None
@@ -268,7 +271,7 @@ def _run(probe: str) -> subprocess.CompletedProcess[str]:
         env=env,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=30,
         check=False,
     )
 

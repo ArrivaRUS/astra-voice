@@ -426,8 +426,16 @@ ApplicationWindow {
     }
 
     StartDialog {
+        id: meetingStartDialog
         meeting: window.meetings
         settings: window.bridge
+        // Qt defers showing a transient window when its owner is hidden.
+        // Binding addresses the native property on Qt 5 Controls ApplicationWindow.
+        Binding {
+            target: meetingStartDialog
+            property: "transientParent"
+            value: window.visible && window.visibility !== Window.Minimized ? window : null
+        }
     }
 
     AvDialog {

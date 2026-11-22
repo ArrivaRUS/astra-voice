@@ -38,6 +38,7 @@ class FakeModelPort:
             layout="test-layout",
             variant="test-variant",
             recommended=True,
+            punctuation=True,
             host="models.example",
             files=(),
         )

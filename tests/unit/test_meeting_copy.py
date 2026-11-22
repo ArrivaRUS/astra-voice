@@ -1,4 +1,4 @@
-"""Owner-approved meeting copy follows the rendered mockup, not quote nesting."""
+"""Owner-approved meeting copy and the unchanged parts of the mockup."""
 
 from __future__ import annotations
 
@@ -12,6 +12,13 @@ from astra_voice.ui.meeting_texts import RESPONSIBILITY_ITEMS, TEXTS
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
+NOTICE_CAPTION = (
+    "Копируется кнопкой на плашке записи и пунктом «Текст для участников…» в меню значка в трее"
+)
+RESPONSIBILITY_NOTICE = (
+    "Готовый текст для чата встречи копируется кнопкой на плашке записи — вставьте его "
+    "в чат и скажите вслух. Лучше предупреждать заранее — например, в приглашении на встречу."
+)
 
 
 def mockup_items() -> list[tuple[str, str, str, str]]:
@@ -35,7 +42,16 @@ def mockup_items() -> list[tuple[str, str, str, str]]:
 @pytest.mark.parametrize("index", range(5))
 @pytest.mark.parametrize("field,column", [("icon", 0), ("title", 1), ("text", 2)])
 def test_responsibility_items_match_rendered_mockup(index: int, field: str, column: int) -> None:
-    assert RESPONSIBILITY_ITEMS[index][field] == mockup_items()[index][column]
+    expected = (
+        RESPONSIBILITY_NOTICE if (index, field) == (3, "text") else mockup_items()[index][column]
+    )
+    assert RESPONSIBILITY_ITEMS[index][field] == expected
+
+
+def test_participant_notice_copy_matches_22_november_decision() -> None:
+    assert TEXTS["noticeCaption"] == NOTICE_CAPTION
+    assert NOTICE_CAPTION in (ROOT / "qml/sections/Meetings.qml").read_text()
+    assert RESPONSIBILITY_NOTICE in (ROOT / "qml/components/ResponsibilityDialog.qml").read_text()
 
 
 @pytest.mark.parametrize("key", ["offDescription", "empty", "noticeCaption", "diarizationCaption"])

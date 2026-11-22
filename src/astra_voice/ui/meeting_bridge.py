@@ -43,6 +43,7 @@ from astra_voice.meetings.settings_ext import (
     MEETING_DEFAULTS,
     EffectiveMeetingSettings,
     effective_settings,
+    normalize_invite_text,
 )
 from astra_voice.meetings.store import MeetingStore, Writer
 from astra_voice.meetings.templates import (
@@ -104,13 +105,14 @@ def _edited_setting(name: str, value: object) -> bool | int | str:
         return default
     limits = {
         "meeting_notice_text": 500,
-        "meeting_invite_text": 500,
         "meeting_self_label": 40,
         "meeting_ai_endpoint": 2048,
         "meeting_ai_model": 128,
     }
     if name == "meeting_self_label":
         return normalize_self_label(value)
+    if name == "meeting_invite_text":
+        return normalize_invite_text(value)
     normalized = normalize_text(value, limits[name])
     return validate_endpoint(normalized) if name == "meeting_ai_endpoint" else normalized
 
@@ -883,7 +885,7 @@ class MeetingBridge(QObject):
 
     @pyqtSlot()
     def requestRecording(self) -> None:
-        if self.enabled and not self._recording and not self._closed:
+        if self.enabled and not self._closed and (not self._recording or self.startDialogOpen):
             if self._capture is not None:
                 self._capture.open_dialog()
             self.recordingRequested.emit()
@@ -1148,14 +1150,16 @@ class MeetingBridge(QObject):
             self._capture.close_interrupted(open_meetings=True)
 
     @pyqtSlot(result=bool)
-    def copyInviteText(self) -> bool:
-        from PyQt5.QtWidgets import QApplication
+    def copyNoticeText(self) -> bool:
+        from astra_voice.ui.meeting_notice import copy_plain_text
 
-        clipboard = QApplication.clipboard()
-        if clipboard is None:
-            return False
-        clipboard.setText(self.settings["meeting_invite_text"])
-        return True
+        return copy_plain_text(self.notice()[0])
+
+    @pyqtSlot(result=bool)
+    def copyInviteText(self) -> bool:
+        from astra_voice.ui.meeting_notice import copy_plain_text
+
+        return copy_plain_text(self.settings["meeting_invite_text"])
 
     # ---- card A «Документ» (E13.M4, spec §3.7/§4.7) -----------------------
 

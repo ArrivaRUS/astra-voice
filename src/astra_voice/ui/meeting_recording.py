@@ -478,7 +478,7 @@ class MeetingRecording(QObject):
             self.controller.on_process_exit(3)
 
     def open_dialog(self) -> None:
-        if self._closed or not self.enabled() or not self.policy_allowed():
+        if self._closed or self.dialog_open or not self.enabled() or not self.policy_allowed():
             return
         if self.offer.state == "start-failed":
             self.offer.start_closed(reason=OfferReason.OPEN_DIALOG)

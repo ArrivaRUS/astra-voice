@@ -16,12 +16,17 @@ from PyQt5.QtGui import QGuiApplication, QRegion
 
 from astra_voice.core.paths import qml_dir
 from astra_voice.platform.session import SessionKind
-from astra_voice.platform.x11 import X11Display
+from astra_voice.platform.x11 import X11Display, focus_window
 from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.meeting_texts import W2_TEXTS
 from astra_voice.ui.overlay import SHADOW_MARGIN, SHADOW_OFFSET_Y, WINDOW_FLAGS, OverlayWindow
 
 log = logging.getLogger(__name__)
+
+# Qt.Tool can attach the unparented view to the Qt client leader as a transient.
+# Keep W2 independent of the application's active window, including keyboard mode.
+W2_WINDOW_FLAGS = (WINDOW_FLAGS & ~Qt.WindowType_Mask) | Qt.Window
+W2_EDGE_INSET = 12
 
 
 class SurfaceWindow(OverlayWindow):
@@ -191,6 +196,7 @@ class MeetingOverlay(SurfaceWindow):
         self,
         recording: MeetingRecording,
         *,
+        notice: Callable[[], tuple[str, bool]],
         session: SessionKind = SessionKind.KDE,
         qml_url: QUrl | None = None,
         view_factory: Callable[[], Any] | None = None,
@@ -198,6 +204,7 @@ class MeetingOverlay(SurfaceWindow):
     ) -> None:
         super().__init__(parent)
         self.recording = recording
+        self._notice = notice
         self._session = session
         self._closed = False
         self._input_region = QRegion()
@@ -208,6 +215,7 @@ class MeetingOverlay(SurfaceWindow):
         self._load_overlay(
             qml_url or QUrl.fromLocalFile(str(qml_dir() / "MeetingOverlay.qml")),
             view_factory=view_factory,
+            window_flags=W2_WINDOW_FLAGS,
         )
         self._root.setProperty("x", SHADOW_MARGIN)
         self._root.setProperty("y", SHADOW_MARGIN)
@@ -215,7 +223,7 @@ class MeetingOverlay(SurfaceWindow):
         self._root.pauseClicked.connect(self.pause)
         self._root.resumeClicked.connect(self.resume)
         self._root.stopClicked.connect(self.stop)
-        self._root.participantsClicked.connect(self.participants)
+        self._root.copyParticipantsClicked.connect(self.copy_participants)
         self._root.extendClicked.connect(self.extend)
         self._root.releaseKeyboardRequested.connect(self.release_keyboard)
         self._root.dragRequested.connect(self._drag)
@@ -264,8 +272,11 @@ class MeetingOverlay(SurfaceWindow):
     def stop(self) -> None:
         self.recording.overlay_action("stop")
 
-    def participants(self) -> None:
-        self.recording.overlay_action("participants")
+    def copy_participants(self) -> None:
+        from astra_voice.ui.meeting_notice import copy_plain_text
+
+        if not self._closed and self.recording.overlay["active"]:
+            self._root.participantsCopyFinished.emit(copy_plain_text(self._notice()[0]))
 
     def extend(self) -> None:
         self.recording.overlay_action("extend")
@@ -275,20 +286,81 @@ class MeetingOverlay(SurfaceWindow):
             return
         presentation = self.recording.overlay
         self._root.setProperty("presentation", presentation)
-        if presentation["visible"] and not self._view.isVisible():
-            self._prepare_window()
         self._resize()
         if presentation["visible"]:
             if not self._view.isVisible():
-                self._prepare_window()
-                self._view.show()
-                self._prepare_window()
+                self._show_surface()
                 self.geometryChanged.emit()
         else:
             self.release_keyboard()
             if self._view.isVisible():
                 self._view.hide()
                 self.geometryChanged.emit()
+
+    def _show_surface(self) -> None:
+        if not self._view.isVisible():
+            self._prepare_window()
+            if self._closed or not self.recording.overlay["visible"]:
+                return
+            self._view.show()
+        self._prepare_window()
+
+    def _configure_native_window(self) -> None:
+        if QGuiApplication.platformName() != "xcb":
+            return
+        if self._x11.d is None and not self._x11.open():
+            return
+        from Xlib import X, Xatom
+        from Xlib.protocol import event
+
+        self._view.winId()
+        # Native creation and MapWindow run on Qt's XCB connection. Order Xlib
+        # properties before the map and the EWMH requests after it.
+        QGuiApplication.sync()
+        connection = self._x11.d
+        if self._closed or connection is None:
+            return
+        wid = int(self._view.winId())
+        window = connection.create_resource_object("window", wid)
+        keyboard = self._root.property("keyboardMode")
+        window_type = (
+            "_NET_WM_WINDOW_TYPE_NORMAL" if keyboard else "_NET_WM_WINDOW_TYPE_NOTIFICATION"
+        )
+        window.change_property(
+            connection.intern_atom("_NET_WM_WINDOW_TYPE"),
+            Xatom.ATOM,
+            32,
+            [connection.intern_atom(window_type)],
+        )
+        if not keyboard:
+            user_time = connection.intern_atom("_NET_WM_USER_TIME")
+            link = connection.intern_atom("_NET_WM_USER_TIME_WINDOW")
+            window.change_property(user_time, Xatom.CARDINAL, 32, [0])
+            target = window.get_full_property(link, Xatom.WINDOW)
+            if target is not None and target.format == 32 and len(target.value) == 1:
+                aux_id = int(target.value[0])
+                if aux_id and aux_id != wid:
+                    aux = connection.create_resource_object("window", aux_id)
+                    aux.change_property(user_time, Xatom.CARDINAL, 32, [0])
+        state = connection.intern_atom("_NET_WM_STATE")
+        above = connection.intern_atom("_NET_WM_STATE_ABOVE")
+        skip_taskbar = connection.intern_atom("_NET_WM_STATE_SKIP_TASKBAR")
+        skip_pager = connection.intern_atom("_NET_WM_STATE_SKIP_PAGER")
+        if self._view.isVisible():
+            for first, second in ((above, 0), (skip_taskbar, skip_pager)):
+                message = event.ClientMessage(
+                    window=wid, client_type=state, data=(32, [1, first, second, 1, 0])
+                )
+                self._x11.root.send_event(
+                    message, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask
+                )
+        else:
+            window.change_property(state, Xatom.ATOM, 32, [above, skip_taskbar, skip_pager])
+            window.change_property(
+                connection.intern_atom("_NET_WM_DESKTOP"), Xatom.CARDINAL, 32, [0xFFFFFFFF]
+            )
+        # On the pre-map call, flush alone would leave a cross-connection race.
+        connection.sync()
 
     def _place(self) -> None:
         screen = (
@@ -301,8 +373,8 @@ class MeetingOverlay(SurfaceWindow):
             return
         if self._dragged_position is None:
             point = QPoint(
-                area.x() + (area.width() - self._view.width()) // 2,
-                area.y() + 12 - SHADOW_MARGIN,
+                area.right() + 1 - W2_EDGE_INSET - self._view.width() + SHADOW_MARGIN,
+                area.y() + W2_EDGE_INSET - SHADOW_MARGIN,
             )
         else:
             point = self._dragged_position
@@ -325,24 +397,26 @@ class MeetingOverlay(SurfaceWindow):
     def activate_keyboard(self) -> None:
         if self._closed or not self.recording.overlay["visible"]:
             return
-        self._view.setFlags(WINDOW_FLAGS & ~Qt.WindowDoesNotAcceptFocus)
+        self._view.setFlags(W2_WINDOW_FLAGS & ~Qt.WindowDoesNotAcceptFocus)
         self._root.setProperty("keyboardMode", True)
-        self._prepare_window()
         self._resize()
-        self._view.show()
+        self._show_surface()
+        if self._closed or not self._view.isVisible() or not self._root.property("keyboardMode"):
+            return
+        if QGuiApplication.platformName() == "xcb":
+            focus_window(int(self._view.winId()))
         self._view.requestActivate()
         QMetaObject.invokeMethod(self._root, "focusFirstControl", Qt.DirectConnection)
 
     def release_keyboard(self) -> None:
         if not self._root.property("keyboardMode"):
             return
-        self._root.setProperty("keyboardMode", False)
         self._root.setProperty("focus", False)
-        self._view.setFlags(WINDOW_FLAGS)
+        self._root.setProperty("keyboardMode", False)
+        self._view.setFlags(W2_WINDOW_FLAGS)
         if not self._closed and self.recording.overlay["visible"]:
-            self._prepare_window()
             self._resize()
-            self._view.show()
+            self._show_surface()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (

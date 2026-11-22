@@ -1873,7 +1873,8 @@ class ModelDownloads(QObject):
                 "metrics": _card_metrics(entry, best_rtfx, merged),
             }
             for entry in self._entries
-            if not entry.removed_from_catalog or self._badge(entry, installed)
+            if (entry.punctuation and not entry.removed_from_catalog)
+            or self._badge(entry, installed)
         ]
 
     def measurements_changed(self) -> None:

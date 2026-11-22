@@ -300,7 +300,7 @@ def test_434_1_start_guard(rig: Rig, at: int) -> None:
         assert view.calls == [SHOW]
 
 
-def test_434_2_started_closes_w1_before_w2_and_w3(rig: Rig) -> None:
+def test_434_2_started_closes_w1_before_w2_and_leaves_w3_closed(rig: Rig) -> None:
     recording = rig.recording
     rig.recording.call_id = "other-card-call"
     rig.recording.app_class = "browser"
@@ -319,7 +319,8 @@ def test_434_2_started_closes_w1_before_w2_and_w3(rig: Rig) -> None:
         assert not notice._view.isVisible() and frames == []
         rig.reply("started", tracks=["mic", "far"])
         assert frames and all(frame == ("close",) for frame in frames)
-        assert recording.overlay["visible"] and notice._view.isVisible()
+        assert recording.overlay["visible"]
+        assert not notice.is_open and not notice._view.isVisible()
         assert recording.notice_app_class == "dion"
         assert memory(rig) == "accepted" and not rig.bridge.startDialogOpen
         from_recording.assert_not_called()

@@ -49,6 +49,7 @@ GIGAAM = CatalogEntry(
     layout="nemo-rnnt",
     variant="int8",
     recommended=True,
+    punctuation=True,
     host="huggingface.co",
     files=(),
     domestic=True,
@@ -58,7 +59,7 @@ TONE = replace(
     id="t-one",
     revision="r1",
     name="T-one",
-    description="Русская, лёгкая, без пунктуации",
+    description="Русская, лёгкая",
     size_bytes=144_000_000,
     recommended=False,
     domestic=False,
@@ -1313,6 +1314,7 @@ def test_removed_catalog_model_stays_manageable(rig: Rig) -> None:
         revision="r1",
         name="old-model",
         min_ram_mb=GIGAAM.min_ram_mb,
+        punctuation=False,
         removed_from_catalog=True,
     )
     port.catalog = (*port.catalog, removed)
