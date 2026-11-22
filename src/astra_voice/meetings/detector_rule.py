@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from astra_voice.worker.meeting_detector import (
     Direction,
@@ -38,6 +38,9 @@ class _Stream:
     program: ProgramKey
     direction: Direction
     active: bool
+    audible: bool
+    index: int = field(repr=False)
+    serial: int | None = field(repr=False)
 
 
 @dataclass
@@ -62,6 +65,7 @@ class MeetingDetectorRule:
         self._clock = clock
         self._available = True
         self._confirmed = True
+        self._updated_at: float | None = None
         # The source's incarnation counter uniquely identifies a stream in its picture.
         self._streams: dict[int, _Stream] = {}
         self._programs: dict[ProgramKey, _Program] = {}
@@ -86,6 +90,7 @@ class MeetingDetectorRule:
         for event in events:
             self._apply(event)
         self._confirmed = self._available and (timing is None or timing.confirmed)
+        self._updated_at = seconds
         if self._available:
             return self._evaluate(now)
         return ()
@@ -96,6 +101,24 @@ class MeetingDetectorRule:
         if state is None or not state.ready:
             return None
         return Candidate(program, state.offered)
+
+    def outputs(self, program: ProgramKey, now: float) -> frozenset[tuple[int, int]] | None:
+        """Read audible outputs from a fresh picture with the observer lock held."""
+        if (
+            not self._available
+            or not self._confirmed
+            or self._updated_at is None
+            or now - self._updated_at > 2
+        ):
+            return None
+        return frozenset(
+            (stream.index, stream.serial)
+            for stream in self._streams.values()
+            if stream.direction is Direction.OUTPUT
+            and stream.program == program
+            and stream.audible
+            and stream.serial is not None
+        )
 
     def mark_offered(self, program: ProgramKey) -> bool:
         """Record an offer for a current candidate after the role's checks."""
@@ -121,12 +144,16 @@ class MeetingDetectorRule:
         if event.kind is EventKind.REMOVE or event.program is None:
             self._streams.pop(incarnation, None)
         elif event.kind is EventKind.UPSERT:
+            uncorked = event.corked is False
+            audible = uncorked and event.muted is not True
             self._streams[incarnation] = _Stream(
-                event.program,
-                event.key.direction,
-                event.corked is False
-                and event.running is not False
-                and (event.key.direction is Direction.MICROPHONE or event.muted is not True),
+                program=event.program,
+                direction=event.key.direction,
+                active=event.running is not False
+                and (uncorked if event.key.direction is Direction.MICROPHONE else audible),
+                audible=audible,
+                index=event.key.index,
+                serial=event.key.serial,
             )
 
     def _evaluate(self, now: int) -> tuple[Candidate | CallEnded, ...]:
