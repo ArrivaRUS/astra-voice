@@ -1024,6 +1024,26 @@ def test_default_output_limit_keeps_offer_without_target(h: Harness) -> None:
     assert allowed.target is not None and len(allowed.target.streams) == 2
 
 
+@pytest.mark.parametrize("count", [8, 9])
+def test_explicit_output_limit_checks_offer_card_and_start(h: Harness, count: int) -> None:
+    h.checker = h.make_checker(output_limit=8)
+    clients, (output, mic) = picture()
+    streams = (
+        mic,
+        *(replace(output, index=OUT + i, properties=props(serial=201 + i)) for i in range(count)),
+    )
+    for purpose in (check.Purpose.OFFER, check.Purpose.CARD):
+        h.queue_pictures((clients, streams))
+        shown = h.run(purpose, program=PROGRAM if purpose == check.Purpose.OFFER else None)
+        assert_offer(shown, variant1=count == 8)
+    h.queue_pictures((clients, streams))
+    result = h.run(check.Purpose.START, anchor=shown.anchor)
+    if count == 8:
+        assert result.target is not None and len(result.target.streams) == count
+    else:
+        assert result.target_error is check.TargetError.MISMATCH and result.target is None
+
+
 def test_close_failure_has_no_audio_and_retries_cleanup_before_new_context(h: Harness) -> None:
     h.close_fails = True
     result = h.run()
@@ -1256,7 +1276,8 @@ def test_queued_follower_cannot_inherit_longer_deadline(h: Harness) -> None:
     assert not joined.variant1 and len(h.ss.calls) == 1
 
 
-def test_missing_output_serial_blocks_target_with_verified_neighbor(h: Harness) -> None:
+@pytest.mark.parametrize("limit", [2, 8])
+def test_missing_output_serial_blocks_target_with_verified_neighbor(h: Harness, limit: int) -> None:
     clients, streams = picture()
     extra = replace(streams[0], index=OUT + 1, properties=props())
     extra = replace(
@@ -1265,7 +1286,7 @@ def test_missing_output_serial_blocks_target_with_verified_neighbor(h: Harness) 
             key: value for key, value in extra.properties.items() if key != "object.serial"
         },
     )
-    h.checker = h.make_checker(output_limit=2)
+    h.checker = h.make_checker(output_limit=limit)
     h.queue_pictures((clients, (*streams, extra)))
     shown = h.run()
     assert_offer(shown, variant1=False)
@@ -1335,7 +1356,7 @@ def test_start_rechecks_rights_even_for_same_shown_stream_objects(h: Harness) ->
     assert not result.variant1 and result.target is None and Reason.NO_CONNECTION in result.journal
 
 
-@pytest.mark.parametrize("limit", [1, 2])
+@pytest.mark.parametrize("limit", [1, 2, 8])
 def test_losing_one_of_the_shown_outputs_never_authorizes_the_remainder(
     h: Harness,
     limit: int,
@@ -1345,7 +1366,7 @@ def test_losing_one_of_the_shown_outputs_never_authorizes_the_remainder(
     neighbor = replace(output, index=OUT + 1, properties=props(serial=202))
     h.queue_pictures((clients, (output, mic, neighbor)))
     shown = h.run()
-    assert_offer(shown, variant1=limit == 2)
+    assert_offer(shown, variant1=limit >= 2)
     h.queue_pictures((clients, (mic, neighbor)))
     start = h.run(check.Purpose.START, anchor=shown.anchor)
     assert start.target_error is check.TargetError.MISMATCH and start.target is None

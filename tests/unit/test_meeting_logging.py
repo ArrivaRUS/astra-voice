@@ -318,6 +318,7 @@ def test_package_logging_uses_only_event_constants_ast() -> None:
     files = sorted((root / "meetings").rglob("*.py")) + sorted(
         (root / "worker").glob("meeting_*.py")
     )
+    files.append(root / "worker/monitor_stream.py")
     assert files
     found = {str(path.relative_to(root)): violations(path.read_text()) for path in files}
     assert not {name: lines for name, lines in found.items() if lines}

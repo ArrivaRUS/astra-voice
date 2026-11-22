@@ -263,7 +263,7 @@ FocusScope {
                 width: parent.width / scale
                 text: root.presentation.secondary || ""
                 wrapMode: Text.Wrap
-                color: root.avState === "app-closed" || root.avState === "notify-fallback" ? PillTheme.pillIconMuted : PillTheme.pillWarning
+                color: root.avState === "app-closed" || root.avState === "notify-fallback" || root.avState === "far-partial" ? PillTheme.pillIconMuted : PillTheme.pillWarning
                 font.family: "PT Root UI"
                 font.pixelSize: PillTheme.pillMeetingBarSize * 2
                 // 04-recording.html inherits the page's CSS line-height: 1.5.

@@ -87,6 +87,8 @@ def reference_crops(out: Path) -> list[dict[str, Any]]:
 
 
 def presentations() -> dict[str, dict[str, Any]]:
+    from astra_voice.ui.meeting_texts import W2_TEXTS
+
     base: dict[str, Any] = {
         "visible": True,
         "state": "recording",
@@ -141,6 +143,11 @@ def presentations() -> dict[str, dict[str, Any]]:
             "state": "app-closed",
             "elapsed": "1:05:21",
             "secondary": "DION закрылся — пишется только микрофон",
+        },
+        "far-partial": {
+            "state": "far-partial",
+            "elapsed": "1:05:21",
+            "secondary": W2_TEXTS["farPartial"],
         },
         "reason-indicator": {
             "elapsed": "0:51:16",

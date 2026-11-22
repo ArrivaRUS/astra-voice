@@ -10,6 +10,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -36,7 +37,7 @@ from test_meeting_m8_offer import (
     tick_at,
 )
 from test_meeting_m8_role_ownership import command_types
-from test_meeting_m8_start import CaptureEvents
+from test_meeting_m8_start import CaptureEvents, resolved_target
 from test_meeting_recording_bridge import (
     MID,
     Rig,
@@ -47,6 +48,7 @@ from test_meeting_recording_bridge import (
 from test_meeting_recording_bridge import delayed_rig as delayed_rig
 from test_meeting_recording_bridge import rig as rig
 from test_meeting_supervisor import receive
+from test_monitor_stream import fake_native_control
 
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.core.meeting_session import ERROR_TEXT, WARNING_TEXT, StorageStatus
@@ -56,7 +58,8 @@ from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.meeting_notice import MeetingNotice
 from astra_voice.ui.meeting_offer import OfferController
 from astra_voice.ui.meeting_recording import AudioHints
-from astra_voice.worker import ipc
+from astra_voice.worker import ipc, monitor_stream
+from astra_voice.worker.meeting_identity_check import PinnedTarget
 from helpers.qt_app import get_qapplication
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
@@ -853,9 +856,64 @@ def test_start_latency_is_once_and_contains_only_fixed_fields(
     assert all(value not in line for value in (CALL, MID, "capture1", "target-", "call1"))
 
 
-@pytest.mark.parametrize("outcome", ["started", "target-mismatch"])
+def _script_single_native_refusal(
+    patch: pytest.MonkeyPatch, worker: RoleRig, target: PinnedTarget, outcome: str
+) -> None:
+    resolved = resolved_target(target)
+    props = {
+        b"object.serial": str(resolved.serial).encode(),
+        b"application.process.id": str(resolved.pid).encode(),
+    }
+    prepared = fake_native_control(patch, resolved, stream_props=props, client_props={})
+    opened = fake_native_control(
+        patch,
+        resolved,
+        stream_props={key: value for key, value in props.items() if key != b"object.serial"},
+        client_props={},
+    )
+    for context in (prepared, opened):
+        context.stream = None
+        context.buffer = bytearray()
+        context.pulse.mainloop = None
+    if outcome == "prepare-sink":
+
+        def missing_sink(ctx: int, index: int, receive: Any, data: Any) -> int:
+            receive(ctx, None, -1, data)
+            return 1
+
+        prepared.pulse.context_errno.return_value = 5
+        prepared.pulse.lib.pa_context_get_sink_info_by_index.side_effect = missing_sink
+    contexts = iter((prepared, opened))
+    patch.setattr(
+        monitor_stream,
+        "ProcReader",
+        lambda **_: Mock(starttime=Mock(return_value=resolved.starttime)),
+    )
+
+    class NativeDouble(monitor_stream.NativePulse):
+        def __init__(self) -> None:
+            self.__dict__.update(next(contexts).__dict__)
+
+    patch.setattr(monitor_stream, "NativePulse", NativeDouble)
+    patch.setattr(worker.state, "backend_factory", monitor_stream.CapturePulseBackend)
+
+
+@pytest.mark.parametrize(
+    "outcome,outputs",
+    [
+        ("started", 1),
+        ("started", 3),
+        ("target-mismatch", 1),
+        ("prepare-sink", 1),
+        ("open-serial", 1),
+    ],
+)
 def test_w1_round_trip_through_worker_supervisor_and_capture_role(
-    rig: Rig, service: tuple[RoleRig, CheckDouble], outcome: str, monkeypatch: pytest.MonkeyPatch
+    rig: Rig,
+    service: tuple[RoleRig, CheckDouble],
+    outcome: str,
+    outputs: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worker, checks = service
     worker.clock.now = rig.now
@@ -873,7 +931,16 @@ def test_w1_round_trip_through_worker_supervisor_and_capture_role(
     commands: list[dict[str, object]] = []
     states: list[dict[str, object]] = []
     replies: list[dict[str, object]] = []
-    capture_events = CaptureEvents(worker, "prepared", "prepare-failed", "opened")
+    capture_events = CaptureEvents(
+        worker,
+        "prepared",
+        "prepare-failed",
+        "opened",
+        "open-failed",
+        "far-partial",
+        "closed",
+        "finalized",
+    )
     archive_started = threading.Event()
     fsync = worker.state.fsync
 
@@ -912,8 +979,20 @@ def test_w1_round_trip_through_worker_supervisor_and_capture_role(
         assert view.calls == [SHOW] and commands == []
 
         worker.clock.now = START_AT / 1000
-        target = replace(TARGET, measured_at=worker.clock() + 0.55)
-        result = replace(ALLOWED, variant1=outcome == "started", target=target)
+        stream = TARGET.streams[0]
+        target = replace(
+            TARGET,
+            streams=tuple(
+                replace(
+                    stream, sink_input=stream.sink_input + i, stream_serial=stream.stream_serial + i
+                )
+                for i in range(outputs)
+            ),
+            measured_at=worker.clock() + 0.55,
+        )
+        if outcome in {"prepare-sink", "open-serial"}:
+            _script_single_native_refusal(patch, worker, target, outcome)
+        result = replace(ALLOWED, variant1=outcome != "target-mismatch", target=target)
         run = checks.plan(result)
         press_start(rig)
         deliver_queued()
@@ -944,12 +1023,42 @@ def test_w1_round_trip_through_worker_supervisor_and_capture_role(
             )
             assert worker.backend.source_targets == [target]
             assert worker.backend.source_targets[0] is target
+            if outputs == 3:
+                worker.backend.sources[0].losses.put(target.streams[1:2])
+                capture_events.wait("far-partial")
+                feed(worker.poll())  # WorkerSupervisor reads and decodes the actual IPC frame.
+                assert rig.recording.overlay["state"] == "far-partial"
+                assert rig.recording.overlay["secondary"] == "Часть звука не записывается"
             assert not rig.bridge.startDialogOpen
             assert [command["type"] for command in commands] == [PREPARE, OPEN]
-        else:
+        elif outcome == "open-serial":
+            capture_events.wait("prepared")
             feed(worker.poll())
-            assert any(reply.get("code") == "target-mismatch" for reply in states)
+            deliver_queued()
+            capture_events.wait("open-failed")
+            feed(worker.poll())
+            assert [reply["code"] for reply in states if reply["type"] == "error"] == [
+                "target-gone"
+            ]
+            assert not any(reply["type"] == "meeting.capture.started" for reply in states)
+            assert rig.recording.controller.far_reason == "target-gone"
+            assert [command["type"] for command in commands] == [PREPARE, OPEN]
+            live_process.kill.assert_called_once()
+            capture_events.wait("closed")
+            worker.poll()
+            capture_events.wait("finalized")
+            worker.poll()
+            live_process.poll.return_value = 0
+            rig.recording.tick()
             assert_call_lost(rig)
+            return
+        else:
+            capture_events.wait("prepare-failed")
+            feed(worker.poll())
+            expected = "target-gone" if outcome == "prepare-sink" else "target-mismatch"
+            assert [reply["code"] for reply in states if reply["type"] == "error"] == [expected]
+            assert_call_lost(rig)
+            assert rig.recording.controller.state == "idle" and not worker.state.stopped
             assert [command["type"] for command in commands] == [PREPARE]
             assert not worker.mics and not worker.backend.sources
         assert view.calls == [SHOW, ("starting",), ("close",)]

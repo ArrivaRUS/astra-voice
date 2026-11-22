@@ -404,11 +404,15 @@ def _meeting_pulse_type() -> Any:
             self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
 
         def context_new(self, api: int, name: bytes) -> int | None:
-            with CONNECT_LOCK:
+            with CONNECT_LOCK, self.admission_guard():
+                if not self.admission_check():
+                    raise ValueError("admission-stale")
                 return super().context_new(api, name)
 
         def context_connect(self, ctx: int, server: bytes | None, flags: int, spawn: None) -> int:
-            with CONNECT_LOCK:
+            with CONNECT_LOCK, self.admission_guard():
+                if not self.admission_check():
+                    raise ValueError("admission-stale")
                 return super().context_connect(ctx, server, flags, spawn)
 
         def iterate(self, timeout_us: int) -> int:
@@ -552,11 +556,16 @@ class NativePulse:
     wait_us = 10000
     skip_unconnected_disconnect = False
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        admission_check: Callable[[], bool] = lambda: True,
+        admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext,
+    ) -> None:
         from astra_voice.worker.pulse_stream import SubscribeCallback
 
-        self.admission_check: Callable[[], bool] = lambda: True
-        self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
+        self.admission_check = admission_check
+        self.admission_guard = admission_guard
         self.pulse: Any = _meeting_pulse_type()()
         self.pulse.admission_check = lambda: self.admission_check()
         self.pulse.admission_guard = lambda: self.admission_guard()
@@ -942,7 +951,7 @@ class MixedFarSource:
         target: PinnedTarget,
         token: str,
         *,
-        factory: Callable[[], NativePulse],
+        factory: Callable[..., NativePulse],
         now_ms: Callable[[], int] = _monotonic_ms,
     ) -> None:
         _check_stream_count(target)
@@ -954,12 +963,14 @@ class MixedFarSource:
         self._close_gate = threading.Lock()
         self._close_requests = 0
         self._members: list[_FarMember] = []
+        self.strict = True
         self.admission_check: Callable[[], bool] = lambda: True
         self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
         self._reset_mix()
 
     def _reset_mix(self) -> None:
         self.ended = self.partial = False
+        self.lost_streams: tuple[PinnedStream, ...] = ()
         self.change: str | None = None
         self.reanchors = self.late_bytes = 0
         self._out_pos = 0
@@ -983,7 +994,9 @@ class MixedFarSource:
                 for stream in self.target.streams:
                     if not self._can_operate():
                         raise ValueError("admission-stale")
-                    pulse = self._factory()
+                    pulse = self._factory(
+                        admission_check=self._can_operate, admission_guard=self.admission_guard
+                    )
                     pulse.skip_unconnected_disconnect = True
                     source = _MixedMemberSource(
                         pulse, self.token, target=replace(self.target, streams=(stream,))
@@ -991,13 +1004,41 @@ class MixedFarSource:
                     source.admission_check = self._can_operate
                     source.admission_guard = lambda: self.admission_guard()
                     self._members.append(_FarMember(source))
-                    source.open(device)
+                    try:
+                        source.open(device)
+                    except ValueError as exc:
+                        if self.strict or str(exc) not in {"target-gone", "target-mismatch"}:
+                            raise
+                        self.lost_streams += (stream,)
+                        source.shutdown()
+                        self._members.pop()
+                if not self._members:
+                    self.ended = True
+                    raise ValueError("target-gone")
+                if self.strict:
+                    self._check_start_events()
+                self.partial = bool(self.lost_streams)
             except BaseException as open_error:
                 try:
                     self._shutdown_members()
                 except Exception as close_error:
                     raise open_error from close_error
                 raise
+
+    def _check_start_events(self) -> None:
+        indexes = {stream.sink_input for stream in self.target.streams}
+        for member in self._members:
+            if not self._can_operate():
+                raise ValueError("admission-stale")
+            events, overflow = cast(NativePulse, member.source.pulse)._poll_events()
+            if not self._can_operate():
+                raise ValueError("admission-stale")
+            if (
+                overflow
+                or member.pending_since is not None
+                or any(kind == "server" or index in indexes for kind, index in events)
+            ):
+                raise ValueError("target-mismatch")
 
     def read_chunk(self) -> bytes | None:
         with self._lock:
@@ -1026,6 +1067,8 @@ class MixedFarSource:
                     if data is None:
                         if not source.ended:
                             raise ValueError("audio-failed")
+                        assert source.target is not None
+                        self.lost_streams += source.target.streams
                         live.remove(member)
                         if self._leader is member:
                             self._leader = None
@@ -1040,7 +1083,7 @@ class MixedFarSource:
 
             if not self._can_operate():
                 return b""
-            self.partial = 0 < len(live) < len(self._members)
+            self.partial = bool(live and self.lost_streams)
             if not live:
                 self.ended = True
                 return None

@@ -91,6 +91,7 @@ def role_checker(observer: MeetingObserver, clock: Callable[[], float]) -> Check
         own_contexts=observer.registry.snapshot,
         clock=clock,
         metadata=_check_metadata,
+        output_limit=8,
     )
 
 

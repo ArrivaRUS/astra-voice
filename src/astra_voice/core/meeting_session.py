@@ -244,6 +244,7 @@ class MeetingController:
         self.lock_signal_unavailable = session_kind == SessionKind.FLY
         self.far_available = False
         self.far_reason = ""
+        self.far_partial = False
         self.mic_only_available = False
         self.saved = False
         self.error_code = ""
@@ -342,6 +343,7 @@ class MeetingController:
         self._far = far or {"kind": "none"}
         self.far_available = self.mic_only_available = False
         self.far_reason = ""
+        self.far_partial = False
         self.meeting = Meeting(
             id=self.id_factory(),
             started_at=datetime.now(UTC).isoformat(),
@@ -865,6 +867,8 @@ class MeetingController:
                 self._persist(MeetingState.PAUSED)
         elif kind == "track":
             self.tracks[event["track"]] = event["state"]
+            if event["track"] == "far" and event["kind"] == "partial":
+                self.far_partial = True
         elif kind == "alive":
             if self._terminal:
                 return
