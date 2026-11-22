@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtTest import QSignalSpy
 from test_meeting_recording_bridge import Rig
 from test_meeting_recording_bridge import rig as rig
@@ -12,6 +15,7 @@ from test_meeting_recording_bridge import rig as rig
 from astra_voice import app
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui.meeting_overlay import MeetingOverlay
 from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.overlay import WINDOW_FLAGS
 from astra_voice.ui.tray_icons import TrayState
@@ -74,18 +78,113 @@ def test_overlay_actions_are_inert_without_a_committed_capture(
         recording.shutdown()
 
 
-def test_tray_record_opens_w4_and_reveals_shell_without_capture(rig: Rig) -> None:
+def test_tray_record_opens_w4_without_revealing_shell_or_running_capture(rig: Rig) -> None:
     tray, show = Mock(), Mock()
     disconnect = app._wire_tray_meetings(tray, rig.bridge, show)
     try:
         tray.on_meeting_record()
         assert rig.bridge.startDialogOpen
-        show.assert_called_once_with()
+        show.assert_not_called()
         assert not any(
             message["type"].endswith(("prepare", "open")) for message in rig.supervisor.messages
         )
     finally:
         disconnect()
+
+
+def test_w2_sets_initial_x11_properties_before_map_and_requests_above_after_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Xlib import X
+
+    trace: list[tuple[object, ...]] = []
+    atoms: dict[str, int] = {}
+    names: dict[int, str] = {0: ""}
+
+    def intern(name: str) -> int:
+        atom = atoms.setdefault(name, len(atoms) + 1)
+        names[atom] = name
+        return atom
+
+    def window(wid: int) -> Mock:
+        return Mock(
+            get_full_property=Mock(return_value=SimpleNamespace(format=32, value=[8])),
+            change_property=Mock(
+                side_effect=lambda atom, _kind, _size, data: trace.append(
+                    ("property", wid, names[atom], tuple(data))
+                )
+            ),
+        )
+
+    def message(event: Any, *, event_mask: int) -> None:
+        assert event.window == 7 and event.client_type == atoms["_NET_WM_STATE"]
+        assert event_mask == X.SubstructureRedirectMask | X.SubstructureNotifyMask
+        fmt, (action, first, second, source, _) = event.data
+        assert (fmt, action, source) == (32, 1, 1)
+        trace.append(("message", names[first], names[second]))
+
+    view = Mock(winId=Mock(return_value=7), isVisible=Mock(return_value=False))
+    keyboard = False
+    target: Any = SimpleNamespace(
+        _view=view,
+        _root=Mock(property=Mock(side_effect=lambda _name: keyboard)),
+        _closed=False,
+        recording=SimpleNamespace(overlay={"visible": True}),
+        _x11=SimpleNamespace(
+            d=Mock(
+                intern_atom=Mock(side_effect=intern),
+                create_resource_object=Mock(side_effect=lambda _, wid: window(wid)),
+                sync=Mock(side_effect=lambda: trace.append(("xlib-sync",))),
+            ),
+            root=Mock(send_event=Mock(side_effect=message)),
+        ),
+    )
+    target._prepare_window = lambda: MeetingOverlay._configure_native_window(target)
+
+    def show() -> None:
+        trace.append(("show",))
+        view.isVisible.return_value = True
+
+    view.show.side_effect = show
+    with monkeypatch.context() as patch:
+        patch.setattr(QGuiApplication, "platformName", lambda: "xcb")
+        patch.setattr(QGuiApplication, "sync", lambda: trace.append(("qt-sync",)))
+        MeetingOverlay._show_surface(target)
+
+    map_index = trace.index(("show",))
+    prior, after = trace[:map_index], trace[map_index + 1 :]
+    above = atoms["_NET_WM_STATE_ABOVE"]
+    skip_taskbar = atoms["_NET_WM_STATE_SKIP_TASKBAR"]
+    skip_pager = atoms["_NET_WM_STATE_SKIP_PAGER"]
+    assert prior == [
+        ("qt-sync",),
+        ("property", 7, "_NET_WM_WINDOW_TYPE", (atoms["_NET_WM_WINDOW_TYPE_NOTIFICATION"],)),
+        ("property", 7, "_NET_WM_USER_TIME", (0,)),
+        ("property", 8, "_NET_WM_USER_TIME", (0,)),
+        ("property", 7, "_NET_WM_STATE", (above, skip_taskbar, skip_pager)),
+        ("property", 7, "_NET_WM_DESKTOP", (0xFFFFFFFF,)),
+        ("xlib-sync",),
+    ]
+    assert after == [
+        ("qt-sync",),
+        *prior[1:4],
+        ("message", "_NET_WM_STATE_ABOVE", ""),
+        ("message", "_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER"),
+        ("xlib-sync",),
+    ]
+    view.requestActivate.assert_not_called()
+
+    trace.clear()
+    keyboard = True
+    with monkeypatch.context() as patch:
+        patch.setattr(QGuiApplication, "platformName", lambda: "xcb")
+        patch.setattr(QGuiApplication, "sync", lambda: trace.append(("qt-sync",)))
+        MeetingOverlay._show_surface(target)
+    assert trace == [
+        ("qt-sync",),
+        ("property", 7, "_NET_WM_WINDOW_TYPE", (atoms["_NET_WM_WINDOW_TYPE_NORMAL"],)),
+        *after[4:],
+    ]
 
 
 def test_disabled_pill_cannot_hide_w2_or_recording_tray(rig: Rig) -> None:

@@ -1,6 +1,6 @@
 """W3 «Предупредите участников о записи» under W2 (spec §2.3/§2.4/§3.6).
 
-Opens once when a recording starts and again on «Текст для участников» (W2, tray).
+Opens on «Текст для участников…» in the tray while recording.
 It never takes focus on its own; the tray path and an explicit text selection
 switch it to keyboard mode. Copy publishes only ``text/plain``. The program never
 claims that participants were warned (US-13.6).
@@ -84,7 +84,6 @@ class MeetingNotice(SurfaceWindow):
         self._closed = False
         self._open = False
         self._copy_state = "default"
-        self._announced = ""
         self._input_region = QRegion()
         self._input_native_window_id: int | None = None
         self._x11 = X11Display()
@@ -166,12 +165,6 @@ class MeetingNotice(SurfaceWindow):
     def refresh(self) -> None:
         if self._closed:
             return
-        meeting_id = self.recording.active_meeting_id
-        if meeting_id and meeting_id != self._announced and self._active():
-            # Spec §2.3: W3 appears with W2 at every start of a recording.
-            self._announced = meeting_id
-            self._open, self._copy_state = True, "default"
-            self._copied.stop()
         if self._open and not self._active():
             self._open = False
             self._copied.stop()
