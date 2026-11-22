@@ -13,7 +13,8 @@ from astra_voice.ui.meeting_texts import RESPONSIBILITY_ITEMS, TEXTS
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
 NOTICE_CAPTION = (
-    "Копируется кнопкой на плашке записи и пунктом «Текст для участников…» в меню значка в трее"
+    "На плашке записи нажмите кнопку копирования. В меню значка в трее — "
+    "«Текст для участников…», затем «Скопировать для чата»"
 )
 RESPONSIBILITY_NOTICE = (
     "Готовый текст для чата встречи копируется кнопкой на плашке записи — вставьте его "

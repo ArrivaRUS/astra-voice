@@ -19,7 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QObject, QPointF, Qt, QUrl
+from PyQt5.QtCore import QObject, QPointF, Qt, QUrl, qVersion
 from PyQt5.QtGui import QClipboard, QWindow
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlEngine, QQmlExpression
 from PyQt5.QtQuick import QQuickWindow
@@ -65,7 +65,18 @@ def load_main():
     info = app._make_app_info(SessionKind.KDE, 'ok')
     install_icon_provider(engine)
     warnings = []
-    engine.warnings.connect(lambda rows: warnings.extend(row.toString() for row in rows))
+
+    def record_warnings(rows):
+        # Qt 5.15.8 with Debian's fonts emits this footer warning on the
+        # pre-UI Main.qml (34f281b) too, before any meeting action.
+        footer_warning = 'QML QQuickItem: Binding loop detected for property "implicitHeight"'
+        for row in rows:
+            if (qVersion() == '5.15.8' and row.url().fileName() == 'AvDialog.qml'
+                    and row.description() == footer_warning):
+                continue
+            warnings.append(row.toString())
+
+    engine.warnings.connect(record_warnings)
     engine.rootContext().setContextProperty('appInfo', info)
     engine.rootContext().setContextProperty('meetingBridge', bridge)
     engine.load(QUrl.fromLocalFile(str(repo / 'qml/Main.qml')))
@@ -100,6 +111,12 @@ def check_settings(shell, info):
         button.clicked.emit()
         assert clipboard_text() == bridge.settings[key]
         assert button.property('iconName') == 'check'
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(meeting_notice, 'copy_plain_text', lambda _: False)
+            button.clicked.emit()
+        assert button.property('iconName') == 'copy', key
+        button.clicked.emit()
+        assert button.property('iconName') == 'check'
     for button in (notice_copy, invite_copy):
         if button.property('iconName') == 'check':
             assert QSignalSpy(button.iconNameChanged).wait(1800)
@@ -132,16 +149,20 @@ def check_settings(shell, info):
     invite_copy.clicked.emit()
     assert clipboard_text() == long_text
 
-    for text in (
-        'First line\nSecond line\r\nThird line',
-        'First line\u2028Second line\u2029Third line',
+    for key, field in (
+        ('meeting_notice_text', notice),
+        ('meeting_invite_text', invite),
     ):
-        QTest.keyClick(shell, Qt.Key_A, Qt.ControlModifier)
-        qt.clipboard().setText(text)
-        QTest.keyClick(shell, Qt.Key_V, Qt.ControlModifier)
-        QTest.keyClick(shell, Qt.Key_Return)
-        assert len(bridge.settings['meeting_invite_text'].splitlines()) == 1
-    assert bridge.settings['meeting_invite_text'] == 'First line Second line Third line'
+        field.forceActiveFocus(Qt.TabFocusReason)
+        for index, separator in enumerate(('\n', '\r', '\r\n', '\u2028', '\u2029', '\r\n\n\u2028')):
+            first = f'First {index}'
+            QTest.keyClick(shell, Qt.Key_A, Qt.ControlModifier)
+            qt.clipboard().setText(first + separator + 'Second')
+            QTest.keyClick(shell, Qt.Key_V, Qt.ControlModifier)
+            QTest.keyClick(shell, Qt.Key_Return)
+            expected = first + ' Second'
+            assert getattr(bridge._stored, key) == expected, (key, repr(separator))
+            assert bridge.settings[key] == expected
 
     bridge.renameRequested.emit('test-id', 'Original name')
     qt.processEvents()
@@ -154,10 +175,10 @@ def check_settings(shell, info):
 
 
 def check_start(shell, info, initial_visibility):
-    tray, show_shell = Mock(), Mock()
+    tray = Mock()
     focuser = app._WindowFocuser(shell)
-    bridge.recordingRequested.connect(focuser.focus_meeting_start)
-    disconnect = app._wire_tray_meetings(tray, bridge, show_shell)
+    show_meetings = app._wire_meeting_windows(bridge, focuser, info)
+    disconnect = app._wire_tray_meetings(tray, bridge, show_meetings)
     dialog = shell.findChild(QWindow, 'meetingStartWindow')
     focus = Mock(return_value=True)
 
@@ -178,7 +199,6 @@ def check_start(shell, info, initial_visibility):
         assert original_visibility == expected
         activate(tray.on_meeting_record)
         assert shell.visibility() == original_visibility
-        show_shell.assert_not_called()
         assert dialog.isExposed() and dialog.transientParent() is None
         focus.assert_called_once_with(int(dialog.winId()))
         assert bridge.startCanStart
@@ -192,13 +212,16 @@ def check_start(shell, info, initial_visibility):
         assert focus.call_count == 2
         assert bridge.selectedSource == 'all' and bridge.startCanStart
         assert (rig.recording._preview_serial, bridge.startOptions, bridge.startWarnings) == before
-        bridge.closeStartDialog()
+        activate(tray.on_meeting_open)
+        qt.processEvents()
+        assert shell.isVisible() and dialog.transientParent() == shell
+        assert focus.call_count == 3 and focus.call_args.args == (int(dialog.winId()),)
+        assert qt.focusWindow() == dialog and bridge.selectedSource == 'all'
+        assert (rig.recording._preview_serial, bridge.startOptions, bridge.startWarnings) == before
+        QTest.keyClick(qt.focusWindow(), Qt.Key_Escape)
         qt.processEvents()
         assert not dialog.isVisible()
 
-        info.show_section(app.SECTION_MEETINGS)
-        qt.processEvents()
-        assert shell.isVisible() and dialog.transientParent() == shell
         section_button = shell.findChild(QObject, 'meetingRecord')
         assert section_button.property('enabled')
         activate(section_button.clicked.emit)
@@ -206,7 +229,7 @@ def check_start(shell, info, initial_visibility):
         assert bridge.selectedSource == 'all'
         before = rig.recording._preview_serial
         activate(section_button.clicked.emit)
-        assert focus.call_count == 4 and focus.call_args.args == (int(dialog.winId()),)
+        assert focus.call_count == 5 and focus.call_args.args == (int(dialog.winId()),)
         assert bridge.selectedSource == 'all' and rig.recording._preview_serial == before
         bridge.closeStartDialog()
         qt.processEvents()

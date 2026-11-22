@@ -166,25 +166,28 @@ def ipc_case(rig: Rig, case: str, trace: list[str]) -> None:
         role_events = [started(), ended(), reply(rig, "old-card-req")]
         for event in role_events:
             old.event({**event, "generation": old.generation})
-        assert trace == [line("dropped", "old-serial")] * len(role_events)
+        assert trace == [line("dropped", "old-serial")] * 2
         trace.clear()
         old.event({"type": "meeting.capture.alive", "generation": old.generation})
         assert trace == []
         old.event({**started(), "generation": old.generation})
     elif case == "generation":
-        for event in (ended(), reply(rig, "other-req")):
+        req = query_after_unlock(rig)
+        trace.clear()
+        for event in (ended(), reply(rig, req), reply(rig, "other-req")):
             rig.supervisor.event({**event, "generation": rig.supervisor.generation - 1})
         assert trace == [line("dropped", "generation")] * 2
         trace.clear()
         rig.supervisor.event({**started(), "generation": rig.supervisor.generation - 1})
     elif case == "decode":
+        req = query_after_unlock(rig)
+        trace.clear()
         deliver(rig, {"type": "error", "request_type": QUERY, "req": ""})
+        assert trace == []
+        deliver(rig, {"type": "error", "request_type": QUERY, "req": req})
         assert trace == [line("dropped", "decode")]
         trace.clear()
         deliver(rig, {"type": "meeting.call.started"})
-    elif case == "card-req":
-        query_after_unlock(rig)
-        deliver(rig, reply(rig, "unknown-request"))
     elif case == "unknown-call":
         deliver(rig, ended("unknown-call"))
 
@@ -357,7 +360,7 @@ def reject_start_case(rig: Rig, case: str, trace: list[str], patch: pytest.Monke
         ],
         *[
             ("ipc", "dropped", reason)
-            for reason in ("old-serial", "generation", "decode", "card-req", "unknown-call")
+            for reason in ("old-serial", "generation", "decode", "unknown-call")
         ],
         *[
             ("memory", "suppressed", reason)
@@ -484,6 +487,18 @@ def test_non_offer_messages_remain_silent(rig: Rig, trace: list[str]) -> None:
     deliver(rig, {"type": "meeting.ack", "req": "unrelated", "request_type": QUERY})
     deliver(rig, {"type": "stats"})
     rig.supervisor.event({"type": "meeting.capture.alive", "generation": -1})
+    assert trace == []
+
+
+def test_closed_w4_reply_is_absent_from_offer_log(rig: Rig, trace: list[str]) -> None:
+    offer_ready(rig)
+    rig.bridge.requestRecording()
+    w4_reply = rig.call_state()
+    rig.bridge.closeStartDialog()
+    trace.clear()
+    rig.supervisor.event(w4_reply)
+    assert trace == []
+    rig.supervisor.event({**w4_reply, "generation": rig.supervisor.generation - 1})
     assert trace == []
 
 

@@ -132,7 +132,10 @@ Item {
                     ToolTip.text: root.copyLabel
                     ToolTip.visible: hovered && visible
                     ToolTip.delay: 500
-                    onClicked: if (root.copyText && root.copyText()) copyTimer.restart()
+                    onClicked: {
+                        if (root.copyText && root.copyText()) copyTimer.restart()
+                        else copyTimer.stop()
+                    }
                     Timer { id: copyTimer; interval: 1200 }
                 }
             }

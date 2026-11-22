@@ -484,7 +484,7 @@ def test_first_run_cards_summary_selection_and_memory_ignore_pair(pair: Any) -> 
         assert len(downloads.models) == 5
         assert not any(row["id"] in MODEL_IDS for row in downloads.models)
         assert downloads.installedCount == 0
-        assert downloads.installedSummary.startswith("Установлено 0 из 12")
+        assert downloads.installedSummary == "Установлено 0 из 5"
         for model_id in MODEL_IDS:
             downloads.makeModelCurrent(model_id)
         assert store.current() is None

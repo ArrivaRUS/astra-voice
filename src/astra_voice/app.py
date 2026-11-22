@@ -923,6 +923,18 @@ def _meeting_model_probe(service: Any) -> Callable[[], Any]:
     return lambda: probe_gigaam_model(min_ram_mb=min_ram)
 
 
+def _wire_meeting_windows(
+    bridge: Any, focuser: _WindowFocuser, app_info: Any
+) -> Callable[[], None]:
+    def show_meetings() -> None:
+        app_info.show_section(SECTION_MEETINGS)
+        focuser.focus_shell()
+
+    bridge.openMeetingsRequested.connect(show_meetings)
+    bridge.recordingRequested.connect(focuser.focus_meeting_start)
+    return show_meetings
+
+
 def _wire_tray_meetings(
     tray: Any, bridge: Any, show_meetings: Callable[[], None]
 ) -> Callable[[], None]:
@@ -1192,14 +1204,26 @@ class _WindowFocuser(QObject):
 
     def focus_shell(self, timestamp: int = 0) -> None:
         """Показывает shell; положительный X timestamp обновляет user time окна."""
-        self.focus(self._shell, timestamp)
+        if self._stopped:
+            return
+        shell = _root_window(self._shell)
+        dialog = self._meeting_start_window(shell)
+        if dialog is not None and dialog.isVisible():
+            _restore(shell)
+            self.focus(dialog, timestamp, restore=False)
+        else:
+            self.focus(shell, timestamp)
 
-    def focus_meeting_start(self) -> None:
+    @staticmethod
+    def _meeting_start_window(shell: Any) -> Any:
         from PyQt5.QtGui import QWindow
 
-        shell = _root_window(self._shell)
-        if shell is not None:
-            self.focus(shell.findChild(QWindow, "meetingStartWindow"), restore=False)
+        return (
+            shell.findChild(QWindow, "meetingStartWindow") if isinstance(shell, QObject) else None
+        )
+
+    def focus_meeting_start(self) -> None:
+        self.focus(self._meeting_start_window(_root_window(self._shell)), restore=False)
 
     def focus(self, target: Any, timestamp: int = 0, *, restore: bool = True) -> None:
         if self._stopped:
@@ -2183,12 +2207,7 @@ def main(argv: list[str] | None = None) -> int:
                 # T-481: an installed/rechecked model starts needs_model jobs by itself.
                 downloads.modelsChanged.connect(jobs.models_changed)
 
-            def show_meetings() -> None:
-                focuser.focus_shell()
-                app_info.show_section(SECTION_MEETINGS)
-
-            meeting_bridge.openMeetingsRequested.connect(show_meetings)
-            meeting_bridge.recordingRequested.connect(focuser.focus_meeting_start)
+            show_meetings = _wire_meeting_windows(meeting_bridge, focuser, app_info)
             meeting_bridge.meetingActionRequested.connect(
                 _meeting_model_action(focuser, app_info, settings_bridge)
             )

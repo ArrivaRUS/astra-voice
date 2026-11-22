@@ -7,6 +7,7 @@ Loading and disabling settings never traverses or deletes meeting data.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from types import MappingProxyType
@@ -51,9 +52,8 @@ def migrate_v2(data: dict[str, Any]) -> dict[str, Any]:
     return {**MEETING_DEFAULTS, **data}
 
 
-def normalize_invite_text(value: str) -> str:
-    # TextInput paste can preserve Unicode line and paragraph separators.
-    return normalize_text(value.replace("\u2028", " ").replace("\u2029", " "), 500, minimum=1)
+def normalize_participant_text(value: str) -> str:
+    return normalize_text(re.sub(r"[\r\n\u2028\u2029]+", " ", value), 500, minimum=1)
 
 
 def validate_setting(name: str, value: Any) -> Any:
@@ -73,7 +73,6 @@ def validate_setting(name: str, value: Any) -> Any:
             return value if 0 <= value <= 365 else invalid()
         return value if value in (0, 30, 90, 365) else invalid()
     limits = {
-        "meeting_notice_text": 500,
         "meeting_self_label": 40,
         "meeting_ai_endpoint": 2048,
         "meeting_ai_model": 128,
@@ -81,13 +80,9 @@ def validate_setting(name: str, value: Any) -> Any:
     try:
         if name == "meeting_self_label":
             return normalize_self_label(value)
-        if name == "meeting_invite_text":
-            return normalize_invite_text(value)
-        return normalize_text(
-            value,
-            limits[name],
-            minimum=1 if name == "meeting_notice_text" else 0,
-        )
+        if name in {"meeting_notice_text", "meeting_invite_text"}:
+            return normalize_participant_text(value)
+        return normalize_text(value, limits[name])
     except MeetingValidationError:
         return invalid()
 

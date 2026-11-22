@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
+from PyQt5.QtCore import QMetaObject, QPoint, QRect
 from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtTest import QSignalSpy
 from test_meeting_recording_bridge import Rig
@@ -15,9 +16,10 @@ from test_meeting_recording_bridge import rig as rig
 from astra_voice import app
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui import meeting_overlay
 from astra_voice.ui.meeting_overlay import MeetingOverlay
 from astra_voice.ui.meeting_recording import MeetingRecording
-from astra_voice.ui.overlay import WINDOW_FLAGS
+from astra_voice.ui.overlay import SHADOW_MARGIN, WINDOW_FLAGS, OverlayWindow
 from astra_voice.ui.tray_icons import TrayState
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
@@ -92,7 +94,7 @@ def test_tray_record_opens_w4_without_revealing_shell_or_running_capture(rig: Ri
         disconnect()
 
 
-def test_w2_sets_initial_x11_properties_before_map_and_requests_above_after_map(
+def test_w2_x11_properties_and_focus_across_passive_and_keyboard_shows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from Xlib import X
@@ -124,12 +126,17 @@ def test_w2_sets_initial_x11_properties_before_map_and_requests_above_after_map(
         trace.append(("message", names[first], names[second]))
 
     view = Mock(winId=Mock(return_value=7), isVisible=Mock(return_value=False))
-    keyboard = False
+    root_state = {"keyboardMode": False}
     target: Any = SimpleNamespace(
         _view=view,
-        _root=Mock(property=Mock(side_effect=lambda _name: keyboard)),
+        _root=Mock(
+            property=Mock(side_effect=root_state.__getitem__),
+            setProperty=Mock(side_effect=root_state.__setitem__),
+        ),
         _closed=False,
         recording=SimpleNamespace(overlay={"visible": True}),
+        _resize=Mock(),
+        geometryChanged=Mock(),
         _x11=SimpleNamespace(
             d=Mock(
                 intern_atom=Mock(side_effect=intern),
@@ -140,19 +147,53 @@ def test_w2_sets_initial_x11_properties_before_map_and_requests_above_after_map(
         ),
     )
     target._prepare_window = lambda: MeetingOverlay._configure_native_window(target)
+    target._show_surface = lambda: MeetingOverlay._show_surface(target)
+    target.release_keyboard = lambda: MeetingOverlay.release_keyboard(target)
 
     def show() -> None:
         trace.append(("show",))
         view.isVisible.return_value = True
 
     view.show.side_effect = show
+    view.hide.side_effect = lambda: setattr(view.isVisible, "return_value", False)
+    view.setProperty.side_effect = lambda name, value: trace.append(("qt-property", name, value))
+    x11_focus = Mock()
     with monkeypatch.context() as patch:
         patch.setattr(QGuiApplication, "platformName", lambda: "xcb")
         patch.setattr(QGuiApplication, "sync", lambda: trace.append(("qt-sync",)))
-        MeetingOverlay._show_surface(target)
+        patch.setattr(QMetaObject, "invokeMethod", Mock())
+        patch.setattr(meeting_overlay, "focus_window", x11_focus)
+        MeetingOverlay.refresh(target)
+        passive = trace[:]
+        view.requestActivate.assert_not_called()
+        x11_focus.assert_not_called()
 
-    map_index = trace.index(("show",))
-    prior, after = trace[:map_index], trace[map_index + 1 :]
+        trace.clear()
+        MeetingOverlay.activate_keyboard(target)
+        normal = trace[:]
+        assert view.requestActivate.call_args_list == [call()]
+        assert x11_focus.call_args_list == [call(7)]
+        trace.clear()
+        MeetingOverlay.release_keyboard(target)
+        notification = trace[:]
+
+        target.recording.overlay = {"visible": False}
+        MeetingOverlay.refresh(target)
+        target.recording.overlay = {"visible": True}
+        trace.clear()
+        MeetingOverlay.refresh(target)
+        assert trace == passive
+        assert view.requestActivate.call_args_list == [call()]
+        assert x11_focus.call_args_list == [call(7)]
+
+        # A keyboard-mode show can remap a view after a native flag change.
+        view.hide()
+        trace.clear()
+        MeetingOverlay.activate_keyboard(target)
+        keyboard_remap = trace[:]
+
+    map_index = passive.index(("show",))
+    prior, after = passive[:map_index], passive[map_index + 1 :]
     above = atoms["_NET_WM_STATE_ABOVE"]
     skip_taskbar = atoms["_NET_WM_STATE_SKIP_TASKBAR"]
     skip_pager = atoms["_NET_WM_STATE_SKIP_PAGER"]
@@ -164,6 +205,7 @@ def test_w2_sets_initial_x11_properties_before_map_and_requests_above_after_map(
         ("property", 7, "_NET_WM_STATE", (above, skip_taskbar, skip_pager)),
         ("property", 7, "_NET_WM_DESKTOP", (0xFFFFFFFF,)),
         ("xlib-sync",),
+        ("qt-property", "_q_showWithoutActivating", True),
     ]
     assert after == [
         ("qt-sync",),
@@ -172,19 +214,47 @@ def test_w2_sets_initial_x11_properties_before_map_and_requests_above_after_map(
         ("message", "_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER"),
         ("xlib-sync",),
     ]
-    view.requestActivate.assert_not_called()
-
-    trace.clear()
-    keyboard = True
-    with monkeypatch.context() as patch:
-        patch.setattr(QGuiApplication, "platformName", lambda: "xcb")
-        patch.setattr(QGuiApplication, "sync", lambda: trace.append(("qt-sync",)))
-        MeetingOverlay._show_surface(target)
-    assert trace == [
+    normal_type = atoms["_NET_WM_WINDOW_TYPE_NORMAL"]
+    switcher = "_KDE_NET_WM_STATE_SKIP_SWITCHER"
+    assert normal == [
         ("qt-sync",),
-        ("property", 7, "_NET_WM_WINDOW_TYPE", (atoms["_NET_WM_WINDOW_TYPE_NORMAL"],)),
-        *after[4:],
+        ("property", 7, "_NET_WM_WINDOW_TYPE", (normal_type,)),
+        ("message", "_NET_WM_STATE_ABOVE", switcher),
+        *after[5:],
     ]
+    assert notification == after
+    assert keyboard_remap == [
+        *normal[:2],
+        ("property", 7, "_NET_WM_STATE", (above, skip_taskbar, skip_pager, atoms[switcher])),
+        *prior[5:7],
+        ("qt-property", "_q_showWithoutActivating", False),
+        ("show",),
+        *normal,
+    ]
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_w2_right_inset_respects_scaled_workarea_and_available_geometry(ratio: int) -> None:
+    screen = Mock(
+        devicePixelRatio=Mock(return_value=ratio),
+        geometry=Mock(return_value=QRect(0, 0, 1920, 1080)),
+        availableGeometry=Mock(return_value=QRect(0, 24, 1860, 1056)),
+    )
+    target: Any = SimpleNamespace(
+        _active_screen=lambda: screen,
+        _dragged_position=None,
+        _net_workarea=lambda: QRect(0, 0, 1840 * ratio, 1080 * ratio),
+        _view=Mock(width=Mock(return_value=400), height=Mock(return_value=80)),
+        geometryChanged=Mock(),
+        _shadow_margin=SHADOW_MARGIN,
+        _shadow_offset_y=6,
+    )
+    target._overlay_workarea = lambda screen: OverlayWindow._overlay_workarea(target, screen)
+    target._clamped = lambda point, area: MeetingOverlay._clamped(target, point, area)
+    MeetingOverlay._place(target)
+    target._view.setPosition.assert_called_once_with(
+        QPoint(1840 - 12 - 400 + SHADOW_MARGIN, 24 + 12 - SHADOW_MARGIN)
+    )
 
 
 def test_disabled_pill_cannot_hide_w2_or_recording_tray(rig: Rig) -> None:

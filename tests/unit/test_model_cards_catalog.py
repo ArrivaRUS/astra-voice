@@ -101,12 +101,14 @@ def test_download_rows_require_punctuation_except_for_installed_models(catalog: 
         }
         speed = visible["gigaam-v3-e2e-rnnt-int8"]["metrics"][1]
         assert speed["fill"] == pytest.approx(42.5 / 83.5)
+        assert downloads.installedSummary == "Установлено 0 из 5"
 
         # An older installed revision must also keep its row.
         model.records[("vosk-small-ru-int8", "older")] = "ok"
         with_installed = {row["id"]: row for row in downloads.models}
         assert with_installed.keys() == visible.keys() | {"vosk-small-ru-int8"}
         assert with_installed["vosk-small-ru-int8"]["badge"] == "installed"
+        assert downloads.installedSummary.split(" · ")[0] == "Установлено 1 из 6"
         assert with_installed["gigaam-v3-e2e-rnnt-int8"]["metrics"][1] == speed
         assert downloads._entries == catalog.dictation_entries
     finally:

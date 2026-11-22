@@ -608,6 +608,15 @@ try:
     root.dragRequested.emit(-100000, -100000)
     assert view.x() + 18 >= area.left()
     assert view.y() + 18 >= area.top()
+    owner.activate_keyboard()
+    app.processEvents()
+    active = app.focusWindow()
+    assert active == view
+    focus_changes = QSignalSpy(app.focusWindowChanged)
+    view.setWindowState(Qt.WindowMinimized)
+    app.processEvents()
+    assert not (view.windowStates() & Qt.WindowMinimized)
+    assert view.isVisible() and app.focusWindow() == active and not focus_changes
     for state in ('recording', 'paused', 'error'):
         recording.overlay.update(state=state, paused=state == 'paused')
         recording.changed.emit()

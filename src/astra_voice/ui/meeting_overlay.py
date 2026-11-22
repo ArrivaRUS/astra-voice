@@ -302,6 +302,9 @@ class MeetingOverlay(SurfaceWindow):
             self._prepare_window()
             if self._closed or not self.recording.overlay["visible"]:
                 return
+            self._view.setProperty(
+                "_q_showWithoutActivating", not self._root.property("keyboardMode")
+            )
             self._view.show()
         self._prepare_window()
 
@@ -346,8 +349,9 @@ class MeetingOverlay(SurfaceWindow):
         above = connection.intern_atom("_NET_WM_STATE_ABOVE")
         skip_taskbar = connection.intern_atom("_NET_WM_STATE_SKIP_TASKBAR")
         skip_pager = connection.intern_atom("_NET_WM_STATE_SKIP_PAGER")
+        skip_switcher = connection.intern_atom("_KDE_NET_WM_STATE_SKIP_SWITCHER") if keyboard else 0
         if self._view.isVisible():
-            for first, second in ((above, 0), (skip_taskbar, skip_pager)):
+            for first, second in ((above, skip_switcher), (skip_taskbar, skip_pager)):
                 message = event.ClientMessage(
                     window=wid, client_type=state, data=(32, [1, first, second, 1, 0])
                 )
@@ -355,7 +359,10 @@ class MeetingOverlay(SurfaceWindow):
                     message, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask
                 )
         else:
-            window.change_property(state, Xatom.ATOM, 32, [above, skip_taskbar, skip_pager])
+            states = [above, skip_taskbar, skip_pager]
+            if skip_switcher:
+                states.append(skip_switcher)
+            window.change_property(state, Xatom.ATOM, 32, states)
             window.change_property(
                 connection.intern_atom("_NET_WM_DESKTOP"), Xatom.CARDINAL, 32, [0xFFFFFFFF]
             )
@@ -419,16 +426,21 @@ class MeetingOverlay(SurfaceWindow):
             self._show_surface()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if (
-            watched is self._view
-            and event.type() == QEvent.Close
-            and not self._closed
-            and self.recording.overlay["visible"]
-        ):
-            event.ignore()
-            return True
-        if watched is self._view and event.type() == QEvent.FocusOut:
-            self.release_keyboard()
+        if watched is self._view:
+            kind = event.type()
+            if kind == QEvent.FocusOut:
+                self.release_keyboard()
+            elif (
+                kind in (QEvent.Close, QEvent.WindowStateChange)
+                and not self._closed
+                and self.recording.overlay["visible"]
+            ):
+                if kind == QEvent.Close:
+                    event.ignore()
+                    return True
+                states = self._view.windowStates()
+                if states & Qt.WindowMinimized:
+                    self._view.setWindowStates(states & ~Qt.WindowMinimized)
         return False
 
     def shutdown(self) -> None:

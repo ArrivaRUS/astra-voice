@@ -952,11 +952,12 @@ class MeetingRecording(QObject):
         kind = event.get("type")
         if kind in ("meeting.call.started", "meeting.call.ended"):
             return True
-        # W1 and W4 use the same reply types. Exclude the known dialog request.
+        # W1 and W4 use the same reply types. Only the current W1 request is attributable.
         return (
             event.get("request_type") == "meeting.call.query"
             and kind in ("meeting.call.state", "error")
-            and (not self._query_req or event.get("req") != self._query_req)
+            and bool(self._offer_query_req)
+            and event.get("req") == self._offer_query_req
         )
 
     def _receive_offer(
@@ -1194,8 +1195,6 @@ class MeetingRecording(QObject):
                 or self._variant1_lost
                 or raw["req"] != self._query_req
             ):
-                if self._is_offer_event(raw):
-                    log_meeting_offer(OfferEvent.DROPPED, OfferReason.CARD_REQ)
                 return
             self.call_id = raw.get("call_id", "")
             self.app_class = raw.get("app_class", "")

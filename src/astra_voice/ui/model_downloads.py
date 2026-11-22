@@ -1824,6 +1824,10 @@ class ModelDownloads(QObject):
             self.reset_store_error()
         return rows
 
+    @staticmethod
+    def _row_visible(entry: CatalogEntry, badge: str) -> bool:
+        return (entry.punctuation and not entry.removed_from_catalog) or bool(badge)
+
     def _model_rows(self) -> list[dict[str, Any]]:
         best_rtfx = catalog_best(self._entries)
         if self._measurements_cache is None:
@@ -1850,7 +1854,7 @@ class ModelDownloads(QObject):
                 "sizeText": format_size(entry.size_bytes),
                 **_card_memory(entry, merged := merge_measurement(entry, measurements, threads)),
                 "selected": entry.id in self._selected,
-                "badge": self._badge(entry, installed),
+                "badge": badge,
                 "state": (state := self._card_state(entry, installed)),
                 "message": self._card_message(entry, state),
                 "canCancel": state in {"downloading", "paused-no-space", "updating"}
@@ -1873,8 +1877,7 @@ class ModelDownloads(QObject):
                 "metrics": _card_metrics(entry, best_rtfx, merged),
             }
             for entry in self._entries
-            if (entry.punctuation and not entry.removed_from_catalog)
-            or self._badge(entry, installed)
+            if self._row_visible(entry, badge := self._badge(entry, installed))
         ]
 
     def measurements_changed(self) -> None:
@@ -1894,14 +1897,15 @@ class ModelDownloads(QObject):
         if not self._entries:
             return ""
         installed = self._installed_ids()
-        entries = [entry for entry in self._entries if self._badge(entry, installed)]
-        visible = sum(
-            1
-            for entry in self._entries
-            if not entry.removed_from_catalog or self._badge(entry, installed)
-        )
-        total = f"Установлено {len(entries)} из {visible}"
-        size = sum(entry.size_bytes for entry in entries)
+        visible = count = size = 0
+        for entry in self._entries:
+            badge = self._badge(entry, installed)
+            if self._row_visible(entry, badge):
+                visible += 1
+            if badge:
+                count += 1
+                size += entry.size_bytes
+        total = f"Установлено {count} из {visible}"
         # Цифра каталога — та же, что в нижней строке каждой карточки.
         return f"{total} · {format_size(size)} на диске" if size else total
 

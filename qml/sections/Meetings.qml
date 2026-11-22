@@ -557,7 +557,7 @@ Column {
                 divider: false
                 objectName: "meetingNoticeField"
                 label: root.txt("noticeLabel", "Текст для чата встречи")
-                sub: root.txt("noticeCaption", "Копируется кнопкой на плашке записи и пунктом «Текст для участников…» в меню значка в трее")
+                sub: root.txt("noticeCaption", "На плашке записи нажмите кнопку копирования. В меню значка в трее — «Текст для участников…», затем «Скопировать для чата»")
                 value: root.value("meeting_notice_text", "Я веду запись и расшифровку этой встречи для протокола.")
                 rowEnabled: root.editable("meeting_notice_text")
                 copyLabel: root.txt("copy", "Скопировать")

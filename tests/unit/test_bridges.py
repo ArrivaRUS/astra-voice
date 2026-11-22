@@ -4670,7 +4670,7 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "previousAvailable": False,
             "isNew": False,
             "reason": "",
-            "tags": [],
+            "tags": ["с пунктуацией"],
             "metrics": [
                 {
                     "kind": "quality",
