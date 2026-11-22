@@ -608,6 +608,12 @@ def validate_message(message: dict[str, Any], role: str) -> dict[str, Any]:
     try:
         clean: dict[str, Any] = _clean(message)
         validate(clean, SCHEMAS[role][kind])
+        if (
+            kind == "meeting.capture.track"
+            and clean["kind"] == "partial"
+            and (clean["track"], clean["state"]) != ("far", "live")
+        ):
+            raise ValueError("meeting-bad-field")
         return clean
     except (ValueError, TypeError, UnicodeError, RecursionError, SchemaInvalid, SchemaUnavailable):
         raise FrameError(BAD_FIELD, "meeting-bad-field") from None

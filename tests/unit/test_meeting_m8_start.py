@@ -103,6 +103,7 @@ def capture_events(
         "closed",
         "finalized",
         "track-ended",
+        "track-change",
         "far-partial",
         "audio-failed",
     )
@@ -530,8 +531,10 @@ def test_private_start_target_is_only_delivered_to_role(
     service: tuple[Rig, CheckDouble],
     capture_events: CaptureEvents,
     caplog: pytest.LogCaptureFixture,
+    native_far: NativeFar,
 ) -> None:
     rig, checks = service
+    pulses, _, plan = native_far
     far = app_far(rig, checks)
     caplog.set_level(logging.DEBUG)
     process = replace(TARGET.streams[0].process, pid=7654321, starttime=654321987)
@@ -551,9 +554,12 @@ def test_private_start_target_is_only_delivered_to_role(
     rig.state.messages.put(event)
     prepared(rig, rig.poll())
     assert rig.state.prepared_target is target
+    plan(target, {})
     open_capture(rig, capture_events)
     assert rig.state.capture_target is target
-    rig.backend.sources[0].losses.put(streams[1:2])
+    mixed_source = rig.state.sources["far"]
+    assert isinstance(mixed_source, MixedFarSource)
+    pulses[1].events.append(("removed", streams[1].sink_input))
     capture_events.wait("far-partial")
     assert [event["kind"] for event in of_type(rig.poll(), "capture.track")] == ["partial"]
     current = rig.state.capture_target
@@ -569,7 +575,16 @@ def test_private_start_target_is_only_delivered_to_role(
     trace += state_repr
     trace += "".join(
         repr_without_object_addresses(item)
-        for item in (rig.state, rig.state.calls, target, current, streams, event, run.result)
+        for item in (
+            rig.state,
+            rig.state.calls,
+            mixed_source,
+            target,
+            current,
+            streams,
+            event,
+            run.result,
+        )
     )
     for number in (
         *(s.sink_input for s in streams),
@@ -797,20 +812,61 @@ def native_far(
     pulses: list[ScriptedPulse] = []
     targets: list[PinnedTarget] = []
     backend = monitor_stream.CapturePulseBackend()
+    native_resolve = monitor_stream.NativePulse.resolve
 
     class NativeDouble(ScriptedPulse):
-        def __init__(self) -> None:
+        def __init__(self, **_admission: Any) -> None:
             target, failure = contexts.get_nowait()
             super().__init__(target)
             pulses.append(self)
+            self.expire_at: str | None = None
             if failure == "target-gone":
                 self.after_open.append(None)
             elif failure == "target-mismatch":
                 self.after_open.append(replace(target, serial=target.serial + 100))
             elif failure == "other-cookie":
                 self.target = replace(target, cookie=target.cookie + 1)
+            elif failure in {
+                "remove-previous",
+                "replace-previous",
+                "change-previous",
+                "move-previous",
+            }:
+                previous = pulses[-2]
+                assert previous.target is not None
+                kind = "removed" if failure == "remove-previous" else "changed"
+                if failure == "move-previous":
+                    previous.target = replace(previous.target, monitor="moved-before-start.monitor")
+                elif failure == "replace-previous":
+                    previous.target = replace(previous.target, serial=previous.target.serial + 100)
+                previous.events.append((kind, previous.target.index))
+            elif failure == "query-access":
+                lookup = fake_native_control(patch, target, stream_props={}, client_props={})
+                lookup.pulse.context_errno.return_value = 1
+
+                def denied(ctx: int, index: int, callback: Any, data: Any) -> int:
+                    callback(ctx, None, -1, data)
+                    return 1
+
+                lookup.pulse.lib.pa_context_get_sink_input_info.side_effect = denied
+                patch.setattr(self, "resolve", native_resolve.__get__(lookup))
+            elif failure in {"expire-create", "expire-connect"}:
+                self.expire_at = failure
             elif failure is not None:
                 self.open_error = ValueError(failure)
+
+        def open_record(self, monitor: str, index: int | None, token: str) -> None:
+            if self.expire_at == "expire-create":
+                rig.clock.now += 1.001
+            if self.expire_at and not self.admission_check():
+                raise ValueError("admission-stale")
+            if self.expire_at:
+                self.calls.append(("create",))
+            if self.expire_at == "expire-connect":
+                rig.clock.now += 1.001
+            if self.expire_at and not self.admission_check():
+                raise ValueError("admission-stale")
+            super().open_record(monitor, index, token)
 
     def plan(target: PinnedTarget, faults: dict[int, str]) -> None:
         for i, stream in enumerate(target.streams):
@@ -829,7 +885,201 @@ def native_far(
         yield pulses, targets, plan
 
 
-@pytest.mark.parametrize("code", ["target-gone", "target-mismatch"])
+@pytest.mark.parametrize(
+    "fault", ["remove-previous", "replace-previous", "change-previous", "move-previous"]
+)
+def test_first_group_open_checks_events_accumulated_while_opening(
+    service: tuple[Rig, CheckDouble],
+    capture_events: CaptureEvents,
+    native_far: NativeFar,
+    fault: str,
+) -> None:
+    rig, checks = service
+    pulses, _, plan = native_far
+    target = pinned_outputs(3, rig.clock())
+    prepare_allowed(rig, checks, app_far(rig, checks), target)
+    plan(target, {1: fault})
+    assert rig.send("open", **admission(rig))[0]["type"] == "meeting.ack"
+    assert rig.state.open_thread is not None
+    rig.state.open_thread.join(2)
+    assert not rig.state.open_thread.is_alive()
+    if fault in {"change-previous", "move-previous"}:
+        assert capture_events.finish("opened", "meeting.capture.started")["tracks"] == [
+            "mic",
+            "far",
+        ]
+        if fault == "move-previous":
+            assert (
+                capture_events.finish("track-change", "meeting.capture.track")["kind"]
+                == "sink-moved"
+            )
+            assert any(
+                call[:2] == ("moved-before-start.monitor", target.streams[0].sink_input)
+                for call in pulses[0].calls
+            )
+        # Live sink moves still work after the original 1 s attestation.
+        rig.clock.now += 1.001
+        pulse = pulses[0]
+        assert pulse.target is not None
+        pulse.target = replace(pulse.target, monitor="changed.monitor")
+        pulse.events.append(("changed", target.streams[0].sink_input))
+        track = capture_events.finish("track-change", "meeting.capture.track")
+        assert (track["track"], track["state"], track["kind"]) == ("far", "live", "sink-moved")
+        assert not errors(rig.events)
+        return
+    assert capture_events.signals["open-failed"].is_set()
+    assert errors(rig.poll())[0]["code"] == (
+        "target-gone" if fault == "remove-previous" else "target-mismatch"
+    )
+    assert capture_events.finish("closed", "meeting.capture.closed")["tracks"] == ["mic", "far"]
+    capture_events.finish("finalized", "meeting.capture.finalized")
+    assert len(pulses) == 3 and all(pulse.destroyed for pulse in pulses)
+    assert not of_type(rig.events, "capture.started")
+    assert all(("read",) not in pulse.calls for pulse in pulses)
+
+
+@pytest.mark.parametrize("fault", ["expire-create", "expire-connect"])
+def test_first_group_open_enforces_admission_at_member_boundaries(
+    service: tuple[Rig, CheckDouble],
+    capture_events: CaptureEvents,
+    native_far: NativeFar,
+    fault: str,
+) -> None:
+    rig, checks = service
+    pulses, _, plan = native_far
+    target = pinned_outputs(3, rig.clock())
+    prepare_allowed(rig, checks, app_far(rig, checks), target)
+    plan(target, {1: fault})
+    assert rig.send("open", **admission(rig))[0]["type"] == "meeting.ack"
+    assert capture_events.finish("open-failed", "error")["code"] == "admission-stale"
+    assert capture_events.finish("closed", "meeting.capture.closed")["tracks"] == ["mic", "far"]
+    first, second = pulses
+    assert any(len(call) == 3 for call in first.calls)
+    assert (("create",) in second.calls) is (fault == "expire-connect")
+    assert not any(len(call) == 3 for call in second.calls)
+    assert first.destroyed and second.destroyed
+    assert not of_type(rig.events, "capture.started")
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_loss_in_reader_crossing_pause_is_remembered(
+    service: tuple[Rig, CheckDouble],
+    capture_events: CaptureEvents,
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+) -> None:
+    rig, checks = service
+    target = pinned_outputs(3, rig.clock())
+    prepare_allowed(rig, checks, app_far(rig, checks), target)
+    entered, finish_read = threading.Event(), threading.Event()
+    source = Source()
+
+    def read() -> bytes | None:
+        entered.set()
+        assert finish_read.wait(2)
+        source.lost_streams = target.streams[:count]
+        source.ended = count == 3
+        return None if source.ended else b""
+
+    real_source = rig.backend.source
+    with monkeypatch.context() as patch:
+        patch.setattr(source, "read_chunk", read)
+        patch.setattr(rig.backend, "source", Mock(side_effect=[source, Source()]))
+        try:
+            open_capture(rig, capture_events)
+            assert entered.wait(2)
+            assert rig.send("pause", reason="user")[0]["type"] == "meeting.ack"
+            rig.clock.now += 0.05
+        finally:
+            finish_read.set()
+        capture_events.wait("far-partial")
+        capture_events.wait("closed")
+        rig.poll()
+        capture_events.finish("finalized", "meeting.capture.finalized")
+    assert not any(e["kind"] == "partial" for e in of_type(rig.events, "capture.track"))
+    assert rig.state.track_states["far"] == ("ended" if count == 3 else "paused")
+    if count == 3:
+        journal = json.loads((rig.directory / "capture.json").read_text())
+        _, end, close = journal["boundaries"]
+        assert [end["kind"], close["kind"]] == ["far_ended", "close"]
+        assert end["t_mono_ms"] == close["t_mono_ms"]
+    kept = rig.state.capture_target
+    assert kept is not None and kept.streams == (
+        target.streams if count == 3 else target.streams[1:]
+    )
+
+    with monkeypatch.context() as patch:
+        make_source = Mock(wraps=real_source)
+        patch.setattr(rig.backend, "source", make_source)
+        assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
+        started = capture_events.finish("opened", "meeting.capture.started")
+    if count == 3:
+        assert started["tracks"] == ["mic"]
+        make_source.assert_not_called()
+        assert_far_track(rig.events, "ended", "target-removed")
+    else:
+        assert started["tracks"] == ["mic", "far"]
+        make_source.assert_called_once_with(rig.state.far, target=kept)
+        assert_far_track(rig.events, "live", "partial")
+
+
+@pytest.mark.parametrize("interrupt", [False, True], ids=["error", "paused"])
+def test_failed_group_resume_preserves_already_confirmed_loss(
+    service: tuple[Rig, CheckDouble],
+    capture_events: CaptureEvents,
+    native_far: NativeFar,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt: bool,
+) -> None:
+    rig, checks = service
+    pulses, targets, plan = native_far
+    target = pinned_outputs(3, rig.clock())
+    prepare_allowed(rig, checks, app_far(rig, checks), target)
+    plan(target, {})
+    open_capture(rig, capture_events)
+    pause_capture(rig, capture_events, "keepalive")
+    plan(target, {0: "target-mismatch", 2: "audio-failed"})
+    entered, release = threading.Event(), threading.Event()
+    native_open = ScriptedPulse.open_record
+
+    def allow_failure(pulse: ScriptedPulse, monitor: str, index: int | None, token: str) -> None:
+        if pulse.open_error is not None:
+            entered.set()
+            assert release.wait(2)
+        native_open(pulse, monitor, index, token)
+
+    with monkeypatch.context() as patch:
+        if interrupt:
+            patch.setattr(ScriptedPulse, "open_record", allow_failure)
+        try:
+            assert (
+                rig.send("keepalive", seq=2, indicators_visible=True, **admission(rig))[0]["type"]
+                == "meeting.ack"
+            )
+            if interrupt:
+                assert entered.wait(2)
+                assert rig.send("pause", reason="user")[0]["type"] == "meeting.ack"
+        finally:
+            release.set()
+        capture_events.wait("open-failed")
+    assert not of_type(rig.poll(), "capture.started")
+    assert capture_events.finish("closed", "meeting.capture.closed")["tracks"] == ["mic", "far"]
+    capture_events.finish("finalized", "meeting.capture.finalized")
+    assert len(pulses) == 6 and all(pulse.destroyed for pulse in pulses)
+    assert rig.state.state == "paused" and not errors(rig.events)
+    if interrupt:
+        assert rig.state.pause_reasons == {"user"}
+    assert not of_type(rig.events, "capture.track")
+    kept = rig.state.capture_target
+    assert kept is not None and kept.streams == target.streams[1:]
+    plan(kept, {})
+    assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
+    assert capture_events.finish("opened", "meeting.capture.started")["tracks"] == ["mic", "far"]
+    assert targets == [target, target, kept]
+    assert_far_track(rig.events, "live", "partial")
+
+
+@pytest.mark.parametrize("code", ["target-gone", "target-mismatch", "audio-failed"])
 def test_first_open_refuses_entire_capture_when_one_of_three_members_fails(
     service: tuple[Rig, CheckDouble],
     capture_events: CaptureEvents,
@@ -913,7 +1163,9 @@ def test_resume_keeps_survivors_and_reopens_only_the_narrowed_target(
     assert not of_type(rig.poll(), "capture.track")
 
 
-@pytest.mark.parametrize("failure", ["target-gone", "other-cookie", "audio-failed"])
+@pytest.mark.parametrize(
+    "failure", ["target-gone", "other-cookie", "audio-failed-first", "audio-failed", "query-access"]
+)
 def test_resume_without_usable_members_or_after_audio_failure(
     service: tuple[Rig, CheckDouble],
     capture_events: CaptureEvents,
@@ -937,14 +1189,25 @@ def test_resume_without_usable_members_or_after_audio_failure(
         rig.poll()
     else:
         pause_capture(rig, capture_events, "resume")
-    plan(target, {i: failure for i in range(3)})
+    request_failed = failure in {"audio-failed-first", "audio-failed", "query-access"}
+    if failure == "audio-failed-first":
+        plan(target, {i: "audio-failed" for i in range(3)})
+    else:
+        plan(target, {1: failure} if request_failed else {i: failure for i in range(3)})
     before = len(rig.events)
     assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
-    if failure == "audio-failed":
+    if request_failed:
         error = capture_events.finish("open-failed", "error")
         assert error["code"] == "audio-failed" and rig.state.state == "paused"
         assert not of_type(rig.events[before:], "capture.started")
         assert not of_type(rig.events, "capture.track")
+        assert capture_events.finish("closed", "meeting.capture.closed")["tracks"] == ["mic", "far"]
+        capture_events.finish("finalized", "meeting.capture.finalized")
+        reopened = pulses[3:]
+        assert len(reopened) == (1 if failure == "audio-failed-first" else 2)
+        if failure != "audio-failed-first":
+            assert any(len(call) == 3 for call in reopened[0].calls)
+        assert all(p.destroyed and not p.recording for p in reopened)
     else:
         started = capture_events.finish("opened", "meeting.capture.started")
         assert started["tracks"] == ["mic"]
@@ -1011,6 +1274,28 @@ def test_far_reader_reports_only_growing_losses_and_keeps_mic_after_all_are_lost
         assert capture_events.finish("opened", "meeting.capture.started")["tracks"] == ["mic"]
         assert rig.state.capture_target is current
         make_source.assert_called_once_with(rig.state.far, target=target)
+        pcm = b"\x34\x12" * 1600
+        archived = threading.Event()
+        archive = rig.state.archive
+        assert archive is not None
+        put = archive.put
+
+        def archive_pcm(kind: str, payload: Any) -> bool:
+            accepted = put(kind, payload)
+            if accepted and kind == "pcm" and payload[:2] == ("mic", pcm):
+                archived.set()
+            return accepted
+
+        patch.setattr(archive, "put", archive_pcm)
+        rig.mics[-1].chunks.append(pcm)
+        assert archived.wait(2)
+        rig.send("stop")
+        capture_events.finish("closed", "meeting.capture.closed")
+        finalized = capture_events.finish("finalized", "meeting.capture.finalized")
+        assert finalized["segments"] == {"mic": 1, "far": 0}
+    (recording,) = (rig.directory / "audio").glob("mic-*.wav")
+    with wave.open(str(recording)) as wav:
+        assert wav.readframes(wav.getnframes()) == pcm
 
 
 @pytest.mark.parametrize("cancel_by", [None, "end", "pause", "server"])

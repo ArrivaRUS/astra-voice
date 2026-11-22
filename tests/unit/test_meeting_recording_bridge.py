@@ -306,6 +306,13 @@ def test_partial_track_wire_accepts_only_public_fields_and_known_kind() -> None:
             ipc.decode(json.dumps({**frame, **extra}).encode(), role="meeting-capture")
 
 
+@pytest.mark.parametrize("track,state", [("mic", "live"), ("far", "paused"), ("far", "ended")])
+def test_partial_wire_requires_live_far(track: str, state: str) -> None:
+    frame = {**partial_frame(), "track": track, "state": state}
+    with pytest.raises(ipc.FrameError):
+        ipc.decode(json.dumps(frame).encode(), role="meeting-capture")
+
+
 def test_far_partial_is_sticky_prioritized_and_scoped_to_current_meeting(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -321,7 +328,7 @@ def test_far_partial_is_sticky_prioritized_and_scoped_to_current_meeting(
         payload = ipc.decode(json.dumps({**frame, **fields}).encode(), role="meeting-capture")
         rig.supervisor.event({**payload, "generation": rig.supervisor.generation})
 
-    for wrong in ({"capture_id": "old"}, {"meeting_generation": 1}, {"track": "mic"}):
+    for wrong in ({"capture_id": "old"}, {"meeting_generation": 1}):
         deliver(**wrong)
         assert not controller.far_partial
     rig.supervisor.event({**frame, "generation": 0})
@@ -351,6 +358,8 @@ def test_far_partial_is_sticky_prioritized_and_scoped_to_current_meeting(
 
     # Earlier row-two branches win while a loss is latched.
     deliver(track="mic", state="paused", kind="device-lost")
+    assert rig.recording.overlay["state"] == "mic-paused"
+    rig.supervisor.event({**frame, "track": "mic", "generation": rig.supervisor.generation})
     assert rig.recording.overlay["state"] == "mic-paused"
     deliver(track="mic", kind="reopened")
     with monkeypatch.context() as patch:

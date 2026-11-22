@@ -109,7 +109,7 @@ class MixCase:
         self.before_open: Callable[[ScriptedPulse, int], None] = lambda pulse, i: None
 
         class Factory(ScriptedPulse):
-            def __init__(pulse) -> None:
+            def __init__(pulse, **_admission: Any) -> None:
                 i = len(self.pulses) % count
                 stream = streams[i]
                 super().__init__(
@@ -319,6 +319,28 @@ def test_member_loss_keeps_survivors_until_all_are_removed(
     assert source.lost_streams == (lost[1], lost[0], lost[2])
     source.shutdown()
     assert source.lost_streams == (lost[1], lost[0], lost[2])
+
+
+def test_all_member_losses_remain_terminal_when_read_admission_is_revoked(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(3)
+    source = case.open()
+    admitted = True
+    source.admission_check = lambda: admitted
+    for pulse, stream in zip(case.pulses, case.target.streams, strict=True):
+        pulse.events.append(("removed", stream.sink_input))
+    poll = case.pulses[-1]._poll_events
+
+    def last_removal() -> tuple[list[tuple[str, int]], bool]:
+        nonlocal admitted
+        admitted = False
+        return poll()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(case.pulses[-1], "_poll_events", last_removal)
+        assert source.read_chunk() is None
+    assert source.ended and source.lost_streams == case.target.streams
 
 
 @pytest.mark.parametrize("step", [0, 400])

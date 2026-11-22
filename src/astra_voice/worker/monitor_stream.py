@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 _PID = "application.process.id"
 _SERIAL = "object.serial"
+_PA_ERR_NOENTITY = 5
 
 
 class _Timeval(ctypes.Structure):
@@ -142,12 +143,10 @@ class MonitorStreamSource:
             self._open_record(self.pulse.default_monitor(), None)
         self.ended = False
 
-    def _resolve(self, *, confirm_loss: bool = False) -> Target:
+    def _resolve(self) -> Target:
         assert self.target is not None
         (stream,) = self.target.streams
-        return _resolve_stream(
-            self.pulse, self.target.server_cookie, stream, confirm_loss=confirm_loss
-        )
+        return _resolve_stream(self.pulse, self.target.server_cookie, stream, confirm_loss=True)
 
     def _open_record(self, monitor: str, index: int | None) -> None:
         if not self.admission_check():
@@ -162,7 +161,7 @@ class MonitorStreamSource:
                     raise ValueError("audio-failed") from connect_error
             if self.target is not None and str(connect_error) != "admission-stale":
                 try:
-                    self._resolve(confirm_loss=True)
+                    self._resolve()
                 except Exception as target_error:
                     if isinstance(target_error, ValueError) and str(target_error) in {
                         "target-gone",
@@ -404,11 +403,15 @@ def _meeting_pulse_type() -> Any:
             self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
 
         def context_new(self, api: int, name: bytes) -> int | None:
-            with CONNECT_LOCK:
+            with CONNECT_LOCK, self.admission_guard():
+                if not self.admission_check():
+                    raise ValueError("admission-stale")
                 return super().context_new(api, name)
 
         def context_connect(self, ctx: int, server: bytes | None, flags: int, spawn: None) -> int:
-            with CONNECT_LOCK:
+            with CONNECT_LOCK, self.admission_guard():
+                if not self.admission_check():
+                    raise ValueError("admission-stale")
                 return super().context_connect(ctx, server, flags, spawn)
 
         def iterate(self, timeout_us: int) -> int:
@@ -552,11 +555,16 @@ class NativePulse:
     wait_us = 10000
     skip_unconnected_disconnect = False
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        admission_check: Callable[[], bool] = lambda: True,
+        admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext,
+    ) -> None:
         from astra_voice.worker.pulse_stream import SubscribeCallback
 
-        self.admission_check: Callable[[], bool] = lambda: True
-        self.admission_guard: Callable[[], AbstractContextManager[Any]] = nullcontext
+        self.admission_check = admission_check
+        self.admission_guard = admission_guard
         self.pulse: Any = _meeting_pulse_type()()
         self.pulse.admission_check = lambda: self.admission_check()
         self.pulse.admission_guard = lambda: self.admission_guard()
@@ -672,9 +680,7 @@ class NativePulse:
         projected, valid = project_properties(props)
         return projected if valid else None
 
-    def _info(
-        self, function: str, argument: Any, structure: Any, *, confirm_loss: bool = False
-    ) -> Any:
+    def _info(self, function: str, argument: Any, structure: Any) -> Any:
         callback_type = ctypes.CFUNCTYPE(
             None, ctypes.c_void_p, ctypes.POINTER(structure), ctypes.c_int, ctypes.c_void_p
         )
@@ -685,12 +691,14 @@ class NativePulse:
         def receive(ctx: int, info: Any, eol: int, unused: int) -> None:
             nonlocal result, done, unavailable
             if eol:
-                if confirm_loss and eol < 0:
+                if eol < 0:
                     result = None
-                    # PA_ERR_NOENTITY is the by-index reply for a removed input.
-                    unavailable = structure is not _InputInfo or self.pulse.context_errno(ctx) != 5
-                elif confirm_loss and result is None:
-                    unavailable = True
+                    unavailable = (
+                        structure is not _InputInfo
+                        or self.pulse.context_errno(ctx) != _PA_ERR_NOENTITY
+                    )
+                else:
+                    unavailable = result is None
                 done = True
             elif info:
                 row = info.contents
@@ -727,9 +735,7 @@ class NativePulse:
             return None
 
         self._server()
-        row = self._info(
-            "pa_context_get_sink_input_info", index, _InputInfo, confirm_loss=confirm_loss
-        )
+        row = self._info("pa_context_get_sink_input_info", index, _InputInfo)
         if row is None:
             return None
         idx, sink, client, props = row
@@ -738,9 +744,7 @@ class NativePulse:
         serial, stream_pid = props.get(_SERIAL), props.get(_PID)
         if not isinstance(serial, int):
             return unavailable()
-        client_row = self._info(
-            "pa_context_get_client_info", client, _ClientInfo, confirm_loss=confirm_loss
-        )
+        client_row = self._info("pa_context_get_client_info", client, _ClientInfo)
         if client_row is None or client_row[0] != client or client_row[1] is None:
             return unavailable()
         client_pid = client_row[1].get(_PID)
@@ -757,9 +761,7 @@ class NativePulse:
             starttime = ProcReader(uid=os.geteuid()).starttime(pid)
         except (OSError, ProcUnavailable):
             return unavailable()
-        monitor = self._info(
-            "pa_context_get_sink_info_by_index", sink, _SinkInfo, confirm_loss=confirm_loss
-        )
+        monitor = self._info("pa_context_get_sink_info_by_index", sink, _SinkInfo)
         if not monitor:
             return unavailable()
         return Target(idx, serial, pid, self.cookie, monitor, client, starttime)
@@ -895,10 +897,10 @@ def _monotonic_ms() -> int:
 
 
 class _MixedMemberSource(MonitorStreamSource):
-    def _resolve(self, *, confirm_loss: bool = False) -> Target:
+    def _resolve(self) -> Target:
         if not self.admission_check():
             raise ValueError("admission-stale")
-        return super()._resolve(confirm_loss=confirm_loss)
+        return super()._resolve()
 
 
 @dataclass
@@ -942,7 +944,7 @@ class MixedFarSource:
         target: PinnedTarget,
         token: str,
         *,
-        factory: Callable[[], NativePulse],
+        factory: Callable[..., NativePulse],
         now_ms: Callable[[], int] = _monotonic_ms,
     ) -> None:
         _check_stream_count(target)
@@ -985,7 +987,9 @@ class MixedFarSource:
                 for stream in self.target.streams:
                     if not self._can_operate():
                         raise ValueError("admission-stale")
-                    pulse = self._factory()
+                    pulse = self._factory(
+                        admission_check=self._can_operate, admission_guard=self.admission_guard
+                    )
                     pulse.skip_unconnected_disconnect = True
                     source = _MixedMemberSource(
                         pulse, self.token, target=replace(self.target, streams=(stream,))
@@ -998,12 +1002,14 @@ class MixedFarSource:
                     except ValueError as exc:
                         if self.strict or str(exc) not in {"target-gone", "target-mismatch"}:
                             raise
+                        self.lost_streams += (stream,)
                         source.shutdown()
                         self._members.pop()
-                        self.lost_streams += (stream,)
                 if not self._members:
                     self.ended = True
                     raise ValueError("target-gone")
+                if self.strict:
+                    self._verify_opened_members()
                 self.partial = bool(self.lost_streams)
             except BaseException as open_error:
                 try:
@@ -1011,6 +1017,24 @@ class MixedFarSource:
                 except Exception as close_error:
                     raise open_error from close_error
                 raise
+
+    def _verify_opened_members(self) -> None:
+        for member in self._members:
+            if not self._can_operate():
+                raise ValueError("admission-stale")
+            source = member.source
+            assert source.target is not None
+            index = source.target.streams[0].sink_input
+            events = source.pulse.poll_events()
+            if ("removed", index) in events:
+                raise ValueError("target-gone")
+            if (
+                any(kind == "server" or event_index == index for kind, event_index in events)
+                and source._resolve().monitor != source.monitor
+            ):
+                # The identity still matches. Reopen the moved member before its first PCM.
+                member.pending_since = self._next_pending_since
+                self._next_pending_since += 1
 
     def read_chunk(self) -> bytes | None:
         with self._lock:
@@ -1053,12 +1077,12 @@ class MixedFarSource:
                         _, _, mono_ms = source.sample_clock()
                         chunks.append((member, data, mono_ms))
 
-            if not self._can_operate():
-                return b""
             self.partial = bool(live and self.lost_streams)
             if not live:
                 self.ended = True
                 return None
+            if not self._can_operate():
+                return b""
 
             if self._leader is None and chunks:
                 self._leader = chunks[0][0]

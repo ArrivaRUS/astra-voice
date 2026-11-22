@@ -200,7 +200,7 @@ def test_multi_member_backend_captures_factory_without_constructing_contexts(
     target = replace(PINNED, streams=(PINNED.streams[0], replace(PINNED.streams[0], sink_input=8)))
 
     class NativeDouble(Pulse):
-        def __init__(self) -> None:
+        def __init__(self, **_admission: Any) -> None:
             super().__init__()
             self.target = replace(RESOLVED, index=7 + len(created))
             created.append(self)
@@ -344,6 +344,9 @@ def test_mixer_propagates_admission_check_and_guard_to_native_boundaries(
         def _connect(self) -> None:
             self.context = 1
 
+        def _poll_events(self) -> tuple[list[tuple[str, int]], bool]:
+            return [], False
+
         def resolve(
             self, index: int, *, expected_pid: int | None = None, confirm_loss: bool = False
         ) -> Target:
@@ -450,6 +453,48 @@ def fake_native_control(
     patch.setattr(native, "_server", lambda: None)
     patch.setattr(native, "_wait", lambda ready: ready())
     return native
+
+
+@pytest.mark.parametrize(
+    "query,eol,errno",
+    [
+        ("pa_context_get_sink_input_info", -1, 1),
+        ("pa_context_get_client_info", -1, 5),
+        ("pa_context_get_sink_info_by_index", -1, 5),
+        ("pa_context_get_sink_input_info", 1, 5),
+        ("pa_context_get_sink_input_info", -1, 5),
+    ],
+    ids=["input-access", "client-noentity", "sink-noentity", "empty-success", "input-noentity"],
+)
+def test_native_query_error_is_only_loss_for_input_noentity(
+    monkeypatch: pytest.MonkeyPatch, query: str, eol: int, errno: int
+) -> None:
+    def reply(context: int, index: int, receive: Any, data: Any) -> int:
+        receive(context, None, eol, data)
+        return 1
+
+    with monkeypatch.context() as patch:
+        native = fake_native_control(
+            patch,
+            RESOLVED,
+            stream_props={
+                b"object.serial": str(RESOLVED.serial).encode(),
+                b"application.process.id": str(RESOLVED.pid).encode(),
+            },
+            client_props={},
+        )
+        patch.setattr(
+            monitor_stream,
+            "ProcReader",
+            lambda **_: Mock(starttime=Mock(return_value=RESOLVED.starttime)),
+        )
+        native.pulse.context_errno.return_value = errno
+        getattr(native.pulse.lib, query).side_effect = reply
+        if (query, eol, errno) == ("pa_context_get_sink_input_info", -1, 5):
+            assert native.resolve(RESOLVED.index, expected_pid=RESOLVED.pid) is None
+        else:
+            with pytest.raises(ValueError, match="^audio-failed$"):
+                native.resolve(RESOLVED.index, expected_pid=RESOLVED.pid)
 
 
 @pytest.mark.parametrize(
@@ -829,7 +874,7 @@ def test_session_guard_refuses_far_reopen_after_resolution(kind: str) -> None:
     assert not source.opened
 
 
-@pytest.mark.parametrize("boundary", ["create", "connect"])
+@pytest.mark.parametrize("boundary", ["context-create", "context-connect", "create", "connect"])
 def test_native_meeting_admission_rechecked_at_pcm_boundary(
     monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
@@ -842,15 +887,20 @@ def test_native_meeting_admission_rechecked_at_pcm_boundary(
     lib.pa_proplist_new.return_value = 10
     lib.pa_proplist_sets.return_value = 0
     lib.pa_stream_new_with_proplist.return_value = 22
-    monkeypatch.setattr(
-        pulse_stream._PulseAsync, "__init__", lambda self: setattr(self, "lib", lib)
-    )
-    native = _meeting_pulse_type()()
-    native.admission_check = lambda: False
-    with pytest.raises(ValueError, match="admission-stale"):
-        if boundary == "create":
-            native.stream_new(1, b"meeting", None, None)
-        else:
-            native.stream_connect_record(22, b"source", None, 0)
+    with monkeypatch.context() as patch:
+        patch.setattr(pulse_stream._PulseAsync, "__init__", lambda self: setattr(self, "lib", lib))
+        native = _meeting_pulse_type()()
+        native.admission_check = lambda: False
+        with pytest.raises(ValueError, match="admission-stale"):
+            if boundary == "context-create":
+                native.context_new(1, b"meeting")
+            elif boundary == "context-connect":
+                native.context_connect(1, None, 0, None)
+            elif boundary == "create":
+                native.stream_new(1, b"meeting", None, None)
+            else:
+                native.stream_connect_record(22, b"source", None, 0)
+    lib.pa_context_new.assert_not_called()
+    lib.pa_context_connect.assert_not_called()
     lib.pa_stream_new_with_proplist.assert_not_called()
     lib.pa_stream_connect_record.assert_not_called()
