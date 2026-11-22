@@ -321,7 +321,7 @@ def test_member_loss_keeps_survivors_until_all_are_removed(
     assert source.lost_streams == (lost[1], lost[0], lost[2])
 
 
-def test_all_member_losses_remain_terminal_when_read_admission_is_revoked(
+def test_stopped_read_keeps_losses_without_committing_a_terminal_state(
     mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     case = mixer(3)
@@ -339,8 +339,26 @@ def test_all_member_losses_remain_terminal_when_read_admission_is_revoked(
 
     with monkeypatch.context() as patch:
         patch.setattr(case.pulses[-1], "_poll_events", last_removal)
-        assert source.read_chunk() is None
-    assert source.ended and source.lost_streams == case.target.streams
+        assert source.read_chunk() == b""
+    assert not source.ended and source.lost_streams == case.target.streams
+
+
+def test_strict_start_rejects_an_already_pending_move(
+    mixer: Callable[[int], MixCase], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = mixer(3)
+    check = case.source._check_start_events
+
+    def check_with_pending() -> None:
+        case.source._members[-1].pending_since = 0
+        check()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(case.source, "_check_start_events", check_with_pending)
+        with pytest.raises(ValueError, match="^target-mismatch$"):
+            case.open()
+    assert len(case.pulses) == 3
+    assert all(pulse.destroyed and ("read",) not in pulse.calls for pulse in case.pulses)
 
 
 @pytest.mark.parametrize("step", [0, 400])

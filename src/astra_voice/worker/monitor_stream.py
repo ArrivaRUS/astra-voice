@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 _PID = "application.process.id"
 _SERIAL = "object.serial"
-_PA_ERR_NOENTITY = 5
 
 
 class _Timeval(ctypes.Structure):
@@ -143,10 +142,12 @@ class MonitorStreamSource:
             self._open_record(self.pulse.default_monitor(), None)
         self.ended = False
 
-    def _resolve(self) -> Target:
+    def _resolve(self, *, confirm_loss: bool = False) -> Target:
         assert self.target is not None
         (stream,) = self.target.streams
-        return _resolve_stream(self.pulse, self.target.server_cookie, stream, confirm_loss=True)
+        return _resolve_stream(
+            self.pulse, self.target.server_cookie, stream, confirm_loss=confirm_loss
+        )
 
     def _open_record(self, monitor: str, index: int | None) -> None:
         if not self.admission_check():
@@ -161,7 +162,7 @@ class MonitorStreamSource:
                     raise ValueError("audio-failed") from connect_error
             if self.target is not None and str(connect_error) != "admission-stale":
                 try:
-                    self._resolve()
+                    self._resolve(confirm_loss=True)
                 except Exception as target_error:
                     if isinstance(target_error, ValueError) and str(target_error) in {
                         "target-gone",
@@ -680,7 +681,9 @@ class NativePulse:
         projected, valid = project_properties(props)
         return projected if valid else None
 
-    def _info(self, function: str, argument: Any, structure: Any) -> Any:
+    def _info(
+        self, function: str, argument: Any, structure: Any, *, confirm_loss: bool = False
+    ) -> Any:
         callback_type = ctypes.CFUNCTYPE(
             None, ctypes.c_void_p, ctypes.POINTER(structure), ctypes.c_int, ctypes.c_void_p
         )
@@ -691,14 +694,12 @@ class NativePulse:
         def receive(ctx: int, info: Any, eol: int, unused: int) -> None:
             nonlocal result, done, unavailable
             if eol:
-                if eol < 0:
+                if confirm_loss and eol < 0:
                     result = None
-                    unavailable = (
-                        structure is not _InputInfo
-                        or self.pulse.context_errno(ctx) != _PA_ERR_NOENTITY
-                    )
-                else:
-                    unavailable = result is None
+                    # PA_ERR_NOENTITY is the by-index reply for a removed input.
+                    unavailable = structure is not _InputInfo or self.pulse.context_errno(ctx) != 5
+                elif confirm_loss and result is None:
+                    unavailable = True
                 done = True
             elif info:
                 row = info.contents
@@ -735,7 +736,9 @@ class NativePulse:
             return None
 
         self._server()
-        row = self._info("pa_context_get_sink_input_info", index, _InputInfo)
+        row = self._info(
+            "pa_context_get_sink_input_info", index, _InputInfo, confirm_loss=confirm_loss
+        )
         if row is None:
             return None
         idx, sink, client, props = row
@@ -744,7 +747,9 @@ class NativePulse:
         serial, stream_pid = props.get(_SERIAL), props.get(_PID)
         if not isinstance(serial, int):
             return unavailable()
-        client_row = self._info("pa_context_get_client_info", client, _ClientInfo)
+        client_row = self._info(
+            "pa_context_get_client_info", client, _ClientInfo, confirm_loss=confirm_loss
+        )
         if client_row is None or client_row[0] != client or client_row[1] is None:
             return unavailable()
         client_pid = client_row[1].get(_PID)
@@ -761,7 +766,9 @@ class NativePulse:
             starttime = ProcReader(uid=os.geteuid()).starttime(pid)
         except (OSError, ProcUnavailable):
             return unavailable()
-        monitor = self._info("pa_context_get_sink_info_by_index", sink, _SinkInfo)
+        monitor = self._info(
+            "pa_context_get_sink_info_by_index", sink, _SinkInfo, confirm_loss=confirm_loss
+        )
         if not monitor:
             return unavailable()
         return Target(idx, serial, pid, self.cookie, monitor, client, starttime)
@@ -897,10 +904,10 @@ def _monotonic_ms() -> int:
 
 
 class _MixedMemberSource(MonitorStreamSource):
-    def _resolve(self) -> Target:
+    def _resolve(self, *, confirm_loss: bool = False) -> Target:
         if not self.admission_check():
             raise ValueError("admission-stale")
-        return super()._resolve()
+        return super()._resolve(confirm_loss=confirm_loss)
 
 
 @dataclass
@@ -1009,7 +1016,7 @@ class MixedFarSource:
                     self.ended = True
                     raise ValueError("target-gone")
                 if self.strict:
-                    self._verify_opened_members()
+                    self._check_start_events()
                 self.partial = bool(self.lost_streams)
             except BaseException as open_error:
                 try:
@@ -1018,23 +1025,20 @@ class MixedFarSource:
                     raise open_error from close_error
                 raise
 
-    def _verify_opened_members(self) -> None:
+    def _check_start_events(self) -> None:
+        indexes = {stream.sink_input for stream in self.target.streams}
         for member in self._members:
             if not self._can_operate():
                 raise ValueError("admission-stale")
-            source = member.source
-            assert source.target is not None
-            index = source.target.streams[0].sink_input
-            events = source.pulse.poll_events()
-            if ("removed", index) in events:
-                raise ValueError("target-gone")
+            events, overflow = cast(NativePulse, member.source.pulse)._poll_events()
+            if not self._can_operate():
+                raise ValueError("admission-stale")
             if (
-                any(kind == "server" or event_index == index for kind, event_index in events)
-                and source._resolve().monitor != source.monitor
+                overflow
+                or member.pending_since is not None
+                or any(kind == "server" or index in indexes for kind, index in events)
             ):
-                # The identity still matches. Reopen the moved member before its first PCM.
-                member.pending_since = self._next_pending_since
-                self._next_pending_since += 1
+                raise ValueError("target-mismatch")
 
     def read_chunk(self) -> bytes | None:
         with self._lock:
@@ -1077,12 +1081,12 @@ class MixedFarSource:
                         _, _, mono_ms = source.sample_clock()
                         chunks.append((member, data, mono_ms))
 
+            if not self._can_operate():
+                return b""
             self.partial = bool(live and self.lost_streams)
             if not live:
                 self.ended = True
                 return None
-            if not self._can_operate():
-                return b""
 
             if self._leader is None and chunks:
                 self._leader = chunks[0][0]

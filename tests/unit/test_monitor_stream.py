@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import ctypes
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -204,6 +205,9 @@ def test_multi_member_backend_captures_factory_without_constructing_contexts(
             super().__init__()
             self.target = replace(RESOLVED, index=7 + len(created))
             created.append(self)
+
+        def _poll_events(self) -> tuple[list[tuple[str, int]], bool]:
+            return self.poll_events(), False
 
     class UnexpectedNative:
         def __init__(self) -> None:
@@ -466,7 +470,7 @@ def fake_native_control(
     ],
     ids=["input-access", "client-noentity", "sink-noentity", "empty-success", "input-noentity"],
 )
-def test_native_query_error_is_only_loss_for_input_noentity(
+def test_native_ordinary_lookup_keeps_legacy_target_loss(
     monkeypatch: pytest.MonkeyPatch, query: str, eol: int, errno: int
 ) -> None:
     def reply(context: int, index: int, receive: Any, data: Any) -> int:
@@ -490,11 +494,121 @@ def test_native_query_error_is_only_loss_for_input_noentity(
         )
         native.pulse.context_errno.return_value = errno
         getattr(native.pulse.lib, query).side_effect = reply
+        assert native.resolve(RESOLVED.index, expected_pid=RESOLVED.pid) is None
+        # Reconfirmation after a failed connect has its original stricter checks.
         if (query, eol, errno) == ("pa_context_get_sink_input_info", -1, 5):
-            assert native.resolve(RESOLVED.index, expected_pid=RESOLVED.pid) is None
+            assert native.resolve(RESOLVED.index, confirm_loss=True) is None
         else:
             with pytest.raises(ValueError, match="^audio-failed$"):
-                native.resolve(RESOLVED.index, expected_pid=RESOLVED.pid)
+                native.resolve(RESOLVED.index, confirm_loss=True)
+
+
+def test_strict_start_poll_sends_no_metadata_queries_after_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = replace(PINNED, streams=(PINNED.streams[0], replace(PINNED.streams[0], sink_input=8)))
+    locked = False
+    requested_after_lock: list[str] = []
+    pulses: list[monitor_stream.NativePulse] = []
+
+    def lock() -> None:
+        nonlocal locked
+        locked = True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            monitor_stream,
+            "ProcReader",
+            lambda **_: Mock(starttime=Mock(return_value=RESOLVED.starttime)),
+        )
+
+        def factory(**_admission: Any) -> monitor_stream.NativePulse:
+            native = fake_native_control(
+                patch,
+                replace(RESOLVED, index=target.streams[len(pulses)].sink_input),
+                stream_props={
+                    b"object.serial": str(RESOLVED.serial).encode(),
+                    b"application.process.id": str(RESOLVED.pid).encode(),
+                },
+                client_props={},
+            )
+            pulses.append(native)
+            native.events, native.overflow = deque(), False
+            native.pulse.context_get_state.return_value = 4
+            native.pulse.iterate.side_effect = lambda _timeout: lock()
+            patch.setattr(native, "open_record", Mock())
+            patch.setattr(native, "close_record", Mock())
+            patch.setattr(native, "close", Mock())
+
+            def record(operation: Mock, name: str) -> Callable[..., Any]:
+                original = operation.side_effect
+
+                def lookup(*args: Any) -> Any:
+                    if locked:
+                        requested_after_lock.append(name)
+                    if name == "input" and operation.call_count == 3:
+                        # A forbidden third lookup would let lock arrive between Pulse requests.
+                        lock()
+                    return original(*args)
+
+                return lookup
+
+            for attr, name in (
+                ("pa_context_get_sink_input_info", "input"),
+                ("pa_context_get_client_info", "client"),
+                ("pa_context_get_sink_info_by_index", "sink"),
+            ):
+                operation = getattr(native.pulse.lib, attr)
+                operation.side_effect = record(operation, name)
+            return native
+
+        source = monitor_stream.MixedFarSource(target, "lock", factory=factory)
+        source.admission_check = lambda: not locked
+        with pytest.raises(ValueError, match="^admission-stale$"):
+            source.open()
+        assert locked and len(pulses) == 2
+        assert requested_after_lock == []
+        for native in pulses:
+            assert native.pulse.lib.pa_context_get_sink_input_info.call_count == 2
+
+
+def test_group_admission_is_installed_before_native_context_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from astra_voice.worker import pulse_stream
+
+    target = replace(PINNED, streams=(PINNED.streams[0], replace(PINNED.streams[0], sink_input=8)))
+    lib = Mock()
+    admitted = True
+    guard_entered = False
+
+    @contextmanager
+    def guard() -> Iterator[None]:
+        nonlocal guard_entered
+        guard_entered = True
+        yield
+
+    def mainloop() -> int:
+        nonlocal admitted
+        admitted = False  # The factory began within the window, context_new has not run yet.
+        return 1
+
+    lib.pa_mainloop_new.side_effect = mainloop
+    lib.pa_mainloop_get_api.return_value = 2
+    lib.pa_context_new.return_value = 3
+    lib.pa_context_connect.return_value = -1
+    with monkeypatch.context() as patch:
+        patch.setattr(pulse_stream._PulseAsync, "__init__", lambda p: setattr(p, "lib", lib))
+        source = monitor_stream.CapturePulseBackend().source(FAR, target=target)
+        assert isinstance(source, monitor_stream.MixedFarSource)
+        source.admission_check = lambda: admitted
+        source.admission_guard = guard
+        with pytest.raises(ValueError, match="^admission-stale$"):
+            source.open()
+    assert guard_entered and not admitted
+    lib.pa_context_new.assert_not_called()
+    lib.pa_context_connect.assert_not_called()
+    lib.pa_mainloop_free.assert_called_once_with(1)
 
 
 @pytest.mark.parametrize(

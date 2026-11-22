@@ -828,18 +828,29 @@ def native_far(
                 self.target = replace(target, cookie=target.cookie + 1)
             elif failure in {
                 "remove-previous",
+                "remove-first-foreign",
                 "replace-previous",
-                "change-previous",
                 "move-previous",
+                "unrelated",
             }:
                 previous = pulses[-2]
                 assert previous.target is not None
-                kind = "removed" if failure == "remove-previous" else "changed"
+                kind = "removed" if failure.startswith("remove") else "changed"
                 if failure == "move-previous":
                     previous.target = replace(previous.target, monitor="moved-before-start.monitor")
                 elif failure == "replace-previous":
                     previous.target = replace(previous.target, serial=previous.target.serial + 100)
-                previous.events.append((kind, previous.target.index))
+                if failure == "remove-first-foreign":
+                    assert pulses[0].target is not None
+                    self.events.append((kind, pulses[0].target.index))
+                else:
+                    previous.events.append(
+                        (kind, OUT + 100 if failure == "unrelated" else previous.target.index)
+                    )
+            elif failure == "overflow":
+                patch.setattr(self, "_poll_events", lambda: ([], True))
+            elif failure == "server-event":
+                self.events.append(("server", 0))
             elif failure == "query-access":
                 lookup = fake_native_control(patch, target, stream_props={}, client_props={})
                 lookup.pulse.context_errno.return_value = 1
@@ -886,37 +897,42 @@ def native_far(
 
 
 @pytest.mark.parametrize(
-    "fault", ["remove-previous", "replace-previous", "change-previous", "move-previous"]
+    "fault",
+    [
+        None,
+        "unrelated",
+        "remove-previous",
+        "remove-first-foreign",
+        "replace-previous",
+        "move-previous",
+        "overflow",
+        "server-event",
+    ],
 )
 def test_first_group_open_checks_events_accumulated_while_opening(
     service: tuple[Rig, CheckDouble],
     capture_events: CaptureEvents,
     native_far: NativeFar,
-    fault: str,
+    fault: str | None,
 ) -> None:
     rig, checks = service
     pulses, _, plan = native_far
     target = pinned_outputs(3, rig.clock())
     prepare_allowed(rig, checks, app_far(rig, checks), target)
-    plan(target, {1: fault})
+    plan(target, {2: fault} if fault is not None else {})
     assert rig.send("open", **admission(rig))[0]["type"] == "meeting.ack"
     assert rig.state.open_thread is not None
     rig.state.open_thread.join(2)
     assert not rig.state.open_thread.is_alive()
-    if fault in {"change-previous", "move-previous"}:
+    assert all(
+        pulse.calls.count(("resolve", stream.sink_input)) == 2
+        for pulse, stream in zip(pulses, target.streams, strict=True)
+    )
+    if fault in {None, "unrelated"}:
         assert capture_events.finish("opened", "meeting.capture.started")["tracks"] == [
             "mic",
             "far",
         ]
-        if fault == "move-previous":
-            assert (
-                capture_events.finish("track-change", "meeting.capture.track")["kind"]
-                == "sink-moved"
-            )
-            assert any(
-                call[:2] == ("moved-before-start.monitor", target.streams[0].sink_input)
-                for call in pulses[0].calls
-            )
         # Live sink moves still work after the original 1 s attestation.
         rig.clock.now += 1.001
         pulse = pulses[0]
@@ -928,9 +944,7 @@ def test_first_group_open_checks_events_accumulated_while_opening(
         assert not errors(rig.events)
         return
     assert capture_events.signals["open-failed"].is_set()
-    assert errors(rig.poll())[0]["code"] == (
-        "target-gone" if fault == "remove-previous" else "target-mismatch"
-    )
+    assert errors(rig.poll())[0]["code"] == "target-mismatch"
     assert capture_events.finish("closed", "meeting.capture.closed")["tracks"] == ["mic", "far"]
     capture_events.finish("finalized", "meeting.capture.finalized")
     assert len(pulses) == 3 and all(pulse.destroyed for pulse in pulses)
@@ -966,9 +980,11 @@ def test_loss_in_reader_crossing_pause_is_remembered(
     service: tuple[Rig, CheckDouble],
     capture_events: CaptureEvents,
     monkeypatch: pytest.MonkeyPatch,
+    native_far: NativeFar,
     count: int,
 ) -> None:
     rig, checks = service
+    _, _, plan = native_far
     target = pinned_outputs(3, rig.clock())
     prepare_allowed(rig, checks, app_far(rig, checks), target)
     entered, finish_read = threading.Event(), threading.Event()
@@ -997,17 +1013,16 @@ def test_loss_in_reader_crossing_pause_is_remembered(
         rig.poll()
         capture_events.finish("finalized", "meeting.capture.finalized")
     assert not any(e["kind"] == "partial" for e in of_type(rig.events, "capture.track"))
-    assert rig.state.track_states["far"] == ("ended" if count == 3 else "paused")
+    assert rig.state.track_states["far"] == "paused"
     if count == 3:
         journal = json.loads((rig.directory / "capture.json").read_text())
-        _, end, close = journal["boundaries"]
-        assert [end["kind"], close["kind"]] == ["far_ended", "close"]
-        assert end["t_mono_ms"] == close["t_mono_ms"]
+        assert [edge["kind"] for edge in journal["boundaries"]] == ["open", "close"]
     kept = rig.state.capture_target
     assert kept is not None and kept.streams == (
         target.streams if count == 3 else target.streams[1:]
     )
 
+    plan(kept, {i: "target-gone" for i in range(count)} if count == 3 else {})
     with monkeypatch.context() as patch:
         make_source = Mock(wraps=real_source)
         patch.setattr(rig.backend, "source", make_source)
@@ -1015,12 +1030,55 @@ def test_loss_in_reader_crossing_pause_is_remembered(
         started = capture_events.finish("opened", "meeting.capture.started")
     if count == 3:
         assert started["tracks"] == ["mic"]
-        make_source.assert_not_called()
+        make_source.assert_called_once_with(rig.state.far, target=kept)
         assert_far_track(rig.events, "ended", "target-removed")
     else:
         assert started["tracks"] == ["mic", "far"]
         make_source.assert_called_once_with(rig.state.far, target=kept)
         assert_far_track(rig.events, "live", "partial")
+
+
+def test_cancelled_empty_resume_does_not_write_far_end_after_archive_close(
+    service: tuple[Rig, CheckDouble],
+    capture_events: CaptureEvents,
+    native_far: NativeFar,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig, checks = service
+    _, targets, plan = native_far
+    target = pinned_outputs(3, rig.clock())
+    prepare_allowed(rig, checks, app_far(rig, checks), target)
+    plan(target, {})
+    open_capture(rig, capture_events)
+    pause_capture(rig, capture_events, "resume")
+    archive = rig.state.archive
+    assert archive is not None
+    put = Mock(wraps=archive.put)
+    losses = dict.fromkeys(range(3), "target-gone")
+    with monkeypatch.context() as patch:
+        patch.setattr(archive, "put", put)
+        plan(target, losses)
+        assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
+        capture_events.wait("opened")
+        assert rig.send("pause", reason="user")[0]["type"] == "meeting.ack"
+        capture_events.wait("closed")
+        rig.clock.now += 0.05
+        rig.poll()
+        capture_events.finish("finalized", "meeting.capture.finalized")
+        assert [(c.args[0], c.args[1]["kind"]) for c in put.call_args_list] == [
+            ("edge", "pause_state"),
+            ("close", "close"),
+        ]
+        assert rig.state.track_states["far"] == "paused"
+        assert not of_type(rig.events, "capture.track")
+        put.reset_mock()
+        plan(target, losses)
+        assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
+        assert capture_events.finish("opened", "meeting.capture.started")["tracks"] == ["mic"]
+        assert_far_track(rig.events, "ended", "target-removed")
+        pause_capture(rig, capture_events, "resume")
+        assert [c.args[0] for c in put.call_args_list] == ["start", "track_start", "edge", "close"]
+    assert targets == [target, target, target]
 
 
 @pytest.mark.parametrize("interrupt", [False, True], ids=["error", "paused"])
@@ -1189,11 +1247,16 @@ def test_resume_without_usable_members_or_after_audio_failure(
         rig.poll()
     else:
         pause_capture(rig, capture_events, "resume")
-    request_failed = failure in {"audio-failed-first", "audio-failed", "query-access"}
+    request_failed = failure in {"audio-failed-first", "audio-failed"}
     if failure == "audio-failed-first":
         plan(target, {i: "audio-failed" for i in range(3)})
     else:
-        plan(target, {1: failure} if request_failed else {i: failure for i in range(3)})
+        plan(
+            target,
+            {1: failure}
+            if request_failed or failure == "query-access"
+            else dict.fromkeys(range(3), failure),
+        )
     before = len(rig.events)
     assert rig.send("resume", **admission(rig))[0]["type"] == "meeting.ack"
     if request_failed:
@@ -1208,6 +1271,14 @@ def test_resume_without_usable_members_or_after_audio_failure(
         if failure != "audio-failed-first":
             assert any(len(call) == 3 for call in reopened[0].calls)
         assert all(p.destroyed and not p.recording for p in reopened)
+    elif failure == "query-access":
+        started = capture_events.finish("opened", "meeting.capture.started")
+        assert started["tracks"] == ["mic", "far"]
+        assert_far_track(rig.events, "live", "partial")
+        kept = rig.state.capture_target
+        assert kept is not None and kept.streams == (target.streams[0], target.streams[2])
+        assert pulses[4].destroyed and not errors(rig.events)
+        return
     else:
         started = capture_events.finish("opened", "meeting.capture.started")
         assert started["tracks"] == ["mic"]

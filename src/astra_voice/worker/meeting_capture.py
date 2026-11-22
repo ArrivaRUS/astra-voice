@@ -1336,8 +1336,6 @@ class MeetingCaptureState:
                         "request": request,
                         "stop": stop,
                         "lost_streams": lost_streams,
-                        "far_ended": far_ended
-                        or bool(target is not None and len(lost_streams) == len(target.streams)),
                         "code": str(exc)
                         if str(exc) in {"admission-stale", "target-gone", "target-mismatch"}
                         else "audio-failed",
@@ -1410,8 +1408,7 @@ class MeetingCaptureState:
                                 {"type": "far-partial", "lost_streams": lost[lost_count:]}
                             )
                             lost_count = len(lost)
-                far_ended = data is None and track == "far" and getattr(source, "ended", False)
-                if stop.is_set() and not far_ended:
+                if stop.is_set():
                     return
                 change = getattr(source, "change", None)
                 if change:
@@ -1421,7 +1418,7 @@ class MeetingCaptureState:
                 if data is None:
                     reason = (
                         "far_ended"
-                        if far_ended
+                        if track == "far" and getattr(source, "ended", False)
                         else (
                             "mic_change"
                             if track == "mic" and getattr(source, "device_change", None)
@@ -1430,8 +1427,7 @@ class MeetingCaptureState:
                     )
                     archive.put("track_close", (track, reason))
                     self.messages.put({"type": "track-ended", "track": track, "reason": reason})
-                    if not stop.is_set():
-                        source.shutdown()
+                    source.shutdown()
                     return
                 if data and not archive.put(
                     "pcm", (track, data, source.sample_clock(), self._recorded())
@@ -1624,8 +1620,28 @@ class MeetingCaptureState:
             )
         )
 
-    def _queue_far_ended(self) -> None:
-        self.messages.put({"type": "track-ended", "track": "far", "reason": "far_ended"})
+    def _end_track(self, track: str, reason: str, result: list[Message]) -> None:
+        self.lease_tracks.discard(track)
+        far = track == "far"
+        if far:
+            self._far_partial_pending = False
+        result.append(
+            self._track_event(
+                track, "ended" if far else "paused", "target-removed" if far else "device-lost"
+            )
+        )
+        if self.archive:
+            self.archive.put(
+                "edge",
+                {
+                    "kind": "far_ended" if far else "mic_gap_start",
+                    "t_mono_ms": self.close_mono_ms
+                    if far and self.close_deadline is not None
+                    else int(self.clock() * 1000),
+                    "recorded_ms": self._recorded(),
+                    "reason": reason,
+                },
+            )
 
     def _first_app_open(self, request: Message) -> bool:
         return bool(request["type"] == "meeting.capture.open" and self.far["kind"] == "app_stream")
@@ -1643,8 +1659,6 @@ class MeetingCaptureState:
         if stop is not None and stop is not self.audio_stop:
             return
         new_loss = self._note_far_losses(event.get("lost_streams", ()))
-        if event.get("far_ended"):
-            self._queue_far_ended()
         if first_app_open and stop is not None and stop.is_set():
             # A physical close may already have completed earlier in this poll.
             self.opening = False
@@ -1673,6 +1687,8 @@ class MeetingCaptureState:
             self.pause_reasons, self.manual_resume_required = event["pause_before"]
             if not request.get("automatic"):
                 result.append(self._outcome(request, failure(request, "not-prepared")))
+            if event.get("far_ended"):
+                self._end_track("far", "far_ended", result)
             return
         self.identity["state_rev"] += 1
         self.state = "recording"
@@ -1713,19 +1729,21 @@ class MeetingCaptureState:
             self._far_partial_pending = True
         if request.get("automatic"):
             self.last_alive = 0
-            return
-        result.append(
-            self._outcome(
-                request,
-                {
-                    "type": "meeting.capture.started",
-                    **self._base(),
-                    **self._pause(),
-                    "t0_mono_ms": edge["t_mono_ms"],
-                    "tracks": list(self.sources),
-                },
+        else:
+            result.append(
+                self._outcome(
+                    request,
+                    {
+                        "type": "meeting.capture.started",
+                        **self._base(),
+                        **self._pause(),
+                        "t0_mono_ms": edge["t_mono_ms"],
+                        "tracks": list(self.sources),
+                    },
+                )
             )
-        )
+        if event.get("far_ended"):
+            self._end_track("far", "far_ended", result)
 
     def _fail_open(self, request: Message, code: str, result: list[Message]) -> None:
         self.opening = False
@@ -1954,34 +1972,11 @@ class MeetingCaptureState:
                 self._note_far_losses(event["lost_streams"])
             elif kind == "track-ended":
                 track, reason = event["track"], event["reason"]
-                self.lease_tracks.discard(track)
                 if reason == "audio_failed":
+                    self.lease_tracks.discard(track)
                     self._autopause("audio_failed", "audio-failed", result)
                 else:
-                    if track == "far":
-                        self._far_partial_pending = False
-                    result.append(
-                        self._track_event(
-                            track,
-                            "ended" if track == "far" else "paused",
-                            "target-removed" if track == "far" else "device-lost",
-                        )
-                    )
-                    if self.archive:
-                        edge_mono_ms = (
-                            self.close_mono_ms
-                            if track == "far" and self.close_deadline is not None
-                            else int(self.clock() * 1000)
-                        )
-                        self.archive.put(
-                            "edge",
-                            {
-                                "kind": "far_ended" if track == "far" else "mic_gap_start",
-                                "t_mono_ms": edge_mono_ms,
-                                "recorded_ms": self._recorded(),
-                                "reason": reason,
-                            },
-                        )
+                    self._end_track(track, reason, result)
             elif kind == "track-change":
                 result.append(self._track_event(event["track"], "live", event["kind"]))
             elif kind in {"disk-failed", "audio-failed"}:
