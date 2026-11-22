@@ -1574,15 +1574,15 @@ class MeetingCaptureState:
         if not observer.rule_lock.acquire(blocking=False):
             return
         try:
-            snapshot = observer.rule.outputs(program.key, now)
-            if snapshot is None or snapshot.connection.cookie != target.server_cookie:
-                return
-            pinned = {(stream.sink_input, stream.stream_serial) for stream in target.streams}
-            if snapshot.streams - pinned:
-                self._far_incomplete = True
-                self._far_partial_pending = True
+            outputs = observer.rule.outputs(program.key, now)
         finally:
             observer.rule_lock.release()
+        if not outputs or observer.registry.snapshot().server_cookie != target.server_cookie:
+            return
+        pinned = {(stream.sink_input, stream.stream_serial) for stream in target.streams}
+        if outputs - pinned:
+            self._far_incomplete = True
+            self._far_partial_pending = True
 
     def _finish_prepare(self, event: Message, result: list[Message]) -> None:
         control: _PreparedControl = event["control"]

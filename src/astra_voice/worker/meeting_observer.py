@@ -6,7 +6,7 @@ import socket
 import threading
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from astra_voice.meetings.detector_rule import Candidate, MeetingDetectorRule
@@ -19,7 +19,6 @@ from astra_voice.worker.meeting_detector import (
     MetadataDisconnected,
     MetadataOpenFailed,
     NormalizedEvent,
-    PictureConnection,
     PictureTiming,
     ProgramKey,
 )
@@ -100,19 +99,10 @@ class OwnContextRegistry:
 
 
 class _RegisteredBackend:
-    def __init__(
-        self,
-        backend: ObserverBackend,
-        index: int,
-        cookie: int,
-        epoch: int,
-        registry: OwnContextRegistry,
-    ) -> None:
+    def __init__(self, backend: ObserverBackend, index: int, registry: OwnContextRegistry) -> None:
         self._backend = backend
         self._registry = registry
         self.own_index = index
-        self.cookie = cookie
-        self.epoch = epoch
         self.snapshot = backend.snapshot
         self.client = backend.client
         self.stream = backend.stream
@@ -184,8 +174,7 @@ class MeetingObserver:
             self._condition.notify_all()
 
     def stop(self, *, exiting: bool = False) -> None:
-        with self.rule_lock, self._condition:
-            self.rule.invalidate_outputs()
+        with self._condition:
             self._epoch += 1
             self._requested = False
             self._exiting |= exiting
@@ -268,7 +257,7 @@ class MeetingObserver:
             except Exception:
                 raise MetadataOpenFailed(backend) from None
             raise
-        return _RegisteredBackend(backend, index, cookie, epoch, self.registry)
+        return _RegisteredBackend(backend, index, self.registry)
 
     def end_revisions(self) -> dict[ProgramKey, int]:
         """Snapshot the call endings with rule_lock held."""
@@ -289,9 +278,6 @@ class MeetingObserver:
         self, events: tuple[NormalizedEvent, ...], timing: PictureTiming, epoch: int
     ) -> None:
         with self.rule_lock:
-            with self._condition:
-                if not self._active(epoch):
-                    timing = replace(timing, connection=None)
             for decision in self.rule.update(events, timing=timing):
                 message = {"program": decision.program, "epoch": epoch}
                 if isinstance(decision, Candidate):
@@ -300,24 +286,6 @@ class MeetingObserver:
                     )
                 else:
                     self._call_ended(decision.program, epoch)
-
-    def _read_picture(
-        self,
-        source: MeetingDetectorSource,
-        read: Callable[[], tuple[NormalizedEvent, ...]],
-        epoch: int,
-    ) -> None:
-        # I/O may rebuild or close the source before the next publication.
-        with self.rule_lock:
-            self.rule.invalidate_outputs()
-        events = read()
-        timing = source.picture_timing
-        current = source.picture_backend
-        if timing.confirmed and current is not None:
-            backend, generation = current
-            if isinstance(backend, _RegisteredBackend) and backend.epoch == epoch:
-                timing = replace(timing, connection=PictureConnection(backend.cookie, generation))
-        self._update(events, timing, epoch)
 
     def _run(self) -> None:
         epoch = 0
@@ -334,15 +302,15 @@ class MeetingObserver:
                 epoch = self._epoch
             retry = False
             try:
-                self._read_picture(source, source.start, epoch)
+                self._update(source.start(), source.picture_timing, epoch)
                 while self._wait_active(epoch, OBSERVER_POLL_SECONDS):
-                    self._read_picture(source, source.poll, epoch)
+                    self._update(source.poll(), source.picture_timing, epoch)
             except Exception:
                 # Recover failures that escaped the source's own retry logic.
                 retry = True
             finally:
                 with suppress(Exception):
-                    self._read_picture(source, source.stop, epoch)
+                    self._update(source.stop(), source.picture_timing, epoch)
             if self.automation_off.is_set():
                 return
             if retry:

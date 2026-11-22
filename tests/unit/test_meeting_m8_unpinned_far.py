@@ -30,7 +30,6 @@ from astra_voice.worker.meeting_detector import (
     Direction,
     EventKind,
     NormalizedEvent,
-    PictureConnection,
     PictureTiming,
     ProgramKey,
     StreamKey,
@@ -64,15 +63,12 @@ def picture(
     kind: EventKind = EventKind.RESET,
     confirmed: bool = True,
     age: float = 0,
-    cookie: int = ANCHOR.server_cookie,
 ) -> None:
     at = rig.clock() - age
     observer = rig.state.observer
     events = (NormalizedEvent(kind, at), *(replace(event, at=at) for event in outputs))
     with observer.rule_lock:
-        observer.rule.update(
-            events, timing=PictureTiming(at, None, confirmed, PictureConnection(cookie, 1))
-        )
+        observer.rule.update(events, timing=PictureTiming(at, None, confirmed))
 
 
 def decode_tracks(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -107,11 +103,27 @@ def test_dion_marks_unpinned_far_once_on_alive_tick(
             tuple(rig.backend.source_targets),
         )
 
+    def checked_poll() -> list[dict[str, Any]]:
+        calls = len(rig.backend.control.mock_calls)
+        starts: list[threading.Thread] = []
+        start = threading.Thread.start
+
+        def start_thread(thread: threading.Thread) -> None:
+            starts.append(thread)
+            start(thread)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(threading.Thread, "start", start_thread)
+            tick = rig.poll()
+        assert len(rig.backend.control.mock_calls) == calls
+        assert not starts
+        return tick
+
     before = audio_calls()
     rig.clock.now += 1
     sounding = output(rig, pinned)
     picture(rig, sounding)
-    tick = rig.poll()
+    tick = checked_poll()
     assert of_type(tick, "capture.alive") and not decode_tracks(tick)
 
     rig.clock.now += 0.5
@@ -121,23 +133,11 @@ def test_dion_marks_unpinned_far_once_on_alive_tick(
     unpinned = replace(output(rig, new), running=False)
     rows = (unpinned,) if reused_index else (sounding, unpinned)
     picture(rig, *rows)
-    assert not decode_tracks(rig.poll())
+    assert not decode_tracks(checked_poll())
     assert not rig.state._far_incomplete
 
     rig.clock.now += 0.5
-    calls = len(rig.backend.control.mock_calls)
-    starts: list[threading.Thread] = []
-    start = threading.Thread.start
-
-    def start_thread(thread: threading.Thread) -> None:
-        starts.append(thread)
-        start(thread)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(threading.Thread, "start", start_thread)
-        tick = rig.poll()
-    assert len(rig.backend.control.mock_calls) == calls
-    assert not starts
+    tick = checked_poll()
     assert of_type(tick, "capture.alive")
     (notice,) = decode_tracks(tick)
     assert (notice["track"], notice["state"], notice["kind"]) == (
@@ -159,14 +159,14 @@ def test_dion_marks_unpinned_far_once_on_alive_tick(
 
     rig.send("keepalive", seq=1, indicators_visible=True, **admission(rig))
     rig.clock.now += 1
-    assert not decode_tracks(rig.poll())
+    assert not decode_tracks(checked_poll())
     rig.clock.now += 1
     picture(rig, kind=EventKind.UNAVAILABLE)
-    assert not decode_tracks(rig.poll())
+    assert not decode_tracks(checked_poll())
     assert rig.state._far_incomplete
     rig.clock.now += 1
     picture(rig, *rows, output(rig, later))
-    assert not decode_tracks(rig.poll())
+    assert not decode_tracks(checked_poll())
     assert rig.state.capture_target is target
     assert audio_calls() == before
 
@@ -228,9 +228,10 @@ def test_far_tick_ignores_unusable_observer_picture(
         kind=EventKind.UNAVAILABLE if case == "unavailable" else EventKind.RESET,
         confirmed=case != "unconfirmed",
         age=2.001 if case == "stale" else 0,
-        cookie=target.server_cookie + 1 if case == "wrong-cookie" else target.server_cookie,
     )
     observer = rig.state.observer
+    if case == "wrong-cookie":
+        observer.registry.set("observer", (42, target.server_cookie + 1))
     if case == "automation-off":
         observer.automation_off.set()
     assert not decode_tracks(rig.poll())
@@ -238,6 +239,7 @@ def test_far_tick_ignores_unusable_observer_picture(
 
     rig.clock.now += 1
     observer.automation_off.clear()
+    observer.registry.set("observer", (42, target.server_cookie))
     picture(rig, output(rig, pinned), output(rig, new), age=2)
     assert_far_track(rig.poll(), "live", "partial")
 
