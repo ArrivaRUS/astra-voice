@@ -244,7 +244,6 @@ def test_request_recording_closes_failed_offer_before_opening_w4(rig: Rig) -> No
     rig.recording.changed.connect(observe_w4)
     rig.storage = StorageStatus(1000, True, False)
     rig.bridge.requestRecording()
-    rig.no_call()
     assert w4_frames and all(frame == ("close",) for frame in w4_frames)
     assert rig.bridge.startDialogOpen and rig.bridge.startCanStart
     assert not rig.recording.offer.starting_slot and memory(rig) == "accepted"
@@ -773,7 +772,6 @@ def test_shutdown_aborts_start_before_waiting_on_role(
         view = start_offer(rig)
     else:
         rig.bridge.requestRecording()
-        rig.no_call()
         rig.bridge.on_start_clicked()
     late = capture_error(rig, "prepare", "target-mismatch")
     rig.now += 0.25
@@ -863,7 +861,6 @@ def test_start_latency_is_once_and_contains_only_fixed_fields(
 def test_room_start_failure_logs_the_role_error(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="astra_voice.meetings")
     rig.bridge.requestRecording()
-    rig.no_call()
     assert rig.bridge.selectedSource == "room"
     rig.bridge.on_start_clicked()
     rig.reply("prepared")
@@ -884,7 +881,6 @@ def test_room_retry_with_disk_low_does_not_log_previous_role_error(
 ) -> None:
     caplog.set_level(logging.INFO, logger="astra_voice.meetings")
     rig.bridge.requestRecording()
-    rig.no_call()
     rig.bridge.on_start_clicked()
     rig.reply("prepared")
     deliver(rig, capture_error(rig, "open", "audio-failed"))
@@ -893,7 +889,6 @@ def test_room_retry_with_disk_low_does_not_log_previous_role_error(
 
     rig.bridge.closeStartDialog()
     rig.bridge.requestRecording()
-    rig.no_call()
     rig.storage = StorageStatus(599, True, False)
     rig.bridge.on_start_clicked()
     rig.recording.tick()

@@ -29,8 +29,6 @@ def start(rig: Rig, *, mid: str | None = None, with_far: bool = False) -> None:
     rig.bridge.requestRecording()
     if with_far:
         rig.supervisor.event(rig.call_state())
-    else:
-        rig.no_call()
     rig.bridge.on_start_clicked()
     fields = {"meeting_id": mid} if mid else {}
     rig.reply("prepared", **fields)

@@ -167,7 +167,6 @@ def test_recording_dialog_reuses_observation_role_for_explicit_start(rig: Rig) -
     role = rig.supervisor
     deliver_detector(role, start, "meeting.detector.started")
     rig.bridge.requestRecording()
-    rig.no_call()
     assert rig.supervisors == [role] and role.starts == 1
     assert rig.bridge.startDialogOpen and rig.bridge.startCanStart
     assert command_types(role) == [DETECTOR_START, "meeting.call.query"]
@@ -187,7 +186,6 @@ def test_preflight_failure_leaves_a_role_owned_only_by_dialog_or_observation(
     if observing:
         observe(rig)
     rig.bridge.requestRecording()
-    rig.no_call()
     role = rig.supervisor
     assert rig.bridge.startCanStart
     rig.storage = StorageStatus(100, True, False)
@@ -219,7 +217,6 @@ def test_prepare_timeout_replaces_role_only_after_poll_confirms_exit(
     previous = rig.supervisor
     deliver_detector(previous, start, "meeting.detector.started")
     rig.bridge.requestRecording()
-    rig.no_call()
     rig.bridge.on_start_clicked()
     assert command_types(previous)[-1] == "meeting.capture.prepare"
     assert rig.recording.controller.state == "preparing"
