@@ -28,7 +28,7 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.ui import meeting_recording
 from astra_voice.ui.meeting_bridge import MeetingBridge
 from astra_voice.ui.meeting_offer import OfferView
-from astra_voice.ui.meeting_recording import AudioHints, MeetingRecording
+from astra_voice.ui.meeting_recording import AudioHints, MeetingRecording, Role
 from astra_voice.ui.meeting_texts import W1_CALL_TEXTS, W2_TEXTS
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
@@ -96,6 +96,10 @@ class Rig:
         *,
         kind: SessionKind = SessionKind.KDE,
         role_type: type[Supervisor] = Supervisor,
+        role_factory: Callable[
+            [Callable[[dict[str, Any]], None], Callable[[int], None], Callable[[], float]], Role
+        ]
+        | None = None,
         settings: Settings | None = None,
         bind_recording: bool = True,
         submit: Callable[[Callable[[], None]], None] | None = lambda job: job(),
@@ -115,9 +119,9 @@ class Rig:
             known_apps=(AppDefinition("dion", "DION", ("dion",), (), AppClass.DION),),
         )
 
-        def factory(
-            event: Callable[[dict[str, Any]], None], exit: Callable[[int], None]
-        ) -> Supervisor:
+        def factory(event: Callable[[dict[str, Any]], None], exit: Callable[[int], None]) -> Role:
+            if role_factory is not None:
+                return role_factory(event, exit, lambda: self.now)
             supervisor = role_type(event, exit)
             self.supervisors.append(supervisor)
             return supervisor
