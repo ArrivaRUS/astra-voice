@@ -106,6 +106,7 @@ def prepare_room(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
         assert previewed.wait(WATCHDOG)
         rig.recording.tick()
 
+    rig.no_call()
     assert rig.bridge.selectedSource == "room"
     assert rig.bridge.startCanStart
     rig.bridge.on_start_clicked()

@@ -59,9 +59,15 @@ def test_q3_controls_share_one_pressed_action_and_avoid_keyboard_and_theme_color
     assert re.search(r"Accessible\.name:\s*control\.label", control)
     assert re.search(r"MouseArea\s*\{", control)
     (press,) = re.findall(r"^\s*onPressed:\s*(.+)$", control, re.M)
-    (accessible,) = re.findall(r"^\s*Accessible\.onPressAction:\s*(.+)$", control, re.M)
     assert press == "control.pressed(true)"
-    assert accessible == "control.pressed(false)"
+    assert "Accessible.onPressAction" not in control
+    assert set(
+        re.findall(r'Accessible\.onPressAction: root\.pressed\("([^"]+)", false\)', offer)
+    ) == {
+        "refuse",
+        "close",
+        "open_meetings",
+    }
     assert set(re.findall(r'onPressed: root\.pressed\("([^"]+)", mouse\)', offer)) == {
         "start",
         "refuse",

@@ -29,7 +29,6 @@ Rectangle {
     Accessible.name: control.label
     // Qt Quick 5 does not expose Item.enabled in the accessible state.
     Accessible.ignored: control.inert || !control.visible
-    Accessible.onPressAction: control.pressed(false)
 
     Icon {
         objectName: "offerCloseGlyph"

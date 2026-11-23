@@ -48,7 +48,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtQml import QQmlEngine, QQmlExpression
 from PyQt5.QtQuick import QQuickItem, QQuickView
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 
 from astra_voice.core.meeting_session import ERROR_TEXT
 from astra_voice.ui.meeting_offer_window import MeetingOffer, OfferQuickView
@@ -297,7 +297,8 @@ def visual_layout(window: MeetingOffer, kind: str) -> None:
     )
     for action, name in CONTROLS.items():
         button = child(window, name)
-        assert qml(button, "Accessible.role === Accessible.Button") is True
+        role = "StaticText" if action == "start" else "Button"
+        assert qml(button, f"Accessible.role === Accessible.{role}") is True
         assert qml(button, "Accessible.name") == W1_TEXTS[action]
     assert start.height() == refuse.height() == 28
     for block in (
@@ -750,7 +751,7 @@ def show_after_failure(directory: Path) -> None:
                 qml(start, "Accessible.pressAction()")
                 if clock == 102.499:
                     press.assert_not_called()
-            assert press.call_args_list == [(("start", 102_500), {})] * 2
+            press.assert_called_once_with("start", 102_500)
     finally:
         instance.bridge.shutdown()
 
@@ -973,13 +974,16 @@ def native_accessibility() -> None:
     with surface(Mock(offer=Mock(now_ms=lambda: 100_000))) as window:
         window.show("call-app", 60)
         controls = [child(window, name) for name in CONTROLS.values()]
+        start = child(window, "offerStart")
         root = window._root
         interface = query(sip.unwrapinstance(root))
 
         def assert_offered() -> None:
-            assert all(c.isEnabled() and not disabled(c) for c in controls)
-            assert accessible_buttons(interface) == {query(sip.unwrapinstance(c)) for c in controls}
-            assert qml(child(window, "offerStart"), "Accessible.name") == W1_TEXTS["start"]
+            buttons = [c for c in controls if c is not start]
+            assert all(c.isEnabled() for c in controls)
+            assert not any(map(disabled, buttons))
+            assert accessible_buttons(interface) == {query(sip.unwrapinstance(c)) for c in buttons}
+            assert qml(start, "Accessible.name") == W1_TEXTS["start"]
             assert qml(root, "Accessible.name") == W1_CALL_TEXTS["call-app"]["title"]
 
         assert_offered()
@@ -1034,14 +1038,17 @@ def input_at(directory: Path, mode: str, elapsed: int) -> None:
             start_observing_with_view(instance, window)
             instance.now = (100_000 + elapsed) / 1000
             assert recording.offer.now_ms() == 100_000 + elapsed
+            root_presses = QSignalSpy(window._root.pressed)
             actions = ("refuse", "close", "start") if elapsed == 100 else ("start",)
             for action in actions:
                 button = child(window, CONTROLS[action])
                 if mode == "accessible":
                     qml(button, "Accessible.pressAction()")
+                    if action == "start":
+                        assert all(entry[0] != "start" for entry in root_presses)
                 else:
                     QTest.mousePress(window._view, Qt.LeftButton, pos=button_position(button))
-                if elapsed < 500:
+                if elapsed < 500 or mode == "accessible":
                     press.assert_not_called()
                 else:
                     press.assert_called_once_with(action, 100_000 + elapsed)
@@ -1054,7 +1061,12 @@ def input_at(directory: Path, mode: str, elapsed: int) -> None:
                     press.assert_not_called()
                 assert window._view.isVisible(), "apply the press on the next tick"
             recording.tick()
-            if elapsed < 500:
+            if elapsed >= 500 and mode == "accessible":
+                # A direct signal also cannot enter the Python start path.
+                window._root.pressed.emit("start", False)
+                press.assert_not_called()
+                recording.tick()
+            if elapsed < 500 or mode == "accessible":
                 intent.assert_not_called()
                 assert not instance.bridge.startDialogOpen and window._view.isVisible()
                 assert_no_capture(instance)
@@ -1122,6 +1134,11 @@ def delayed_expose(directory: Path, mode: str) -> None:
                 assert_no_capture(instance)
             instance.now = 101.15
             click()
+            if mode == "accessible":
+                press.assert_not_called()
+                intent.assert_not_called()
+                assert_no_capture(instance)
+                return
             press.assert_called_once_with("start", 101_150)
             intent.assert_called_once_with("call-PRIVATE-1", "dion")
             assert view.isVisible() and window._root.property("starting")
@@ -1196,11 +1213,8 @@ def x_retry(directory: Path) -> None:
             button = child(window, CONTROLS["start"])
             mouse_click_at(view, button, 100_600)
             press.assert_not_called()
-            with patch.context() as access_patch:
-                accessible = Mock(return_value=False)
-                access_patch.setattr(recording, "press_offer", accessible)
-                qml(button, "Accessible.pressAction()")
-                accessible.assert_called_once_with("start", 100_600)
+            qml(button, "Accessible.pressAction()")
+            press.assert_not_called()
             swap_frame(view)
             assert sample.call_count == 2
             assert window._frame_x_time == 100_001
@@ -1380,13 +1394,12 @@ def keys_and_close(directory: Path) -> None:
                 input_patch.setattr(recording, "press_offer", actions)
                 for action, name in CONTROLS.items():
                     button = child(window, name)
+                    actions.reset_mock()
                     QTest.mouseClick(view, Qt.LeftButton, pos=button_position(button))
                     qml(button, "Accessible.pressAction()")
-                    assert actions.call_args_list[-2:] == [
-                        ((action, 100_600), {}),
-                        ((action, 100_600), {}),
-                    ]
-                assert actions.call_count == 6
+                    assert actions.call_args_list == [((action, 100_600), {})] * (
+                        1 if action == "start" else 2
+                    )
             QCoreApplication.processEvents()
             keys = [Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space]
             counter = KeyCounter()

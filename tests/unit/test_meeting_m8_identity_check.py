@@ -76,8 +76,12 @@ def picture(
     return (
         (RawClient(client, props(pid)),),
         (
-            RawStream(OUT, client, Direction.OUTPUT, props(pid, serial=output_serial)),
-            RawStream(MIC, client, Direction.MICROPHONE, props(pid, serial=mic_serial)),
+            RawStream(
+                OUT, client, Direction.OUTPUT, props(pid, serial=output_serial), corked=False
+            ),
+            RawStream(
+                MIC, client, Direction.MICROPHONE, props(pid, serial=mic_serial), corked=False
+            ),
         ),
     )
 
@@ -86,8 +90,10 @@ def test_projection_canonical_fields_and_own_index() -> None:
     raw = picture()
     baseline = check._project(raw, frozenset())
     other = RawClient(12, props(pid=12))
-    output = replace(raw[1][0], corked=True, muted=True)
-    microphone = replace(raw[1][1], properties={**raw[1][1].properties, "media.name": "private"})
+    output = raw[1][0]
+    microphone = replace(
+        raw[1][1], muted=True, properties={**raw[1][1].properties, "media.name": "private"}
+    )
     assert (
         check._project(
             ((other, *raw[0]), (microphone, output, replace(output, client=12))),
@@ -1012,6 +1018,43 @@ def test_offer_looks_for_microphone_and_output_in_fresh_snapshot(h: Harness) -> 
     assert_offer(h.run(), variant1=False)
 
 
+@pytest.mark.parametrize(
+    ("output_fields", "mic_fields"),
+    [
+        ({"corked": True}, {"corked": True}),
+        ({"corked": True}, {}),
+        ({}, {"corked": True}),
+        ({"muted": True}, {}),
+    ],
+    ids=["both-corked", "output-corked", "mic-corked", "output-muted"],
+)
+def test_card_and_start_require_two_active_directions(
+    h: Harness, output_fields: dict[str, Any], mic_fields: dict[str, Any]
+) -> None:
+    shown = h.run(check.Purpose.CARD)
+    assert_offer(shown, variant1=True)
+    clients, (output, microphone) = picture()
+    inactive = (clients, (replace(output, **output_fields), replace(microphone, **mic_fields)))
+    h.queue_pictures(inactive)
+    card = h.run(check.Purpose.CARD)
+    assert card.settled and not card.offer and not card.variant1 and card.target is None
+    h.queue_pictures(inactive)
+    start = h.run(check.Purpose.START, anchor=shown.anchor)
+    assert start.settled and start.target_error is check.TargetError.MISMATCH
+    assert not start.offer and not start.variant1 and start.target is None
+
+
+def test_muted_microphone_keeps_card_and_start_active(h: Harness) -> None:
+    clients, (output, microphone) = picture()
+    h.queue_pictures((clients, (output, replace(microphone, muted=True))))
+    card = h.run(check.Purpose.CARD)
+    assert_offer(card, variant1=True)
+    h.queue_pictures(
+        (clients, (output, microphone)), (clients, (output, replace(microphone, muted=True)))
+    )
+    assert_offer(h.run(check.Purpose.START, anchor=card.anchor), variant1=True)
+
+
 def test_default_output_limit_keeps_offer_without_target(h: Harness) -> None:
     clients, streams = picture()
     more = (*streams, replace(streams[0], index=OUT + 1, properties=props(serial=202)))
@@ -1618,9 +1661,19 @@ def test_coalesced_cards_select_the_requested_active_program(h: Harness) -> None
     h.checker = h.make_checker(apps=(APP, chromium))
     clients, streams = picture()
     chromium_streams = (
-        RawStream(OUT + 1, chromium_client, Direction.OUTPUT, props(chromium_pid, "chromium", 202)),
         RawStream(
-            MIC + 1, chromium_client, Direction.MICROPHONE, props(chromium_pid, "chromium", 302)
+            OUT + 1,
+            chromium_client,
+            Direction.OUTPUT,
+            props(chromium_pid, "chromium", 202),
+            corked=False,
+        ),
+        RawStream(
+            MIC + 1,
+            chromium_client,
+            Direction.MICROPHONE,
+            props(chromium_pid, "chromium", 302),
+            corked=False,
         ),
     )
     h.queue_pictures(

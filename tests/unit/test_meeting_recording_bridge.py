@@ -171,6 +171,13 @@ class Rig:
             "generation": self.supervisor.generation,
         }
 
+    def no_call(self) -> None:
+        event = self.call_state()
+        self.supervisor.event(
+            {key: event[key] for key in ("type", "request_type", "req", "generation")}
+            | {"active": False}
+        )
+
     def reply(self, action: str, **fields: Any) -> None:
         request = self.supervisor.messages[-1]
         event = {
@@ -231,6 +238,7 @@ def test_bridge_w4_opens_without_prepare_and_only_start_click_records(rig: Rig) 
     assert not any(
         message["type"].endswith(("prepare", "open")) for message in rig.supervisor.messages
     )
+    rig.no_call()
     rig.bridge.on_start_clicked()
     assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
     assert rig.supervisor.messages[-1]["mic_device"] == "test-mic"
@@ -261,12 +269,81 @@ def test_setting_or_policy_off_keeps_programmatic_w4_and_start_inert(rig: Rig, g
 
 def test_current_card_enables_call_and_starts_app_stream_on_click(rig: Rig) -> None:
     rig.bridge.requestRecording()
+    assert not rig.bridge.startCanStart
+    rig.bridge.on_start_clicked()
+    event = rig.call_state()
+    assert rig.supervisor.messages[-1]["type"] == "meeting.call.query"
+    fields = {key: event[key] for key in ("req", "request_type", "generation")}
+    rig.supervisor.event({**fields, "type": "meeting.ack"})
+    assert not rig.bridge.startCanStart
     rig.supervisor.event(rig.call_state())
+    assert rig.bridge.startCanStart
     assert rig.recording.call_id == "call1" and rig.recording.variant1
     assert [row["id"] for row in rig.bridge.startOptions] == ["call", "room", "all"]
     assert rig.bridge.selectedSource == "call"
     rig.bridge.on_start_clicked()
     assert rig.supervisor.messages[-1]["far"] == {"kind": "app_stream", "call_id": "call1"}
+
+
+def test_explicit_room_starts_before_card_and_ignores_late_result(rig: Rig) -> None:
+    rig.bridge.requestRecording()
+    late = rig.call_state()
+    assert not rig.bridge.startCanStart
+    rig.bridge.selectRecordingSource("room")
+    assert rig.bridge.startCanStart
+    rig.bridge.on_start_clicked()
+    assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+    rig.supervisor.event(late)
+    assert rig.bridge.selectedSource == "room"
+    assert [row["id"] for row in rig.bridge.startOptions] == ["room", "all"]
+    assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
+
+
+def test_card_error_enables_default_once_per_open(rig: Rig) -> None:
+    rig.bridge.requestRecording()
+    event = rig.call_state()
+    fields = {key: event[key] for key in ("req", "request_type", "generation")}
+    error = {**fields, "type": "error", "code": "limit", "message": "meeting-command-failed"}
+    rig.supervisor.event({**error, "req": "stale"})
+    assert not rig.bridge.startCanStart
+    rig.supervisor.event(error)
+    assert rig.bridge.startCanStart and rig.bridge.selectedSource == "room"
+    rig.recording.tick()
+    assert [m["type"] for m in rig.supervisor.messages] == ["meeting.call.query"]
+    rig.bridge.closeStartDialog()
+    rig.supervisor.ready, rig.supervisor.exited = False, True
+    rig.supervisor.on_exit(0)
+    rig.bridge.requestRecording()
+    assert not rig.bridge.startCanStart
+    assert rig.call_state()["req"] != fields["req"]
+    rig.supervisor.event(event)
+    assert not rig.bridge.startCanStart
+    rig.no_call()
+    assert rig.bridge.startCanStart
+
+
+def test_existing_card_deadline_enables_default_after_ack(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.bridge.requestRecording()
+    (query,) = rig.supervisor.messages
+    on_event = Mock(wraps=rig.recording._event)
+    role = WorkerSupervisor(on_event, role="meeting-capture", clock=lambda: rig.now, use_qt=False)
+    role.state = "running"
+    role.generation = rig.supervisor.generation
+    role._receive(ipc.encode(ipc.make_hello(role=role.role), role=role.role), role.generation)
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.recording.controller, "supervisor", role)
+        role.send(query)
+        ack = {"type": "meeting.ack", "req": query["req"], "request_type": query["type"]}
+        role._receive(ipc.encode(ack, role=role.role), role.generation)
+        rig.now += 0.999
+        role._expire_meeting()
+        assert not rig.bridge.startCanStart
+        rig.now = 101.0
+        role._expire_meeting()
+        assert on_event.call_args.args[0]["code"] == "timeout"
+        assert rig.bridge.startCanStart and rig.bridge.selectedSource == "room"
 
 
 def test_browser_offer_and_card_keep_the_all_tabs_copy(rig: Rig) -> None:
@@ -296,6 +373,47 @@ def partial_frame() -> dict[str, Any]:
         "kind": "partial",
         "at_recorded_ms": 100,
     }
+
+
+@pytest.mark.parametrize("with_far", [True, False], ids=["call", "microphone-only"])
+def test_far_lost_on_resume_is_shown_only_for_meeting_with_far(rig: Rig, with_far: bool) -> None:
+    rig.bridge.requestRecording()
+    if with_far:
+        rig.supervisor.event(rig.call_state())
+    else:
+        rig.no_call()
+    rig.bridge.on_start_clicked()
+    rig.reply("prepared")
+    tracks = ["mic", "far"] if with_far else ["mic"]
+    rig.reply("started", tracks=tracks)
+    rig.recording.clicks.on_pause_clicked()
+    rig.reply("closed", tracks=tracks, state_rev=2)
+    rig.reply(
+        "finalized",
+        segments={"mic": 0, "far": 0},
+        intervals=[],
+        status="succeeded",
+        state_rev=2,
+    )
+    assert rig.recording.overlay["state"] == "paused"
+    assert rig.recording.clicks.on_resume_clicked()
+    rig.reply("started", tracks=["mic"], state_rev=3, blocked_epoch=2)
+    assert rig.recording.overlay["secondary"] == ""
+    # A far-ended update must never claim a loss for a mic-only meeting.
+    rig.supervisor.event(
+        {
+            **partial_frame(),
+            "state": "ended",
+            "kind": "target-removed",
+            "state_rev": 3,
+            "generation": rig.supervisor.generation,
+        }
+    )
+    assert rig.recording.overlay["secondary"] == (W2_TEXTS["farEnded"] if with_far else "")
+    if with_far:
+        rig.now += 8
+        rig.recording.tick()
+        assert rig.recording.overlay["secondary"] == ""
 
 
 def test_partial_track_wire_accepts_only_public_fields_and_known_kind() -> None:
@@ -538,6 +656,7 @@ def test_w4_preflight_warnings_are_visible_before_prepare(rig: Rig, kind: Sessio
     rig.storage = StorageStatus(1000, True, True)
     rig.audio = AudioHints(remote=True, speakers=True)
     rig.bridge.requestRecording()
+    rig.no_call()
     assert len(rig.bridge.startWarnings) == 2 and rig.bridge.startSpeakers
     assert rig.bridge.startCanStart
     assert not any(m["type"].endswith("prepare") for m in rig.supervisor.messages)
@@ -551,6 +670,7 @@ def test_fly_unknown_lock_has_no_warning_and_allows_start(tmp_path: Path) -> Non
     try:
         rig.session.value = SessionSnapshot(known=False, supported=False)
         rig.bridge.requestRecording()
+        rig.no_call()
         assert rig.bridge.startWarnings == []
         assert rig.bridge.startCanStart
         rig.bridge.on_start_clicked()
@@ -581,6 +701,7 @@ def test_preflight_errors_do_not_create_meeting(
 
 def test_session_monitor_pauses_and_unlock_does_not_resume(rig: Rig) -> None:
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.bridge.on_start_clicked()
     rig.reply("prepared")
     rig.reply("started")
@@ -697,8 +818,10 @@ def test_new_remote_warning_requires_new_click_after_confirmed_exit(
 
 def test_cancel_during_prepare_blocks_late_open(rig: Rig) -> None:
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.bridge.on_start_clicked()
     prepare = rig.supervisor.messages[-1]
+    assert prepare["type"] == "meeting.capture.prepare"
     rig.bridge.closeStartDialog()
     rig.supervisor.event(
         {
@@ -844,6 +967,7 @@ def test_native_supervisor_launch_failure_is_visible_and_retryable(
 
 def test_closed_before_finalized_row_is_stopped_not_live(rig: Rig) -> None:
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.bridge.on_start_clicked()
     rig.reply("prepared")
     rig.reply("started")
@@ -859,6 +983,7 @@ def test_preview_pending_never_grants_start(rig: Rig) -> None:
     jobs: list[Callable[[], None]] = []
     rig.recording._submit = jobs.append
     rig.bridge.requestRecording()
+    rig.no_call()
     assert not rig.bridge.startCanStart
     rig.bridge.on_start_clicked()
     assert not any(m["type"] == "meeting.capture.prepare" for m in rig.supervisor.messages)
@@ -871,7 +996,9 @@ def test_policy_revoke_during_start_blocks_open(rig: Rig) -> None:
     from astra_voice.core.policy import Policy
 
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.bridge.on_start_clicked()
+    assert rig.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
     rig.bridge.refreshPolicy(Policy(raw={"meeting_record": "off"}))
     assert not rig.bridge.startDialogOpen
     assert not rig.bridge.startCanStart
@@ -882,6 +1009,7 @@ def test_late_list_result_cannot_replace_live_paused_overlay(rig: Rig) -> None:
     from copy import deepcopy
 
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.bridge.on_start_clicked()
     rig.reply("prepared")
     rig.reply("started")
@@ -908,6 +1036,7 @@ def test_call_default_respects_explicit_choice(rig: Rig, selection: str | None) 
 def test_microphone_choice_frozen_before_async_prepare(rig: Rig) -> None:
     jobs: list[Callable[[], None]] = []
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.recording.controller._filesystem_submit = jobs.append
     rig.bridge.on_start_clicked()
     rig.microphone = "replacement-mic"
@@ -1000,6 +1129,7 @@ def test_enabled_recording_never_launches_capture_before_a_click(
 @pytest.mark.parametrize("entry", ["retry", "reopen"])
 def test_fresh_standby_role_after_exit_accepts_next_start_click(rig: Rig, entry: str) -> None:
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.bridge.on_start_clicked()
     rig.reply("prepared", server_local=False)
     previous = rig.supervisor
@@ -1011,6 +1141,7 @@ def test_fresh_standby_role_after_exit_accepts_next_start_click(rig: Rig, entry:
     else:
         rig.bridge.closeStartDialog()
         rig.bridge.requestRecording()
+        rig.no_call()
     assert len(rig.supervisors) == 2 and rig.supervisor is not previous
     assert rig.recording.controller.state == "stopped"
     assert rig.supervisor.ready and rig.bridge.startCanStart
@@ -1126,6 +1257,7 @@ def test_remote_latch_survives_role_replacement(
         deliver_remote(previous, stale=remote == "stale")
 
     if replace == "after-capture":
+        rig.bridge.selectRecordingSource("room")
         rig.bridge.on_start_clicked()
         rig.reply("prepared")
         rig.reply("started")
@@ -1150,9 +1282,10 @@ def test_remote_latch_survives_role_replacement(
     rig.recording.tick()
     assert rig.supervisor is not previous and rig.supervisor.ready
     assert background_commands(previous) == expected
-    assert background_commands(rig.supervisor) == (
-        [] if remote == "current" else [DETECTOR_START, "meeting.call.query"]
-    )
+    commands = [] if remote == "current" else [DETECTOR_START]
+    if remote != "current" and replace != "exit-with-open-dialog":
+        commands.append("meeting.call.query")
+    assert background_commands(rig.supervisor) == commands
 
 
 def detector_reply(request: dict[str, Any], kind: str, **fields: Any) -> dict[str, Any]:
@@ -1170,6 +1303,7 @@ def deliver_detector(role: Supervisor, request: dict[str, Any], kind: str, **fie
 
 def start_recording(rig: Rig) -> None:
     rig.bridge.requestRecording()
+    rig.no_call()
     rig.bridge.on_start_clicked()
     rig.reply("prepared")
     rig.reply("started")
@@ -1249,6 +1383,7 @@ def test_busy_window_suppresses_detector_commands(
     if initially_running:
         (first,) = detector_commands(role)
         deliver_detector(role, first, "meeting.detector.started")
+    rig.no_call()
     rig.bridge.on_start_clicked()
     if state != "preparing":
         rig.reply("prepared")
@@ -1620,8 +1755,10 @@ def test_unused_role_deadline_and_confirmed_exit_gate_replacement(
     assert rig.supervisor.starts == 1 and not rig.supervisor.ready
     rig.supervisor.ready = True
     rig.recording.tick()
-    assert rig.bridge.startCanStart  # reopened W4 needs no invisible/manual retry
     assert rig.supervisor.messages[-1]["type"] == "meeting.call.query"
+    assert not rig.bridge.startCanStart
+    rig.no_call()
+    assert rig.bridge.startCanStart  # reopened W4 needs no invisible/manual retry
     assert not any(m["type"].endswith(("prepare", "open")) for m in previous.messages)
 
 

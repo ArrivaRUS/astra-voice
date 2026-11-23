@@ -207,6 +207,9 @@ class _StreamRow:
     index: int
     client: int
     properties: _Properties
+    corked: bool | None
+    output_muted: bool
+    running: bool
 
 
 @dataclass(frozen=True, repr=False)
@@ -248,6 +251,9 @@ def _project(
                     stream.index,
                     stream.client,
                     _Properties.read(stream.properties, stream.valid),
+                    stream.corked,
+                    stream.direction is Direction.OUTPUT and stream.muted is True,
+                    stream.running is not False,
                 )
             )
     indexes = {row.index for row in client_rows}
@@ -302,7 +308,15 @@ class _Call:
 
     @property
     def active(self) -> bool:
-        return _has_call(self.members)
+        # Match MeetingDetectorRule: microphone mute does not interrupt a call.
+        directions = {
+            stream.direction
+            for participant in self.participants
+            if (stream := participant.stream).corked is False
+            and stream.running
+            and not stream.output_muted
+        }
+        return directions == {Direction.OUTPUT, Direction.MICROPHONE}
 
     def unambiguous(self, limit: int) -> bool:
         # Each PID has exactly one frozen ProcessKey in this measurement.
@@ -322,10 +336,6 @@ class _Call:
 
 def _outputs(members: frozenset[_Member]) -> frozenset[_Member]:
     return frozenset(member for member in members if member.direction is Direction.OUTPUT)
-
-
-def _has_call(members: frozenset[_Member]) -> bool:
-    return {member.direction for member in members} == {Direction.OUTPUT, Direction.MICROPHONE}
 
 
 def _resolve(

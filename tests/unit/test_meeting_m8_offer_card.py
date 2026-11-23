@@ -423,6 +423,7 @@ def test_fly_requires_real_lock_support_for_offer_and_card(tmp_path: Path, known
         assert view.calls == []
         assert not fly.recording._offer_query_req
         fly.bridge.requestRecording()
+        fly.no_call()
         assert fly.bridge.startCanStart
         fly.bridge.on_start_clicked()
         assert fly.supervisor.messages[-1]["type"] == "meeting.capture.prepare"
@@ -548,7 +549,9 @@ def test_positive_w4_card_tracks_call_end_without_showing_w1(rig: Rig) -> None:
     deliver(rig, ended("old-id", reason="evicted"))
     assert memory(rig) == "refused"
     rig.bridge.requestRecording()
-    deliver(rig, reply(rig, rig.recording._query_req, call_id="w4-id"))
+    req = rig.recording._query_req
+    assert req
+    deliver(rig, reply(rig, req, call_id="w4-id"))
     assert rig.recording.call_id == "w4-id"
     rig.bridge.closeStartDialog()
     rig.recording.tick()

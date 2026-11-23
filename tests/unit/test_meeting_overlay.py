@@ -25,12 +25,16 @@ from astra_voice.ui.tray_icons import TrayState
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
 
-def start(rig: Rig, *, mid: str | None = None) -> None:
+def start(rig: Rig, *, mid: str | None = None, with_far: bool = False) -> None:
     rig.bridge.requestRecording()
+    if with_far:
+        rig.supervisor.event(rig.call_state())
+    else:
+        rig.no_call()
     rig.bridge.on_start_clicked()
     fields = {"meeting_id": mid} if mid else {}
     rig.reply("prepared", **fields)
-    rig.reply("started", **fields)
+    rig.reply("started", tracks=["mic", "far"] if with_far else ["mic"], **fields)
     assert rig.bridge.overlay["state"] == "recording"
 
 
@@ -342,11 +346,8 @@ def test_transient_reason_cannot_cross_into_new_capture(rig: Rig, previous: str)
     next_id = "2026-11-01_120100-abce"
     ids = iter(["2026-11-01_120000-abcd", next_id])
     rig.recording.controller.id_factory = lambda: next(ids)
-    start(rig)
+    start(rig, with_far=previous == "far-ended")
     if previous == "far-ended":
-        rig.reply(
-            "track", track="far", state="live", state_rev=1, kind="reopened", at_recorded_ms=0
-        )
         rig.reply(
             "track",
             track="far",

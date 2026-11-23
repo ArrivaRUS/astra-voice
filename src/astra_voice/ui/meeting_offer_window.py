@@ -320,7 +320,7 @@ class MeetingOffer(SurfaceWindow):
             self._restoring_user_time = False
 
     def _press(self, action: str, mouse: bool) -> None:
-        if self._starting:
+        if self._starting or (action == "start" and not mouse):
             return
         if not self._open or not self._view.isVisible() or not self._view.isExposed():
             return

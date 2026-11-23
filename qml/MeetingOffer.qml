@@ -96,6 +96,7 @@ Item {
             inert: root.starting
             glyph: "x"
             label: root.texts.close || ""
+            Accessible.onPressAction: root.pressed("close", false)
             onPressed: root.pressed("close", mouse)
         }
     }
@@ -151,6 +152,7 @@ Item {
             spinning: root.starting
             freezeAnimations: root.freezeAnimations
             label: (root.starting ? root.texts.starting : root.texts.start) || ""
+            Accessible.role: Accessible.StaticText
             onPressed: root.pressed("start", mouse)
         }
         MeetingOfferControl {
@@ -159,6 +161,7 @@ Item {
             visible: !root.startFailed
             inert: root.starting
             label: root.texts.refuse || ""
+            Accessible.onPressAction: root.pressed("refuse", false)
             onPressed: root.pressed("refuse", mouse)
         }
         MeetingOfferControl {
@@ -166,6 +169,7 @@ Item {
             objectName: "offerOpenMeetings"
             visible: root.startFailed
             label: root.texts.openMeetings || ""
+            Accessible.onPressAction: root.pressed("open_meetings", false)
             onPressed: root.pressed("open_meetings", mouse)
         }
     }

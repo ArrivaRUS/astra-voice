@@ -183,7 +183,8 @@ class MeetingRecording(QObject):
         self._supervisor_factory = supervisor_factory
         self._role_serial = 0
         self._role_started = False
-        self._query_req = ""
+        # W4 CARD: "" before sending, request ID while pending, None after completion.
+        self._query_req: str | None = ""
         self._offer_query_req = ""
         self._closed = False
         self._shutting_down = False
@@ -355,7 +356,8 @@ class MeetingRecording(QObject):
         self._retire_deadline: float | None = None
         self._retire_sent = False
         self._retire_killed = False
-        self._query_req = ""
+        if self._query_req:
+            self._query_req = None
         self._reset_detector(None)
         return self._supervisor_factory(event, exited)
 
@@ -582,6 +584,12 @@ class MeetingRecording(QObject):
         return (
             self.dialog_open
             and self._preview_ready
+            and (
+                self._query_req is None
+                or self._selection_touched
+                or self._automation_off
+                or bool(self._variant1_lost)
+            )
             and not self.error
             and self._start_allowed()
             and (self.selected_source != "call" or self._call_available and not self.no_app_split)
@@ -661,6 +669,7 @@ class MeetingRecording(QObject):
             far = {"kind": "sink_monitor"}
         elif self.selected_source == "call" and self._call_available:
             far = {"kind": "app_stream", "call_id": self.call_id}
+        self._query_req = None
         self._start_pressed_at = self.offer.now_ms()
         app_class = self.app_class if far["kind"] == "app_stream" else ""
         self._start_capture(far, StartOrigin.CARD, app_class)
@@ -904,7 +913,12 @@ class MeetingRecording(QObject):
         request = uuid4().hex
         if kind == "meeting.call.query":
             self._query_req = request
-        self.controller.supervisor.send({"type": kind, "request_type": kind, "req": request})
+        try:
+            self.controller.supervisor.send({"type": kind, "request_type": kind, "req": request})
+        except (RuntimeError, ValueError):
+            if kind != "meeting.call.query":
+                raise
+            self._query_req = None
 
     def _offer_eligible(self) -> bool:
         role = self.controller.supervisor
@@ -1133,7 +1147,7 @@ class MeetingRecording(QObject):
             and (not self._start_remote or reason == "target-mismatch")
         ):
             self._pending_call_lost = self._notice_app
-            self._query_req = ""
+            self._query_req = None
             if origin == StartOrigin.OFFER:
                 self.offer.start_resolved()
             self._log_start_outcome(StartOutcome.CALL_LOST)
@@ -1190,11 +1204,16 @@ class MeetingRecording(QObject):
                     self._receive_offer(raw, "card", snapshot, current=current)
                 return
             if (
-                raw["type"] != "meeting.call.state"
+                raw["type"] not in {"meeting.call.state", "error"}
                 or not self.dialog_open
                 or self._variant1_lost
+                or not self._query_req
                 or raw["req"] != self._query_req
             ):
+                return
+            self._query_req = None
+            if raw["type"] == "error":
+                self._publish()
                 return
             self.call_id = raw.get("call_id", "")
             self.app_class = raw.get("app_class", "")
@@ -1312,6 +1331,8 @@ class MeetingRecording(QObject):
             self.controller.on_process_exit(code)
         self._role_started = False
         self._retire_deadline = None
+        if self._query_req:
+            self._query_req = None
         self._offer_query_req = ""
         self.offer.role_ended(self._role_serial, reason=OfferReason.ROLE_ENDED)
         if retiring and self.dialog_open:
@@ -1366,7 +1387,7 @@ class MeetingRecording(QObject):
             and not self._pending_call_lost
             and self._retire_deadline is None
             and self.controller.supervisor.ready
-            and not self._query_req
+            and self._query_req == ""
         ):
             self._send_query("meeting.call.query")
         for mid in self.controller.interrupted_dialog_ids:
@@ -1472,7 +1493,9 @@ class MeetingRecording(QObject):
         far_state = self.controller.tracks.get("far", "")
         if (
             far_state == "ended"
-            and self._overlay_far_state == "live"
+            and self._overlay_far_state != "ended"
+            and self.controller.meeting is not None
+            and self.controller.meeting.variant != "mic_only"
             and self.controller.state == "recording"
         ):
             self._overlay_far_deadline = self.clock() + 8
