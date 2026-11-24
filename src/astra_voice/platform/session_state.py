@@ -39,6 +39,7 @@ ReadCallback = Callable[[Any, bool], None]
 # first good answer. A steady state issues no reads at all.
 RETRY_FIRST_MS = 1000
 RETRY_MAX_MS = 30_000
+_MAX_IRRELEVANT_SESSIONS = 128
 
 
 def monotonic_ms() -> int:
@@ -220,6 +221,7 @@ class SessionState(QObject):
         self._hint_true_seen = False
         self._subscriptions: list[Callable[[], None]] = []
         self._session_subscriptions: list[Callable[[], None]] = []
+        self._irrelevant_sessions: set[str] = set()
         self._started = False
         self._retry_ms = RETRY_FIRST_MS
         self._retry_reconnect = False
@@ -302,6 +304,7 @@ class SessionState(QObject):
         return True
 
     def _cancel_subscriptions(self) -> None:
+        self._irrelevant_sessions.clear()
         for cancel in self._session_subscriptions + self._subscriptions:
             # A dead connection cannot disconnect; there is nothing else to do.
             with contextlib.suppress(Exception):
@@ -359,9 +362,15 @@ class SessionState(QObject):
         method: str,
         arguments: list[Any],
         callback: Callable[[Any], None],
+        *,
+        classification: bool = False,
     ) -> None:
         def finish(value: Any, error: bool) -> None:
             if generation != self.generation or not self._started:
+                if classification:
+                    # A probe never owns the cache verdict. Leave the verdict
+                    # of the event that superseded it in place (e.g. Lock).
+                    return
                 # Contract §9 explicitly closes the cache on stale replies too.
                 # The newer read may already have finished (a slow login1 reply
                 # or timeout arriving late), so "unknown" must not stick: schedule
@@ -370,8 +379,11 @@ class SessionState(QObject):
                 self._schedule_retry()
                 return
             if error:
-                self._invalidate()
-                self._schedule_retry()
+                if classification:
+                    self.refresh()
+                else:
+                    self._invalidate()
+                    self._schedule_retry()
                 return
             try:
                 callback(value)
@@ -462,6 +474,27 @@ class SessionState(QObject):
             generation, MANAGER_PATH, PROPERTIES, "Get", [MANAGER, "PreparingForSleep"], sleeping
         )
 
+    def _is_irrelevant_session(self, properties: Any) -> bool:
+        if not isinstance(properties, dict):
+            return False
+        user = properties.get("User")
+        if not isinstance(user, (list, tuple)) or len(user) != 2 or type(user[0]) is not int:
+            return False
+        if user[0] != self.uid:
+            return True
+        seat = properties.get("Seat")
+        session_class = properties.get("Class")
+        return (
+            properties.get("Remote") is True
+            and isinstance(seat, (list, tuple))
+            and len(seat) == 2
+            and isinstance(seat[0], str)
+            and not seat[0]
+            and isinstance(seat[1], str)
+            and isinstance(session_class, str)
+            and session_class == "user"
+        )
+
     def _apply(self, snapshots: dict[str, dict[str, Any]]) -> None:
         graphical = []
         for path, properties in snapshots.items():
@@ -470,7 +503,9 @@ class SessionState(QObject):
                 raise ValueError
             if type(user[0]) is not int or user[0] != self.uid:
                 raise ValueError
-            if properties["Type"] in {"x11", "wayland"}:
+            if properties["Type"] in {"x11", "wayland"} and not self._is_irrelevant_session(
+                properties
+            ):
                 graphical.append(path)
         if graphical != [self.session_path]:
             raise ValueError
@@ -556,21 +591,53 @@ class SessionState(QObject):
 
     def _owner_changed(self, name: str, old: str, new: str) -> None:
         if name == LOGIN:
+            self._irrelevant_sessions.clear()
             self._invalidate()
             if new:
                 self.refresh()
 
     def _disconnected(self) -> None:
+        self._irrelevant_sessions.clear()
         self._invalidate()
         self._schedule_retry(reconnect=True)
 
     def _session_removed(self, session_id: str, path: str) -> None:
+        if isinstance(path, str) and path in self._irrelevant_sessions:
+            self._irrelevant_sessions.remove(path)
+            if path != self.session_path:
+                return
         self._invalidate()
         if path != self.session_path:
             self.refresh()
 
     def _session_new(self, session_id: str, path: str) -> None:
-        self.refresh()
+        if not isinstance(path, str) or not path.startswith(LOGIN_PATH_PREFIX):
+            self.refresh()
+            return
+        self._irrelevant_sessions.discard(path)
+        if (
+            path == self.session_path
+            or not self.known
+            or not self._subscriptions
+            or not self._session_subscriptions
+        ):
+            self.refresh()
+            return
+
+        def classified(properties: Any) -> None:
+            if not self._is_irrelevant_session(properties):
+                self.refresh()
+                return
+            if len(self._irrelevant_sessions) >= _MAX_IRRELEVANT_SESSIONS:
+                # Forget all paths, including this one. Their removals take
+                # the ordinary fail-closed path.
+                self._irrelevant_sessions.clear()
+                return
+            self._irrelevant_sessions.add(path)
+
+        self._read(
+            self.generation, path, PROPERTIES, "GetAll", [SESSION], classified, classification=True
+        )
 
 
 def _fly_process_present(proc: Path = Path("/proc")) -> bool:
