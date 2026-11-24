@@ -16,7 +16,7 @@ PROBE = r'''
 import re
 import sys
 from pathlib import Path
-from PyQt5.QtCore import QObject, QPoint, QMetaObject, Qt, QUrl, pyqtProperty, pyqtSignal
+from PyQt5.QtCore import QObject, QPoint, QPointF, QMetaObject, Qt, QUrl, pyqtProperty, pyqtSignal
 from PyQt5.QtGui import QGuiApplication, QFontDatabase, QFontInfo, QFontMetricsF
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickWindow
@@ -60,6 +60,8 @@ import QtQuick 2.15
 import QtQuick.Window 2.15
 import "qml"
 Window {
+    property color mutedIcon: PillTheme.pillIconMuted
+    property string overlayAccessibleName: overlay.Accessible.name
     width: overlay.pillWidth + 36
     height: overlay.pillHeight + 42
     visible: true
@@ -185,6 +187,7 @@ if mode == "states":
             {"secondary": "DION закрылся — пишется только микрофон"},
             "DION закрылся",
         ),
+        ("far-partial", {"secondary": W2_TEXTS["farPartial"]}, W2_TEXTS["farPartial"]),
         (
             "recording",
             {
@@ -259,6 +262,8 @@ elif mode == "geometry":
                             microphoneName="Встроенный микрофон"), (482, 96)),
         ("app-closed", dict(elapsed="1:05:21",
                             secondary="DION закрылся — пишется только микрофон"), (482, 63)),
+        # Measured against the app-closed layout; far-partial has no reference image.
+        ("far-partial", dict(elapsed="1:05:21", secondary=W2_TEXTS["farPartial"]), (482, 63)),
         ("paused-lock", dict(secondary="Экран был заблокирован — продолжите вручную"),
                             (464, 63)),
         ("mic-paused", dict(elapsed="0:12:40",
@@ -297,6 +302,18 @@ elif mode == "geometry":
             if state == "notify-fallback":
                 assert not item("meetingExtend").property("visible")
                 assert not item("meetingResumeMicrophone").property("visible")
+            if state == "far-partial":
+                assert (
+                    item("meetingSecondaryText").property("color") == window.property("mutedIcon")
+                )
+                assert window.property("overlayAccessibleName").endswith(
+                    ". Часть звука не записывается"
+                )
+                row2_top = item("meetingSecondary").mapToItem(root, QPointF()).y()
+                for name in ("meetingPause", "meetingStop"):
+                    button = item(name)
+                    assert button.property("visible") and button.property("enabled")
+                    assert button.mapToItem(root, QPointF(0, button.height())).y() <= row2_top
             if state in ("stopping", "error"):
                 root.setProperty("compact", True)
                 QTest.qWait(20)
@@ -308,6 +325,9 @@ elif mode == "geometry":
             QTest.qWait(20)
             assert abs(root.property("pillWidth") - 141.6) < .01
             assert root.property("pillHeight") == 36
+            if state == "far-partial":
+                assert not item("meetingSecondary").property("visible")
+                assert W2_TEXTS["farPartial"] not in window.property("overlayAccessibleName")
         root.setProperty("compact", False)
         update()
         title = item("meetingTitle")
@@ -384,7 +404,7 @@ elif mode == "actions":
         "pauseClicked",
         "resumeClicked",
         "stopClicked",
-        "participantsClicked",
+        "copyParticipantsClicked",
         "extendClicked",
         "resumeMicrophoneClicked",
         "releaseKeyboardRequested",
@@ -394,7 +414,7 @@ elif mode == "actions":
     for control, signal in [
         ("meetingPause", "pauseClicked"),
         ("meetingStop", "stopClicked"),
-        ("meetingParticipants", "participantsClicked"),
+        ("meetingParticipants", "copyParticipantsClicked"),
     ]:
         click(control)
         assert received.pop() == signal
@@ -441,6 +461,10 @@ elif mode == "actions":
     assert item("meetingStop").property("activeFocus")
     QTest.keyClick(window, Qt.Key_Return)
     assert received.pop() == "stopClicked"
+    QTest.keyClick(window, Qt.Key_Tab)
+    assert item("meetingParticipants").property("activeFocus")
+    QTest.keyClick(window, Qt.Key_Return)
+    assert received.pop() == "copyParticipantsClicked"
     QTest.keyClick(window, Qt.Key_Escape)
     assert root.property("compact") and root.property("visible")
     assert received.pop() == "releaseKeyboardRequested"
@@ -525,9 +549,9 @@ NATIVE_SETUP = r"""
 import sys
 from pathlib import Path
 from PyQt5.QtCore import QObject, QMetaObject, Qt, pyqtSignal
-from PyQt5.QtGui import QGuiApplication, QFontDatabase
+from PyQt5.QtGui import QGuiApplication, QFontDatabase, QWindow
 from PyQt5.QtQuick import QQuickView, QQuickWindow
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5 import sip
 repo = Path(sys.argv[1])
 sys.path.insert(0, str(repo / 'src'))
@@ -556,7 +580,7 @@ def make_view():
     return view
 
 recording = Recording()
-owner = MeetingOverlay(recording, view_factory=make_view)
+owner = MeetingOverlay(recording, notice=lambda: ('Текст встречи', False), view_factory=make_view)
 view = owner._view
 root = view.rootObject()
 """
@@ -565,25 +589,55 @@ NATIVE_PROBE = (
     NATIVE_SETUP
     + r"""
 try:
-    QTest.qWait(30)
+    app.processEvents()
     assert view.isVisible()
     assert view.flags() & Qt.WindowDoesNotAcceptFocus
     assert view.flags() & Qt.WindowStaysOnTopHint
     area = view.screen().availableGeometry()
-    assert abs(view.x() - (area.x() + (area.width() - view.width()) // 2)) <= 1
+    if view.width() != owner._surface_size()[0] + 36:
+        assert QSignalSpy(view.widthChanged).wait(1000)
+    assert owner.surface_rect().right() == area.right() - 12
     assert view.y() + 18 == area.y() + 12
     original = view.position()
-    root.dragRequested.emit(50, 20)
-    assert view.position().x() == original.x() + 50
+    root.dragRequested.emit(-50, 20)
+    assert view.position().x() == original.x() - 50
     assert view.position().y() == original.y() + 20
+    dragged = view.position()
+    recording.changed.emit()
+    assert view.position() == dragged
     root.dragRequested.emit(-100000, -100000)
     assert view.x() + 18 >= area.left()
     assert view.y() + 18 >= area.top()
+    other = QWindow()
+    try:
+        other.show()
+        other.requestActivate()
+        app.processEvents()
+        assert app.focusWindow() == other
+        assert not root.property('keyboardMode')
+        focus_changes = QSignalSpy(app.focusWindowChanged)
+        view.setWindowState(Qt.WindowMinimized)
+        app.processEvents()
+        assert not (view.windowStates() & Qt.WindowMinimized)
+        assert view.isVisible()
+        assert app.focusWindow() == other and not focus_changes, 'passive W2 took focus'
+        assert not root.property('keyboardMode')
+    finally:
+        other.close()
+    owner.activate_keyboard()
+    app.processEvents()
+    active = app.focusWindow()
+    assert active == view
+    focus_changes = QSignalSpy(app.focusWindowChanged)
+    view.setWindowState(Qt.WindowMinimized)
+    app.processEvents()
+    assert not (view.windowStates() & Qt.WindowMinimized)
+    assert view.isVisible() and app.focusWindow() == active and not focus_changes
     for state in ('recording', 'paused', 'error'):
         recording.overlay.update(state=state, paused=state == 'paused')
         recording.changed.emit()
         owner.activate_keyboard()
-        QTest.qWait(20)
+        app.processEvents()
         assert not (view.flags() & Qt.WindowDoesNotAcceptFocus)
         assert view.isVisible()
         view.close()
@@ -592,7 +646,7 @@ try:
     recording.overlay.update(state='paused', paused=True)
     recording.changed.emit()
     owner.activate_keyboard()
-    QTest.qWait(20)
+    app.processEvents()
     QMetaObject.invokeMethod(root, 'focusFirstControl', Qt.DirectConnection)
     QTest.keyClick(view, Qt.Key_Escape)
     assert root.property('compact')
@@ -600,8 +654,7 @@ try:
     assert view.flags() & Qt.WindowDoesNotAcceptFocus
     assert not root.property('keyboardMode')
     for signal, action in [('pauseClicked', 'pause'), ('resumeClicked', 'resume'),
-                           ('stopClicked', 'stop'), ('participantsClicked', 'participants'),
-                           ('extendClicked', 'extend')]:
+                           ('stopClicked', 'stop'), ('extendClicked', 'extend')]:
         getattr(root, signal).emit()
         assert recording.actions.pop() == action
     assert not warnings, warnings

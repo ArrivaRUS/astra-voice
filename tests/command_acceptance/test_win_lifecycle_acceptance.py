@@ -573,27 +573,28 @@ def test_peer_failure_releases_held_super_within_one_second_and_requires_fresh_p
     isolated_keyboard: IsolatedKeyboard, recording: bool, failure: str
 ) -> None:
     keyboard = isolated_keyboard
-    keyboard.key("Super_L", True)
-    if recording:
-        keyboard.pump(0.35)
-    before = len(keyboard.started)
-    child = keyboard.backend.process
-    assert child is not None
-    began = time.monotonic()
-    if failure == "parent_stall":
-        time.sleep(0.75)  # intentionally stop GUI heartbeat, but not the X client
-    elif failure == "eof":
-        connection = keyboard.backend._connection
-        assert connection is not None
-        connection.shutdown(socket.SHUT_RDWR)
-        keyboard.pump(0.05)
-    else:
-        os.kill(child.pid, signal.SIGKILL if failure == "kill" else signal.SIGSTOP)
-        keyboard.pump(0.75)
+    # Connect before the press to keep X setup out of the pending hold and release timing.
     with X11Display() as rival:
+        keyboard.key("Super_L", True)
+        if recording:
+            keyboard.pump(0.35)
+        before = len(keyboard.started)
+        child = keyboard.backend.process
+        assert child is not None
+        began = time.monotonic()
+        if failure == "parent_stall":
+            time.sleep(0.75)  # intentionally stop GUI heartbeat, but not the X client
+        elif failure == "eof":
+            connection = keyboard.backend._connection
+            assert connection is not None
+            connection.shutdown(socket.SHUT_RDWR)
+            keyboard.pump(0.05)
+        else:
+            os.kill(child.pid, signal.SIGKILL if failure == "kill" else signal.SIGSTOP)
+            keyboard.pump(0.75)
         assert rival.grab_keyboard(), "peer failure prevented the locker taking keyboard"
         rival.ungrab_keyboard()
-    assert time.monotonic() - began < 1
+        assert time.monotonic() - began < 1
     keyboard.pump(0.05)
     assert child.poll() is not None
     assert len(keyboard.started) == before, "old confirmed press survived the failed lease"

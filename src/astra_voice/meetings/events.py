@@ -161,21 +161,223 @@ class ExceptionClass(StrEnum):
     EXCEPTION = "Exception"
 
 
+class DetectorPurpose(StrEnum):
+    OBSERVE = "observe"
+    OFFER = "offer"
+    CARD = "card"
+    START = "start"
+
+
+class DetectorCode(StrEnum):
+    IDENTITY_MISMATCH = "identity_mismatch"
+    IDENTITY_MISMATCH_COUNTER = "identity_mismatch_counter"
+    VERIFICATION_UNAVAILABLE = "verification=unavailable"
+    VERIFICATION_FAILED = "verification=failed"
+    PULSE_FAILED = "pulse_failed"
+    PICTURE_CHANGED = "picture_changed"
+    BUDGET = "budget"
+    BUSY = "busy"
+    RATE = "rate"
+    REMOTE = "remote"
+    TARGET_GONE = "target-gone"
+    TARGET_MISMATCH = "target-mismatch"
+    NO_CALL = "no_call"
+
+
 # Constant templates are the only messages accepted in meeting-scoped logs.
 # POLICY_REJECTED preserves the existing finite policy code vocabulary exactly.
 POLICY_REJECTED = "%s"
 SETTING_INVALID = "meeting-setting-invalid setting=%s"
 EXCEPTION = "meeting-exception exception=%s"
 INVALID_LOG = "meeting-invalid-log"
+CATALOG_LOAD_FAILED = "meeting-catalog-load-failed"
 CAPTURE_STATS = "meeting-capture duration_ms=%d bytes=%d"
 NATIVE_STDERR = "meeting-native-stderr bytes=%d lines=%d"
-LOG_FIELDS: dict[str, tuple[type[StrEnum] | None, ...]] = {
+DETECTOR_CODE = "meeting-detector purpose=%s code=%s duration_ms=%d"
+START_LATENCY = "meeting-start origin=%s outcome=%s latency_ms=%d"
+START_FAILED = "meeting-start-failed code=%s request=%s"
+OFFER_LIFECYCLE = "meeting-offer event=%s reason=%s shown_ms=%d"
+
+
+class StartOrigin(StrEnum):
+    OFFER = "offer"
+    CARD = "card"
+
+
+class StartOutcome(StrEnum):
+    STARTED = "started"
+    CALL_LOST = "call-lost"
+    FAILED = "start-failed"
+    ABORTED = "aborted"
+
+
+class StartFailureCode(StrEnum):
+    # Wire vocabulary from worker.meeting_contract.ERROR_CODES.
+    BAD_FIELD = "bad-field"
+    BAD_FRAME = "bad-frame"
+    UNKNOWN_MESSAGE = "unknown-message"
+    NOT_PREPARED = "not-prepared"
+    ADMISSION_STALE = "admission-stale"
+    REQ_CONFLICT = "req-conflict"
+    HARDENING_FAILED = "hardening-failed"
+    AUDIO_NO_DEVICE = "audio-no-device"
+    AUDIO_BUSY = "audio-busy"
+    AUDIO_FAILED = "audio-failed"
+    TARGET_GONE = "target-gone"
+    TARGET_MISMATCH = "target-mismatch"
+    DIR_UNWRITABLE = "dir-unwritable"
+    LIMIT = "limit"
+    MODEL = "model"
+    MODEL_UNTRUSTED = "model-untrusted"
+    EXTERNAL_DATA = "external-data"
+    MEMORY = "memory"
+    IO = "io"
+    TIMEOUT = "timeout"
+    HELLO_TIMEOUT = "hello-timeout"
+    PROTOCOL_MISMATCH = "protocol-mismatch"
+    WORKER_CRASHED = "worker-crashed"
+    LOAD_TIMEOUT = "load-timeout"
+    RESTART_LIMIT = "restart-limit"
+    WORKER_START = "worker-start"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "StartFailureCode":
+        return cls.OTHER
+
+
+class StartFailureRequest(StrEnum):
+    # Wire vocabulary from worker.meeting_contract.COMMAND_FIELDS.
+    DETECTOR_START = "meeting.detector.start"
+    DETECTOR_STOP = "meeting.detector.stop"
+    CALL_QUERY = "meeting.call.query"
+    CAPTURE_PREPARE = "meeting.capture.prepare"
+    CAPTURE_OPEN = "meeting.capture.open"
+    CAPTURE_KEEPALIVE = "meeting.capture.keepalive"
+    CAPTURE_PAUSE = "meeting.capture.pause"
+    CAPTURE_RESUME = "meeting.capture.resume"
+    CAPTURE_TRACK_RESUME = "meeting.capture.track.resume"
+    CAPTURE_EXTEND = "meeting.capture.extend"
+    CAPTURE_STOP = "meeting.capture.stop"
+    CAPTURE_SHUTDOWN = "meeting.capture.shutdown"
+    PING = "ping"
+    MODEL_LOAD = "model.load"
+    MODEL_UNLOAD = "model.unload"
+    MEASURE = "measure"
+    JOB_START = "meeting.job.start"
+    JOB_CREDIT = "meeting.job.credit"
+    JOB_CANCEL = "meeting.job.cancel"
+    JOB_APPLIED = "meeting.job.applied"
+    DIAR_LOAD = "diar.load"
+    DIAR_BLOCK = "diar.block"
+    DIAR_FINISH = "diar.finish"
+    DIAR_CANCEL = "diar.cancel"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "StartFailureRequest":
+        return cls.OTHER
+
+
+class OfferEvent(StrEnum):
+    RECEIVED = "received"
+    DROPPED = "dropped"
+    SUPPRESSED = "suppressed"
+    SHOWN = "shown"
+    FIRST_FRAME = "first-frame"
+    START = "start"
+    CLOSED = "closed"
+    MEMORY = "memory"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "OfferEvent":
+        return cls.OTHER
+
+
+class OfferReason(StrEnum):
+    OFFER = "offer"
+    CARD = "card"
+    CARD_ERROR = "card-error"
+    UNKNOWN_CLASS = "unknown-class"
+    NO_ROLE = "no-role"
+    UNBOUND = "unbound"
+    NOT_ELIGIBLE = "not-eligible"
+    SESSION_BLOCKED = "session-blocked"
+    PENDING = "pending"
+    VISIBLE = "visible"
+    STARTING = "starting"
+    CALL_ENDED = "call-ended"
+    STALE = "stale"
+    EPOCH_CHANGED = "epoch-changed"
+    DEFERRED_SUPPRESSED = "deferred-suppressed"
+    SHOW_FAILED = "show-failed"
+    OLD_SERIAL = "old-serial"
+    GENERATION = "generation"
+    DECODE = "decode"
+    CARD_REQ = "card-req"
+    UNKNOWN_CALL = "unknown-call"
+    CARD_MEMORY = "card-memory"
+    INHERITED = "inherited"
+    SAME_CALL = "same-call"
+    LOCK_CLOSED = "lock-closed"
+    CARD_ORIGIN = "card-origin"
+    PLACED = "placed"
+    NO_WORKAREA = "no-workarea"
+    FRAME_SWAPPED = "frame-swapped"
+    BIND = "bind"
+    UNBIND = "unbind"
+    ROLE_ENDED = "role-ended"
+    ROLE_REPLACED = "role-replaced"
+    SERVER_CHANGED = "server-changed"
+    DETECTOR_OFF = "detector-off"
+    OPEN_DIALOG = "open-dialog"
+    RECORDING = "recording"
+    POLICY = "policy"
+    REMOTE = "remote"
+    MIC_RELEASED = "mic-released"
+    APP_GONE = "app-gone"
+    EVICTED = "evicted"
+    TIMEOUT = "timeout"
+    REFUSED = "refused"
+    CLOSE_BUTTON = "close-button"
+    WM_CLOSE = "wm-close"
+    ACCEPTED = "accepted"
+    STARTED = "started"
+    START_FAILED = "start-failed"
+    START_ABORTED = "start-aborted"
+    OPEN_MEETINGS = "open-meetings"
+    CALL_LOST = "call-lost"
+    NO_APP_SPLIT = "no-app-split"
+    SHUTDOWN = "shutdown"
+    REMEMBER_SHOWN = "remember-shown"
+    REMEMBER_REFUSED = "remember-refused"
+    REMEMBER_ACCEPTED = "remember-accepted"
+    REMEMBER_LOCK_CLOSED = "remember-lock-closed"
+    RESET = "reset"
+    INHERIT = "inherit"
+    EXPIRE = "expire"
+    DROP = "drop"
+    CLEAR = "clear"
+    OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "OfferReason":
+        return cls.OTHER
+
+
+LOG_FIELDS: dict[str, tuple[type[StrEnum] | type[int] | None, ...]] = {
     POLICY_REJECTED: (PolicyCode,),
     SETTING_INVALID: (SettingKey,),
     EXCEPTION: (ExceptionClass,),
     INVALID_LOG: (),
+    CATALOG_LOAD_FAILED: (),
     CAPTURE_STATS: (None, None),
     NATIVE_STDERR: (None, None),
+    DETECTOR_CODE: (DetectorPurpose, DetectorCode, None),
+    START_LATENCY: (StartOrigin, StartOutcome, None),
+    START_FAILED: (StartFailureCode, StartFailureRequest),
+    OFFER_LIFECYCLE: (OfferEvent, OfferReason, int),
 }
 
 
@@ -217,8 +419,8 @@ def log_arguments(message: object, args: object) -> tuple[object, ...] | None:
         return None
     result: list[object] = []
     for value, kind in zip(args, fields, strict=True):
-        if kind is None:
-            if not is_number(value):
+        if kind is None or kind is int:
+            if not is_number(value) or (kind is int and type(value) is not int):
                 return None
             result.append(value)
         elif not isinstance(value, kind):
@@ -276,6 +478,7 @@ STATS_CHOICES = {
     "endpoint_class": frozenset({"off", "internal", "external", "unset"}),
     "exception": frozenset(ExceptionClass),
     "code": frozenset(PolicyCode)
+    | frozenset(DetectorCode)
     | {
         "timeout",
         "limit",
@@ -308,7 +511,7 @@ def stats_event(
             if type(value) is str and value in STATS_CHOICES[key]:
                 result[key] = value
             elif (
-                type(value) in {MeetingState, PauseReason, ExceptionClass, PolicyCode}
+                type(value) in {MeetingState, PauseReason, ExceptionClass, PolicyCode, DetectorCode}
                 and isinstance(value, StrEnum)
                 and value in STATS_CHOICES[key]
             ):

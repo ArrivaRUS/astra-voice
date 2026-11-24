@@ -24,16 +24,23 @@ from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.meetings.events import MeetingState
 from astra_voice.meetings.model import Interval, Mark, Meeting
 from astra_voice.meetings.segments import CaptureJournal, SegmentSidecar
-from astra_voice.meetings.store import MeetingStore, MeetingStoreError, Writer, new_meeting_id
+from astra_voice.meetings.store import (
+    MeetingStore,
+    MeetingStoreBusy,
+    MeetingStoreError,
+    Writer,
+    new_meeting_id,
+)
 from astra_voice.platform.session import SessionKind
 from astra_voice.security.files import private_directory
 from astra_voice.worker import ipc
 
 MEETING_HARD_LIMIT_MS = 14_400_000
+METADATA_RETRY_SECONDS = 2.0
 LOCK_SIGNAL_BY_SESSION = {SessionKind.KDE: "login1", SessionKind.FLY: "none"}
 ERROR_TEXT = {
     "disk-low": (
-        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
+        "Мало места на диске: для записи встречи нужно около 600 МБ. Освободите "
         "место или удалите старые встречи."
     ),
     "audio-unavailable": (
@@ -64,6 +71,7 @@ WARNING_TEXT = {
     ),
 }
 Message = dict[str, Any]
+TARGET_REFUSALS = frozenset({"target-gone", "target-mismatch"})
 
 
 class CaptureSupervisor(Protocol):
@@ -181,7 +189,10 @@ def probe_storage(path: Path) -> StorageStatus:
 
 class MeetingController:
     def close(self, *, timeout: float = 0.0) -> bool:
-        return self._writer.close(timeout=timeout)
+        drained = self._writer.close(timeout=timeout)
+        if not drained:
+            self._metadata_retry_stop.set()
+        return drained
 
     def __init__(
         self,
@@ -196,6 +207,8 @@ class MeetingController:
         policy_allowed: Callable[[], bool] = lambda: False,
         id_factory: Callable[[], str] = lambda: new_meeting_id(datetime.now(UTC)),
         metadata_submit: Callable[[Callable[[], None]], None] | None = None,
+        metadata_retry_clock: Callable[[], float] = time.monotonic,
+        metadata_retry_wait: Callable[[threading.Event, float], bool] = threading.Event.wait,
         filesystem_submit: Callable[[Callable[[], None]], None] | None = None,
         mic_device: Callable[[], str | None] = lambda: None,
     ) -> None:
@@ -211,6 +224,9 @@ class MeetingController:
         self._selected_mic: str | None = None
         self._writer = MetadataWriter()
         self._metadata_submit = metadata_submit or self._writer.submit
+        self._metadata_retry_clock = metadata_retry_clock
+        self._metadata_retry_wait = metadata_retry_wait
+        self._metadata_retry_stop = threading.Event()
         self._filesystem_submit = filesystem_submit or self._writer.submit
         self._filesystem_results: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._filesystem_pending = 0
@@ -228,9 +244,11 @@ class MeetingController:
         self.lock_signal_unavailable = session_kind == SessionKind.FLY
         self.far_available = False
         self.far_reason = ""
+        self.far_partial = False
         self.mic_only_available = False
         self.saved = False
         self.error_code = ""
+        self.role_start_error: tuple[str, str] = ("", "")
         self.warnings: list[str] = []
         self.interrupted_dialog_ids: list[str] = []
         self.tracks: dict[str, str] = {}
@@ -309,6 +327,7 @@ class MeetingController:
 
     def start(self, far: Message | None = None) -> bool:
         """Click-only API; construction, recovery and polling never invoke it."""
+        self.role_start_error = ("", "")
         if not self.enabled() or not self.policy_allowed():
             return self._error("disabled")
         if (
@@ -326,6 +345,7 @@ class MeetingController:
         self._far = far or {"kind": "none"}
         self.far_available = self.mic_only_available = False
         self.far_reason = ""
+        self.far_partial = False
         self.meeting = Meeting(
             id=self.id_factory(),
             started_at=datetime.now(UTC).isoformat(),
@@ -767,6 +787,33 @@ class MeetingController:
             self._submit_filesystem(commit)
             return
         if kind == "error":
+            if event["code"] in TARGET_REFUSALS:
+                if (
+                    event.get("request_type") == "meeting.capture.prepare"
+                    and self.state == "preparing"
+                    and self._prepare_sent
+                    and not self._exit_confirmed
+                ):
+                    # This prepare failed before granting open or publishing a meeting.
+                    meeting_id = self.meeting.id
+                    self._prepare_deadline = None
+                    self._reserved = False
+                    self.meeting = None
+                    self.state = "idle"
+                    self.error_code = ""
+                    self.far_reason = event["code"]
+
+                    def discard() -> Callable[[], None]:
+                        self.store.discard_reserved(meeting_id)
+                        return lambda: None
+
+                    self._submit_filesystem(discard)
+                    return
+                if event.get("request_type") == "meeting.capture.open":
+                    self.error_code = ""
+                    self.far_reason = event["code"]
+                    self._escalate()
+                    return
             if (
                 event.get("request_type") == "meeting.capture.keepalive"
                 and event.get("code") == "not-prepared"
@@ -782,6 +829,8 @@ class MeetingController:
                 self._epoch_pending = True
                 self._error("session-blocked")
                 return
+            if self.state in {"preparing", "opening"}:
+                self.role_start_error = (event["code"], event.get("request_type", ""))
             self._error("audio-unavailable")
             self._escalate()
             return
@@ -822,6 +871,8 @@ class MeetingController:
                 self._persist(MeetingState.PAUSED)
         elif kind == "track":
             self.tracks[event["track"]] = event["state"]
+            if event["track"] == "far" and event["kind"] == "partial":
+                self.far_partial = True
         elif kind == "alive":
             if self._terminal:
                 return
@@ -914,12 +965,26 @@ class MeetingController:
         snapshot = deepcopy(meeting)
 
         def write() -> None:
+            deadline = self._metadata_retry_clock() + METADATA_RETRY_SECONDS
+            delay = 0.01
+            succeeded = False
             try:
-                self.store.write(snapshot.id, "meeting.json", snapshot, writer=Writer.GUI)
+                # Preserve the last disk state once exit has stopped the drain.
+                while not self._metadata_retry_stop.is_set():
+                    try:
+                        self.store.write(snapshot.id, "meeting.json", snapshot, writer=Writer.GUI)
+                        succeeded = True
+                        break
+                    except MeetingStoreBusy:
+                        remaining = deadline - self._metadata_retry_clock()
+                        if remaining <= 0 or self._metadata_retry_stop.is_set():
+                            raise
+                        # The lock may have cleared while this wait was ending.
+                        self._metadata_retry_wait(self._metadata_retry_stop, min(delay, remaining))
+                        delay = min(delay * 2, 0.2)
             except (MeetingStoreError, OSError):
-                self._write_results.put((snapshot.id, False, final))
-            else:
-                self._write_results.put((snapshot.id, True, final))
+                pass
+            self._write_results.put((snapshot.id, succeeded, final))
 
         try:
             self._metadata_submit(write)

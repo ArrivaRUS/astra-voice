@@ -520,7 +520,12 @@ def test_bridge_meta_contract_and_model_provider_wire(
     from astra_voice.core import meeting_jobs
     from astra_voice.meetings import diar_models
     from astra_voice.platform.session import SessionKind
-    from astra_voice.ui import meeting_notice, meeting_notifications, meeting_overlay
+    from astra_voice.ui import (
+        meeting_notice,
+        meeting_notifications,
+        meeting_offer_window,
+        meeting_overlay,
+    )
     from astra_voice.ui import meeting_recording as recording_module
 
     meta = rig.bridge.metaObject()
@@ -537,14 +542,7 @@ def test_bridge_meta_contract_and_model_provider_wire(
         meta.property(meta.indexOfProperty("speakerOperation")).notifySignal().methodSignature()
         == b"speakerOperationChanged()"
     )
-    for module, name in (
-        (meeting_overlay, "MeetingOverlay"),
-        (meeting_notice, "MeetingNotice"),
-        (meeting_notifications, "MeetingNotifications"),
-    ):
-        monkeypatch.setattr(module, name, Mock())
     recording = Mock()
-    monkeypatch.setattr(recording_module, "MeetingRecording", Mock(return_value=recording))
     settings = Settings(meeting_diarization=True)
     policy = parse_policy(Policy())
     probe = Mock(
@@ -555,13 +553,22 @@ def test_bridge_meta_contract_and_model_provider_wire(
             "embedder_sha256": "b" * 64,
         }
     )
-    monkeypatch.setattr(diar_models, "enabled_diar_models", probe)
     jobs_factory = Mock()
-    monkeypatch.setattr(meeting_jobs, "MeetingJobs", jobs_factory)
     bridge = Mock(_store=rig.store, _stored=settings, _parsed=policy)
-    app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None)
-    resolver = jobs_factory.call_args.kwargs["diar_models"]
-    assert resolver() == {
+    with monkeypatch.context() as patch:
+        for module, name in (
+            (meeting_overlay, "MeetingOverlay"),
+            (meeting_notice, "MeetingNotice"),
+            (meeting_offer_window, "MeetingOffer"),
+            (meeting_notifications, "MeetingNotifications"),
+        ):
+            patch.setattr(module, name, Mock())
+        patch.setattr(recording_module, "MeetingRecording", Mock(return_value=recording))
+        patch.setattr(diar_models, "enabled_diar_models", probe)
+        patch.setattr(meeting_jobs, "MeetingJobs", jobs_factory)
+        app._bind_meeting_recording(bridge, Mock(device=""), SessionKind.KDE, None)
+        resolved = jobs_factory.call_args.kwargs["diar_models"]()
+    assert resolved == {
         "segmentation_dir": "/trusted/seg",
         "embedder_dir": "/trusted/embed",
         "segmentation_sha256": "a" * 64,

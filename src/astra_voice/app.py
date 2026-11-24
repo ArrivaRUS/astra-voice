@@ -838,6 +838,7 @@ def _bind_meeting_recording(
         enabled=lambda: bridge.enabled,
         policy_allowed=lambda: bridge.canEnable,
         session_kind=session_kind,
+        detector_allowed=bridge.detector_allowed,
         microphone=lambda: settings_bridge.device or None,
         parent=bridge,
         **options,
@@ -851,13 +852,19 @@ def _bind_meeting_recording(
         from astra_voice.meetings.diar_models import enabled_diar_models
         from astra_voice.ui.meeting_notice import MeetingNotice
         from astra_voice.ui.meeting_notifications import MeetingNotifications, job_notifier
+        from astra_voice.ui.meeting_offer_window import MeetingOffer
         from astra_voice.ui.meeting_overlay import MeetingOverlay
         from astra_voice.ui.meeting_recording import transcribe_supervisor
 
-        overlay = MeetingOverlay(recording, session=session_kind, parent=bridge)
+        overlay = MeetingOverlay(
+            recording, notice=bridge.notice, session=session_kind, parent=bridge
+        )
         created.append(overlay)
         notice = MeetingNotice(recording, overlay, notice=bridge.notice, parent=bridge)
         created.append(notice)
+        offer = MeetingOffer(recording, parent=bridge)
+        created.append(offer)
+        recording.bind_offer(offer)
         notifications = MeetingNotifications(recording, parent=bridge)
         created.append(notifications)
         # E13.M4: the transcription queue is bound with capture; both start only when
@@ -895,6 +902,7 @@ def _bind_meeting_recording(
     bridge._meeting_overlay = overlay
     bridge.overlayKeyboardRequested.connect(overlay.activate_keyboard)
     bridge._meeting_notice = notice
+    bridge._meeting_offer = offer
     bridge.noticeKeyboardRequested.connect(notice.activate_keyboard)
     bridge._meeting_notifications = notifications
     bridge.bindRecording(recording)
@@ -913,6 +921,18 @@ def _meeting_model_probe(service: Any) -> Callable[[], Any]:
         return entry.min_ram_mb if entry is not None else None
 
     return lambda: probe_gigaam_model(min_ram_mb=min_ram)
+
+
+def _wire_meeting_windows(
+    bridge: Any, focuser: _WindowFocuser, app_info: Any
+) -> Callable[[], None]:
+    def show_meetings() -> None:
+        focuser.focus_shell()
+        app_info.show_section(SECTION_MEETINGS)
+
+    bridge.openMeetingsRequested.connect(show_meetings)
+    bridge.recordingRequested.connect(focuser.focus_meeting_start)
+    return show_meetings
 
 
 def _wire_tray_meetings(
@@ -953,13 +973,9 @@ def _wire_tray_meetings(
         else:
             bridge.on_overlay_pause_clicked()
 
-    def record_meeting() -> None:
-        show_meetings()
-        bridge.requestRecording()
-
     bridge.changed.connect(refresh)
     tray.set_meeting_record_entry_enabled(False)
-    tray.on_meeting_record = record_meeting
+    tray.on_meeting_record = bridge.requestRecording
     tray.on_meeting_open = show_meetings
     tray.on_meeting_pause = pause_or_resume
     tray.on_meeting_stop = bridge.on_overlay_stop_clicked
@@ -1190,13 +1206,23 @@ class _WindowFocuser(QObject):
         """Показывает shell; положительный X timestamp обновляет user time окна."""
         self.focus(self._shell, timestamp)
 
-    def focus(self, target: Any, timestamp: int = 0) -> None:
+    def focus_meeting_start(self) -> None:
+        from PyQt5.QtGui import QWindow
+
+        shell = _root_window(self._shell)
+        if shell is not None:
+            self.focus(shell.findChild(QWindow, "meetingStartWindow"), restore=False)
+
+    def focus(self, target: Any, timestamp: int = 0, *, restore: bool = True) -> None:
         if self._stopped:
             return
         root = _root_window(target)
         if root is None:
             return
-        _restore(root)
+        if restore:
+            _restore(root)
+        elif not root.isVisible():
+            return
         if hasattr(root, "raise_"):
             root.raise_()
         self._root = root
@@ -1208,14 +1234,15 @@ class _WindowFocuser(QObject):
         root = self._root
         if self._stopped or root is None:
             return
+        timestamp = self._timestamp
+        self._root = None
+        self._timestamp = 0
+        if hasattr(root, "isVisible") and not root.isVisible():
+            return
         try:
             window_id = int(root.winId())
         except Exception:  # noqa: BLE001 — окно могло ещё не получить нативный id
             window_id = 0
-        timestamp = self._timestamp
-        self._root = None
-        self._timestamp = 0
-
         if window_id:
             from astra_voice.platform.x11 import focus_window, set_user_time
 
@@ -2168,11 +2195,7 @@ def main(argv: list[str] | None = None) -> int:
                 # T-481: an installed/rechecked model starts needs_model jobs by itself.
                 downloads.modelsChanged.connect(jobs.models_changed)
 
-            def show_meetings() -> None:
-                focuser.focus_shell()
-                app_info.show_section(SECTION_MEETINGS)
-
-            meeting_bridge.openMeetingsRequested.connect(show_meetings)
+            show_meetings = _wire_meeting_windows(meeting_bridge, focuser, app_info)
             meeting_bridge.meetingActionRequested.connect(
                 _meeting_model_action(focuser, app_info, settings_bridge)
             )

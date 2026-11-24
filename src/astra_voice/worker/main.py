@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 PR_SET_PDEATHSIG = 1
 PR_SET_DUMPABLE = 4
 PR_GET_DUMPABLE = 3
+M_ARENA_MAX = -8  # glibc malloc.h
 MIN_ADDRESS_SPACE = 3 * 1024 * 1024 * 1024
 # Запас к дедлайну в секунду на отправку и освобождение устройства.
 POLL_INTERVAL = 0.25
@@ -147,6 +148,9 @@ def harden_meeting_limits(role: str) -> bool:
     if requested is None:
         return False
     try:
+        # Do this before run_role starts any threads, including with a clean environment.
+        if role == "meeting-capture" and ctypes.CDLL("libc.so.6").mallopt(M_ARENA_MAX, 2) != 1:
+            return False
         _, hard = resource.getrlimit(resource.RLIMIT_AS)
         actual = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
         if actual <= 0:
@@ -160,7 +164,7 @@ def harden_meeting_limits(role: str) -> bool:
                 os.nice(19 - current)
             if os.getpriority(os.PRIO_PROCESS, 0) != 19:
                 return False
-    except (OSError, ValueError):
+    except (AttributeError, OSError, ValueError):
         return False
     return True
 

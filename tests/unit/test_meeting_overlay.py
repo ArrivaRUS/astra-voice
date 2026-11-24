@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock, call
 
 import pytest
+from PyQt5.QtCore import QMetaObject
+from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtTest import QSignalSpy
 from test_meeting_recording_bridge import Rig
 from test_meeting_recording_bridge import rig as rig
@@ -12,6 +16,8 @@ from test_meeting_recording_bridge import rig as rig
 from astra_voice import app
 from astra_voice.core.command_mode import SessionSnapshot
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui import meeting_overlay
+from astra_voice.ui.meeting_overlay import MeetingOverlay
 from astra_voice.ui.meeting_recording import MeetingRecording
 from astra_voice.ui.overlay import WINDOW_FLAGS
 from astra_voice.ui.tray_icons import TrayState
@@ -19,24 +25,29 @@ from astra_voice.ui.tray_icons import TrayState
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
 
-def start(rig: Rig, *, mid: str | None = None) -> None:
+def start(rig: Rig, *, mid: str | None = None, with_far: bool = False) -> None:
     rig.bridge.requestRecording()
+    if with_far:
+        rig.supervisor.event(rig.call_state())
     rig.bridge.on_start_clicked()
     fields = {"meeting_id": mid} if mid else {}
     rig.reply("prepared", **fields)
-    rig.reply("started", **fields)
+    rig.reply("started", tracks=["mic", "far"] if with_far else ["mic"], **fields)
     assert rig.bridge.overlay["state"] == "recording"
 
 
 def finish(rig: Rig) -> None:
     rig.bridge.on_overlay_stop_clicked()
-    rig.reply("closed", tracks=["mic"], state_rev=2)
+    stop = rig.supervisor.messages[-1]
+    assert stop["type"] == "meeting.capture.stop"
+    revision = stop["state_rev"] + 1
+    rig.reply("closed", tracks=["mic"], state_rev=revision)
     rig.reply(
         "finalized",
         segments={"mic": 0, "far": 0},
         intervals=[],
         status="succeeded",
-        state_rev=2,
+        state_rev=revision,
     )
     role = rig.supervisor
     role.ready, role.exited = False, True
@@ -74,18 +85,157 @@ def test_overlay_actions_are_inert_without_a_committed_capture(
         recording.shutdown()
 
 
-def test_tray_record_opens_w4_and_reveals_shell_without_capture(rig: Rig) -> None:
+def test_tray_record_opens_w4_without_revealing_shell_or_running_capture(rig: Rig) -> None:
     tray, show = Mock(), Mock()
     disconnect = app._wire_tray_meetings(tray, rig.bridge, show)
     try:
         tray.on_meeting_record()
         assert rig.bridge.startDialogOpen
-        show.assert_called_once_with()
+        show.assert_not_called()
         assert not any(
             message["type"].endswith(("prepare", "open")) for message in rig.supervisor.messages
         )
     finally:
         disconnect()
+
+
+def test_w2_x11_properties_and_focus_across_passive_and_keyboard_shows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Xlib import X
+
+    trace: list[tuple[object, ...]] = []
+    atoms: dict[str, int] = {}
+    names: dict[int, str] = {0: ""}
+
+    def intern(name: str) -> int:
+        atom = atoms.setdefault(name, len(atoms) + 1)
+        names[atom] = name
+        return atom
+
+    def window(wid: int) -> Mock:
+        return Mock(
+            get_full_property=Mock(return_value=SimpleNamespace(format=32, value=[8])),
+            change_property=Mock(
+                side_effect=lambda atom, _kind, _size, data: trace.append(
+                    ("property", wid, names[atom], tuple(data))
+                )
+            ),
+        )
+
+    def message(event: Any, *, event_mask: int) -> None:
+        assert event.window == 7 and event.client_type == atoms["_NET_WM_STATE"]
+        assert event_mask == X.SubstructureRedirectMask | X.SubstructureNotifyMask
+        fmt, (action, first, second, source, _) = event.data
+        assert (fmt, action, source) == (32, 1, 1)
+        trace.append(("message", names[first], names[second]))
+
+    view = Mock(winId=Mock(return_value=7), isVisible=Mock(return_value=False))
+    root_state = {"keyboardMode": False}
+    target: Any = SimpleNamespace(
+        _view=view,
+        _root=Mock(
+            property=Mock(side_effect=root_state.__getitem__),
+            setProperty=Mock(side_effect=root_state.__setitem__),
+        ),
+        _closed=False,
+        recording=SimpleNamespace(overlay={"visible": True}),
+        _resize=Mock(),
+        geometryChanged=Mock(),
+        _x11=SimpleNamespace(
+            d=Mock(
+                intern_atom=Mock(side_effect=intern),
+                create_resource_object=Mock(side_effect=lambda _, wid: window(wid)),
+                sync=Mock(side_effect=lambda: trace.append(("xlib-sync",))),
+            ),
+            root=Mock(send_event=Mock(side_effect=message)),
+        ),
+    )
+    target._prepare_window = lambda: MeetingOverlay._configure_native_window(target)
+    target._show_surface = lambda: MeetingOverlay._show_surface(target)
+    target.release_keyboard = lambda: MeetingOverlay.release_keyboard(target)
+
+    def show() -> None:
+        trace.append(("show",))
+        view.isVisible.return_value = True
+
+    view.show.side_effect = show
+    view.hide.side_effect = lambda: setattr(view.isVisible, "return_value", False)
+    view.setProperty.side_effect = lambda name, value: trace.append(("qt-property", name, value))
+    x11_focus = Mock()
+    with monkeypatch.context() as patch:
+        patch.setattr(QGuiApplication, "platformName", lambda: "xcb")
+        patch.setattr(QGuiApplication, "sync", lambda: trace.append(("qt-sync",)))
+        patch.setattr(QMetaObject, "invokeMethod", Mock())
+        patch.setattr(meeting_overlay, "focus_window", x11_focus)
+        MeetingOverlay.refresh(target)
+        passive = trace[:]
+        view.requestActivate.assert_not_called()
+        x11_focus.assert_not_called()
+
+        trace.clear()
+        MeetingOverlay.activate_keyboard(target)
+        normal = trace[:]
+        assert view.requestActivate.call_args_list == [call()]
+        assert x11_focus.call_args_list == [call(7)]
+        trace.clear()
+        MeetingOverlay.release_keyboard(target)
+        notification = trace[:]
+
+        target.recording.overlay = {"visible": False}
+        MeetingOverlay.refresh(target)
+        target.recording.overlay = {"visible": True}
+        trace.clear()
+        MeetingOverlay.refresh(target)
+        assert trace == passive
+        assert view.requestActivate.call_args_list == [call()]
+        assert x11_focus.call_args_list == [call(7)]
+
+        # A keyboard-mode show can remap a view after a native flag change.
+        view.hide()
+        trace.clear()
+        MeetingOverlay.activate_keyboard(target)
+        keyboard_remap = trace[:]
+
+    map_index = passive.index(("show",))
+    prior, after = passive[:map_index], passive[map_index + 1 :]
+    above = atoms["_NET_WM_STATE_ABOVE"]
+    skip_taskbar = atoms["_NET_WM_STATE_SKIP_TASKBAR"]
+    skip_pager = atoms["_NET_WM_STATE_SKIP_PAGER"]
+    assert prior == [
+        ("qt-sync",),
+        ("property", 7, "_NET_WM_WINDOW_TYPE", (atoms["_NET_WM_WINDOW_TYPE_NOTIFICATION"],)),
+        ("property", 7, "_NET_WM_USER_TIME", (0,)),
+        ("property", 8, "_NET_WM_USER_TIME", (0,)),
+        ("property", 7, "_NET_WM_STATE", (above, skip_taskbar, skip_pager)),
+        ("property", 7, "_NET_WM_DESKTOP", (0xFFFFFFFF,)),
+        ("xlib-sync",),
+        ("qt-property", "_q_showWithoutActivating", True),
+    ]
+    assert after == [
+        ("qt-sync",),
+        *prior[1:4],
+        ("message", "_NET_WM_STATE_ABOVE", ""),
+        ("message", "_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER"),
+        ("xlib-sync",),
+    ]
+    normal_type = atoms["_NET_WM_WINDOW_TYPE_NORMAL"]
+    switcher = "_KDE_NET_WM_STATE_SKIP_SWITCHER"
+    assert normal == [
+        ("qt-sync",),
+        ("property", 7, "_NET_WM_WINDOW_TYPE", (normal_type,)),
+        ("message", "_NET_WM_STATE_ABOVE", switcher),
+        *after[5:],
+    ]
+    assert notification == after
+    assert keyboard_remap == [
+        *normal[:2],
+        ("property", 7, "_NET_WM_STATE", (above, skip_taskbar, skip_pager, atoms[switcher])),
+        *prior[5:7],
+        ("qt-property", "_q_showWithoutActivating", False),
+        ("show",),
+        *normal,
+    ]
 
 
 def test_disabled_pill_cannot_hide_w2_or_recording_tray(rig: Rig) -> None:
@@ -197,11 +347,8 @@ def test_transient_reason_cannot_cross_into_new_capture(rig: Rig, previous: str)
     next_id = "2026-11-01_120100-abce"
     ids = iter(["2026-11-01_120000-abcd", next_id])
     rig.recording.controller.id_factory = lambda: next(ids)
-    start(rig)
+    start(rig, with_far=previous == "far-ended")
     if previous == "far-ended":
-        rig.reply(
-            "track", track="far", state="live", state_rev=1, kind="reopened", at_recorded_ms=0
-        )
         rig.reply(
             "track",
             track="far",

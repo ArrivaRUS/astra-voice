@@ -3099,7 +3099,7 @@ def main(argv: list[str] | None = None) -> int:
             "(точные inclusive CPU sections + sampling100ms; "
             "если поток недоступен — только sections при завершении): "
             "normal → FILE; дополнительные → "
-            "FILE.target-gone/.fallback/.crash (SIGKILL: последний checkpoint); "
+            "FILE.fallback/FILE.crash (SIGKILL: последний checkpoint); "
             "CPU включает накладные расходы профилировщика"
         ),
     )

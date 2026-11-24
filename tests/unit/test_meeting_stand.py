@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -14,6 +17,8 @@ from unittest.mock import Mock
 
 import pytest
 from tools import meeting_stand as stand
+
+from astra_voice.core import audio_env
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("filesystem_euid")]
 
@@ -38,6 +43,25 @@ def test_private_environment_ignores_inherited_endpoints(
     for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
         assert Path(env[key]).is_relative_to(tmp_path)
         assert Path(env[key]).stat().st_mode & 0o777 == 0o700
+
+
+def test_private_client_config_matches_app_pool_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = stand.private_environment(tmp_path / "stand")
+    user_config = tmp_path / "app" / "config" / "pulse" / "client.conf"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("enable-shm = yes\nshm-size-bytes = 0\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_config.parent.parent))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "app" / "cache"))
+    monkeypatch.delenv("PULSE_CLIENTCONFIG", raising=False)
+
+    audio_env.deny_pulse_autospawn()
+
+    app_lines = Path(os.environ["PULSE_CLIENTCONFIG"]).read_text(encoding="utf-8").splitlines()
+    stand_lines = Path(env["PULSE_CLIENTCONFIG"]).read_text(encoding="utf-8").splitlines()
+    include_index = app_lines.index(f".include {user_config}")
+    assert stand_lines[:3] == app_lines[include_index + 1 :]
 
 
 def test_missing_binary_fails_without_start(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,11 +160,10 @@ def test_profile_paths_keep_normal_output_and_separate_other_scenarios(tmp_path:
     paths = stand.capture_profile_paths(output)
     assert paths == {
         "normal": output,
-        "target-gone": tmp_path / "capture.pstats.target-gone",
         "fallback": tmp_path / "capture.pstats.fallback",
         "crash": tmp_path / "capture.pstats.crash",
     }
-    assert len(set(paths.values())) == 4
+    assert len(set(paths.values())) == 3
 
 
 def test_runner_passes_profile_to_exercise_and_reports_overhead(
@@ -999,9 +1022,42 @@ def test_filesystem_failure_returns_sanitized_report_and_cleans(
     close.assert_called_once()
 
 
-@pytest.mark.parametrize("profiled", [False, True])
-def test_exercise_complete_sequence_keeps_sentinel_and_uses_all_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profiled: bool
+@pytest.mark.parametrize(
+    "tail_frames",
+    [
+        pytest.param(0, id="same-samples"),
+        pytest.param(160, id="tail-10ms"),
+        pytest.param(16, id="tail-too-short"),
+    ],
+)
+def test_mic_marker_rejects_output_tone(tmp_path: Path, tail_frames: int) -> None:
+    import wave
+
+    rate = 16000
+    mic = [round(16000 * math.sin(math.tau * 1000 * i / rate)) for i in range(320)]
+    output = [
+        round(1800 * math.sin(math.tau * 1700 * i / rate)) for i in range(tail_frames or len(mic))
+    ]
+    samples = mic + output if tail_frames else [a + b for a, b in zip(mic, output, strict=True)]
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    with wave.open(str(audio / "mic-0000.wav"), "wb") as source:
+        source.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+        source.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+    assert not stand._has_mic_signal(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "profiled,mic_pcm",
+    [
+        pytest.param(False, "mic", id="mic"),
+        pytest.param(True, "mic", id="mic-profiled"),
+        pytest.param(False, "output", id="output-only"),
+        pytest.param(False, "mixed", id="mic-and-output"),
+    ],
+)
+def test_exercise_records_only_manual_sources_and_uses_all_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profiled: bool, mic_pcm: str
 ) -> None:
 
     from tools import meeting_stand_metrics as metrics
@@ -1019,10 +1075,6 @@ def test_exercise_complete_sequence_keeps_sentinel_and_uses_all_evidence(
         process.live = False
 
     owner.terminate.side_effect = terminate
-    monkeypatch.setattr("tools.meeting_stand.time.monotonic", lambda: now[0])
-    monkeypatch.setattr(
-        "tools.meeting_stand.time.sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)
-    )
     server = Mock()
     server.daemons = [Mock(pid=99)]
     server.versions = {"pipewire": "1.6.2"}
@@ -1038,11 +1090,11 @@ def test_exercise_complete_sequence_keeps_sentinel_and_uses_all_evidence(
         return process
 
     server.play.side_effect = play
-    server.target.side_effect = lambda process: {
-        "kind": "app_stream",
-        "sink_input": process.pid,
-        "object_serial": 7,
-    }
+
+    def wait_playing(process: Any) -> None:
+        assert process.live
+
+    server.wait_playing.side_effect = wait_playing
     server.rows.side_effect = lambda kind: (
         [{"index": c.supervisor.process.pid} for c in captures if c.active]
         if kind == "source-outputs"
@@ -1056,13 +1108,13 @@ def test_exercise_complete_sequence_keeps_sentinel_and_uses_all_evidence(
         return {"routes": live, "outputs": len([c for c in captures if c.active])}
 
     server.snapshot.side_effect = snapshot
-    monkeypatch.setattr(stand, "AudioServer", lambda *args: server)
 
     class FakeCapture:
         def __init__(self, owner: Any, directory: Path, *, profile: Path | None = None) -> None:
             self.directory = directory
             self.profile = profile
             self.active = False
+            self.kind = ""
             self.supervisor = Mock(process=Mock(pid=2000 + len(captures)))
             self.supervisor.stop.side_effect = self.stopped
             captures.append(self)
@@ -1070,17 +1122,29 @@ def test_exercise_complete_sequence_keeps_sentinel_and_uses_all_evidence(
         def start(self) -> None:
             events.append("start")
 
-        def prepare(self, target: dict[str, Any]) -> None:
-            events.append("prepare:" + target["kind"])
-            assert players[0].foreign and players[0].live
+        def prepare(self, far: dict[str, Any]) -> None:
+            self.kind = far["kind"]
+            assert far == {"kind": self.kind}
+            assert {player.sink for player in players if player.live} == {"stand_mic", "stand_far"}
+            assert any(player.foreign and player.live for player in players) == (
+                self.kind == "none"
+            )
+            events.append("prepare:" + self.kind)
 
         def open(self) -> None:
             events.append("open")
             self.active = True
-            (self.directory / "audio/far-0000.wav").write_bytes(b"fixed-evidence")
+            if self.kind == "sink_monitor":
+                (self.directory / "audio/far-0000.wav").write_bytes(b"fixed-evidence")
+            else:
+                audio = self.directory / "audio"
+                if mic_pcm != "output":
+                    shutil.copyfile(tmp_path / "fallback.wav", audio / "mic-0000.wav")
+                if mic_pcm != "mic":
+                    shutil.copyfile(tmp_path / "foreign.wav", audio / "mic-0001.wav")
 
         def tick(self) -> None:
-            assert players[0].live
+            assert sum(player.live for player in players) == 2
             now[0] += 0.25
 
         def stopped(self) -> None:
@@ -1090,70 +1154,68 @@ def test_exercise_complete_sequence_keeps_sentinel_and_uses_all_evidence(
             events.append("stop")
             self.stopped()
 
-        def wait(self, kind: str, **kwargs: Any) -> dict[str, str]:
-            assert players[0].live
-            events.append("target-ended")
-            return {"track": "far", "state": "ended"}
-
         def intervals(self) -> list[dict[str, int]]:
             return []
 
     def killpg(pid: int, number: int) -> None:
         assert number == signal.SIGKILL
-        assert players[0].live and sum(p.live for p in players) == 3
+        assert sum(p.live for p in players) == 2
         events.append("kill9")
         for capture in captures:
             if capture.supervisor.process.pid == pid:
                 capture.active = False
 
-    monkeypatch.setattr("tools.meeting_stand.os.killpg", killpg)
-    monkeypatch.setattr(stand, "Capture", FakeCapture)
-    monkeypatch.setattr(stand, "_has_signal", lambda directory: True)
     sampler = Mock()
     sampler.sample.side_effect = lambda roles, **kwargs: {"t_mono_s": kwargs["now_s"]}
-    monkeypatch.setattr(metrics, "ProcSampler", lambda: sampler)
 
     def analyze(path: Path, **kwargs: Any) -> dict[str, Any]:
         analyses.append("crash" if "crash_mono_ms" in kwargs else "normal")
         return {"criteria": [{"name": analyses[-1], "status": "pass"}]}
 
-    def exclusive(path: Path, **kwargs: Any) -> dict[str, Any]:
-        analyses.append("exclusive")
-        assert players[0].live and kwargs["expected_beeps_ms"]
-        return {"criteria": [{"name": "farforeign_rms_dbfs", "status": "pass"}]}
-
     def resources(samples: list[dict[str, Any]]) -> dict[str, Any]:
         assert samples[-1]["t_mono_s"] - samples[0]["t_mono_s"] >= 120
         return {"criteria": [], "full_soak": False, "projected": True}
 
-    monkeypatch.setattr(metrics, "analyze_recording", analyze)
-    monkeypatch.setattr(metrics, "analyze_exclusivity", exclusive, raising=False)
-    monkeypatch.setattr(metrics, "summarize_resources", resources)
     profile = tmp_path / "capture.pstats" if profiled else None
-    result = stand.exercise(owner, tmp_path, 2, "pipewire", profile)
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "monotonic", lambda: now[0])
+        patch.setattr(time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+        patch.setattr(os, "killpg", killpg)
+        patch.setattr(stand, "AudioServer", lambda *args: server)
+        patch.setattr(stand, "Capture", FakeCapture)
+        patch.setattr(metrics, "ProcSampler", lambda: sampler)
+        patch.setattr(metrics, "analyze_recording", analyze)
+        patch.setattr(metrics, "summarize_resources", resources)
+        result = stand.exercise(owner, tmp_path, 2, "pipewire", profile)
     assert [capture.profile for capture in captures] == (
-        list(stand.capture_profile_paths(profile).values()) if profile else [None] * 4
+        list(stand.capture_profile_paths(profile).values()) if profile else [None] * 3
     )
-    assert result["rc"] == 0
+    assert result["rc"] == (0 if mic_pcm == "mic" else 1)
     import wave
 
     with wave.open(str(tmp_path / "beeps.wav"), "rb") as wav:
         assert wav.getnframes() / wav.getframerate() >= 120 + 180
-    assert events[0] == "sentinel"
-    assert analyses == ["normal", "exclusive", "crash"]
-    assert events.count("prepare:app_stream") == 3
-    assert events.count("prepare:sink_monitor") == 1
+    assert analyses == ["normal", "crash"]
+    assert [event for event in events if event.startswith("prepare:")] == [
+        "prepare:sink_monitor",
+        "prepare:none",
+        "prepare:sink_monitor",
+    ]
+    assert events.count("sentinel") == 1
     assert events.count("kill9") == 1
-    assert all(1000 in snapshot for snapshot in snapshots)
-    assert any(len(snapshot) == 3 for snapshot in snapshots)
-    assert len(captures) == 4
+    assert snapshots[0] == snapshots[-1] == ()
+    assert any(len(snapshot) == 2 for snapshot in snapshots)
+    assert len(captures) == 3
     names = {item["name"] for item in result["criteria"]}
+    status = {item["name"]: item["status"] for item in result["criteria"]}
+    assert status["fallback_pcm_present"] == ("pass" if mic_pcm == "mic" else "fail")
+    assert status["fallback_no_far_pcm"] == "pass"
     assert {
         "prepare_zero_pcm",
         "normal_graph_unchanged",
         "crash_graph_unchanged",
-        "foreign_audio_rejected",
-        "farforeign_rms_dbfs",
+        "fallback_pcm_present",
+        "fallback_no_far_pcm",
     } <= names
     assert now[0] < 340  # --minutes 2 plus all side scenarios remains under four minutes.
 

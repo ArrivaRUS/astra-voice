@@ -20,7 +20,15 @@ from astra_voice.models.catalog import (
 )
 from astra_voice.security.verify import Verifier
 from astra_voice.ui.formatting import format_accuracy, format_rtfx
-from astra_voice.ui.model_downloads import _vendor_short, catalog_best, entry_metrics, entry_tags
+from astra_voice.ui.model_downloads import (
+    ModelDownloads,
+    _vendor_short,
+    catalog_best,
+    entry_metrics,
+    entry_tags,
+)
+from helpers.qt_app import get_qapplication
+from helpers.scripted_model_port import ScriptedModelPort
 
 pytestmark = pytest.mark.unit
 
@@ -76,6 +84,35 @@ def test_metrics_fill_and_levels(catalog: Catalog) -> None:
         "level": "good",
         "measured": False,
     }
+
+
+def test_download_rows_require_punctuation_except_for_installed_models(catalog: Catalog) -> None:
+    get_qapplication()
+    model = ScriptedModelPort(catalog.dictation_entries)
+    downloads = ModelDownloads(model)
+    try:
+        visible = {row["id"]: row for row in downloads.models}
+        assert visible.keys() == {
+            "gigaam-v3-e2e-rnnt-int8",
+            "gigaam-v3-e2e-ctc-int8",
+            "nemo-fastconformer-ru-pc-ctc-int8",
+            "whisper-large-v3-turbo-int8",
+            "whisper-small-int8",
+        }
+        speed = visible["gigaam-v3-e2e-rnnt-int8"]["metrics"][1]
+        assert speed["fill"] == pytest.approx(42.5 / 83.5)
+        assert downloads.installedSummary == "Установлено 0 из 5"
+
+        # An older installed revision must also keep its row.
+        model.records[("vosk-small-ru-int8", "older")] = "ok"
+        with_installed = {row["id"]: row for row in downloads.models}
+        assert with_installed.keys() == visible.keys() | {"vosk-small-ru-int8"}
+        assert with_installed["vosk-small-ru-int8"]["badge"] == "installed"
+        assert downloads.installedSummary.split(" · ")[0] == "Установлено 1 из 6"
+        assert with_installed["gigaam-v3-e2e-rnnt-int8"]["metrics"][1] == speed
+        assert downloads._entries == catalog.dictation_entries
+    finally:
+        downloads.shutdown()
 
 
 def test_accuracy_uses_absolute_scale_and_fastest_speed_fills_bar(catalog: Catalog) -> None:

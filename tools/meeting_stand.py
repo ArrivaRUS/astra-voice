@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from astra_voice.core.audio_env import PULSE_POOL_BYTES
 from astra_voice.meetings.model import Meeting
 from astra_voice.meetings.store import MeetingStore, new_meeting_id
 from astra_voice.worker.supervisor import WorkerSupervisor, worker_command
@@ -59,7 +60,12 @@ def private_environment(root: Path) -> dict[str, str]:
     pulse_config = root / "config/pulse"
     pulse_config.mkdir(mode=0o700, exist_ok=True)
     client = pulse_config / "client.conf"
-    client.write_text("autospawn = no\nauto-connect-localhost = no\nauto-connect-display = no\n")
+    client.write_text(
+        "enable-shm = no\n"
+        f"shm-size-bytes = {PULSE_POOL_BYTES}\n"
+        "autospawn = no\nauto-connect-localhost = no\nauto-connect-display = no\n",
+        encoding="utf-8",
+    )
     env.update(
         {
             "PATH": "/usr/bin:/bin",
@@ -83,7 +89,7 @@ def private_environment(root: Path) -> dict[str, str]:
 def capture_profile_paths(profile: Path) -> dict[str, Path]:
     return {
         name: profile if name == "normal" else Path(f"{profile}.{name}")
-        for name in ("normal", "target-gone", "fallback", "crash")
+        for name in ("normal", "fallback", "crash")
     }
 
 
@@ -522,24 +528,23 @@ class AudioServer:
                 if foreign
                 else "--property=application.id=ru.dion.desktop",
                 "--property=media.role=music" if foreign else "--property=media.role=phone",
-                "--property=object.serial=7001",
                 str(path),
             ]
         )
 
-    def target(self, process: subprocess.Popen[bytes]) -> dict[str, Any]:
+    def wait_playing(self, process: subprocess.Popen[bytes]) -> None:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             for row in self.rows("sink-inputs"):
                 props = row.get("properties", {})
                 if str(props.get("application.process.id")) == str(process.pid):
-                    return {
-                        "kind": "app_stream",
-                        "sink_input": int(row["index"]),
-                        "object_serial": int(props["object.serial"]),
-                    }
+                    return
             time.sleep(0.05)
-        raise StandUnavailable("target-unavailable")
+        raise StandUnavailable("playback-unavailable")
+
+
+MIC_MARKER_HZ = 1000
+OUTPUT_MARKER_HZ = 1700
 
 
 def write_signal(
@@ -555,8 +560,9 @@ def write_signal(
     rate = 16000
     # Bounded memory: stream one second at a time, including the 60-minute case.
     tone = bytearray(rate * 2)
+    frequency = OUTPUT_MARKER_HZ if foreign else MIC_MARKER_HZ
     for sample in range(rate if foreign else 2400):
-        value = int(16000 * math.sin(2 * math.pi * (1700 if foreign else 1000) * sample / rate))
+        value = int(16000 * math.sin(2 * math.pi * frequency * sample / rate))
         struct.pack_into("<h", tone, sample * 2, value)
     silence = bytes(rate * 2)
     with wave.open(str(path), "wb") as output:
@@ -784,10 +790,6 @@ class Capture:
         ]
 
 
-def _far_evidence(directory: Path) -> dict[str, bytes]:
-    return {path.name: path.read_bytes() for path in (directory / "audio").glob("far-*")}
-
-
 def meeting_directory(root: Path) -> Path:
     started = datetime.now(UTC)
     identity = new_meeting_id(started)
@@ -796,18 +798,60 @@ def meeting_directory(root: Path) -> Path:
     return root / "meetings" / identity
 
 
-def _has_signal(directory: Path) -> bool:
-    for track in ("mic", "far"):
-        nonzero = False
-        for path in (directory / "audio").glob(f"{track}-*.wav"):
-            with wave.open(str(path), "rb") as source:
-                while chunk := source.readframes(16000):
-                    nonzero |= any(
-                        abs(sample[0]) > 4000 for sample in struct.iter_unpack("<h", chunk)
+def _has_signal(directory: Path, track: str) -> bool:
+    for path in (directory / "audio").glob(f"{track}-*.wav"):
+        with wave.open(str(path), "rb") as source:
+            while chunk := source.readframes(16000):
+                if any(abs(sample[0]) > 4000 for sample in struct.iter_unpack("<h", chunk)):
+                    return True
+    return False
+
+
+def _has_mic_signal(directory: Path) -> bool:
+    if not _has_signal(directory, "mic"):
+        return False
+    output_threshold = 1000
+    mic_present = False
+    for path in sorted((directory / "audio").glob("mic-*.wav")):
+        with wave.open(str(path), "rb") as source:
+            if source.getnchannels() != 1 or source.getsampwidth() != 2:
+                return False
+            rate = source.getframerate()
+            frames = rate // 50  # 20 ms covers whole cycles of both markers at 16 kHz.
+            if frames < 1 or rate <= 2 * OUTPUT_MARKER_HZ:
+                return False
+            min_frames = math.ceil(rate / (OUTPUT_MARKER_HZ - MIC_MARKER_HZ))
+            angles = [
+                [2 * math.pi * frequency * sample / rate for sample in range(frames)]
+                for frequency in (MIC_MARKER_HZ, OUTPUT_MARKER_HZ)
+            ]
+            weights = [[(math.cos(angle), math.sin(angle)) for angle in tone] for tone in angles]
+            while chunk := source.readframes(frames):
+                samples = struct.unpack(f"<{len(chunk) // 2}h", chunk)
+                if len(samples) < min_frames:
+                    # Reject strong tails too short to resolve the two markers.
+                    if any(abs(sample) > output_threshold for sample in samples):
+                        return False
+                    continue
+                amplitudes = [
+                    2
+                    * math.hypot(
+                        sum(
+                            sample * cosine
+                            for sample, (cosine, _) in zip(samples, tone, strict=False)
+                        ),
+                        sum(
+                            sample * sine for sample, (_, sine) in zip(samples, tone, strict=False)
+                        ),
                     )
-        if not nonzero:
-            return False
-    return True
+                    / len(samples)
+                    for tone in weights
+                ]
+                mic, output = amplitudes
+                if output > output_threshold:
+                    return False
+                mic_present |= mic > 4000
+    return mic_present
 
 
 def exercise(
@@ -815,7 +859,6 @@ def exercise(
 ) -> dict[str, Any]:
     from tools.meeting_stand_metrics import (
         ProcSampler,
-        analyze_exclusivity,
         analyze_recording,
         summarize_resources,
         verdict,
@@ -826,10 +869,6 @@ def exercise(
     signal_path = root / "beeps.wav"
     seconds = minutes * 60
     onsets = write_signal(signal_path, seconds + 180, train_end_s=seconds - 5)
-    music = root / "foreign.wav"
-    write_signal(music, seconds + 180, foreign=True)
-    sentinel = audio.play(music, "stand_far", foreign=True)
-    audio.target(sentinel)  # Wait for the persistent competing stream to exist.
     baseline = audio.snapshot()
     sampler = ProcSampler()
     samples: list[dict[str, Any]] = []
@@ -862,8 +901,6 @@ def exercise(
         if resources:
             sample_resources(capture, started)
         while time.monotonic() < deadline:
-            if sentinel.poll() is not None:
-                raise StandUnavailable("sentinel-exited")
             capture.tick()
             now = time.monotonic()
             if resources and now >= sample_at:
@@ -872,9 +909,9 @@ def exercise(
         if resources:
             sample_resources(capture, time.monotonic())
 
-    def prepare(capture: Capture, target: dict[str, Any], prefix: str = "") -> None:
+    def prepare(capture: Capture, far: dict[str, Any], prefix: str = "") -> None:
         before = audio.snapshot()
-        capture.prepare(target)
+        capture.prepare(far)
         criteria.append(
             _criterion(prefix + "prepare_zero_streams", not audio.rows("source-outputs"))
         )
@@ -888,69 +925,50 @@ def exercise(
     started_ms = time.monotonic() * 1000
     far = audio.play(signal_path, "stand_far")
     mic = audio.play(signal_path, "stand_mic")
-    target = audio.target(far)
-    audio.target(mic)
+    audio.wait_playing(far)
+    audio.wait_playing(mic)
     normal_routes = audio.snapshot()
     capture = new_capture("normal")
-    prepare(capture, target)
+    # Per-application capture and its exclusivity checks resume with step 6a.
+    prepare(capture, {"kind": "sink_monitor"})
     capture.open()
     if time.monotonic() * 1000 >= started_ms + 9000:
         raise StandUnavailable("capture-startup-too-slow")
     observe(capture, seconds, resources=True)
     capture.stop()
-    # Both the target and competing player survive stop; route changes cannot
-    # disappear merely because the stand removed all sink-inputs first.
+    # Both players survive stop so the snapshot still detects route changes.
     criteria.append(_criterion("normal_graph_unchanged", audio.snapshot() == normal_routes))
     expected_beeps = [started_ms + onset * 1000 for onset in onsets]
     reports["normal"] = analyze_recording(
         capture.directory / "audio", expected_beeps_ms=expected_beeps, intervals=capture.intervals()
     )
-    reports["exclusivity"] = analyze_exclusivity(
-        capture.directory / "audio", expected_beeps_ms=expected_beeps
-    )
     reports["resources"] = summarize_resources(samples)
-    for section in ("normal", "exclusivity", "resources"):
+    for section in ("normal", "resources"):
         criteria.extend(reports[section]["criteria"])
-
-    # Target disappearance is separate from normal stop. The competing stream
-    # has already been playing on the same sink and remains alive for >=10s.
-    lost = new_capture("target-gone")
-    prepare(lost, target, "target_loss_")
-    lost.open()
-    observe(lost, 0.5)
     owner.terminate(far)
     owner.terminate(mic)
-    ended = lost.wait("meeting.capture.track", timeout=3)
-    criteria.append(
-        _criterion(
-            "far_target_ended", ended.get("track") == "far" and ended.get("state") == "ended"
-        )
-    )
-    observe(lost, 0.5)
-    before = _far_evidence(lost.directory)
-    observe(lost, 10)
-    criteria.append(
-        _criterion(
-            "foreign_audio_rejected", bool(before) and before == _far_evidence(lost.directory)
-        )
-    )
-    lost.stop()
-    criteria.append(_criterion("target_loss_graph_unchanged", audio.snapshot() == baseline))
 
-    # Explicit A path is a separate request; never silently downgrade B-prime.
+    # Mic-only is an explicit request while there is also audio on the output.
     a_path = root / "fallback.wav"
     write_signal(a_path, 30, lead_s=2)
-    a_far = audio.play(a_path, "stand_far")
+    music = root / "foreign.wav"
+    write_signal(music, 30, foreign=True)
+    a_far = audio.play(music, "stand_far", foreign=True)
     a_mic = audio.play(a_path, "stand_mic")
-    audio.target(a_far)
-    audio.target(a_mic)
+    audio.wait_playing(a_far)
+    audio.wait_playing(a_mic)
     fallback_routes = audio.snapshot()
     fallback = new_capture("fallback")
-    prepare(fallback, {"kind": "sink_monitor"}, "fallback_")
+    prepare(fallback, {"kind": "none"}, "fallback_")
     fallback.open()
     observe(fallback, 6)
     fallback.stop()
-    criteria.append(_criterion("fallback_pcm_present", _has_signal(fallback.directory)))
+    if a_far.poll() is not None:
+        raise StandUnavailable("sentinel-exited")
+    criteria.append(_criterion("fallback_pcm_present", _has_mic_signal(fallback.directory)))
+    criteria.append(
+        _criterion("fallback_no_far_pcm", not any((fallback.directory / "audio").glob("far-*")))
+    )
     criteria.append(_criterion("fallback_graph_unchanged", audio.snapshot() == fallback_routes))
     owner.terminate(a_far)
     owner.terminate(a_mic)
@@ -958,11 +976,11 @@ def exercise(
     # A separate bounded crash session keeps --minutes 2 below four minutes.
     crash_far = audio.play(signal_path, "stand_far")
     crash_mic = audio.play(signal_path, "stand_mic")
-    crash_target = audio.target(crash_far)
-    audio.target(crash_mic)
+    audio.wait_playing(crash_far)
+    audio.wait_playing(crash_mic)
     crash_routes = audio.snapshot()
     crash = new_capture("crash")
-    prepare(crash, crash_target, "crash_")
+    prepare(crash, {"kind": "sink_monitor"}, "crash_")
     crash.open()
     observe(crash, 35)
     assert crash.supervisor.process is not None
@@ -1007,7 +1025,6 @@ def _unavailable_criteria() -> list[dict[str, Any]]:
         "beep_drift": (50.0, "ms"),
         "timecodes": (1000.0, "ms"),
         "crash_loss": (10000.0, "ms"),
-        "farforeign_rms_dbfs": (-60.0, "dBFS"),
         "segments": (0.0, "invalid"),
     }
     return [
@@ -1034,9 +1051,8 @@ def _unavailable_criteria() -> list[dict[str, Any]]:
             "prepare_zero_pcm",
             "normal_graph_unchanged",
             "crash_graph_unchanged",
-            "far_target_ended",
-            "foreign_audio_rejected",
             "fallback_pcm_present",
+            "fallback_no_far_pcm",
         )
     ]
 

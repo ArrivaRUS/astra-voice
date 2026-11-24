@@ -399,6 +399,9 @@ class MeetingBridge(QObject):
     def _effective(self) -> EffectiveMeetingSettings:
         return effective_settings(self._stored, self._parsed)
 
+    def detector_allowed(self) -> bool:
+        return self._effective().detector_allowed
+
     @pyqtProperty(str, notify=changed)
     def sectionState(self) -> str:
         if not self._parsed.recording_allowed:
@@ -778,9 +781,9 @@ class MeetingBridge(QObject):
             raise RuntimeError("meeting-speaker-save-timeout")
         self._speaker_writer.close(timeout=0.0)
         self._speaker_timer.stop()
-        # No notices about our own exit; W3 first, then the ordinary stop with
+        # Close W3 and W1 before our own exit, then the ordinary stop with
         # finalization (W2 still shows «Сохраняю запись…»), then W2.
-        for name in ("_meeting_notifications", "_meeting_notice"):
+        for name in ("_meeting_notifications", "_meeting_notice", "_meeting_offer"):
             owner = getattr(self, name, None)
             if owner is not None:
                 owner.shutdown()
@@ -880,7 +883,7 @@ class MeetingBridge(QObject):
 
     @pyqtSlot()
     def requestRecording(self) -> None:
-        if self.enabled and not self._recording and not self._closed:
+        if self.enabled and not self._closed and (not self._recording or self.startDialogOpen):
             if self._capture is not None:
                 self._capture.open_dialog()
             self.recordingRequested.emit()
@@ -926,6 +929,7 @@ class MeetingBridge(QObject):
         if capture.jobs is not None:
             capture.jobs.release_files = self._release_files
         capture.changed.connect(self._capture_changed)
+        self.changed.connect(capture.sync_detector)
         capture.openMeetingsRequested.connect(self.openMeetingsRequested)
         capture.participantsRequested.connect(self.participantsRequested)
         self._capture_changed()
@@ -1144,14 +1148,16 @@ class MeetingBridge(QObject):
             self._capture.close_interrupted(open_meetings=True)
 
     @pyqtSlot(result=bool)
-    def copyInviteText(self) -> bool:
-        from PyQt5.QtWidgets import QApplication
+    def copyNoticeText(self) -> bool:
+        from astra_voice.ui.meeting_notice import copy_plain_text
 
-        clipboard = QApplication.clipboard()
-        if clipboard is None:
-            return False
-        clipboard.setText(self.settings["meeting_invite_text"])
-        return True
+        return copy_plain_text(self.notice()[0])
+
+    @pyqtSlot(result=bool)
+    def copyInviteText(self) -> bool:
+        from astra_voice.ui.meeting_notice import copy_plain_text
+
+        return copy_plain_text(self.settings["meeting_invite_text"])
 
     # ---- card A «Документ» (E13.M4, spec §3.7/§4.7) -----------------------
 

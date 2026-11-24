@@ -283,7 +283,7 @@ def test_each_active_track_keeps_two_second_queue_credit_during_fsync(
 
     rig = Rig(tmp_path, fsync=fsync)
     try:
-        rig.prepare("app_stream" if far_ended else "none")
+        rig.prepare("sink_monitor" if far_ended else "none")
         rig.open()
         archive = rig.state.archive
         assert archive is not None

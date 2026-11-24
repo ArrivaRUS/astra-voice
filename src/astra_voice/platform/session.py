@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
 log = logging.getLogger(__name__)
+_LOCAL_DISPLAY = re.compile(r"(?:unix)?(:[0-9]+(?:\.[0-9]+)?)")
+_SSH_VARIABLES = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 
 
 class SessionKind(StrEnum):
@@ -160,3 +163,16 @@ def detect(env: Mapping[str, str] | None = None) -> SessionKind:
         if kind is not None:
             return kind
     return SessionKind.OTHER
+
+
+def detect_for_capture(env: Mapping[str, str] | None = None) -> SessionKind:
+    """Use the environment first, then an explicitly Unix-only Xlib display."""
+    environ = os.environ if env is None else env
+    kind = _from_env(environ)
+    if kind is not None:
+        return kind
+    display = _LOCAL_DISPLAY.fullmatch(environ.get("DISPLAY", ""))
+    if display is None or any(name in environ for name in _SSH_VARIABLES):
+        return SessionKind.OTHER
+    # Xlib's explicit protocol disables TCP fallback even if the Unix socket fails.
+    return _from_x11(f"unix/{display[1]}") or SessionKind.OTHER

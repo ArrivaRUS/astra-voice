@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from astra_voice.platform.session import SessionKind, detect
+from astra_voice.platform.session import SessionKind, detect_for_capture
 
 POLL_SECONDS = 0.5
 READ_TIMEOUT = 0.075  # Three calls, <=225ms; never wait for DBus in capture control.
@@ -271,7 +271,7 @@ class MeetingSession:
 
     @classmethod
     def production(cls) -> MeetingSession:
-        return cls(SessionAdmission(kind=detect().value))
+        return cls(SessionAdmission(kind=detect_for_capture().value))
 
     def tick(self) -> None:
         generation = self.state.generation

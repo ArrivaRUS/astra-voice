@@ -16,6 +16,13 @@ MID = "2026-10-29_120000-ab12"
 IDENTITY: dict[str, Any] = {"meeting_id": MID, "meeting_generation": 7}
 CAPTURE: dict[str, Any] = {**IDENTITY, "capture_id": "capture1", "state_rev": 2}
 PAUSE = {"pause_reasons": ["lock"], "manual_resume_required": True, "blocked_epoch": 3}
+CALL = {"call_id": "call1", "app_class": "dion", "variant1": True, "measured_mono_ms": 1010}
+DETECTOR_EVENT = {
+    "type": "meeting.detector.code",
+    "purpose": "offer",
+    "code": "budget",
+    "duration_ms": 0,
+}
 MODEL = {
     "id": "gigaam",
     "revision": "r1",
@@ -42,7 +49,7 @@ COMMANDS: dict[str, dict[str, dict[str, Any]]] = {
         "meeting.capture.prepare": {
             **IDENTITY,
             "dir": "/not-opened",
-            "far": {"kind": "app_stream", "sink_input": 1, "object_serial": 2, "call_id": "call1"},
+            "far": {"kind": "app_stream", "call_id": "call1"},
             "segment_s": 300,
             "fsync_s": 10,
             "segment_index_from": 0,
@@ -128,16 +135,9 @@ def ack(reply_type: str, request: str, **fields: Any) -> dict[str, Any]:
 
 REPLIES: dict[str, list[dict[str, Any]]] = {
     "meeting-capture": [
-        ack("meeting.detector.started", "meeting.detector.start", own_client_index=1),
+        ack("meeting.detector.started", "meeting.detector.start", apps_version=1),
         ack("meeting.detector.stopped", "meeting.detector.stop"),
-        ack(
-            "meeting.call.state",
-            "meeting.call.query",
-            active=True,
-            call_id="call1",
-            app_class="dion",
-            target={"sink_input": 1, "object_serial": 2, "verified": "declared-verified"},
-        ),
+        ack("meeting.call.state", "meeting.call.query", active=True, **CALL),
         ack(
             "meeting.capture.prepared",
             "meeting.capture.prepare",
@@ -191,6 +191,7 @@ REPLIES: dict[str, list[dict[str, Any]]] = {
             kind="reopened",
             at_recorded_ms=10,
         ),
+        ack("meeting.call.state", "meeting.call.query", active=False),
     ],
     "meeting-transcribe": [
         ack(
@@ -221,15 +222,8 @@ REPLIES: dict[str, list[dict[str, Any]]] = {
 }
 EVENTS: dict[str, list[dict[str, Any]]] = {
     "meeting-capture": [
-        {
-            "type": "meeting.call.started",
-            **IDENTITY,
-            "call_id": "call1",
-            "app_class": "browser",
-            "verified": "declared",
-            "has_target": True,
-        },
-        {"type": "meeting.call.ended", **IDENTITY, "call_id": "call1", "reason": "mic_released"},
+        {"type": "meeting.call.started", **CALL, "app_class": "browser"},
+        {"type": "meeting.call.ended", "call_id": "call1", "reason": "mic_released"},
         {
             "type": "meeting.capture.alive",
             **CAPTURE,
@@ -274,6 +268,7 @@ EVENTS: dict[str, list[dict[str, Any]]] = {
             "pause_reasons": ["user"],
         },
         {"type": "meeting.capture.warning", **CAPTURE, "code": "gaps", "value": 1},
+        DETECTOR_EVENT,
     ],
     "meeting-transcribe": [
         {
@@ -418,11 +413,110 @@ def test_invalid_meeting_fields(field: str, value: object) -> None:
 @pytest.mark.parametrize("role,message", CASES)
 def test_commands_and_acks_need_both_correlation_fields(role: str, message: dict[str, Any]) -> None:
     if "req" not in message:
-        assert "meeting_id" in message and "meeting_generation" in message
+        if message["type"] in {
+            "meeting.call.started",
+            "meeting.call.ended",
+            "meeting.detector.code",
+        }:
+            assert not ({"meeting_id", "meeting_generation", "request_type"} & message.keys())
+        else:
+            assert "meeting_id" in message and "meeting_generation" in message
         return
     for field in ("req", "request_type"):
         with pytest.raises(ipc.FrameError):
             ipc.encode({k: v for k, v in message.items() if k != field}, role=role)
+
+
+@pytest.mark.parametrize(
+    "far",
+    [
+        pytest.param({"kind": "app_stream"}, id="app-stream-missing-call"),
+        pytest.param({"kind": "app_stream", "call_id": "c1", "sink_input": 1}, id="sink-input"),
+        pytest.param(
+            {"kind": "app_stream", "call_id": "c1", "object_serial": 2}, id="object-serial"
+        ),
+        pytest.param({"kind": "sink_monitor", "call_id": "c1"}, id="monitor-with-call"),
+        pytest.param({"kind": "none", "call_id": "c1"}, id="none-with-call"),
+    ],
+)
+def test_prepare_rejects_fields_outside_far_contract(far: dict[str, Any]) -> None:
+    message = command("meeting-capture", "meeting.capture.prepare")
+    _assert_bad_capture_field({**message, "far": far})
+
+
+def _assert_bad_capture_field(message: dict[str, Any]) -> None:
+    with pytest.raises(ipc.FrameError) as encoded:
+        ipc.encode(message, role="meeting-capture")
+    assert encoded.value.code == ipc.BAD_FIELD
+    with pytest.raises(ipc.FrameError) as decoded:
+        ipc.decode(json.dumps(message).encode(), role="meeting-capture")
+    assert decoded.value.code == ipc.BAD_FIELD
+
+
+@pytest.mark.parametrize("field", CALL)
+def test_active_call_state_requires_all_call_fields(field: str) -> None:
+    message = ack("meeting.call.state", "meeting.call.query", active=True, **CALL)
+    del message[field]
+    _assert_bad_capture_field(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            ack("meeting.call.state", "meeting.call.query", active=False, call_id="c1"),
+            id="inactive-with-call",
+        ),
+        pytest.param(
+            ack("meeting.call.state", "meeting.call.query", active=0), id="active-integer"
+        ),
+        pytest.param({**EVENTS["meeting-capture"][0], "meeting_id": MID}, id="started-meeting-id"),
+        pytest.param({**EVENTS["meeting-capture"][1], "meeting_id": MID}, id="ended-meeting-id"),
+        pytest.param(
+            {**REPLIES["meeting-capture"][0], "own_client_index": 1}, id="own-client-index"
+        ),
+        pytest.param({**DETECTOR_EVENT, "code": "automation_off"}, id="unknown-code"),
+        pytest.param({**DETECTOR_EVENT, "req": "req1"}, id="code-extra-field"),
+        pytest.param({**DETECTOR_EVENT, "purpose": "query"}, id="unknown-purpose"),
+        pytest.param({**DETECTOR_EVENT, "duration_ms": -1}, id="negative-duration"),
+    ],
+)
+def test_call_and_detector_reject_fields_outside_contract(message: dict[str, Any]) -> None:
+    _assert_bad_capture_field(message)
+
+
+def test_detector_code_and_call_end_wire_vocabularies() -> None:
+    from astra_voice.worker.meeting_contract import EVENT_FIELDS
+
+    fields = EVENT_FIELDS["meeting-capture"]
+    assert set(fields["meeting.detector.code"]["code"]["enum"]) == {
+        "identity_mismatch",
+        "identity_mismatch_counter",
+        "verification=unavailable",
+        "verification=failed",
+        "pulse_failed",
+        "picture_changed",
+        "budget",
+        "busy",
+        "rate",
+        "remote",
+        "target-gone",
+        "target-mismatch",
+        "no_call",
+    }
+    assert set(fields["meeting.detector.code"]["purpose"]["enum"]) == {
+        "observe",
+        "offer",
+        "card",
+        "start",
+    }
+    assert set(fields["meeting.call.ended"]["reason"]["enum"]) == {
+        "mic_released",
+        "app_gone",
+        "server_changed",
+        "evicted",
+        "detector_off",
+    }
 
 
 def test_nested_bad_data_and_existing_frame_limits() -> None:
@@ -471,7 +565,10 @@ def test_m1_capture_boundaries_use_disk_units_and_intervals() -> None:
         close_reason="user",
     )
     raw = sidecar.to_dict()
-    message = {key: raw[key] for key in EVENTS["meeting-capture"][5] if key != "type"}
+    segment = next(
+        event for event in EVENTS["meeting-capture"] if event["type"] == "meeting.capture.segment"
+    )
+    message = {key: raw[key] for key in segment if key != "type"}
     message["type"] = "meeting.capture.segment"
     assert (
         ipc.decode(ipc.encode(message, role="meeting-capture")[4:], role="meeting-capture")

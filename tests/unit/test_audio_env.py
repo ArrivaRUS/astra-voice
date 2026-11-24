@@ -17,6 +17,10 @@ import pytest
 from astra_voice.core import audio_env, paths
 
 pytestmark = pytest.mark.unit
+POOL_LINES = ("enable-shm = no", "shm-size-bytes = 2097152")
+CONFIG_WITHOUT_INCLUDE = (
+    "\n".join(("autospawn = no", *POOL_LINES, "autospawn = no")) + "\n"
+).encode()
 
 
 @pytest.fixture(autouse=True, params=[None, "unix:/nonexistent"])
@@ -45,7 +49,7 @@ def test_creates_private_config_without_include(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     lines = path.read_text(encoding="utf-8").splitlines()
-    assert lines == ["autospawn = no", "autospawn = no"]
+    assert lines == ["autospawn = no", *POOL_LINES, "autospawn = no"]
 
 
 @pytest.mark.parametrize("config_home", ["xdg", "empty", "unset"])
@@ -62,7 +66,7 @@ def test_includes_existing_user_config_between_denials(
             monkeypatch.delenv("XDG_CONFIG_HOME")
     user_config = directory / "pulse" / "client.conf"
     user_config.parent.mkdir(parents=True)
-    original = "autospawn = yes\ndefault-sink = custom\n"
+    original = "autospawn = yes\ndefault-sink = custom\nenable-shm = yes\nshm-size-bytes = 0\n"
     user_config.write_text(original, encoding="utf-8")
 
     audio_env.deny_pulse_autospawn()
@@ -71,9 +75,30 @@ def test_includes_existing_user_config_between_denials(
     assert path.read_text(encoding="utf-8").splitlines() == [
         "autospawn = no",
         f".include {user_config}",
+        *POOL_LINES,
         "autospawn = no",
     ]
     assert user_config.read_text(encoding="utf-8") == original
+
+
+def test_cached_config_without_pool_settings_is_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    include = audio_env.SYSTEM_CLIENT_CONFIG
+    include.parent.mkdir()
+    include.write_text("enable-shm = yes\nshm-size-bytes = 0\n")
+    path = paths.cache_dir() / "pulse-client.conf"
+    old_lines = ["autospawn = no", f".include {include}", "autospawn = no"]
+    path.write_text("\n".join(old_lines) + "\n")
+    path.chmod(0o600)
+
+    with monkeypatch.context() as patch:
+        patch.setenv("PULSE_CLIENTCONFIG", str(path))
+        audio_env.deny_pulse_autospawn()
+        assert os.environ["PULSE_CLIENTCONFIG"] == str(path)
+
+    assert path.read_text().splitlines() == [*old_lines[:2], *POOL_LINES, old_lines[-1]]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("character", ["#", ";", "\n", "\r"])
@@ -95,6 +120,7 @@ def test_unsafe_include_path_is_skipped(
     path = Path(os.environ["PULSE_CLIENTCONFIG"])
     assert path.read_text(encoding="utf-8").splitlines() == [
         "autospawn = no",
+        *POOL_LINES,
         "autospawn = no",
     ]
     assert len(caplog.records) == 1
@@ -121,6 +147,7 @@ def test_system_config_is_only_fallback(tmp_path: Path, user_exists: bool) -> No
     assert path.read_text().splitlines() == [
         "autospawn = no",
         f".include {user_config if user_exists else system_config}",
+        *POOL_LINES,
         "autospawn = no",
     ]
     assert system_config.read_text() == "default-server = unix:/admin/pulse\nautospawn = yes\n"
@@ -142,7 +169,7 @@ def test_own_environment_rechecks_config(damage: str) -> None:
     audio_env.deny_pulse_autospawn()
 
     assert os.environ["PULSE_CLIENTCONFIG"] == value
-    assert path.read_bytes() == expected == b"autospawn = no\nautospawn = no\n"
+    assert path.read_bytes() == expected == CONFIG_WITHOUT_INCLUDE
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
@@ -191,7 +218,7 @@ def test_unsafe_config_is_replaced_without_blocking(
     assert result.returncode == 0, result.stdout + result.stderr
     assert stat.S_ISREG(path.lstat().st_mode)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert path.read_bytes() == b"autospawn = no\nautospawn = no\n"
+    assert path.read_bytes() == CONFIG_WITHOUT_INCLUDE
     assert target.read_bytes() == original
     if kind in {"directory", "nonempty-directory"}:
         displaced = list(path.parent.glob(".pulse-client.conf.replaced-*"))

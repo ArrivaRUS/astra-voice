@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
+from astra_voice.core.command_mode import SessionSnapshot
+from astra_voice.core.meeting_session import MeetingController, StorageStatus
+from astra_voice.meetings.store import MeetingStore
+from astra_voice.platform import session_state
+from astra_voice.platform.session import SessionKind
 from astra_voice.platform.session_state import (
     LOGIN,
     MANAGER_PATH,
@@ -14,6 +22,7 @@ from astra_voice.platform.session_state import (
     ReadCallback,
     SessionState,
 )
+from astra_voice.worker import ipc
 from helpers.qt_app import get_qapplication
 
 pytestmark = pytest.mark.unit
@@ -39,6 +48,7 @@ class FakeLogin:
                 "Active": True,
             }
         }
+        self.selected_path = SESSION_PATH
         self.sleeping = False
         self.closed = 0
 
@@ -67,7 +77,7 @@ class FakeLogin:
         path, _, method, _, callback = self.pending.pop(0)
         payload: Any = {
             "Get": self.sleeping,
-            "GetSession": SESSION_PATH,
+            "GetSession": self.selected_path,
             "ListSessions": self.rows,
             "GetAll": self.props.get(path),
         }[method]
@@ -99,6 +109,586 @@ def ready(session: tuple[SessionState, FakeLogin]) -> tuple[SessionState, FakeLo
     fake.complete()
     assert cache.is_admissible()
     return cache, fake
+
+
+def add_remote_session(
+    fake: FakeLogin,
+    session_id: str = "two",
+    *,
+    session_type: str = "tty",
+    uid: int = 1000,
+    announce: bool = True,
+) -> str:
+    path = f"/org/freedesktop/login1/session/{session_id}"
+    fake.rows.append([session_id, uid, "user", "", path])
+    fake.props[path] = {
+        "User": [uid, f"/org/freedesktop/login1/user/_{uid}"],
+        "Class": "user",
+        "Type": session_type,
+        "Remote": True,
+        "Seat": ["", "/"],
+    }
+    if announce:
+        fake.signal(MANAGER_PATH, "SessionNew", session_id, path)
+    return path
+
+
+def remove_session(fake: FakeLogin, path: str) -> None:
+    fake.rows = [row for row in fake.rows if row[4] != path]
+    del fake.props[path]
+    fake.signal(MANAGER_PATH, "SessionRemoved", path.rsplit("/", 1)[-1], path)
+
+
+@pytest.fixture
+def recording(
+    session: tuple[SessionState, FakeLogin],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filesystem_euid: None,
+) -> Iterator[tuple[MeetingController, list[dict[str, Any]], list[SessionSnapshot]]]:
+    cache, _ = session
+    worker = session_state._SessionWorker()
+    worker._fly_environment = False
+    worker.state = cache
+    cache.changed.connect(worker._changed)
+    with monkeypatch.context() as patch:
+        patch.setattr(session_state, "_fly_process_present", lambda: False)
+        ready(session)
+
+    sent: list[dict[str, Any]] = []
+    published: list[SessionSnapshot] = []
+    supervisor = Mock(ready=True, generation=1)
+    supervisor.send.side_effect = sent.append
+    controller = MeetingController(
+        MeetingStore(tmp_path / "meetings"),
+        supervisor,
+        session=lambda: worker.snapshot,
+        session_kind=SessionKind.KDE,
+        enabled=lambda: True,
+        policy_allowed=lambda: True,
+        storage_probe=lambda _: StorageStatus(1000, True, False),
+        metadata_submit=lambda job: job(),
+        filesystem_submit=lambda job: job(),
+        clock=lambda: 100.0,
+    )
+
+    def notify(snapshot: SessionSnapshot) -> None:
+        published.append(snapshot)
+        controller.on_session_changed()
+
+    worker.updated.connect(notify)
+    try:
+        assert controller.start()
+        assert controller.meeting is not None
+        for state, fields in (
+            (
+                "prepared",
+                {
+                    "mic_label": "",
+                    "far_available": False,
+                    "server_local": True,
+                    "server_kind": "pipewire",
+                },
+            ),
+            ("started", {"t0_mono_ms": 100_000, "tracks": ["mic"]}),
+        ):
+            request = sent[-1]
+            event = {
+                "type": f"meeting.capture.{state}",
+                "req": request["req"],
+                "request_type": request["type"],
+                "meeting_id": controller.meeting.id,
+                "meeting_generation": 0,
+                "capture_id": "capture1",
+                "state_rev": int(state == "started"),
+                "blocked_epoch": 1,
+                "pause_reasons": [],
+                "manual_resume_required": False,
+                **fields,
+            }
+            ipc.encode(event, role="meeting-capture")
+            controller.handle_event({**event, "generation": 1})
+        assert controller.state == "recording"
+        yield controller, sent, published
+    finally:
+        cache.changed.disconnect(worker._changed)
+        controller.close()
+
+
+@pytest.mark.parametrize(
+    ("uid", "session_type"),
+    [(1000, "tty"), (1000, "unspecified"), (1001, "x11")],
+    ids=["ssh", "ssh-without-tty", "other-user"],
+)
+def test_unrelated_login_and_logout_leave_recording_running(
+    session: tuple[SessionState, FakeLogin],
+    recording: tuple[MeetingController, list[dict[str, Any]], list[SessionSnapshot]],
+    uid: int,
+    session_type: str,
+) -> None:
+    cache, fake = session
+    controller, sent, published = recording
+    path = add_remote_session(fake, uid=uid, session_type=session_type)
+    if session_type == "unspecified":
+        fake.props[path]["Seat"] = ("", "/")
+    if uid != cache.uid:
+        # An exact foreign UID is enough even for a local graphical session.
+        fake.props[path].update(Type="x11", Remote=False, Seat=fake.props[SESSION_PATH]["Seat"])
+        fake.rows[-1][3] = "seat0"
+    fake.complete()
+    reads = len(fake.trace)
+    remove_session(fake, path)
+    fake.complete()
+    unknown = [snapshot.known for snapshot in published if not snapshot.known]
+    pauses = [message["reason"] for message in sent if message["type"] == "meeting.capture.pause"]
+    assert (unknown, pauses) == ([], [])
+    assert controller.state == "recording"
+    assert len(fake.trace) == reads
+
+
+@pytest.mark.parametrize("session_type", ["x11", "wayland"])
+def test_remote_graphical_session_closes_admission(
+    session: tuple[SessionState, FakeLogin], session_type: str
+) -> None:
+    cache, fake = ready(session)
+    add_remote_session(fake, session_type=session_type)
+    assert cache.known
+    fake.complete()
+    assert not cache.known and not cache.is_admissible()
+    fake.signal(SESSION_PATH, "PropertiesChanged", SESSION, {}, ["LockedHint"])
+    assert not cache.known
+    fake.complete()
+    assert not cache.known and not cache.is_admissible()
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"Remote": False, "Seat": ["seat1", "/org/freedesktop/login1/seat/seat1"]},
+        {"Remote": 1},
+        {"Remote": "true"},
+        {"Seat": ["seat1", "/org/freedesktop/login1/seat/seat1"]},
+        {"Seat": [None, "/"]},
+        {"Seat": ["", 0]},
+        {"Seat": ["", "/org/freedesktop/login1/seat/seat0"]},
+        {"Class": "greeter"},
+        {"User": [True, "/org/freedesktop/login1/user/_1000"]},
+        {"Type": "web"},
+        {"Type": None},
+    ],
+    ids=[
+        "local",
+        "integer",
+        "string",
+        "seat",
+        "seat-id-type",
+        "seat-path-type",
+        "seat-path-present",
+        "class",
+        "uid",
+        "type-web",
+        "type-invalid",
+    ],
+)
+def test_unconfirmed_session_triggers_full_refresh(
+    session: tuple[SessionState, FakeLogin], properties: dict[str, Any]
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    fake.props[path].update(properties)
+    assert cache.known  # Wait for evidence before deciding whether to invalidate.
+    fake.complete_one()
+    assert not cache.known and not cache.is_admissible()
+    assert fake.trace[-1] == ("read", MANAGER_PATH, "Get")
+
+
+def test_second_local_graphical_session_closes_admission(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake, session_type="x11")
+    fake.props[path].update(Remote=False, Seat=["seat1", "/org/freedesktop/login1/seat/seat1"])
+    fake.complete()
+    assert not cache.known and not cache.is_admissible()
+
+
+def test_classification_read_error_invalidates_and_refreshes(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    assert cache.known
+    request_path, _, method, _, reply = fake.pending.pop(0)
+    assert (request_path, method) == (path, "GetAll")
+    reply(None, True)
+    assert not cache.known and not cache.is_admissible()
+    fake.complete()
+    assert cache.is_admissible()
+
+
+def complete_retry(cache: SessionState, fake: FakeLogin) -> None:
+    # Deliver the scheduled single-shot timeout without a wall-clock delay.
+    assert cache._retry_timer.isActive()
+    cache._retry_timer.stop()
+    cache._retry_timer.timeout.emit()
+    fake.complete()
+    assert cache.is_admissible()
+
+
+@pytest.mark.parametrize("error", [True, False], ids=["read-error", "unconfirmed"])
+def test_classification_refresh_exception_recovers_via_retry(
+    session: tuple[SessionState, FakeLogin], monkeypatch: pytest.MonkeyPatch, error: bool
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    request_path, _, method, _, reply = fake.pending.pop(0)
+    assert (request_path, method) == (path, "GetAll")
+    with monkeypatch.context() as patch:
+        patch.setattr(fake, "read", Mock(side_effect=RuntimeError("transport failed")))
+        reply(None, error)
+    assert not cache.known and not cache.is_admissible()
+    complete_retry(cache, fake)
+
+
+def test_lock_during_classification_keeps_locked_verdict(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    fake.signal(SESSION_PATH, "Lock")
+    assert cache.known and cache.locked and not cache.is_admissible()
+    fake.complete()
+    assert cache.known and cache.locked and not cache.is_admissible()
+    remove_session(fake, path)
+    assert not cache.known  # The pre-Lock reply must not cache the path either.
+
+
+def test_selected_session_events_invalidate_without_classification(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    fake.signal(MANAGER_PATH, "SessionNew", "one", SESSION_PATH)
+    assert not cache.known
+    assert fake.trace[-1] == ("read", MANAGER_PATH, "Get")
+    fake.complete()
+    assert cache.is_admissible()
+    remove_session(fake, SESSION_PATH)
+    assert not cache.known and not cache.is_admissible()
+    assert not fake.pending
+
+
+@pytest.mark.parametrize("marked", [False, True], ids=["ordinary", "marked"])
+def test_selected_session_removal_recovers_via_retry(
+    session: tuple[SessionState, FakeLogin], marked: bool
+) -> None:
+    cache, fake = ready(session)
+    replacement = add_remote_session(fake, session_type="x11")
+    fake.selected_path = replacement
+    fake.props[replacement] = fake.props[SESSION_PATH].copy()
+    fake.rows[-1][3] = "seat0"
+    if marked:
+        cache._irrelevant_sessions.add(SESSION_PATH)
+    remove_session(fake, SESSION_PATH)
+    assert not cache.known and not cache.is_admissible()
+    assert cache._retry_timer.isActive()  # Removal itself must schedule the search.
+    assert [(request[0], request[2]) for request in fake.pending] == [(replacement, "GetAll")]
+    fake.complete_one()  # Classification of B was sent before A was removed.
+    assert not cache.known
+    assert not fake.pending
+    before_retry = len(fake.trace)
+    complete_retry(cache, fake)
+    assert cache.session_path == replacement
+    assert [(path, method) for op, path, method in fake.trace[before_retry:] if op == "read"] == [
+        (MANAGER_PATH, "Get"),
+        (MANAGER_PATH, "GetSession"),
+        (MANAGER_PATH, "ListSessions"),
+        (replacement, "GetAll"),
+    ]
+    assert not cache._retry_timer.isActive()
+
+
+def test_stale_classification_does_not_schedule_retry_before_owner_returns(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    add_remote_session(fake)
+    fake.signal("/org/freedesktop/DBus", "NameOwnerChanged", LOGIN, ":1.1", "")
+    assert not cache.known and not cache._retry_timer.isActive()
+    fake.complete_one()
+    assert not cache.known and not fake.pending and not cache._retry_timer.isActive()
+    fake.signal("/org/freedesktop/DBus", "NameOwnerChanged", LOGIN, "", ":1.2")
+    fake.complete()
+    assert cache.is_admissible()
+
+
+@pytest.mark.parametrize(("ssh_count", "reply_ms"), [(1, 400), (37, 800)])
+def test_slow_refresh_finishes_without_retry_from_stale_classification(
+    session: tuple[SessionState, FakeLogin],
+    monkeypatch: pytest.MonkeyPatch,
+    ssh_count: int,
+    reply_ms: int,
+) -> None:
+    cache, fake = session
+    for index in range(ssh_count - 1):
+        add_remote_session(fake, f"ssh{index}", announce=False)
+    cache.start()
+    for _ in range(ssh_count + 3):
+        fake.complete_one()
+    assert cache.is_admissible() and not fake.pending
+    before = len(fake.trace)
+    now_ms = 0
+    replies: deque[int] = deque()
+    read = fake.read
+
+    class VirtualRetryTimer:
+        deadline: int | None = None
+
+        def isActive(self) -> bool:
+            return self.deadline is not None
+
+        def start(self, delay_ms: int) -> None:
+            self.deadline = now_ms + delay_ms
+
+        def stop(self) -> None:
+            self.deadline = None
+
+    def delayed_read(
+        path: str, interface: str, method: str, arguments: list[Any], callback: ReadCallback
+    ) -> None:
+        read(path, interface, method, arguments, callback)
+        replies.append(now_ms + reply_ms)
+
+    timer = VirtualRetryTimer()
+    with monkeypatch.context() as patch:
+        patch.setattr(cache, "_retry_timer", timer)
+        patch.setattr(fake, "read", delayed_read)
+        add_remote_session(fake)
+        fake.signal(SESSION_PATH, "PropertiesChanged", SESSION, {}, ["LockedHint"])
+        assert not cache.known
+        while not cache.is_admissible():
+            response_at = replies[0] if replies else None
+            retry_at = timer.deadline
+            if retry_at is not None and (response_at is None or retry_at < response_at):
+                now_ms = retry_at
+                timer.stop()
+                cache._retry()
+            elif response_at is not None:
+                now_ms = replies.popleft()
+                fake.complete_one()
+            else:
+                break
+            if now_ms >= 155_000:
+                break
+
+        reads = fake.trace[before:].count(("read", MANAGER_PATH, "Get"))
+        # A full cycle has 3 manager replies and 1 GetAll per own-UID session.
+        assert (cache.is_admissible(), reads, now_ms) == (True, 1, (ssh_count + 4) * reply_ms)
+        assert not fake.pending and not timer.isActive()
+
+
+def test_unknown_cache_refreshes_on_session_new_without_classification(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    cache.refresh()
+    assert not cache.known
+    add_remote_session(fake)
+    assert fake.trace[-1] == ("read", MANAGER_PATH, "Get")
+    fake.complete()
+    assert cache.is_admissible()
+
+
+@pytest.mark.parametrize("remembered", [False, True], ids=["first-reply", "second-reply"])
+def test_removal_before_classification_reply_takes_fail_closed_path(
+    session: tuple[SessionState, FakeLogin], remembered: bool
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    if remembered:
+        fake.complete()
+        fake.signal(MANAGER_PATH, "SessionNew", "two", path)
+    properties = fake.props[path]
+    request_path, _, method, _, reply = fake.pending.pop(0)
+    assert (request_path, method) == (path, "GetAll")
+    remove_session(fake, path)
+    assert not cache.known
+    fake.complete()
+    assert cache.is_admissible()
+    reply(properties, False)
+    assert cache.is_admissible()
+    assert not fake.pending and not cache._retry_timer.isActive()
+
+
+@pytest.mark.parametrize("event", ["disconnected", "owner-changed", "stop"])
+def test_classification_reset_restores_removal_invalidation(
+    session: tuple[SessionState, FakeLogin], event: str
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    fake.complete()
+    assert cache.is_admissible()
+    if event == "disconnected":
+        fake.signal("/org/freedesktop/DBus/Local", "Disconnected")
+        assert not cache.known
+    elif event == "owner-changed":
+        fake.signal("/org/freedesktop/DBus", "NameOwnerChanged", LOGIN, ":1.1", ":1.2")
+        assert not cache.known
+    else:
+        cache.stop()
+        cache.start()
+    seen: list[bool] = []
+    cache.changed.connect(lambda: seen.append(cache.known))
+    remove_session(fake, path)
+    assert seen and not any(seen)
+    fake.complete()
+    assert cache.is_admissible()
+
+
+@pytest.fixture
+def existing_login(request: pytest.FixtureRequest, session: tuple[SessionState, FakeLogin]) -> str:
+    _, fake = session
+    return add_remote_session(fake, uid=request.param, announce=False)
+
+
+@pytest.mark.parametrize("existing_login", [1000, 1001], ids=["ssh", "other-user"], indirect=True)
+def test_logout_of_session_present_before_monitor_keeps_recording(
+    session: tuple[SessionState, FakeLogin],
+    existing_login: str,
+    recording: tuple[MeetingController, list[dict[str, Any]], list[SessionSnapshot]],
+) -> None:
+    cache, fake = session
+    controller, sent, published = recording
+    gets = [path for op, path, method in fake.trace if op == "read" and method == "GetAll"]
+    if fake.props[existing_login]["User"][0] == cache.uid:
+        assert sorted(gets) == sorted([SESSION_PATH, existing_login])
+    else:
+        assert gets == [SESSION_PATH]
+    reads = len(fake.trace)
+    remove_session(fake, existing_login)
+    assert cache.is_admissible() and not published
+    assert controller.state == "recording"
+    assert not any(message["type"] == "meeting.capture.pause" for message in sent)
+    assert len(fake.trace) == reads
+
+
+def test_classification_overflow_restores_removal_pause(
+    session: tuple[SessionState, FakeLogin],
+    recording: tuple[MeetingController, list[dict[str, Any]], list[SessionSnapshot]],
+) -> None:
+    cache, fake = session
+    controller, sent, published = recording
+    for index in range(session_state._MAX_IRRELEVANT_SESSIONS):
+        add_remote_session(fake, f"ssh{index}", uid=1001)
+        fake.complete()
+    path = add_remote_session(fake, "overflow", uid=1001)
+    fake.complete()
+    assert cache.is_admissible()
+    assert all(snapshot.known for snapshot in published)
+
+    remove_session(fake, "/org/freedesktop/login1/session/ssh0")
+    assert not cache.known
+    fake.complete()
+    assert cache.is_admissible()
+    # The successful refresh sees 128 remaining paths, so they fit again.
+    remove_session(fake, path)
+    assert cache.is_admissible() and not fake.pending
+    assert [m["reason"] for m in sent if m["type"] == "meeting.capture.pause"] == ["unknown"]
+    assert controller.state == "paused" and controller.manual_resume_required
+
+
+def test_full_read_overflow_forgets_all_paths(session: tuple[SessionState, FakeLogin]) -> None:
+    cache, fake = session
+    paths = [
+        add_remote_session(fake, f"ssh{index}", uid=1001, announce=False)
+        for index in range(session_state._MAX_IRRELEVANT_SESSIONS + 2)
+    ]
+    ready(session)
+    assert not cache._irrelevant_sessions
+    remove_session(fake, paths[-1])
+    assert not cache.known
+    fake.complete()
+    assert cache.is_admissible() and not cache._irrelevant_sessions
+    remove_session(fake, paths[0])
+    assert not cache.known
+    fake.complete()
+    assert cache.is_admissible()
+    remove_session(fake, paths[-2])
+    assert cache.is_admissible() and not fake.pending
+
+
+def test_full_read_counts_duplicate_rows_once_at_capacity(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = session
+    paths = [
+        add_remote_session(fake, f"ssh{index}", uid=1001, announce=False)
+        for index in range(session_state._MAX_IRRELEVANT_SESSIONS)
+    ]
+    fake.rows.append(fake.rows[-1].copy())
+    ready(session)
+    assert cache._irrelevant_sessions == set(paths)
+    remove_session(fake, paths[-1])
+    assert cache.is_admissible() and not fake.pending
+
+
+@pytest.mark.parametrize("foreign_first", [True, False], ids=["foreign-first", "foreign-last"])
+def test_foreign_list_row_cannot_mark_own_local_path(
+    session: tuple[SessionState, FakeLogin], foreign_first: bool
+) -> None:
+    cache, fake = session
+    path = add_remote_session(fake, announce=False)
+    fake.props[path]["Remote"] = False
+    foreign_row = ["two", 1001, "other", "", path]
+    fake.rows.insert(1 if foreign_first else len(fake.rows), foreign_row)
+    ready(session)
+    remove_session(fake, path)
+    assert not cache.known and fake.trace[-1] == ("read", MANAGER_PATH, "Get")
+    fake.complete()
+    assert cache.is_admissible()
+
+
+def test_full_read_cannot_repopulate_paths_after_stop_during_publication(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = session
+    add_remote_session(fake, announce=False)
+
+    def stop_on_success() -> None:
+        if cache.known:
+            cache.stop()
+
+    cache.changed.connect(stop_on_success)
+    cache.start()
+    fake.complete()
+    assert fake.closed == 1
+    assert not cache.known and not fake.subscriptions and not cache._irrelevant_sessions
+
+
+def test_full_read_replaces_previously_remembered_paths(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    fake.complete()
+    fake.props[path]["Type"] = "web"
+    cache.refresh()
+    fake.complete()
+    assert cache.is_admissible()
+    remove_session(fake, path)
+    assert not cache.known
+
+
+def test_newly_selected_path_is_forgotten_before_full_read(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = ready(session)
+    path = add_remote_session(fake)
+    fake.complete()
+    fake.selected_path = path
+    cache.refresh()
+    fake.complete_one()  # PreparingForSleep
+    fake.complete_one()  # GetSession("auto")
+    assert cache.session_path == path and path not in cache._irrelevant_sessions
 
 
 def test_construction_unknown_then_subscriptions_before_first_locked_hint_read(

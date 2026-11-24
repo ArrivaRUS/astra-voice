@@ -14,6 +14,7 @@ from requests.exceptions import RequestException
 
 from astra_voice.core import logging as av_logging
 from astra_voice.meetings import events
+from astra_voice.worker.meeting_contract import COMMAND_FIELDS, ERROR_CODES
 
 pytestmark = pytest.mark.unit
 MARKER = "PRIVATE_MEETING_MARKER"
@@ -27,6 +28,12 @@ SECRETS = (
     "completion",
     "segment_text",
 )
+
+
+def test_start_failure_log_vocabularies_match_meeting_contract() -> None:
+    assert {code.value for code in events.StartFailureCode} == {*ERROR_CODES["enum"], "other"}
+    commands = {command for role in COMMAND_FIELDS.values() for command in role}
+    assert {request.value for request in events.StartFailureRequest} == commands | {"other"}
 
 
 @pytest.mark.parametrize("field", SECRETS)
@@ -318,6 +325,7 @@ def test_package_logging_uses_only_event_constants_ast() -> None:
     files = sorted((root / "meetings").rglob("*.py")) + sorted(
         (root / "worker").glob("meeting_*.py")
     )
+    files.append(root / "worker/monitor_stream.py")
     assert files
     found = {str(path.relative_to(root)): violations(path.read_text()) for path in files}
     assert not {name: lines for name, lines in found.items() if lines}

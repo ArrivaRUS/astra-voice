@@ -647,7 +647,7 @@ class WorkerSupervisor:
         del self._outgoing[:sent]
 
     def pump(self, timeout: float = 0.0) -> None:
-        """Читает порцию IPC через select; ожидание ограничено 50 мс и дедлайном."""
+        """Вычитывает доступные кадры IPC перед проверкой сроков ожидания."""
         if not math.isfinite(timeout) or timeout < 0:
             raise ValueError("Таймаут pump должен быть конечным и неотрицательным.")
         if self._exit_notifying:
@@ -657,43 +657,52 @@ class WorkerSupervisor:
         if self._restart_pending is not None:
             self._poll_restart()
             return
-        self._expire()
         connection = self._socket
-        if self.state != "running" or connection is None:
+        if connection is None:
+            self._expire()
+            return
+        if self.state != "running":
             return
         generation = self.generation
         delay = min(timeout, _POLL_INTERVAL_S)
         deadlines = [p.deadline for p in self._pending.values() if p.deadline is not None]
+        if self.role != "worker":
+            deadlines.extend(self._meeting_close_deadlines.values())
+            if not self._hello_accepted:
+                deadlines.append(self._hello_deadline)
+            if self._meeting_exit_deadline is not None:
+                deadlines.append(self._meeting_exit_deadline)
         if deadlines:
             delay = min(delay, max(0.0, min(deadlines) - self._clock()))
+        eof = False
         try:
-            readable, writable, _ = select.select(
+            _, writable, _ = select.select(
                 [connection], [connection] if self._outgoing else [], [], delay
             )
-            self._expire()
-            if self._socket is not connection:
-                return
-            if writable:
-                self._flush()
-            if readable and self._socket is connection:
-                data = connection.recv(ipc.MAX_FRAME_BYTES)
-                if not data:
-                    if self.role != "worker" and self._meeting_exit_deadline is not None:
-                        self._expire_meeting()
-                        return
-                    self._restart()
-                    return
-                self._receive(data, generation)
-        except BlockingIOError:
-            pass
+            # A stalled GUI can wake after the deadline with replies already queued.
+            with suppress(BlockingIOError):
+                while self._socket is connection:
+                    data = connection.recv(ipc.MAX_FRAME_BYTES)
+                    if not data:
+                        eof = True
+                        break
+                    self._receive(data, generation)
         except OSError:
             if self._socket is connection:
                 self._restart()
-        if self.state == "running" and self.process is not None and self.process.poll() is not None:
-            if self.role != "worker" and self._meeting_exit_deadline is not None:
+            return
+        if self._socket is not connection:
+            return
+        self._expire()
+        if self._socket is not connection:
+            return
+        if eof or (self.process is not None and self.process.poll() is not None):
+            if self._meeting_exit_deadline is not None:
                 self._expire_meeting()
             else:
                 self._restart()
+        elif writable:
+            self._flush()
 
     def _receive(self, data: bytes, generation: int) -> None:
         """Разбирает каждое тело отдельно, сохраняя кадры после безопасной ошибки."""

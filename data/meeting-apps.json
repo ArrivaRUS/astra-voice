@@ -4,9 +4,33 @@
     {
       "id": "dion",
       "title": "DION",
-      "binary": ["dion"],
-      "exe": [],
-      "class": "dion"
+      "binary": [
+        "dion"
+      ],
+      "exe": [
+        "/opt/Dion/dion"
+      ],
+      "class": "dion",
+      "verification": "executable"
+    },
+    {
+      "id": "browser",
+      "title": "Браузер",
+      "binary": [
+        "chromium",
+        "chromium-browser",
+        "yandex_browser",
+        "firefox",
+        "firefox-bin",
+        "firefox-esr"
+      ],
+      "exe": [
+        "/usr/lib/chromium/chromium",
+        "/opt/yandex/browser/yandex_browser",
+        "/usr/lib/firefox/firefox"
+      ],
+      "class": "browser",
+      "verification": "executable"
     }
   ]
 }

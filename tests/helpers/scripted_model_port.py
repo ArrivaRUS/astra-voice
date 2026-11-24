@@ -34,6 +34,7 @@ FIRST = CatalogEntry(
     layout="nemo-rnnt",
     variant="int8",
     recommended=True,
+    punctuation=True,
     host="huggingface.co",
     files=(),
     domestic=True,

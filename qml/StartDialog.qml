@@ -37,6 +37,16 @@ ApplicationWindow {
             ? settings.lockedSettings.indexOf(name) >= 0 : false
     }
     function cancel() { if (meeting) meeting.closeStartDialog() }
+    function repeatedActionKey(event) {
+        return event.isAutoRepeat &&
+            (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space)
+    }
+    component DialogButton: AvButton {
+        Keys.onPressed: if (root.repeatedActionKey(event)) event.accepted = true
+        Keys.onReleased: if (root.repeatedActionKey(event)) event.accepted = true
+        Keys.onReturnPressed: if (!root.repeatedActionKey(event) && enabled) clicked()
+        Keys.onEnterPressed: if (!root.repeatedActionKey(event) && enabled) clicked()
+    }
     function focusInitialButton() {
         if (!visible || !active || !initialFocusPending) return
         initialFocusPending = false
@@ -73,7 +83,8 @@ ApplicationWindow {
         }
     }
     function handleKey(event) {
-        if (event.key === Qt.Key_Escape) { cancel(); event.accepted = true }
+        if (repeatedActionKey(event)) { event.accepted = true }
+        else if (event.key === Qt.Key_Escape) { cancel(); event.accepted = true }
         else if (event.key === Qt.Key_Down || event.key === Qt.Key_Right) { chooseNext(1); event.accepted = true }
         else if (event.key === Qt.Key_Up || event.key === Qt.Key_Left) { chooseNext(-1); event.accepted = true }
     }
@@ -151,6 +162,8 @@ ApplicationWindow {
                             Accessible.role: Accessible.RadioButton
                             Accessible.name: option.title + ". " + option.caption
                             Accessible.checked: selected
+                            Keys.onPressed: if (root.repeatedActionKey(event)) event.accepted = true
+                            Keys.onReleased: if (root.repeatedActionKey(event)) event.accepted = true
                             onClicked: if (root.meeting) root.meeting.selectRecordingSource(option.id)
                             background: Rectangle {
                                 color: Theme.meetingStartOptionBg
@@ -313,7 +326,7 @@ ApplicationWindow {
                     variant: "error"
                     iconName: "alert"
                     body: root.error
-                    AvButton {
+                    DialogButton {
                         visible: root.state === "error-disk" || root.state === "error-audio"
                         small: true
                         text: root.text(root.state === "error-disk" ? "openMeetings" : "retry", "")
@@ -345,12 +358,12 @@ ApplicationWindow {
             height: implicitHeight
             spacing: 8
             Item { Layout.fillWidth: true }
-            AvButton {
+            DialogButton {
                 objectName: "meetingStartCancel"
                 text: root.text("cancel", qsTr("Отмена"))
                 onClicked: root.cancel()
             }
-            AvButton {
+            DialogButton {
                 id: startButton
                 objectName: "meetingStartConfirm"
                 text: root.text(root.starting ? "starting" : "start", "")
@@ -361,10 +374,6 @@ ApplicationWindow {
                 enabled: root.starting || (root.meeting && root.meeting.startCanStart === true)
                 hoverEnabled: !root.starting
                 onClicked: if (!root.starting && root.meeting && root.meeting.startCanStart === true)
-                    root.meeting.on_start_clicked()
-                Keys.onReturnPressed: if (!root.starting && enabled && root.meeting)
-                    root.meeting.on_start_clicked()
-                Keys.onEnterPressed: if (!root.starting && enabled && root.meeting)
                     root.meeting.on_start_clicked()
                 contentItem: RowLayout {
                     id: startContent

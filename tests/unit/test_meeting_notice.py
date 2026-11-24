@@ -86,24 +86,7 @@ def test_mute_line_names_dion_only_for_a_dion_call() -> None:
 @pytest.mark.parametrize("app_class", ["dion", "browser"])
 def test_recording_remembers_the_call_app_for_w3(rig: Rig, app_class: str) -> None:
     rig.bridge.requestRecording()
-    rig.recording.tick()
-    query = rig.supervisor.messages[-1]
-    rig.supervisor.event(
-        {
-            "type": "meeting.call.state",
-            "req": query["req"],
-            "request_type": "meeting.call.query",
-            "active": True,
-            "app_class": app_class,
-            "call_id": "call1",
-            "target": {
-                "sink_input": 7,
-                "object_serial": 9,
-                "verified": "declared-verified",
-            },
-            "generation": 1,
-        }
-    )
+    rig.supervisor.event(rig.call_state(app_class))
     assert rig.bridge.selectedSource == "call"
     rig.bridge.on_start_clicked()
     assert rig.recording.notice_app_class == app_class

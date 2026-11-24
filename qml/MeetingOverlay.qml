@@ -15,7 +15,8 @@ FocusScope {
     signal pauseClicked()
     signal resumeClicked()
     signal stopClicked()
-    signal participantsClicked()
+    signal copyParticipantsClicked()
+    signal participantsCopyFinished(bool copied)
     signal extendClicked()
     signal resumeMicrophoneClicked()
     signal keyboardRequested()
@@ -33,6 +34,12 @@ FocusScope {
     implicitWidth: pillWidth
     implicitHeight: pillHeight
     visible: !!presentation.visible
+    onVisibleChanged: if (!visible) participantsCopyTimer.stop()
+    onParticipantsCopyFinished: function(copied) {
+        if (copied) participantsCopyTimer.restart()
+        else participantsCopyTimer.stop()
+    }
+    Timer { id: participantsCopyTimer; interval: 1200 }
     Accessible.role: Accessible.AlertMessage
     Accessible.name: (terminal ? title.text : (paused ? (texts.paused || "") : (texts.recording || ""))) + (hasSecondary ? ". " + presentation.secondary : "")
     Keys.onEscapePressed: {
@@ -220,10 +227,10 @@ FocusScope {
             visible: !root.effectiveCompact && !root.terminal
             y: (row1.height - height) / 2
             iconOnly: true
-            iconName: "chat"
-            tooltip: root.texts.participants || ""
+            iconName: participantsCopyTimer.running ? "check" : "copy"
+            tooltip: root.texts.copyParticipants || ""
             keyboardMode: root.keyboardMode
-            onClicked: root.participantsClicked()
+            onClicked: root.copyParticipantsClicked()
         }
         MeetingOverlayButton {
             id: collapse
@@ -263,7 +270,7 @@ FocusScope {
                 width: parent.width / scale
                 text: root.presentation.secondary || ""
                 wrapMode: Text.Wrap
-                color: root.avState === "app-closed" || root.avState === "notify-fallback" ? PillTheme.pillIconMuted : PillTheme.pillWarning
+                color: root.avState === "app-closed" || root.avState === "notify-fallback" || root.avState === "far-partial" ? PillTheme.pillIconMuted : PillTheme.pillWarning
                 font.family: "PT Root UI"
                 font.pixelSize: PillTheme.pillMeetingBarSize * 2
                 // 04-recording.html inherits the page's CSS line-height: 1.5.
