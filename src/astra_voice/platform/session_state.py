@@ -370,6 +370,8 @@ class SessionState(QObject):
                 if classification:
                     # A probe never owns the cache verdict. Leave the verdict
                     # of the event that superseded it in place (e.g. Lock).
+                    if not self.known:
+                        self._schedule_retry()
                     return
                 # Contract §9 explicitly closes the cache on stale replies too.
                 # The newer read may already have finished (a slow login1 reply
@@ -378,15 +380,15 @@ class SessionState(QObject):
                 self._unknown()
                 self._schedule_retry()
                 return
-            if error:
-                if classification:
-                    self.refresh()
-                else:
-                    self._invalidate()
-                    self._schedule_retry()
-                return
             try:
-                callback(value)
+                if error:
+                    if classification:
+                        self.refresh()
+                    else:
+                        self._invalidate()
+                        self._schedule_retry()
+                else:
+                    callback(value)
             except Exception:
                 self._invalidate()
                 self._schedule_retry()
@@ -408,6 +410,7 @@ class SessionState(QObject):
         def selected(path: Any) -> None:
             if not isinstance(path, str) or not path.startswith(LOGIN_PATH_PREFIX):
                 raise ValueError
+            self._irrelevant_sessions.discard(path)
             if path != self.session_path or not self._session_subscriptions:
                 # Re-subscribe only when the session path changes (review minor).
                 for cancel in self._session_subscriptions:
@@ -457,6 +460,8 @@ class SessionState(QObject):
             def next_session() -> None:
                 if not remaining:
                     self._apply(snapshots)
+                    if generation == self.generation:
+                        self._replace_irrelevant_sessions(rows, snapshots)
                     return
                 path = remaining.pop()
 
@@ -484,16 +489,51 @@ class SessionState(QObject):
             return True
         seat = properties.get("Seat")
         session_class = properties.get("Class")
+        session_type = properties.get("Type")
         return (
             properties.get("Remote") is True
+            and isinstance(session_class, str)
+            and session_class == "user"
+            and isinstance(session_type, str)
+            and session_type in {"tty", "unspecified"}
             and isinstance(seat, (list, tuple))
             and len(seat) == 2
             and isinstance(seat[0], str)
-            and not seat[0]
+            and seat[0] == ""
             and isinstance(seat[1], str)
-            and isinstance(session_class, str)
-            and session_class == "user"
+            and seat[1] == "/"
         )
+
+    def _remember_irrelevant_session(self, path: str) -> bool:
+        if path in self._irrelevant_sessions:
+            return True
+        if len(self._irrelevant_sessions) >= _MAX_IRRELEVANT_SESSIONS:
+            # Forget all paths, including this one. Their removals take
+            # the ordinary fail-closed path until a successful re-read.
+            self._irrelevant_sessions.clear()
+            return False
+        self._irrelevant_sessions.add(path)
+        return True
+
+    def _replace_irrelevant_sessions(
+        self, rows: list[Any] | tuple[Any, ...], snapshots: dict[str, dict[str, Any]]
+    ) -> None:
+        self._irrelevant_sessions.clear()
+        for row in rows:
+            path = row[4]
+            if (
+                not isinstance(path, str)
+                or not path.startswith(LOGIN_PATH_PREFIX)
+                or path == self.session_path
+            ):
+                continue
+            # Prefer the validated own-UID snapshot if the ListSessions path is repeated.
+            if (row[1] == self.uid or path in snapshots) and not self._is_irrelevant_session(
+                snapshots.get(path)
+            ):
+                continue
+            if not self._remember_irrelevant_session(path):
+                return
 
     def _apply(self, snapshots: dict[str, dict[str, Any]]) -> None:
         graphical = []
@@ -503,9 +543,7 @@ class SessionState(QObject):
                 raise ValueError
             if type(user[0]) is not int or user[0] != self.uid:
                 raise ValueError
-            if properties["Type"] in {"x11", "wayland"} and not self._is_irrelevant_session(
-                properties
-            ):
+            if properties["Type"] in {"x11", "wayland"}:
                 graphical.append(path)
         if graphical != [self.session_path]:
             raise ValueError
@@ -609,6 +647,8 @@ class SessionState(QObject):
         self._invalidate()
         if path != self.session_path:
             self.refresh()
+        else:
+            self._schedule_retry()
 
     def _session_new(self, session_id: str, path: str) -> None:
         if not isinstance(path, str) or not path.startswith(LOGIN_PATH_PREFIX):
@@ -625,15 +665,10 @@ class SessionState(QObject):
             return
 
         def classified(properties: Any) -> None:
-            if not self._is_irrelevant_session(properties):
+            if self._is_irrelevant_session(properties):
+                self._remember_irrelevant_session(path)
+            else:
                 self.refresh()
-                return
-            if len(self._irrelevant_sessions) >= _MAX_IRRELEVANT_SESSIONS:
-                # Forget all paths, including this one. Their removals take
-                # the ordinary fail-closed path.
-                self._irrelevant_sessions.clear()
-                return
-            self._irrelevant_sessions.add(path)
 
         self._read(
             self.generation, path, PROPERTIES, "GetAll", [SESSION], classified, classification=True
