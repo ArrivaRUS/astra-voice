@@ -216,8 +216,9 @@ class MeetingRecording(QObject):
         self._recovery_seen: set[str] = set()
         self.recovered: dict[str, Meeting] = {}
         self._signature = ""
-        self._overlay_identity = ""
+        self._overlay_identity = ("", "")
         self._overlay_far_state = ""
+        self._overlay_far_pending = False
         self._overlay_far_deadline = 0.0
         self._overlay_error_deadline = 0.0
         self._overlay_error_seen = False
@@ -603,6 +604,10 @@ class MeetingRecording(QObject):
         )
 
     @property
+    def _card_editable(self) -> bool:
+        return self.dialog_open and not self.busy and self._start_origin != StartOrigin.CARD
+
+    @property
     def _call_available(self) -> bool:
         return (
             not self._variant1_lost
@@ -831,7 +836,7 @@ class MeetingRecording(QObject):
             elif self.clock() < self._overlay_recovery_deadline:
                 state = self._overlay_recovery_reason
                 secondary = self._overlay_recovery_text
-            elif self.clock() < self._overlay_far_deadline:
+            elif not self._overlay_far_pending and self.clock() < self._overlay_far_deadline:
                 state, secondary = "app-closed", W2_TEXTS["farEnded"]
             elif self.clock() < self._overlay_fallback_deadline:
                 # S17-A4: the notification service did not take the notice.
@@ -1191,7 +1196,7 @@ class MeetingRecording(QObject):
                 return
             if (
                 raw["type"] != "meeting.call.state"
-                or not self.dialog_open
+                or not self._card_editable
                 or self._variant1_lost
                 or raw["req"] != self._query_req
             ):
@@ -1209,11 +1214,19 @@ class MeetingRecording(QObject):
             self._publish()
             return
         if raw["type"] == "meeting.call.started":
+            if self._card_editable:
+                self._query_req = ""
             self._receive_offer(raw, "offer", self._update_offer_session())
             return
         if raw["type"] == "meeting.call.ended":
             if self.offer.call_ended(raw["call_id"], raw["reason"]):
                 self._offer_query_req = ""
+            if self._card_editable and raw["call_id"] == self.call_id:
+                self.call_id = self.app_class = ""
+                self.variant1 = False
+                if self.selected_source == "call":
+                    self.selected_source = "room"
+                self._publish()
             return
         if raw["type"] == "meeting.detector.code":
             if raw["code"] == DetectorCode.REMOTE and not self._automation_off:
@@ -1360,7 +1373,7 @@ class MeetingRecording(QObject):
             self._send_offer_query()
         self._tick_jobs()
         if (
-            self.dialog_open
+            self._card_editable
             and not self._automation_off
             and not self._variant1_lost
             and not self._pending_call_lost
@@ -1438,6 +1451,40 @@ class MeetingRecording(QObject):
             self.openMeetingsRequested.emit()
         self._publish()
 
+    def _update_overlay_far(self) -> None:
+        controller = self.controller
+        far_state = controller.tracks.get("far", "")
+        state = controller.state
+        now = self.clock()
+        if far_state == "live" or state not in {"opening", "paused", "recording"}:
+            self._overlay_far_pending = False
+            self._overlay_far_deadline = 0.0
+        elif (
+            far_state == "ended"
+            and self._overlay_far_state != "ended"
+            and controller.meeting is not None
+            and controller.meeting.variant != "mic_only"
+            and state in {"paused", "recording"}
+        ):
+            self._overlay_far_pending = state == "paused" or now < self._overlay_recovery_deadline
+            self._overlay_far_deadline = 0.0 if self._overlay_far_pending else now + 8
+        self._overlay_far_state = far_state
+        if (
+            not self._overlay_far_pending
+            or state != "recording"
+            or now < self._overlay_recovery_deadline
+        ):
+            return
+        if 0 < self._overlay_far_deadline <= now:
+            self._overlay_far_pending = False
+        elif controller.tracks.get("mic") in {"lost", "paused"} or controller.limit_warning:
+            # Give a higher-priority row a bounded window to clear.
+            if not self._overlay_far_deadline:
+                self._overlay_far_deadline = now + 8
+        else:
+            self._overlay_far_pending = False
+            self._overlay_far_deadline = now + 8
+
     def _publish(self, *, started: bool = False) -> None:
         if started and self._start_origin is not None:
             origin = self._start_origin
@@ -1445,12 +1492,16 @@ class MeetingRecording(QObject):
             self._clear_start()
             if origin == StartOrigin.OFFER:
                 self.offer.start_done()
+            elif origin == StartOrigin.CARD:
+                self.offer.remember_card_start(self.call_id, self.app_class)
         self._resolve_start()
-        identity = self.controller.meeting.id if self.controller.meeting else ""
+        meeting = self.controller.meeting
+        identity = (meeting.id if meeting else "", self.controller.capture_id)
         if identity != self._overlay_identity:
             self._overlay_identity = identity
             self._overlay_far_deadline = self._overlay_error_deadline = 0.0
             self._overlay_far_state = ""
+            self._overlay_far_pending = False
             self._overlay_error_seen = False
             self._overlay_recovery_key = None
             self._overlay_recovery_deadline = 0.0
@@ -1469,16 +1520,7 @@ class MeetingRecording(QObject):
                     "restoredIndicator" if reason == "indicators" else "restoredHang"
                 ].format(duration=self._duration(recovery["duration_ms"]))
                 self._overlay_recovery_deadline = self.clock() + 8
-        far_state = self.controller.tracks.get("far", "")
-        if (
-            far_state == "ended"
-            and self._overlay_far_state != "ended"
-            and self.controller.meeting is not None
-            and self.controller.meeting.variant != "mic_only"
-            and self.controller.state == "recording"
-        ):
-            self._overlay_far_deadline = self.clock() + 8
-        self._overlay_far_state = far_state
+        self._update_overlay_far()
         audio_error = bool(
             self.controller._committed
             and self.controller.state == "stopped"

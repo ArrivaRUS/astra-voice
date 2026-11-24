@@ -247,6 +247,11 @@ class OfferController:
         if app_class in _KINDS and self._role_serial is not None:
             self._calls[call_id] = app_class
 
+    def remember_card_start(self, call_id: str, app_class: str) -> None:
+        """Remember the call shown in W4 after a successful manual start."""
+        if self._calls.get(call_id) == app_class:
+            self._remember(call_id, app_class, "card", "accepted")
+
     def receive(
         self,
         *,
@@ -306,18 +311,25 @@ class OfferController:
         if call.deferred is not None or not self._suppressed(call):
             self._pending = call
 
-    def _remember(self, call: _Call, outcome: Outcome, role_serial: int | None = None) -> None:
+    def _remember(
+        self,
+        call_id: str,
+        app_class: str,
+        origin: Origin,
+        outcome: Outcome,
+        role_serial: int | None = None,
+    ) -> None:
         serial = self._role_serial if role_serial is None else role_serial
         assert serial is not None
-        entry = self._memory.get(call.app_class)
+        entry = self._memory.get(app_class)
         ids = entry.call_ids if entry is not None else set()
-        ids.add(call.call_id)
+        ids.add(call_id)
         deadline = (
             self.now_ms() + _INHERIT_MS
             if serial != self._role_serial and self._detector_started
             else None
         )
-        self._memory[call.app_class] = _Memory(outcome, ids, serial, call.origin, deadline)
+        self._memory[app_class] = _Memory(outcome, ids, serial, origin, deadline)
         log_meeting_offer(OfferEvent.MEMORY, OfferReason("remember-" + outcome.replace("_", "-")))
 
     def _take_visible(self) -> _Call | None:
@@ -338,7 +350,7 @@ class OfferController:
         if call is None:
             return
         if outcome is not None:
-            self._remember(call, outcome)
+            self._remember(call.call_id, call.app_class, call.origin, outcome)
         assert self._view is not None
         shown_ms = self.now_ms() - shown_at if shown_at is not None else 0
         log_meeting_offer(OfferEvent.CLOSED, reason, shown_ms)
@@ -362,8 +374,12 @@ class OfferController:
         self._visibility_changed()
 
     def start_aborted(self) -> None:
-        if self._starting is not None:
-            self._remember(self._starting.call, "lock_closed", self._starting.role_serial)
+        slot = self._starting
+        if slot is not None:
+            call = slot.call
+            self._remember(
+                call.call_id, call.app_class, call.origin, "lock_closed", slot.role_serial
+            )
             self.start_closed(reason=OfferReason.START_ABORTED)
 
     def start_closed(self, *, reason: OfferReason = OfferReason.OTHER) -> None:
@@ -389,7 +405,7 @@ class OfferController:
             log_meeting_offer(OfferEvent.DROPPED, reason)
         if for_capture and pending is not None:
             if pending.deferred is None:
-                self._remember(pending, "shown")
+                self._remember(pending.call_id, pending.app_class, pending.origin, "shown")
             else:
                 pending.deferred = "shown"
                 self._pending = pending
@@ -515,7 +531,7 @@ class OfferController:
         if call is not None and call.received_tick < self._tick_number:
             self._pending = None
             if call.deferred == "shown":
-                self._remember(call, "shown")
+                self._remember(call.call_id, call.app_class, call.origin, "shown")
             elif not eligible:
                 log_meeting_offer(OfferEvent.DROPPED, OfferReason.NOT_ELIGIBLE)
             elif not session.allowed:
@@ -561,7 +577,7 @@ class OfferController:
         self._guarded = True
         self._seconds = _DISPLAY_MS // 1000
         self._query_at = None
-        self._remember(call, "shown")
+        self._remember(call.call_id, call.app_class, call.origin, "shown")
         try:
             self._view.show(_KINDS[call.app_class], self._seconds)
         except Exception:
@@ -618,7 +634,7 @@ class OfferController:
             shown_at = self._shown_at
             call = self._take_visible()
             assert call is not None and self._role_serial is not None and self._view is not None
-            self._remember(call, "accepted", self._role_serial)
+            self._remember(call.call_id, call.app_class, call.origin, "accepted", self._role_serial)
             self._starting = _StartSlot(
                 call, self._role_serial, pressed_at_ms, pressed_at_ms + _START_TIMEOUT_MS, shown_at
             )
