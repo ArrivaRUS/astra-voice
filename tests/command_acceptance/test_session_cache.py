@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -381,19 +382,32 @@ def test_selected_session_removal_recovers_via_retry(
     session: tuple[SessionState, FakeLogin], marked: bool
 ) -> None:
     cache, fake = ready(session)
-    replacement = add_remote_session(fake, announce=False)
+    replacement = add_remote_session(fake, session_type="x11")
     fake.selected_path = replacement
     fake.props[replacement] = fake.props[SESSION_PATH].copy()
+    fake.rows[-1][3] = "seat0"
     if marked:
         cache._irrelevant_sessions.add(SESSION_PATH)
     remove_session(fake, SESSION_PATH)
     assert not cache.known and not cache.is_admissible()
+    assert cache._retry_timer.isActive()  # Removal itself must schedule the search.
+    assert [(request[0], request[2]) for request in fake.pending] == [(replacement, "GetAll")]
+    fake.complete_one()  # Classification of B was sent before A was removed.
+    assert not cache.known
     assert not fake.pending
+    before_retry = len(fake.trace)
     complete_retry(cache, fake)
     assert cache.session_path == replacement
+    assert [(path, method) for op, path, method in fake.trace[before_retry:] if op == "read"] == [
+        (MANAGER_PATH, "Get"),
+        (MANAGER_PATH, "GetSession"),
+        (MANAGER_PATH, "ListSessions"),
+        (replacement, "GetAll"),
+    ]
+    assert not cache._retry_timer.isActive()
 
 
-def test_stale_classification_while_unknown_recovers_via_retry(
+def test_stale_classification_does_not_schedule_retry_before_owner_returns(
     session: tuple[SessionState, FakeLogin],
 ) -> None:
     cache, fake = ready(session)
@@ -401,8 +415,75 @@ def test_stale_classification_while_unknown_recovers_via_retry(
     fake.signal("/org/freedesktop/DBus", "NameOwnerChanged", LOGIN, ":1.1", "")
     assert not cache.known and not cache._retry_timer.isActive()
     fake.complete_one()
-    assert not cache.known and not fake.pending
-    complete_retry(cache, fake)
+    assert not cache.known and not fake.pending and not cache._retry_timer.isActive()
+    fake.signal("/org/freedesktop/DBus", "NameOwnerChanged", LOGIN, "", ":1.2")
+    fake.complete()
+    assert cache.is_admissible()
+
+
+@pytest.mark.parametrize(("ssh_count", "reply_ms"), [(1, 400), (37, 800)])
+def test_slow_refresh_finishes_without_retry_from_stale_classification(
+    session: tuple[SessionState, FakeLogin],
+    monkeypatch: pytest.MonkeyPatch,
+    ssh_count: int,
+    reply_ms: int,
+) -> None:
+    cache, fake = session
+    for index in range(ssh_count - 1):
+        add_remote_session(fake, f"ssh{index}", announce=False)
+    cache.start()
+    for _ in range(ssh_count + 3):
+        fake.complete_one()
+    assert cache.is_admissible() and not fake.pending
+    before = len(fake.trace)
+    now_ms = 0
+    replies: deque[int] = deque()
+    read = fake.read
+
+    class VirtualRetryTimer:
+        deadline: int | None = None
+
+        def isActive(self) -> bool:
+            return self.deadline is not None
+
+        def start(self, delay_ms: int) -> None:
+            self.deadline = now_ms + delay_ms
+
+        def stop(self) -> None:
+            self.deadline = None
+
+    def delayed_read(
+        path: str, interface: str, method: str, arguments: list[Any], callback: ReadCallback
+    ) -> None:
+        read(path, interface, method, arguments, callback)
+        replies.append(now_ms + reply_ms)
+
+    timer = VirtualRetryTimer()
+    with monkeypatch.context() as patch:
+        patch.setattr(cache, "_retry_timer", timer)
+        patch.setattr(fake, "read", delayed_read)
+        add_remote_session(fake)
+        fake.signal(SESSION_PATH, "PropertiesChanged", SESSION, {}, ["LockedHint"])
+        assert not cache.known
+        while not cache.is_admissible():
+            response_at = replies[0] if replies else None
+            retry_at = timer.deadline
+            if retry_at is not None and (response_at is None or retry_at < response_at):
+                now_ms = retry_at
+                timer.stop()
+                cache._retry()
+            elif response_at is not None:
+                now_ms = replies.popleft()
+                fake.complete_one()
+            else:
+                break
+            if now_ms >= 155_000:
+                break
+
+        reads = fake.trace[before:].count(("read", MANAGER_PATH, "Get"))
+        # A full cycle has 3 manager replies and 1 GetAll per own-UID session.
+        assert (cache.is_admissible(), reads, now_ms) == (True, 1, (ssh_count + 4) * reply_ms)
+        assert not fake.pending and not timer.isActive()
 
 
 def test_unknown_cache_refreshes_on_session_new_without_classification(
@@ -435,7 +516,7 @@ def test_removal_before_classification_reply_takes_fail_closed_path(
     assert cache.is_admissible()
     reply(properties, False)
     assert cache.is_admissible()
-    assert not fake.pending
+    assert not fake.pending and not cache._retry_timer.isActive()
 
 
 @pytest.mark.parametrize("event", ["disconnected", "owner-changed", "stop"])
@@ -519,16 +600,68 @@ def test_full_read_overflow_forgets_all_paths(session: tuple[SessionState, FakeL
     cache, fake = session
     paths = [
         add_remote_session(fake, f"ssh{index}", uid=1001, announce=False)
-        for index in range(session_state._MAX_IRRELEVANT_SESSIONS + 1)
+        for index in range(session_state._MAX_IRRELEVANT_SESSIONS + 2)
     ]
     ready(session)
     assert not cache._irrelevant_sessions
+    remove_session(fake, paths[-1])
+    assert not cache.known
+    fake.complete()
+    assert cache.is_admissible() and not cache._irrelevant_sessions
     remove_session(fake, paths[0])
     assert not cache.known
     fake.complete()
     assert cache.is_admissible()
+    remove_session(fake, paths[-2])
+    assert cache.is_admissible() and not fake.pending
+
+
+def test_full_read_counts_duplicate_rows_once_at_capacity(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = session
+    paths = [
+        add_remote_session(fake, f"ssh{index}", uid=1001, announce=False)
+        for index in range(session_state._MAX_IRRELEVANT_SESSIONS)
+    ]
+    fake.rows.append(fake.rows[-1].copy())
+    ready(session)
+    assert cache._irrelevant_sessions == set(paths)
     remove_session(fake, paths[-1])
     assert cache.is_admissible() and not fake.pending
+
+
+@pytest.mark.parametrize("foreign_first", [True, False], ids=["foreign-first", "foreign-last"])
+def test_foreign_list_row_cannot_mark_own_local_path(
+    session: tuple[SessionState, FakeLogin], foreign_first: bool
+) -> None:
+    cache, fake = session
+    path = add_remote_session(fake, announce=False)
+    fake.props[path]["Remote"] = False
+    foreign_row = ["two", 1001, "other", "", path]
+    fake.rows.insert(1 if foreign_first else len(fake.rows), foreign_row)
+    ready(session)
+    remove_session(fake, path)
+    assert not cache.known and fake.trace[-1] == ("read", MANAGER_PATH, "Get")
+    fake.complete()
+    assert cache.is_admissible()
+
+
+def test_full_read_cannot_repopulate_paths_after_stop_during_publication(
+    session: tuple[SessionState, FakeLogin],
+) -> None:
+    cache, fake = session
+    add_remote_session(fake, announce=False)
+
+    def stop_on_success() -> None:
+        if cache.known:
+            cache.stop()
+
+    cache.changed.connect(stop_on_success)
+    cache.start()
+    fake.complete()
+    assert fake.closed == 1
+    assert not cache.known and not fake.subscriptions and not cache._irrelevant_sessions
 
 
 def test_full_read_replaces_previously_remembered_paths(

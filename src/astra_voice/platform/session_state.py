@@ -370,8 +370,6 @@ class SessionState(QObject):
                 if classification:
                     # A probe never owns the cache verdict. Leave the verdict
                     # of the event that superseded it in place (e.g. Lock).
-                    if not self.known:
-                        self._schedule_retry()
                     return
                 # Contract §9 explicitly closes the cache on stale replies too.
                 # The newer read may already have finished (a slow login1 reply
