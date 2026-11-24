@@ -15,7 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, Qt, QUrl
+from PyQt5.QtCore import QCoreApplication, QEvent, QObject, QPointF, Qt, QUrl
 from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtQml import QQmlApplicationEngine
 from PyQt5.QtQuick import QQuickItem
@@ -159,14 +159,19 @@ def test_w4_held_key_cannot_accept_fallback(tmp_path: Path, key: str) -> None:
     run_qt_probe(key, tmp_path)
 
 
-@pytest.mark.parametrize("gesture", ["mouse", "space", "mouse-cancel"])
-def test_w4_first_card_cannot_change_source_during_start_gesture(
-    tmp_path: Path, gesture: str
-) -> None:
+@pytest.mark.parametrize("gesture", ["mouse", "space"])
+def test_w4_refreshed_card_keeps_room_during_start_gesture(tmp_path: Path, gesture: str) -> None:
     run_qt_probe(f"gesture-{gesture}", tmp_path)
 
 
-def w4_first_card_during_gesture(rig: Rig, gesture: str) -> None:
+@pytest.mark.parametrize("initial_card_answered", [False, True], ids=["pending", "answered"])
+def test_w4_held_space_after_failed_start_keeps_room(
+    tmp_path: Path, initial_card_answered: bool
+) -> None:
+    run_qt_probe("spinner-answered" if initial_card_answered else "spinner-pending", tmp_path)
+
+
+def w4_failed_start_during_spinner(rig: Rig, *, initial_card_answered: bool) -> None:
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("meetingBridge", rig.bridge)
     install_icon_provider(engine)
@@ -174,6 +179,68 @@ def w4_first_card_during_gesture(rig: Rig, gesture: str) -> None:
     (window,) = engine.rootObjects()
     try:
         rig.bridge.requestRecording()
+        initial = rig.supervisor.messages[-1]
+        assert initial["type"] == QUERY
+        if initial_card_answered:
+            deliver(
+                rig,
+                {
+                    "type": "meeting.call.state",
+                    "request_type": QUERY,
+                    "req": initial["req"],
+                    "active": False,
+                },
+            )
+        QCoreApplication.processEvents()
+        button = window.findChild(QQuickItem, "meetingStartConfirm")
+        assert window.isVisible() and button is not None
+        button.forceActiveFocus(Qt.TabFocusReason)
+        assert button.hasActiveFocus() and rig.bridge.startCanStart
+        QTest.keyClick(window, Qt.Key_Return)
+        assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+        assert window.property("starting") and not rig.bridge.startCanStart
+        QTest.keyPress(window, Qt.Key_Space)
+        assert button.property("pressed")
+        deliver(rig, capture_error(rig, "prepare", "target-mismatch"))
+        rig.recording.tick()
+        refreshed = rig.supervisor.messages[-1]
+        assert refreshed["type"] == QUERY and refreshed["req"] != initial["req"]
+        deliver(rig, {**rig.call_state("browser", req=refreshed["req"]), "call_id": "browser2"})
+        assert rig.bridge.startOptions[0]["id"] == "call"
+        assert button.property("pressed") and rig.bridge.startCanStart
+        assert command_types(rig.supervisor).count(PREPARE) == 1
+        QTest.keyRelease(window, Qt.Key_Space)
+        assert command_types(rig.supervisor).count(PREPARE) == 2
+        assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+        assert rig.bridge.selectedSource == "room"
+    finally:
+        window.hide()
+        sip.delete(engine)
+
+
+def w4_refreshed_card_during_gesture(rig: Rig, gesture: str) -> None:
+    engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("meetingBridge", rig.bridge)
+    install_icon_provider(engine)
+    engine.load(QUrl.fromLocalFile(str(ROOT / "qml/StartDialog.qml")))
+    (window,) = engine.rootObjects()
+    try:
+        rig.bridge.requestRecording()
+        initial = rig.supervisor.messages[-1]
+        assert initial["type"] == QUERY
+        deliver(
+            rig,
+            {
+                "type": "meeting.call.state",
+                "request_type": QUERY,
+                "req": initial["req"],
+                "active": False,
+            },
+        )
+        deliver(rig, started("browser2", app_class="browser"))
+        rig.recording.tick()
+        refreshed = rig.supervisor.messages[-1]
+        assert refreshed["type"] == QUERY and refreshed["req"] != initial["req"]
         QCoreApplication.processEvents()
         button = window.findChild(QQuickItem, "meetingStartConfirm")
         assert window.isVisible() and button is not None
@@ -187,24 +254,17 @@ def w4_first_card_during_gesture(rig: Rig, gesture: str) -> None:
         assert button.property("pressed")
         assert rig.bridge.selectedSource == "room"
         assert_no_capture(rig)
-        if gesture == "mouse-cancel":
-            outside = QPoint(1, 1)
-            QTest.mouseMove(window, outside)
-            QTest.mouseRelease(window, Qt.LeftButton, pos=outside)
-            assert not button.property("pressed")
-            assert_no_capture(rig)
-        deliver(rig, rig.call_state("browser"))
+        deliver(rig, {**rig.call_state("browser", req=refreshed["req"]), "call_id": "browser2"})
+        assert button.property("pressed")
         assert button.isEnabled() and rig.bridge.selectedSource == "room"
-        assert rig.recording.call_id == "call1" and rig.recording.variant1
-        if gesture == "mouse-cancel":
-            assert_no_capture(rig)
+        assert rig.recording.call_id == "browser2" and rig.recording.variant1
+        assert rig.bridge.startOptions[0]["id"] == "call"
+        if gesture == "space":
+            QTest.keyRelease(window, Qt.Key_Space)
         else:
-            if gesture == "space":
-                QTest.keyRelease(window, Qt.Key_Space)
-            else:
-                QTest.mouseRelease(window, Qt.LeftButton, pos=center)
-            assert command_types(rig.supervisor).count(PREPARE) == 1
-            assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+            QTest.mouseRelease(window, Qt.LeftButton, pos=center)
+        assert command_types(rig.supervisor).count(PREPARE) == 1
+        assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
     finally:
         window.hide()
         sip.delete(engine)
@@ -1216,7 +1276,11 @@ if __name__ == "__main__":
     probe_rig = Rig(Path(directory))
     try:
         if mode.startswith("gesture-"):
-            w4_first_card_during_gesture(probe_rig, mode.removeprefix("gesture-"))
+            w4_refreshed_card_during_gesture(probe_rig, mode.removeprefix("gesture-"))
+        elif mode.startswith("spinner-"):
+            w4_failed_start_during_spinner(
+                probe_rig, initial_card_answered=mode == "spinner-answered"
+            )
         else:
             w4_held_key(probe_rig, keys[mode])
     finally:

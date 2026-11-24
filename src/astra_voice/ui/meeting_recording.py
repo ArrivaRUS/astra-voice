@@ -662,6 +662,7 @@ class MeetingRecording(QObject):
     def begin_clicked(self) -> None:
         if not self.can_start:
             return
+        self._selection_touched = True
         far: Message = {"kind": "none"}
         if self.selected_source == "all":
             far = {"kind": "sink_monitor"}
@@ -1100,8 +1101,6 @@ class MeetingRecording(QObject):
         self._clear_start()
         if origin == StartOrigin.CARD and self.dialog_open:
             self._query_req = ""
-            if self._selection_touched is False:
-                self._selection_touched = None
         elif origin == StartOrigin.OFFER:
             if failed:
                 self.offer.start_failed(ERROR_TEXT[code])
@@ -1466,7 +1465,6 @@ class MeetingRecording(QObject):
         state = controller.state
         now = self.clock()
         if far_state == "live" or state not in {"opening", "paused", "recording"}:
-            self._overlay_far_state = ""
             self._overlay_far_pending = False
             self._overlay_far_deadline = 0.0
         elif (
@@ -1476,9 +1474,9 @@ class MeetingRecording(QObject):
             and controller.meeting.variant != "mic_only"
             and state in {"paused", "recording"}
         ):
-            self._overlay_far_state = "ended"
             self._overlay_far_pending = state == "paused" or now < self._overlay_recovery_deadline
             self._overlay_far_deadline = 0.0 if self._overlay_far_pending else now + 8
+        self._overlay_far_state = far_state
         if (
             not self._overlay_far_pending
             or state != "recording"

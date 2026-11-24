@@ -219,15 +219,18 @@ def test_w4_reopen_resets_call_and_explicit_choice(rig: Rig) -> None:
     assert rig.bridge.selectedSource == "call"
 
 
-@pytest.mark.parametrize("selected", [None, "room", "all"])
-def test_w4_refresh_after_failed_preflight_renews_first_card_only(
-    rig: Rig, selected: str | None
-) -> None:
+@pytest.mark.parametrize("selected", [None, "room", "all", "call"])
+def test_w4_refresh_after_failed_preflight_preserves_source(rig: Rig, selected: str | None) -> None:
     rig.bridge.requestRecording()
     (first,) = card_requests(rig)
-    inactive_card(rig, first)
-    if selected is not None:
-        rig.bridge.selectRecordingSource(selected)
+    if selected == "call":
+        rig.supervisor.event(rig.call_state(req=first))
+    else:
+        inactive_card(rig, first)
+        if selected is not None:
+            rig.bridge.selectRecordingSource(selected)
+    expected_source = selected or "room"
+    assert rig.bridge.selectedSource == expected_source
     deliver(rig, started(CALL))
     rig.recording.tick()
     _, revoked = card_requests(rig)
@@ -243,11 +246,36 @@ def test_w4_refresh_after_failed_preflight_renews_first_card_only(
     current = requests[-1]
     assert current != revoked and rig.bridge.startCanStart
     rig.supervisor.event(rig.call_state("browser", req=revoked))
-    assert rig.bridge.selectedSource == (selected or "room") and not rig.recording.call_id
+    assert (rig.bridge.selectedSource, rig.recording.call_id) == (
+        expected_source,
+        CALL if selected == "call" else "",
+    )
     rig.supervisor.event(rig.call_state(req=current))
-    assert rig.bridge.selectedSource == (selected or "call")
+    assert (rig.bridge.selectedSource, rig.recording.call_id) == (expected_source, CALL)
+    assert rig.bridge.startOptions[0]["id"] == "call"
     rig.recording.tick()
     assert card_requests(rig) == requests
+
+
+def test_w4_first_card_after_failed_call_leaves_replacement_unselected(rig: Rig) -> None:
+    rig.bridge.requestRecording()
+    (first,) = card_requests(rig)
+    rig.supervisor.event(rig.call_state(req=first))
+    assert rig.bridge.selectedSource == "call" and rig.recording.app_class == "dion"
+    rig.storage = replace(rig.storage, free_mb=599)
+    rig.bridge.on_start_clicked()
+    rig.recording.tick()
+    assert rig.bridge.startState == "error-disk" and rig.bridge.selectedSource == "call"
+
+    rig.storage = replace(rig.storage, free_mb=1000)
+    rig.bridge.retryStart()
+    _, fresh = card_requests(rig)
+    assert fresh != first
+    rig.supervisor.event({**rig.call_state("browser", req=fresh), "call_id": "browser2"})
+    assert rig.recording.call_id == "browser2" and rig.bridge.startCanStart
+    rig.bridge.on_start_clicked()
+    assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+    assert rig.bridge.selectedSource == "room"
 
 
 def test_w4_idle_after_unexpected_refusal_accepts_fresh_card(rig: Rig) -> None:
@@ -262,7 +290,8 @@ def test_w4_idle_after_unexpected_refusal_accepts_fresh_card(rig: Rig) -> None:
     _, current = card_requests(rig)
     assert current != first
     rig.supervisor.event(rig.call_state(req=current))
-    assert rig.bridge.selectedSource == "call" and rig.recording.call_id == CALL
+    assert (rig.bridge.selectedSource, rig.recording.call_id) == ("room", CALL)
+    assert rig.bridge.startOptions[0]["id"] == "call"
 
 
 def automatic_pause(rig: Rig, reason: str, *, with_far: bool = True, revision: int = 2) -> None:
@@ -440,17 +469,27 @@ def test_w2_full_far_warning_for_loss_during_recovery_text(rig: Rig) -> None:
     assert_full_far_warning(rig)
 
 
-def test_w2_auto_resume_does_not_repeat_already_shown_loss(rig: Rig) -> None:
+def test_w2_loss_under_limit_before_autopause_gets_full_warning(rig: Rig) -> None:
     start(rig, with_far=True)
-    far_track(rig, "ended", "target-removed", revision=2)
-    assert_full_far_warning(rig)
+    rig.now += 6910
+    rig.recording.tick()
+    assert rig.bridge.overlay["state"] == "limit-soon"
+    rig.reply(
+        "track",
+        track="far",
+        state="ended",
+        kind="target-removed",
+        state_rev=2,
+        at_recorded_ms=6_910_000,
+    )
+    assert rig.bridge.overlay["state"] == "limit-soon"
     automatic_pause(rig, "lease", revision=3)
     rig.reply(
         "alive",
         seq=1,
         state="paused",
         state_rev=3,
-        recorded_ms=2000,
+        recorded_ms=6_911_000,
         tracks={"mic": "paused", "far": "ended"},
         free_mb=1000,
         cpu_pct=0,
@@ -458,13 +497,16 @@ def test_w2_auto_resume_does_not_repeat_already_shown_loss(rig: Rig) -> None:
         manual_resume_required=False,
         blocked_epoch=2,
     )
-    auto_resume(rig, "lease", revision=4)
+    auto_resume(rig, "lease", revision=4, recorded_ms=6_911_000)
+    assert rig.bridge.overlay["state"] == "limit-soon"
+    rig.bridge.on_overlay_extend_clicked()
+    assert rig.supervisor.messages[-1]["type"] == "meeting.capture.extend"
     assert rig.bridge.overlay["state"] == "reason-hang"
-    rig.now += 8
+    resumed_at = rig.now
+    rig.now = resumed_at + 7.999
     rig.recording.tick()
-    assert rig.bridge.overlay["state"] == "recording" and rig.bridge.overlay["secondary"] == ""
-    far_track(rig, "live", "reopened", revision=4)
-    far_track(rig, "ended", "target-removed", revision=4)
+    assert rig.bridge.overlay["state"] == "reason-hang"
+    rig.now = resumed_at + 8
     assert_full_far_warning(rig)
 
 
