@@ -38,13 +38,16 @@ def start(rig: Rig, *, mid: str | None = None, with_far: bool = False) -> None:
 
 def finish(rig: Rig) -> None:
     rig.bridge.on_overlay_stop_clicked()
-    rig.reply("closed", tracks=["mic"], state_rev=2)
+    stop = rig.supervisor.messages[-1]
+    assert stop["type"] == "meeting.capture.stop"
+    revision = stop["state_rev"] + 1
+    rig.reply("closed", tracks=["mic"], state_rev=revision)
     rig.reply(
         "finalized",
         segments={"mic": 0, "far": 0},
         intervals=[],
         status="succeeded",
-        state_rev=2,
+        state_rev=revision,
     )
     role = rig.supervisor
     role.ready, role.exited = False, True
