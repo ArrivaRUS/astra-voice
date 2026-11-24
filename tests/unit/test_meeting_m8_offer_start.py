@@ -15,9 +15,11 @@ from unittest.mock import Mock
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, QUrl
+from PyQt5.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, Qt, QUrl
 from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtQml import QQmlApplicationEngine
+from PyQt5.QtQuick import QQuickItem
+from PyQt5.QtTest import QTest
 from test_meeting_capture import Rig as RoleRig
 from test_meeting_m8_call_service import ALLOWED, TARGET, CheckDouble, checked_card
 from test_meeting_m8_call_service import service as service
@@ -155,6 +157,57 @@ def run_qt_probe(mode: str, directory: Path) -> None:
 @pytest.mark.parametrize("key", ["return", "keypad-enter", "space"])
 def test_w4_held_key_cannot_accept_fallback(tmp_path: Path, key: str) -> None:
     run_qt_probe(key, tmp_path)
+
+
+@pytest.mark.parametrize("gesture", ["mouse", "space", "mouse-cancel"])
+def test_w4_first_card_cannot_change_source_during_start_gesture(
+    tmp_path: Path, gesture: str
+) -> None:
+    run_qt_probe(f"gesture-{gesture}", tmp_path)
+
+
+def w4_first_card_during_gesture(rig: Rig, gesture: str) -> None:
+    engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("meetingBridge", rig.bridge)
+    install_icon_provider(engine)
+    engine.load(QUrl.fromLocalFile(str(ROOT / "qml/StartDialog.qml")))
+    (window,) = engine.rootObjects()
+    try:
+        rig.bridge.requestRecording()
+        QCoreApplication.processEvents()
+        button = window.findChild(QQuickItem, "meetingStartConfirm")
+        assert window.isVisible() and button is not None
+        button.forceActiveFocus(Qt.TabFocusReason)
+        assert button.hasActiveFocus() and button.isEnabled()
+        center = button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint()
+        if gesture == "space":
+            QTest.keyPress(window, Qt.Key_Space)
+        else:
+            QTest.mousePress(window, Qt.LeftButton, pos=center)
+        assert button.property("pressed")
+        assert rig.bridge.selectedSource == "room"
+        assert_no_capture(rig)
+        if gesture == "mouse-cancel":
+            outside = QPoint(1, 1)
+            QTest.mouseMove(window, outside)
+            QTest.mouseRelease(window, Qt.LeftButton, pos=outside)
+            assert not button.property("pressed")
+            assert_no_capture(rig)
+        deliver(rig, rig.call_state("browser"))
+        assert button.isEnabled() and rig.bridge.selectedSource == "room"
+        assert rig.recording.call_id == "call1" and rig.recording.variant1
+        if gesture == "mouse-cancel":
+            assert_no_capture(rig)
+        else:
+            if gesture == "space":
+                QTest.keyRelease(window, Qt.Key_Space)
+            else:
+                QTest.mouseRelease(window, Qt.LeftButton, pos=center)
+            assert command_types(rig.supervisor).count(PREPARE) == 1
+            assert rig.supervisor.messages[-1]["far"] == {"kind": "none"}
+    finally:
+        window.hide()
+        sip.delete(engine)
 
 
 def w4_held_key(rig: Rig, key: Qt.Key) -> None:
@@ -1162,6 +1215,9 @@ if __name__ == "__main__":
     get_qapplication()
     probe_rig = Rig(Path(directory))
     try:
-        w4_held_key(probe_rig, keys[mode])
+        if mode.startswith("gesture-"):
+            w4_first_card_during_gesture(probe_rig, mode.removeprefix("gesture-"))
+        else:
+            w4_held_key(probe_rig, keys[mode])
     finally:
         probe_rig.bridge.shutdown()

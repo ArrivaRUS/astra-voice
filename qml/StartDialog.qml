@@ -373,6 +373,8 @@ ApplicationWindow {
                 implicitWidth: startContent.implicitWidth + leftPadding + rightPadding
                 enabled: root.starting || (root.meeting && root.meeting.startCanStart === true)
                 hoverEnabled: !root.starting
+                onPressed: if (!root.starting && root.meeting && root.meeting.startCanStart === true)
+                    root.meeting.selectRecordingSource(root.meeting.selectedSource)
                 onClicked: if (!root.starting && root.meeting && root.meeting.startCanStart === true)
                     root.meeting.on_start_clicked()
                 contentItem: RowLayout {

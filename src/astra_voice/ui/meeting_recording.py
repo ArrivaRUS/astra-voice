@@ -189,7 +189,8 @@ class MeetingRecording(QObject):
         self._shutting_down = False
         self.dialog_open = False
         self.selected_source = "room"
-        self._selection_touched = False
+        # None: awaiting first CARD; False: first CARD handled; True: user chose.
+        self._selection_touched: bool | None = None
         self.call_id = ""
         self.app_class = ""
         self.variant1 = False
@@ -494,7 +495,7 @@ class MeetingRecording(QObject):
             self._publish()
             return
         self.selected_source = "room"
-        self._selection_touched = False
+        self._selection_touched = None
         self._preview_error = ""
         self.controller.error_code = ""
         self._preview_ready = False
@@ -1097,7 +1098,11 @@ class MeetingRecording(QObject):
         failed = code in _START_FAILURES
         self._log_start_outcome(StartOutcome.FAILED if failed else StartOutcome.ABORTED)
         self._clear_start()
-        if origin == StartOrigin.OFFER:
+        if origin == StartOrigin.CARD and self.dialog_open:
+            self._query_req = ""
+            if self._selection_touched is False:
+                self._selection_touched = None
+        elif origin == StartOrigin.OFFER:
             if failed:
                 self.offer.start_failed(ERROR_TEXT[code])
             elif code == "disabled":
@@ -1167,7 +1172,7 @@ class MeetingRecording(QObject):
         code = controller.error_code
         if code in {"session-blocked", "disabled", "storage-unavailable", "disk-low"}:
             self._finish_start_error(code)
-        elif state == "stopped":
+        elif state in {"idle", "stopped"}:
             self._finish_start_error(code or "audio-unavailable")
 
     def _event(self, event: Message) -> None:
@@ -1201,16 +1206,19 @@ class MeetingRecording(QObject):
                 or raw["req"] != self._query_req
             ):
                 return
-            self.call_id = raw.get("call_id", "")
-            self.app_class = raw.get("app_class", "")
+            target = (raw.get("call_id", ""), raw.get("app_class", ""))
+            target_changed = target != (self.call_id, self.app_class)
+            self.call_id, self.app_class = target
             self.variant1 = raw.get("variant1", False)
             if raw["active"]:
                 self.offer.track_call(self.call_id, self.app_class)
-            if self._call_available:
-                if not self._selection_touched and not self.no_app_split:
-                    self.selected_source = "call"
-            elif self.selected_source == "call":
+            first_card = self._selection_touched is None
+            if first_card:
+                self._selection_touched = False
+            if self.selected_source == "call" and (target_changed or not self._call_available):
                 self.selected_source = "room"
+            elif first_card and self._call_available and not self.no_app_split:
+                self.selected_source = "call"
             self._publish()
             return
         if raw["type"] == "meeting.call.started":
@@ -1222,6 +1230,7 @@ class MeetingRecording(QObject):
             if self.offer.call_ended(raw["call_id"], raw["reason"]):
                 self._offer_query_req = ""
             if self._card_editable and raw["call_id"] == self.call_id:
+                self._query_req = ""
                 self.call_id = self.app_class = ""
                 self.variant1 = False
                 if self.selected_source == "call":
@@ -1457,6 +1466,7 @@ class MeetingRecording(QObject):
         state = controller.state
         now = self.clock()
         if far_state == "live" or state not in {"opening", "paused", "recording"}:
+            self._overlay_far_state = ""
             self._overlay_far_pending = False
             self._overlay_far_deadline = 0.0
         elif (
@@ -1466,9 +1476,9 @@ class MeetingRecording(QObject):
             and controller.meeting.variant != "mic_only"
             and state in {"paused", "recording"}
         ):
+            self._overlay_far_state = "ended"
             self._overlay_far_pending = state == "paused" or now < self._overlay_recovery_deadline
             self._overlay_far_deadline = 0.0 if self._overlay_far_pending else now + 8
-        self._overlay_far_state = far_state
         if (
             not self._overlay_far_pending
             or state != "recording"
